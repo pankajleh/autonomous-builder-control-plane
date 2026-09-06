@@ -50,12 +50,12 @@ git diff --check
 - [x] Run validation, mark Task 1 complete, and commit.
 ### Task 2: Preserve terminal-failure evidence before cleanup
 
-- [ ] Add immutable recovery snapshot metadata tying run/attempt identity to repository, worktree, branch, HEAD, status, and owner proof.
-- [ ] Capture uncommitted diff/status and relevant Ralphex progress metadata before any authorized cleanup.
-- [ ] Bound snapshot sizes and preserve truncation metadata; never silently omit oversized state.
-- [ ] Ensure snapshot publication failure prevents cleanup/restart.
-- [ ] Add tests proving dirty state preservation, clean-state snapshot, immutable hashes, size bounds, and no cleanup on evidence failure.
-- [ ] Run validation, mark Task 2 complete, and commit.
+- [x] Add immutable recovery snapshot metadata tying run/attempt identity to repository, worktree, branch, HEAD, status, and owner proof.
+- [x] Capture uncommitted diff/status and relevant Ralphex progress metadata before any authorized cleanup.
+- [x] Bound snapshot sizes and preserve truncation metadata; never silently omit oversized state.
+- [x] Ensure snapshot publication failure prevents cleanup/restart.
+- [x] Add tests proving dirty state preservation, clean-state snapshot, immutable hashes, size bounds, and no cleanup on evidence failure.
+- [x] Run validation, mark Task 2 complete, and commit.
 
 ### Task 3: Implement deterministic failure/blocker classification
 
