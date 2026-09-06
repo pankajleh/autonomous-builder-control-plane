@@ -9,13 +9,13 @@ This is a bounded correction plan for one independently verified Claude Code maj
 
 ### Task 1: Synchronize bounded subprocess output capture
 
-- [ ] Fix the `internal/supervisor` bounded stdout/stderr capture so `Write`, truncation reads, and evidence byte reads are race-free when `exec.Cmd.WaitDelay` returns before copy goroutines have fully quiesced.
-- [ ] Use the smallest synchronization mechanism appropriate for `boundedBuffer`; `Bytes()` must return a stable copy safe for hashing/publishing.
-- [ ] Preserve the existing non-blocking output-limit signal behavior and all existing outcome semantics.
-- [ ] Add a deterministic regression test that exercises the WaitDelay/retained-pipe path with a descendant writing concurrently or otherwise proves the prior race is closed.
-- [ ] Preserve process-group cleanup, output-limit, cancellation, timeout, signal, and evidence behavior.
-- [ ] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
-- [ ] Mark this task complete and commit only this bounded correction.
+- [x] Fix the `internal/supervisor` bounded stdout/stderr capture so `Write`, truncation reads, and evidence byte reads are race-free when `exec.Cmd.WaitDelay` returns before copy goroutines have fully quiesced.
+- [x] Use the smallest synchronization mechanism appropriate for `boundedBuffer`; `Bytes()` must return a stable copy safe for hashing/publishing.
+- [x] Preserve the existing non-blocking output-limit signal behavior and all existing outcome semantics.
+- [x] Add a deterministic regression test that exercises the WaitDelay/retained-pipe path with a descendant writing concurrently or otherwise proves the prior race is closed.
+- [x] Preserve process-group cleanup, output-limit, cancellation, timeout, signal, and evidence behavior.
+- [x] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
+- [x] Mark this task complete and commit only this bounded correction.
 
 ## Non-goals
 

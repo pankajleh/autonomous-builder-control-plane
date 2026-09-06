@@ -126,6 +126,19 @@ func TestRunTerminatesAndBoundsExcessiveOutput(t *testing.T) {
 	}
 }
 
+func TestBoundedBufferBytesReturnsStableCopy(t *testing.T) {
+	buffer := newBoundedBuffer(16, make(chan struct{}, 1))
+	if _, err := buffer.Write([]byte("captured")); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := buffer.Bytes()
+	snapshot[0] = 'X'
+	if got := string(buffer.Bytes()); got != "captured" {
+		t.Fatalf("buffer bytes = %q after snapshot mutation, want %q", got, "captured")
+	}
+}
+
 func TestRunValidatesStructuredInput(t *testing.T) {
 	valid, _ := helperCommand(t, "success")
 	tests := map[string]func(*Command){

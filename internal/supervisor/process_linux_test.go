@@ -5,6 +5,7 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -110,6 +111,13 @@ func TestRunBoundsOutputPipeRetainedByEscapedDescendant(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 3*time.Second {
 		t.Fatalf("retained output pipe blocked supervisor for %s", elapsed)
 	}
+	stdout, err := os.ReadFile(result.StdoutRef.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(stdout), "escaped descendant output") {
+		t.Fatalf("captured stdout = %q, want concurrent descendant output", stdout)
+	}
 	data, err := os.ReadFile(pidPath)
 	if err != nil {
 		t.Fatal(err)
@@ -123,8 +131,13 @@ func TestRunBoundsOutputPipeRetainedByEscapedDescendant(t *testing.T) {
 
 func TestSupervisorInheritedPipeHelper(t *testing.T) {
 	if os.Getenv("GO_WANT_SUPERVISOR_PIPE_CHILD") == "1" {
-		time.Sleep(10 * time.Second)
-		return
+		for {
+			if _, err := fmt.Fprintln(os.Stdout, "escaped descendant output"); err != nil {
+				time.Sleep(10 * time.Second)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
 	if os.Getenv("GO_WANT_SUPERVISOR_PIPE_PARENT") != "1" {
 		return

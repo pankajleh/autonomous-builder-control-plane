@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -262,6 +263,7 @@ func classify(result *Result, ctx context.Context, cmd *exec.Cmd, waitErr error,
 }
 
 type boundedBuffer struct {
+	mu        sync.Mutex
 	buffer    bytes.Buffer
 	remaining int64
 	truncated bool
@@ -273,6 +275,9 @@ func newBoundedBuffer(limit int64, exceeded chan<- struct{}) boundedBuffer {
 }
 
 func (b *boundedBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	written := len(data)
 	if int64(len(data)) <= b.remaining {
 		_, _ = b.buffer.Write(data)
@@ -294,9 +299,15 @@ func (b *boundedBuffer) Write(data []byte) (int, error) {
 }
 
 func (b *boundedBuffer) Bytes() []byte {
-	return b.buffer.Bytes()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return append([]byte(nil), b.buffer.Bytes()...)
 }
 
 func (b *boundedBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	return b.truncated
 }
