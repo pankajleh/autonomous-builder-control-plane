@@ -47,12 +47,12 @@ make smoke
 
 ### Task 2: Implement immutable evidence artifact store
 
-- [ ] Add `internal/evidence` with a run-scoped store rooted under a caller-supplied evidence directory, never implicitly inside a target repository.
-- [ ] Write artifacts atomically into the run directory, compute SHA256 over exact bytes, and return `ledger.EvidenceRef` with URI/path, SHA256 and kind.
-- [ ] Reject unsafe artifact names/path traversal and prevent escape from the run evidence directory.
-- [ ] Provide helpers for byte artifacts and JSON metadata without mutating previously written artifacts.
-- [ ] Add tests proving exact hashing, path containment, immutability/no overwrite, and independent run directories.
-- [ ] Run the validation baseline, mark Task 2 complete, and commit.
+- [x] Add `internal/evidence` with a run-scoped store rooted under a caller-supplied evidence directory, never implicitly inside a target repository.
+- [x] Write artifacts atomically into the run directory, compute SHA256 over exact bytes, and return `ledger.EvidenceRef` with URI/path, SHA256 and kind.
+- [x] Reject unsafe artifact names/path traversal and prevent escape from the run evidence directory.
+- [x] Provide helpers for byte artifacts and JSON metadata without mutating previously written artifacts.
+- [x] Add tests proving exact hashing, path containment, immutability/no overwrite, and independent run directories.
+- [x] Run the validation baseline, mark Task 2 complete, and commit.
 
 ### Task 3: Implement supervised subprocess execution
 
