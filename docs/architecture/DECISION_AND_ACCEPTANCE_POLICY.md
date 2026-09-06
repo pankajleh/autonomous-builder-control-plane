@@ -88,6 +88,14 @@ independent cross-model review
 
 Cross-model review is never a replacement for deterministic acceptance.
 
+### Independent-review provider fallback
+
+When a risk-triggered independent cross-model review is required, the configured independent provider is attempted first. If that provider fails before delivering a complete review because of capacity/session limits, quota/auth/provider outage, timeout, or tool failure, the failure is recorded and the review defaults to a controller-authority architecture/security review against the same exact Git SHA. The current controller authority is ChatGPT unless project policy names another reviewer.
+
+The fallback reviewer must use the same Critical/Major scope and may return a clean gate only when deterministic acceptance for that exact code state has passed. A substantive Critical/Major finding from an independent provider is not a provider failure and cannot be bypassed by fallback; it must be corrected and reviewed again.
+
+The merge audit must record the exact reviewed SHA, reviewer mode (`cross_model` or `controller_fallback`), provider-failure reason when applicable, deterministic acceptance result, and final Critical/Major verdict.
+
 ## 6. Failure semantics
 
 A required command failure produces failed acceptance even if Ralphex previously emitted COMPLETED.
