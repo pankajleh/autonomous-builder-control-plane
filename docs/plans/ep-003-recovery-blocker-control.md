@@ -59,12 +59,12 @@ git diff --check
 
 ### Task 3: Implement deterministic failure/blocker classification
 
-- [ ] Add typed classifier output with class, confidence/evidence basis, retryability, and recommended controller state/action.
-- [ ] Distinguish transient execution failure, capacity/rate-limit wait, hard quota/usage exhaustion, auth/authorization, billing/account failure, validator unavailable, policy block, external dependency, secret requirement, human decision, and unrecoverable failure.
-- [ ] Keep secret values out of classifier payloads/evidence; redact credential-like material in captured diagnostics.
-- [ ] Unknown/ambiguous input must not be auto-retried destructively.
-- [ ] Add table-driven tests from harmless representative stderr/exit metadata including EXP-03/05/06-style cases.
-- [ ] Run validation, mark Task 3 complete, and commit.
+- [x] Add typed classifier output with class, confidence/evidence basis, retryability, and recommended controller state/action.
+- [x] Distinguish transient execution failure, capacity/rate-limit wait, hard quota/usage exhaustion, auth/authorization, billing/account failure, validator unavailable, policy block, external dependency, secret requirement, human decision, and unrecoverable failure.
+- [x] Keep secret values out of classifier payloads/evidence; redact credential-like material in captured diagnostics.
+- [x] Unknown/ambiguous input must not be auto-retried destructively.
+- [x] Add table-driven tests from harmless representative stderr/exit metadata including EXP-03/05/06-style cases.
+- [x] Run validation, mark Task 3 complete, and commit.
 ### Task 4: Add explicit blocker and resume authority records
 
 - [ ] Add typed controller records/events for recovery/blocker decisions using existing domain states and durable evidence refs.
