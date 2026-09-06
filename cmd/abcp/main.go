@@ -84,12 +84,12 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "validate authority: %v\n", err)
 		return 1
 	}
-	artifacts, err := evidence.NewStore(*evidenceRoot, governed.RunID())
+	canonicalLedger, err := canonicalLedgerDestination(*ledgerPath, *evidenceRoot)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	canonicalLedger, err := canonicalLedgerDestination(*ledgerPath, artifacts.Root())
+	artifacts, err := evidence.NewStore(*evidenceRoot, governed.RunID())
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -126,27 +126,11 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 }
 
 func canonicalLedgerDestination(path, evidenceRoot string) (string, error) {
-	absolute, err := filepath.Abs(path)
+	canonical, err := canonicalFuturePath(path)
 	if err != nil {
 		return "", fmt.Errorf("resolve ledger path: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
-		return "", fmt.Errorf("create ledger directory: %w", err)
-	}
-	canonicalParent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
-	if err != nil {
-		return "", fmt.Errorf("canonicalize ledger directory: %w", err)
-	}
-	canonical := filepath.Join(canonicalParent, filepath.Base(absolute))
-	if info, statErr := os.Lstat(absolute); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
-		canonical, err = filepath.EvalSymlinks(absolute)
-		if err != nil {
-			return "", fmt.Errorf("canonicalize ledger symlink: %w", err)
-		}
-	} else if statErr != nil && !os.IsNotExist(statErr) {
-		return "", fmt.Errorf("inspect ledger path: %w", statErr)
-	}
-	evidenceRoot, err = filepath.EvalSymlinks(evidenceRoot)
+	evidenceRoot, err = canonicalFuturePath(evidenceRoot)
 	if err != nil {
 		return "", fmt.Errorf("canonicalize evidence root: %w", err)
 	}
@@ -158,6 +142,51 @@ func canonicalLedgerDestination(path, evidenceRoot string) (string, error) {
 		return "", errors.New("ledger path must be outside the evidence root")
 	}
 	return canonical, nil
+}
+
+func canonicalFuturePath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return resolveFuturePath(filepath.Clean(absolute), 0)
+}
+
+func resolveFuturePath(path string, symlinkDepth int) (string, error) {
+	if symlinkDepth > 255 {
+		return "", errors.New("too many symlinks while resolving path")
+	}
+	volume := filepath.VolumeName(path)
+	root := volume + string(filepath.Separator)
+	relative := strings.TrimPrefix(path, root)
+	components := strings.Split(relative, string(filepath.Separator))
+	cursor := root
+	for index, component := range components {
+		if component == "" {
+			continue
+		}
+		candidate := filepath.Join(cursor, component)
+		info, err := os.Lstat(candidate)
+		if errors.Is(err, os.ErrNotExist) {
+			return filepath.Join(append([]string{candidate}, components[index+1:]...)...), nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			cursor = candidate
+			continue
+		}
+		target, err := os.Readlink(candidate)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(cursor, target)
+		}
+		return resolveFuturePath(filepath.Join(append([]string{target}, components[index+1:]...)...), symlinkDepth+1)
+	}
+	return filepath.Clean(cursor), nil
 }
 
 func loadManifest(path string) (authority.Manifest, error) {

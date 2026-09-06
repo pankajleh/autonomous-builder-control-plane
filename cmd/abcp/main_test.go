@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,6 +114,35 @@ func TestCanonicalLedgerDestinationRejectsEvidenceOverlap(t *testing.T) {
 	}
 	if canonical != outside {
 		t.Fatalf("canonical ledger path = %q, want %q", canonical, outside)
+	}
+}
+
+func TestCanonicalLedgerDestinationDoesNotCreateRejectedPath(t *testing.T) {
+	root := t.TempDir()
+	evidenceRoot := filepath.Join(root, "evidence")
+	poisonedArtifact := filepath.Join(evidenceRoot, "run-123", "authority.json")
+	ledgerPath := filepath.Join(poisonedArtifact, "events.jsonl")
+
+	if _, err := canonicalLedgerDestination(ledgerPath, evidenceRoot); err == nil || !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("expected ledger/evidence overlap rejection, got %v", err)
+	}
+	if _, err := os.Lstat(evidenceRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected destination mutated evidence namespace: %v", err)
+	}
+}
+
+func TestCanonicalLedgerDestinationRejectsDanglingSymlinkIntoEvidence(t *testing.T) {
+	root := t.TempDir()
+	evidenceRoot := filepath.Join(root, "evidence")
+	if err := os.MkdirAll(filepath.Join(evidenceRoot, "run-123"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ledgerLink := filepath.Join(root, "ledger-link")
+	if err := os.Symlink(filepath.Join(evidenceRoot, "run-123", "events.jsonl"), ledgerLink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := canonicalLedgerDestination(ledgerLink, evidenceRoot); err == nil || !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("expected dangling ledger symlink overlap rejection, got %v", err)
 	}
 }
 

@@ -319,6 +319,38 @@ if [ "$OPENAI_API_KEY" != "authorized-provider-key" ]; then exit 42; fi
 	}
 }
 
+func TestRunnerIgnoresAmbientGitRepositoryOverrides(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	t.Setenv("GIT_DIR", filepath.Join(t.TempDir(), "attacker.git"))
+	t.Setenv("GIT_WORK_TREE", t.TempDir())
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+	t.Setenv("GIT_CONFIG_VALUE_0", "attacker-helper")
+	t.Setenv("ABCP_CONTROLLER_SECRET", "must-not-reach-git")
+
+	result := fixture.execute(t)
+	if !result.Accepted() {
+		t.Fatalf("ambient Git overrides redirected governed validation: %#v", result)
+	}
+}
+
+func TestRunnerAcceptsNonWorktreeCandidateFromCleanDetachedCheckout(t *testing.T) {
+	script := "#!/bin/sh\nprintf 'uncommitted output\\n' > uncommitted.txt\n"
+	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, commandPath(t, "test"), "!", "-e", "uncommitted.txt")
+
+	result := fixture.execute(t)
+	if !result.Accepted() {
+		t.Fatalf("committed candidate was not accepted independently of uncommitted Ralphex output: %#v", result)
+	}
+	records := result.Acceptance.Commands()
+	if len(records) != 1 || records[0].Process.Cwd == fixture.authority.Repository().Path {
+		t.Fatalf("non-worktree acceptance did not use a clean detached checkout: %#v", records)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.authority.Repository().Path, "uncommitted.txt")); err != nil {
+		t.Fatalf("fixture did not leave uncommitted Ralphex output in source checkout: %v", err)
+	}
+}
+
 func TestRunnerCancellationDuringIdentityValidationRecordsCancelled(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	ctx, cancel := context.WithCancel(context.Background())

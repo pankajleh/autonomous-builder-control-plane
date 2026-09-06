@@ -20,6 +20,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/acceptance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
@@ -520,6 +521,7 @@ func hashFile(path string) (string, error) {
 func gitOutput(ctx context.Context, repository string, args ...string) (string, error) {
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = repository
+	command.Env = gitexec.Environment()
 	output, err := command.Output()
 	if err != nil {
 		return "", err
@@ -530,6 +532,7 @@ func gitOutput(ctx context.Context, repository string, args ...string) (string, 
 func localBranchExists(ctx context.Context, repository, branch string) (bool, error) {
 	command := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
 	command.Dir = repository
+	command.Env = gitexec.Environment()
 	err := command.Run()
 	if err == nil {
 		return true, nil
@@ -556,7 +559,8 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 		if err := requireDescendsFrom(ctx, repository.Path, repository.StartSHA, headSHA); err != nil {
 			return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q does not descend from governed start SHA: %w", currentBranch, err)
 		}
-		return acceptance.Target{RepositoryPath: repository.Path, Branch: currentBranch, HeadSHA: headSHA}, func() error { return nil }, nil
+		branch = currentBranch
+		return materializeAcceptanceTarget(ctx, repository.Path, branch, headSHA)
 	}
 
 	headSHA, err := gitOutput(ctx, repository.Path, "rev-parse", "--verify", "refs/heads/"+branch+"^{commit}")
@@ -567,13 +571,18 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q does not descend from governed start SHA: %w", branch, err)
 	}
 
+	return materializeAcceptanceTarget(ctx, repository.Path, branch, headSHA)
+}
+
+func materializeAcceptanceTarget(ctx context.Context, repository, branch, headSHA string) (acceptance.Target, func() error, error) {
 	temporaryRoot, err := os.MkdirTemp("", "abcp-acceptance-")
 	if err != nil {
 		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("create acceptance checkout root: %w", err)
 	}
 	checkout := filepath.Join(temporaryRoot, "checkout")
 	add := exec.CommandContext(ctx, "git", "worktree", "add", "--detach", checkout, headSHA)
-	add.Dir = repository.Path
+	add.Dir = repository
+	add.Env = gitexec.Environment()
 	if output, addErr := add.CombinedOutput(); addErr != nil {
 		_ = os.RemoveAll(temporaryRoot)
 		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("materialize candidate checkout: %w: %s", addErr, strings.TrimSpace(string(output)))
@@ -583,7 +592,8 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		remove := exec.CommandContext(cleanupCtx, "git", "worktree", "remove", "--force", checkout)
-		remove.Dir = repository.Path
+		remove.Dir = repository
+		remove.Env = gitexec.Environment()
 		removeErr := remove.Run()
 		filesystemErr := os.RemoveAll(temporaryRoot)
 		if removeErr != nil || filesystemErr != nil {
@@ -597,6 +607,7 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 func requireDescendsFrom(ctx context.Context, repository, startSHA, headSHA string) error {
 	ancestor := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", startSHA, headSHA)
 	ancestor.Dir = repository
+	ancestor.Env = gitexec.Environment()
 	return ancestor.Run()
 }
 

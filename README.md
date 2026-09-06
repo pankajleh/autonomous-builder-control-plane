@@ -141,6 +141,8 @@ Example authority manifest:
 
 Repository identity, complete remotes, and the default branch are required;
 the identity must match the repository path encoded by at least one remote.
+Remote URLs must not embed HTTP credentials, query parameters, or fragments;
+configure repository authentication outside the persisted authority manifest.
 Timeouts use Go duration syntax and must be positive; `wait_on_limit` may be
 `0s` to disable retries explicitly. At least one acceptance command must be
 required. Supported Ralphex modes are `full`,
@@ -163,5 +165,5 @@ overlap immutable evidence artifacts from any run.
 This project must not rebuild capabilities already demonstrated to work reliably in Ralphex, Codex/Claude, Git, or Linux. In particular, it does not implement its own coding agent, its own worktree manager, its own branch commit engine, or another native review framework unless future evidence shows a material gap.
 
 Ralphex still owns implementation worktrees and candidate commits. The
-controller only materializes a temporary detached candidate checkout after
-Ralphex cleanup so independent acceptance runs against the correct branch.
+controller always materializes a temporary detached candidate checkout after
+Ralphex returns so independent acceptance runs against committed branch bytes.

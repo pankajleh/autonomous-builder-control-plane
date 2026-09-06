@@ -307,10 +307,31 @@ func validateRequired(manifest Manifest) error {
 		if remoteURL == "" || remoteURL != strings.TrimSpace(remoteURL) || strings.ContainsAny(remoteURL, "\r\n") {
 			return fmt.Errorf("repository remote %q URL must be non-empty and contain no surrounding whitespace or newlines", name)
 		}
+		if err := rejectRemoteCredentials(remoteURL); err != nil {
+			return fmt.Errorf("repository remote %q: %w", name, err)
+		}
 		identityMatched = identityMatched || remoteIdentity(remoteURL) == manifest.Repository.Identity
 	}
 	if !identityMatched {
 		return fmt.Errorf("repository.identity %q does not match any governed remote URL", manifest.Repository.Identity)
+	}
+	return nil
+}
+
+func rejectRemoteCredentials(remoteURL string) error {
+	parsed, err := url.Parse(remoteURL)
+	if err != nil || parsed.Scheme == "" {
+		return nil
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if parsed.User != nil {
+		_, hasPassword := parsed.User.Password()
+		if hasPassword || (scheme != "ssh" && scheme != "git+ssh") {
+			return errors.New("URL must not contain credentials")
+		}
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("URL must not contain query credentials or fragments")
 	}
 	return nil
 }

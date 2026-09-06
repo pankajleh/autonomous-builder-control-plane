@@ -16,6 +16,7 @@ import (
 	"unicode"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
 )
@@ -429,6 +430,7 @@ func (e *Executor) runGit(ctx context.Context, repository, label string, argv []
 	return e.runner.Run(ctx, supervisor.Command{
 		Argv: argv,
 		Cwd:  repository,
+		Env:  gitexec.Environment(),
 		Stdout: supervisor.EvidenceSink{
 			Writer: e.artifacts,
 			Name:   "acceptance-git-" + label + "-stdout.log",

@@ -71,6 +71,32 @@ func TestNewRejectsRepositoryIdentityNotBoundToRemote(t *testing.T) {
 	}
 }
 
+func TestNewRejectsCredentialBearingRemoteURLs(t *testing.T) {
+	remoteURLs := []string{
+		"https://user:token@example.test/example/project.git",
+		"https://token@example.test/example/project.git",
+		"https://example.test/example/project.git?access_token=secret",
+	}
+	for _, remoteURL := range remoteURLs {
+		t.Run(remoteURL, func(t *testing.T) {
+			manifest := fixtureManifest(t)
+			manifest.Repository.Remotes["origin"] = remoteURL
+			_, err := New(manifest)
+			if err == nil || !strings.Contains(err.Error(), "credentials") {
+				t.Fatalf("expected credential-bearing remote rejection, got %v", err)
+			}
+		})
+	}
+}
+
+func TestNewAllowsSSHRemoteUsername(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Repository.Remotes["origin"] = "ssh://git@example.test/example/project.git"
+	if _, err := New(manifest); err != nil {
+		t.Fatalf("SSH username should not be treated as a persisted secret: %v", err)
+	}
+}
+
 func TestNewRejectsInvalidTimingPolicy(t *testing.T) {
 	tests := []struct {
 		name   string
