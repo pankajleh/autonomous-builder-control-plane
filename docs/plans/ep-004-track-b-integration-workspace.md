@@ -13,18 +13,19 @@
 
 ### Task 1: Implement disposable integration workspace and textual conflict evidence
 
-- [ ] Verify the governed context capsule before reading implementation files or making changes.
-- [ ] Reuse `internal/scheduler` accepted-candidate/risk contracts as read-only inputs; do not revise the frozen Track A contract.
-- [ ] Add a controller-owned disposable integration workspace abstraction under `internal/integrationworkspace/`.- [ ] Materialize integration only from exact committed baseline/candidate SHAs in a controller-owned temporary root; never modify candidate branches or the primary working tree.
-- [ ] Apply candidates in deterministic governed order and capture exact Git argv/outcome/evidence for each integration step.
-- [ ] Detect and capture textual conflicts deterministically, including conflicting paths and immutable evidence sufficient for later serial gate assembly.
-- [ ] Fail closed on missing/non-commit objects, invalid ancestry, ambiguous Git output, unexpected repository state, path escape/symlink hazards, evidence truncation, or cleanup uncertainty.
-- [ ] Cleanup must be bounded and scoped only to the controller-created disposable workspace; preserve evidence before destructive cleanup.
-- [ ] Return an immutable result distinguishing clean textual integration from textual conflict/unavailable states; do not classify semantic conflicts.
-- [ ] Add tests for clean multi-candidate integration, deterministic order, textual conflict capture, immutable candidate branches, malformed/missing object rejection, cleanup scope, and evidence preservation.
-- [ ] Keep `internal/scheduler/`, `internal/combinedacceptance/`, canonical state machine, branch acceptance, and merge authority untouched.
-- [ ] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
-- [ ] Mark only this task complete and commit the bounded Track B implementation.
+- [x] Verify the governed context capsule before reading implementation files or making changes.
+- [x] Reuse `internal/scheduler` accepted-candidate/risk contracts as read-only inputs; do not revise the frozen Track A contract.
+- [x] Add a controller-owned disposable integration workspace abstraction under `internal/integrationworkspace/`.
+- [x] Materialize integration only from exact committed baseline/candidate SHAs in a controller-owned temporary root; never modify candidate branches or the primary working tree.
+- [x] Apply candidates in deterministic governed order and capture exact Git argv/outcome/evidence for each integration step.
+- [x] Detect and capture textual conflicts deterministically, including conflicting paths and immutable evidence sufficient for later serial gate assembly.
+- [x] Fail closed on missing/non-commit objects, invalid ancestry, ambiguous Git output, unexpected repository state, path escape/symlink hazards, evidence truncation, or cleanup uncertainty.
+- [x] Cleanup must be bounded and scoped only to the controller-created disposable workspace; preserve evidence before destructive cleanup.
+- [x] Return an immutable result distinguishing clean textual integration from textual conflict/unavailable states; do not classify semantic conflicts.
+- [x] Add tests for clean multi-candidate integration, deterministic order, textual conflict capture, immutable candidate branches, malformed/missing object rejection, cleanup scope, and evidence preservation.
+- [x] Keep `internal/scheduler/`, `internal/combinedacceptance/`, canonical state machine, branch acceptance, and merge authority untouched.
+- [x] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
+- [x] Mark only this task complete and commit the bounded Track B implementation.
 
 ## Track boundary
 

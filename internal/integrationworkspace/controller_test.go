@@ -1,0 +1,382 @@
+package integrationworkspace
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/scheduler"
+)
+
+func TestIntegrateCleanCandidatesInGovernedOrderWithoutMutatingSource(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+	headA := branchCommit(t, repository, baseline, "candidate-a", "a.txt", "candidate a\n")
+	headB := branchCommit(t, repository, baseline, "candidate-b", "b.txt", "candidate b\n")
+	git(t, repository, "checkout", "--quiet", "main")
+
+	candidateA := acceptedCandidate(t, repository, "candidate-a", baseline, headA, "run-a", time.Date(2026, 9, 6, 1, 0, 0, 0, time.UTC))
+	candidateB := acceptedCandidate(t, repository, "candidate-b", baseline, headB, "run-b", time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC))
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidateB, candidateA})
+
+	beforeHead := git(t, repository, "rev-parse", "HEAD")
+	beforeStatus := git(t, repository, "status", "--porcelain=v1", "--untracked-files=all")
+	beforeA := git(t, repository, "rev-parse", "refs/heads/candidate-a")
+	beforeB := git(t, repository, "rev-parse", "refs/heads/candidate-b")
+	temporaryRoot := t.TempDir()
+	store := evidenceStore(t)
+	controller := newTestController(t, temporaryRoot, store)
+
+	result, err := controller.Integrate(context.Background(), Request{
+		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "clean",
+	})
+	if err != nil {
+		t.Fatalf("Integrate() error = %v, result = %s", err, result.CanonicalJSON())
+	}
+	if result.Status() != StatusClean {
+		t.Fatalf("Status() = %q, want %q", result.Status(), StatusClean)
+	}
+	steps := result.Steps()
+	if len(steps) != 2 || steps[0].Candidate.Key() != candidateA.Key() || steps[1].Candidate.Key() != candidateB.Key() {
+		t.Fatalf("steps are not in governed order: %#v", steps)
+	}
+	for index, step := range steps {
+		if step.Outcome != StepMerged || step.BeforeSHA == "" || step.AfterSHA == "" || step.CommandStart >= step.CommandEnd || step.CommandEnd > len(result.Commands()) {
+			t.Fatalf("step %d = %#v, want completed merge", index, step)
+		}
+	}
+	if got := git(t, repository, "rev-parse", "HEAD"); got != beforeHead {
+		t.Fatalf("source HEAD changed from %s to %s", beforeHead, got)
+	}
+	if got := git(t, repository, "status", "--porcelain=v1", "--untracked-files=all"); got != beforeStatus {
+		t.Fatalf("source status changed from %q to %q", beforeStatus, got)
+	}
+	if got := git(t, repository, "rev-parse", "refs/heads/candidate-a"); got != beforeA {
+		t.Fatalf("candidate-a changed from %s to %s", beforeA, got)
+	}
+	if got := git(t, repository, "rev-parse", "refs/heads/candidate-b"); got != beforeB {
+		t.Fatalf("candidate-b changed from %s to %s", beforeB, got)
+	}
+	assertEvidence(t, result.CaptureRef(), captureEvidenceKind)
+	assertEvidence(t, result.CleanupRef(), cleanupEvidenceKind)
+	if !result.Cleanup().WorkspaceRemoved {
+		t.Fatal("workspace was not reported removed")
+	}
+	repeated, err := controller.Integrate(context.Background(), Request{
+		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "clean-repeat",
+	})
+	if err != nil {
+		t.Fatalf("repeat Integrate() error = %v", err)
+	}
+	repeatedSteps := repeated.Steps()
+	if repeatedSteps[len(repeatedSteps)-1].AfterSHA != steps[len(steps)-1].AfterSHA {
+		t.Fatalf("final integrated commit is nondeterministic: %s != %s", repeatedSteps[len(repeatedSteps)-1].AfterSHA, steps[len(steps)-1].AfterSHA)
+	}
+	entries, err := os.ReadDir(temporaryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary root contains leftovers: %#v", entries)
+	}
+
+	// Accessors must not expose mutable result storage.
+	commands := result.Commands()
+	commands[0].Argv[0] = "changed"
+	commands[0].Stdout = append(commands[0].Stdout, 'x')
+	if result.Commands()[0].Argv[0] != "git" || bytes.Equal(commands[0].Stdout, result.Commands()[0].Stdout) {
+		t.Fatal("command evidence was mutable through an accessor")
+	}
+}
+
+func TestIntegrateCapturesDeterministicTextualConflictAndPreservesEvidence(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "conflict.txt", "base\n", "baseline")
+	headA := branchCommit(t, repository, baseline, "candidate-a", "conflict.txt", "left\n")
+	headB := branchCommit(t, repository, baseline, "candidate-b", "conflict.txt", "right\n")
+	git(t, repository, "checkout", "--quiet", "main")
+	candidateA := acceptedCandidate(t, repository, "candidate-a", baseline, headA, "run-a", time.Date(2026, 9, 6, 1, 0, 0, 0, time.UTC))
+	candidateB := acceptedCandidate(t, repository, "candidate-b", baseline, headB, "run-b", time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC))
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidateB, candidateA})
+	temporaryRoot := t.TempDir()
+	controller := newTestController(t, temporaryRoot, evidenceStore(t))
+
+	result, err := controller.Integrate(context.Background(), Request{
+		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "conflict",
+	})
+	if err != nil {
+		t.Fatalf("Integrate() conflict error = %v", err)
+	}
+	if result.Status() != StatusConflict {
+		t.Fatalf("Status() = %q, want %q", result.Status(), StatusConflict)
+	}
+	steps := result.Steps()
+	if len(steps) != 2 || steps[1].Outcome != StepConflict || len(steps[1].ConflictPaths) != 1 || steps[1].ConflictPaths[0] != "conflict.txt" {
+		t.Fatalf("conflict steps = %#v", steps)
+	}
+	paths := steps[1].ConflictPaths
+	paths[0] = "changed"
+	if result.Steps()[1].ConflictPaths[0] != "conflict.txt" {
+		t.Fatal("conflict paths were mutable through an accessor")
+	}
+	assertEvidence(t, result.CaptureRef(), captureEvidenceKind)
+	assertEvidence(t, result.CleanupRef(), cleanupEvidenceKind)
+	if _, err := os.Stat(result.CaptureRef().URI); err != nil {
+		t.Fatalf("capture did not survive cleanup: %v", err)
+	}
+	if entries, err := os.ReadDir(temporaryRoot); err != nil || len(entries) != 0 {
+		t.Fatalf("disposable workspace was not cleaned: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestIntegrateRejectsMissingAcceptedCommit(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+	head := branchCommit(t, repository, baseline, "candidate", "candidate.txt", "candidate\n")
+	git(t, repository, "checkout", "--quiet", "main")
+	candidate := acceptedCandidate(t, repository, "candidate", baseline, head, "run", time.Now().UTC())
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidate})
+	git(t, repository, "branch", "-D", "candidate")
+	git(t, repository, "reflog", "expire", "--expire=now", "--all")
+	git(t, repository, "prune", "--expire=now")
+	if command := exec.Command("git", "-C", repository, "cat-file", "-e", head+"^{commit}"); command.Run() == nil {
+		t.Fatal("candidate object remained reachable after prune")
+	}
+	controller := newTestController(t, t.TempDir(), evidenceStore(t))
+
+	result, err := controller.Integrate(context.Background(), Request{
+		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "missing",
+	})
+	if err == nil || result.Status() != StatusUnavailable || !strings.Contains(result.Failure(), "missing or non-commit") {
+		t.Fatalf("Integrate() = status %q failure %q err %v", result.Status(), result.Failure(), err)
+	}
+	assertEvidence(t, result.CaptureRef(), captureEvidenceKind)
+}
+
+func TestIntegrateFailsClosedOnMalformedGitOutputAndTruncation(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+	head := branchCommit(t, repository, baseline, "candidate", "candidate.txt", "candidate\n")
+	git(t, repository, "checkout", "--quiet", "main")
+	candidate := acceptedCandidate(t, repository, "candidate", baseline, head, "run", time.Now().UTC())
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidate})
+
+	t.Run("malformed", func(t *testing.T) {
+		controller := newTestController(t, t.TempDir(), evidenceStore(t))
+		controller.runner = staticRunner{result: gitResult{
+			Stdout: []byte("ambiguous\n"), ExitCode: 0, StdoutLimitBytes: 100, StderrLimitBytes: 100,
+		}}
+		result, err := controller.Integrate(context.Background(), Request{BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "malformed"})
+		if err == nil || result.Status() != StatusUnavailable || !strings.Contains(result.Failure(), "ambiguous object verification output") {
+			t.Fatalf("malformed output result = %s, err = %v", result.CanonicalJSON(), err)
+		}
+	})
+
+	t.Run("truncated", func(t *testing.T) {
+		store := evidenceStore(t)
+		controller, err := NewController(Config{TemporaryRoot: t.TempDir(), Artifacts: store, StdoutLimitBytes: 1, StderrLimitBytes: 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := controller.Integrate(context.Background(), Request{BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "truncated"})
+		if err == nil || result.Status() != StatusUnavailable || !strings.Contains(result.Failure(), "truncated") {
+			t.Fatalf("truncated output result = %s, err = %v", result.CanonicalJSON(), err)
+		}
+		commands := result.Commands()
+		if len(commands) == 0 || !commands[0].StdoutTruncated {
+			t.Fatalf("truncation not captured in command evidence: %#v", commands)
+		}
+	})
+}
+
+func TestCleanupIsScopedAndFailsClosedWhenRemovalIsUncertain(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+	head := branchCommit(t, repository, baseline, "candidate", "candidate.txt", "candidate\n")
+	git(t, repository, "checkout", "--quiet", "main")
+	candidate := acceptedCandidate(t, repository, "candidate", baseline, head, "run", time.Now().UTC())
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidate})
+	temporaryRoot := t.TempDir()
+	sentinel := filepath.Join(temporaryRoot, "controller-sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller := newTestController(t, temporaryRoot, evidenceStore(t))
+	var cleanupTarget string
+	controller.removeAll = func(target string) error {
+		cleanupTarget = target
+		return nil // Simulate an uncertain no-op cleanup.
+	}
+
+	result, err := controller.Integrate(context.Background(), Request{
+		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "uncertain-cleanup",
+	})
+	if err == nil || result.Status() != StatusUnavailable || !strings.Contains(result.Failure(), "still exists") {
+		t.Fatalf("uncertain cleanup result = %s, err = %v", result.CanonicalJSON(), err)
+	}
+	if filepath.Dir(cleanupTarget) != temporaryRoot || filepath.Base(cleanupTarget) == filepath.Base(sentinel) {
+		t.Fatalf("cleanup target %q was not one direct disposable child", cleanupTarget)
+	}
+	if data, readErr := os.ReadFile(sentinel); readErr != nil || string(data) != "keep" {
+		t.Fatalf("cleanup touched sibling sentinel: data=%q err=%v", data, readErr)
+	}
+	assertEvidence(t, result.CaptureRef(), captureEvidenceKind)
+}
+
+func TestControllerRejectsSymlinkTemporaryRoot(t *testing.T) {
+	realRoot := t.TempDir()
+	link := filepath.Join(t.TempDir(), "root-link")
+	if err := os.Symlink(realRoot, link); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewController(Config{TemporaryRoot: link, Artifacts: evidenceStore(t)})
+	if err == nil || !strings.Contains(err.Error(), "non-symlink") {
+		t.Fatalf("NewController() error = %v, want symlink rejection", err)
+	}
+}
+
+func TestIntegrateRejectsWorkspaceRootInsideCandidateRepository(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+	head := branchCommit(t, repository, baseline, "candidate", "candidate.txt", "candidate\n")
+	git(t, repository, "checkout", "--quiet", "main")
+	candidate := acceptedCandidate(t, repository, "candidate", baseline, head, "run", time.Now().UTC())
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidate})
+	temporaryRoot := filepath.Join(repository, "controller-temp")
+	if err := os.Mkdir(temporaryRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	controller := newTestController(t, temporaryRoot, evidenceStore(t))
+
+	result, err := controller.Integrate(context.Background(), Request{
+		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "overlap",
+	})
+	if err == nil || result.Status() != StatusUnavailable || !strings.Contains(result.Failure(), "must be disjoint") {
+		t.Fatalf("overlapping root result = %s, err = %v", result.CanonicalJSON(), err)
+	}
+	entries, readErr := os.ReadDir(temporaryRoot)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("overlapping temporary root was used: entries=%v err=%v", entries, readErr)
+	}
+}
+
+type staticRunner struct {
+	result gitResult
+	err    error
+}
+
+func (runner staticRunner) Run(_ context.Context, _ string, arguments ...string) (gitResult, error) {
+	result := runner.result
+	result.Argv = append([]string{"git"}, arguments...)
+	return result, runner.err
+}
+
+func newTestController(t *testing.T, temporaryRoot string, artifacts ArtifactWriter) *Controller {
+	t.Helper()
+	controller, err := NewController(Config{TemporaryRoot: temporaryRoot, Artifacts: artifacts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return controller
+}
+
+func evidenceStore(t *testing.T) *evidence.Store {
+	t.Helper()
+	store, err := evidence.NewStore(t.TempDir(), "integration-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func assertEvidence(t *testing.T, ref ledger.EvidenceRef, kind string) {
+	t.Helper()
+	if ref.Kind != kind || ref.URI == "" {
+		t.Fatalf("evidence ref = %#v, want kind %q", ref, kind)
+	}
+	data, err := os.ReadFile(ref.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	if ref.SHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("evidence digest %q does not match bytes", ref.SHA256)
+	}
+}
+
+func newRepository(t *testing.T) string {
+	t.Helper()
+	repository := t.TempDir()
+	git(t, repository, "init", "--quiet", "--initial-branch=main")
+	git(t, repository, "config", "user.name", "Test User")
+	git(t, repository, "config", "user.email", "test@example.invalid")
+	return repository
+}
+
+func commitFile(t *testing.T, repository, name, content, message string) string {
+	t.Helper()
+	filename := filepath.Join(repository, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(filename), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filename, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repository, "add", "--", name)
+	git(t, repository, "commit", "--quiet", "-m", message)
+	return git(t, repository, "rev-parse", "HEAD")
+}
+
+func branchCommit(t *testing.T, repository, baseline, branch, name, content string) string {
+	t.Helper()
+	git(t, repository, "checkout", "--quiet", "-b", branch, baseline)
+	return commitFile(t, repository, name, content, branch)
+}
+
+func acceptedCandidate(t *testing.T, repository, branch, start, head, run string, acceptedAt time.Time) scheduler.AcceptedCandidate {
+	t.Helper()
+	digest := sha256.Sum256([]byte(run))
+	candidate, err := scheduler.NewAcceptedCandidate(scheduler.CandidateInput{
+		ProjectID: "project", PlanID: "plan-" + run, RunID: run, AttemptID: "attempt",
+		Repository: repository, Branch: branch, StartSHA: start, HeadSHA: head,
+		AcceptanceEvidence: []ledger.EvidenceRef{{URI: "/evidence/" + run, SHA256: hex.EncodeToString(digest[:]), Kind: "acceptance"}},
+		AcceptedAt:         acceptedAt, AcceptancePolicyIdentity: "policy-v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return candidate
+}
+
+func riskReport(t *testing.T, candidates []scheduler.AcceptedCandidate) scheduler.RiskReport {
+	t.Helper()
+	analyzer, err := scheduler.NewAnalyzer(scheduler.RiskPolicy{PolicyIdentity: "risk-v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := analyzer.Analyze(context.Background(), candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return report
+}
+
+func git(t *testing.T, repository string, arguments ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", repository}, arguments...)...)
+	command.Env = append(os.Environ(), "LC_ALL=C")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(arguments, " "), err, output)
+	}
+	return strings.TrimSpace(string(output))
+}
