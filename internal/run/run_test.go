@@ -448,28 +448,113 @@ func TestRunnerRejectsUngovernedPushURL(t *testing.T) {
 	}
 }
 
-func TestRunnerRejectsRepositoryLocalRalphexConfiguration(t *testing.T) {
+func TestRunnerAllowsRepositoryLocalRalphexRuntimeState(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
-	localConfig := filepath.Join(fixture.authority.Repository().Path, ".ralphex", "config")
-	if err := os.MkdirAll(filepath.Dir(localConfig), 0o700); err != nil {
+	ralphexDir := filepath.Join(fixture.authority.Repository().Path, ".ralphex")
+	if err := os.MkdirAll(ralphexDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeTestFile(t, localConfig, []byte("executor = claude\nuse_worktree = true\n"), 0o600)
-	runGit(t, fixture.authority.Repository().Path, "add", ".ralphex/config")
-	runGit(t, fixture.authority.Repository().Path, "commit", "-m", "add local Ralphex override")
-	manifest := fixture.authority.Manifest()
-	manifest.Repository.StartSHA = runGit(t, fixture.authority.Repository().Path, "rev-parse", "HEAD")
-	governed, err := authority.New(manifest)
-	if err != nil {
+	writeTestFile(t, filepath.Join(ralphexDir, ".gitignore"), []byte(".gitignore\nprogress/\nworktrees/\n"), 0o600)
+	if err := os.MkdirAll(filepath.Join(ralphexDir, "progress"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	fixture.authority = governed
+	writeTestFile(t, filepath.Join(ralphexDir, "progress", "run.txt"), []byte("runtime progress\n"), 0o600)
+	if err := os.MkdirAll(filepath.Join(ralphexDir, "worktrees", "run"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(ralphexDir, "worktrees", "run", "HEAD"), []byte("runtime worktree\n"), 0o600)
+
 	result, err := fixture.runner(t).Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "repository-local .ralphex configuration is not allowed") {
-		t.Fatalf("expected local Ralphex config rejection, got %v", err)
+	if err != nil {
+		t.Fatalf("benign repository-local Ralphex runtime state was rejected: %v", err)
 	}
-	if result.State != domain.StateFailed {
-		t.Fatalf("local Ralphex config state = %s, want FAILED", result.State)
+	if result.State != domain.StateBranchAccepted {
+		t.Fatalf("benign Ralphex runtime state result = %s, want BRANCH_ACCEPTED", result.State)
+	}
+}
+
+func TestRunnerRejectsRepositoryLocalRalphexConfiguration(t *testing.T) {
+	for _, surface := range []string{"config", "prompts", "agents"} {
+		t.Run(surface, func(t *testing.T) {
+			fixture := newRunFixture(t, 0, commandPath(t, "true"))
+			overrideFile := filepath.Join(fixture.authority.Repository().Path, ".ralphex", surface)
+			if surface != "config" {
+				overrideFile = filepath.Join(overrideFile, "override.md")
+			}
+			if err := os.MkdirAll(filepath.Dir(overrideFile), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, overrideFile, []byte("local override\n"), 0o600)
+			runGit(t, fixture.authority.Repository().Path, "add", filepath.Join(".ralphex", surface))
+			runGit(t, fixture.authority.Repository().Path, "commit", "-m", "add local Ralphex override")
+			fixture = fixture.atCurrentHead(t)
+
+			result, err := fixture.runner(t).Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "repository-local .ralphex/"+surface+" configuration is not allowed") {
+				t.Fatalf("expected local Ralphex %s rejection, got %v", surface, err)
+			}
+			if result.State != domain.StateFailed {
+				t.Fatalf("local Ralphex %s state = %s, want FAILED", surface, result.State)
+			}
+		})
+	}
+}
+
+func TestRunnerRejectsUnsafeRepositoryLocalRalphexBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		create     func(*testing.T, string)
+		wantReason string
+	}{
+		{
+			name: "symlink",
+			create: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Symlink(t.TempDir(), path); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantReason: "must not be a symlink",
+		},
+		{
+			name: "regular file",
+			create: func(t *testing.T, path string) {
+				t.Helper()
+				writeTestFile(t, path, []byte("not a directory\n"), 0o600)
+			},
+			wantReason: "must be a directory",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRunFixture(t, 0, commandPath(t, "true"))
+			boundary := filepath.Join(fixture.authority.Repository().Path, ".ralphex")
+			test.create(t, boundary)
+			runGit(t, fixture.authority.Repository().Path, "add", ".ralphex")
+			runGit(t, fixture.authority.Repository().Path, "commit", "-m", "add unsafe Ralphex boundary")
+			fixture = fixture.atCurrentHead(t)
+
+			result, err := fixture.runner(t).Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), test.wantReason) {
+				t.Fatalf("expected unsafe Ralphex boundary rejection, got %v", err)
+			}
+			if result.State != domain.StateFailed {
+				t.Fatalf("unsafe Ralphex boundary state = %s, want FAILED", result.State)
+			}
+		})
+	}
+}
+
+func TestRunnerTransitionRejectsInvalidDomainEdgeBeforeAppend(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	events := &recordingEventAppender{}
+	runner := &Runner{governed: fixture.authority, events: events}
+
+	err := runner.transition(domain.StateRunCreated, domain.StateImplementing, "test", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "transition RUN_CREATED -> IMPLEMENTING is not allowed") {
+		t.Fatalf("expected invalid domain transition rejection, got %v", err)
+	}
+	if len(events.events) != 0 {
+		t.Fatalf("invalid transition appended %d events", len(events.events))
 	}
 }
 
@@ -490,6 +575,15 @@ type runFixture struct {
 	authority  authority.Authority
 	ledgerPath string
 	evidence   string
+}
+
+type recordingEventAppender struct {
+	events []ledger.Event
+}
+
+func (a *recordingEventAppender) Append(event ledger.Event) error {
+	a.events = append(a.events, event)
+	return nil
 }
 
 func newRunFixture(t *testing.T, ralphexExit int, acceptanceArgv ...string) runFixture {
@@ -615,6 +709,18 @@ func (f runFixture) execute(t *testing.T) Result {
 		t.Fatal(err)
 	}
 	return result
+}
+
+func (f runFixture) atCurrentHead(t *testing.T) runFixture {
+	t.Helper()
+	manifest := f.authority.Manifest()
+	manifest.Repository.StartSHA = runGit(t, manifest.Repository.Path, "rev-parse", "HEAD")
+	governed, err := authority.New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.authority = governed
+	return f
 }
 
 func readEvents(t *testing.T, path string) []ledger.Event {

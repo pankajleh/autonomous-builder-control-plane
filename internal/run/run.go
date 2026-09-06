@@ -313,6 +313,9 @@ func (r *Runner) transition(from, to domain.State, source string, payload map[st
 	if !ep002State(to) {
 		return fmt.Errorf("EP-002 runner cannot transition to %s", to)
 	}
+	if err := domain.ValidateTransition(from, to); err != nil {
+		return fmt.Errorf("validate %s -> %s transition: %w", from, to, err)
+	}
 	event, err := ledger.NewEvent(r.governed.RunID(), eventStateTransition, actorController, source)
 	if err != nil {
 		return fmt.Errorf("create %s transition: %w", to, err)
@@ -451,10 +454,8 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	if !validation.WorkingTreeClean {
 		return validation, errors.New("governed repository working tree is not clean")
 	}
-	if _, localConfigErr := os.Lstat(filepath.Join(repository.Path, ".ralphex")); localConfigErr == nil {
-		return validation, errors.New("repository-local .ralphex configuration is not allowed for governed execution")
-	} else if !errors.Is(localConfigErr, os.ErrNotExist) {
-		return validation, fmt.Errorf("inspect repository-local Ralphex configuration: %w", localConfigErr)
+	if err := validateRalphexLocalConfiguration(repository.Path); err != nil {
+		return validation, err
 	}
 
 	names := make([]string, 0, len(repository.Remotes))
@@ -498,6 +499,33 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	}
 	validation.RepositoryID = repository.Identity
 	return validation, nil
+}
+
+func validateRalphexLocalConfiguration(repositoryPath string) error {
+	boundary := filepath.Join(repositoryPath, ".ralphex")
+	info, err := os.Lstat(boundary)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect repository-local Ralphex configuration boundary: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("repository-local .ralphex configuration boundary must not be a symlink")
+	}
+	if !info.IsDir() {
+		return errors.New("repository-local .ralphex configuration boundary must be a directory")
+	}
+
+	for _, name := range []string{"config", "prompts", "agents"} {
+		override := filepath.Join(boundary, name)
+		if _, err := os.Lstat(override); err == nil {
+			return fmt.Errorf("repository-local .ralphex/%s configuration is not allowed for governed execution", name)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect repository-local .ralphex/%s configuration: %w", name, err)
+		}
+	}
+	return nil
 }
 
 func ralphexEnvironment(executor string) []string {
