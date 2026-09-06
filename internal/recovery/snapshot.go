@@ -93,8 +93,8 @@ type SnapshotMetadata struct {
 // PublishedSnapshot is the proof token passed to a protected action only
 // after all snapshot artifacts, including the final metadata, are immutable.
 type PublishedSnapshot struct {
-	Metadata    SnapshotMetadata
-	MetadataRef ledger.EvidenceRef
+	Metadata    SnapshotMetadata   `json:"metadata"`
+	MetadataRef ledger.EvidenceRef `json:"metadata_ref"`
 }
 
 // Snapshotter captures and publishes pre-cleanup recovery evidence.

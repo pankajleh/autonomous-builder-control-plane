@@ -17,6 +17,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/recovery"
 	runctl "github.com/pankajleh/autonomous-builder-control-plane/internal/run"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
 )
@@ -54,10 +55,123 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "run":
 		return runCommand(args[1:], stdout, stderr)
+	case "recovery-inspect":
+		return recoveryInspectCommand(args[1:], stdout, stderr)
+	case "recovery-resume":
+		return recoveryResumeCommand(args[1:], stdout, stderr)
 	default:
 		usage(stderr)
 		return 2
 	}
+}
+
+func recoveryInspectCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("recovery-inspect", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	ownershipPath := flags.String("ownership", "", "path to governed recovery ownership JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *ownershipPath == "" {
+		fmt.Fprintln(stderr, "usage: abcp recovery-inspect --ownership <path>")
+		return 2
+	}
+	ownership, err := loadJSONFile[recovery.Ownership](*ownershipPath, "recovery ownership")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	inspection := recovery.Inspect(context.Background(), ownership)
+	if err := writeJSONOutput(stdout, inspection); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func recoveryResumeCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("recovery-resume", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	requestPath := flags.String("request", "", "path to an explicitly authorized recovery request")
+	ledgerPath := flags.String("ledger", "", "path to the append-only JSONL ledger")
+	evidenceRoot := flags.String("evidence-root", "", "root directory for immutable recovery evidence")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *requestPath == "" || *ledgerPath == "" || *evidenceRoot == "" {
+		fmt.Fprintln(stderr, "usage: abcp recovery-resume --request <path> --ledger <path> --evidence-root <path>")
+		return 2
+	}
+
+	request, err := loadJSONFile[recovery.WorkflowRequest](*requestPath, "recovery request")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	canonicalLedger, err := canonicalLedgerDestination(*ledgerPath, *evidenceRoot)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	artifacts, err := evidence.NewStore(*evidenceRoot, request.Ownership.Attempt.RunID)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	events, err := ledger.NewJSONLLedger(canonicalLedger)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	workflow, err := recovery.NewWorkflow(events, artifacts, recovery.GovernedCleaner{})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	result, err := workflow.Recover(ctx, request)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err := writeJSONOutput(stdout, result); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func loadJSONFile[T any](path, description string) (T, error) {
+	var value T
+	file, err := os.Open(path)
+	if err != nil {
+		return value, fmt.Errorf("open %s: %w", description, err)
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return value, fmt.Errorf("decode %s: %w", description, err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return value, fmt.Errorf("decode %s: multiple JSON values", description)
+		}
+		return value, fmt.Errorf("decode %s: %w", description, err)
+	}
+	return value, nil
+}
+
+func writeJSONOutput(writer io.Writer, value any) error {
+	encoder := json.NewEncoder(writer)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(value); err != nil {
+		return fmt.Errorf("encode output: %w", err)
+	}
+	return nil
 }
 
 func runCommand(args []string, stdout, stderr io.Writer) int {
@@ -213,5 +327,5 @@ func loadManifest(path string) (authority.Manifest, error) {
 }
 
 func usage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|run>")
+	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|run|recovery-inspect|recovery-resume>")
 }

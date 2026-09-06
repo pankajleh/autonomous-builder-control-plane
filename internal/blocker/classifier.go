@@ -81,11 +81,11 @@ const (
 // input. Unavailable means the operation could not be invoked or observed; it
 // is distinct from an invoked validator returning a failing result.
 type FailureInput struct {
-	Phase       FailurePhase
-	Outcome     supervisor.Outcome
-	ExitCode    int
-	Unavailable bool
-	Diagnostics string
+	Phase       FailurePhase       `json:"phase"`
+	Outcome     supervisor.Outcome `json:"outcome,omitempty"`
+	ExitCode    int                `json:"exit_code,omitempty"`
+	Unavailable bool               `json:"unavailable,omitempty"`
+	Diagnostics string             `json:"diagnostics,omitempty"`
 }
 
 // Classification is safe to persist. Diagnostics is redacted and bounded;

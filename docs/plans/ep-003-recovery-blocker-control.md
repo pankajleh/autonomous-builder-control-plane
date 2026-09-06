@@ -76,13 +76,13 @@ git diff --check
 
 ### Task 5: Implement bounded cleanup/restart workflow and CLI
 
-- [ ] Add orchestration that performs: inspect → owner-dead proof → snapshot → classify/authorize → cleanup → new attempt authority → restart preparation.
-- [ ] Cleanup only the exact governed stale worktree/runtime state proven by Task 1; preserve committed branch history.
-- [ ] Add explicit CLI surface to inspect recovery and execute an authorized recovery/resume without hidden destructive defaults.
-- [ ] Record every recovery transition/action in the append-only ledger with immutable evidence refs.
-- [ ] Add deterministic E2E tests for successful stale recovery, live-owner refusal, ambiguous-owner refusal, dirty-state preservation, missing authority, and cleanup failure.
-- [ ] Ensure the workflow ends at a restart-ready/EP-002 execution boundary and cannot reach integration/merge/completion.
-- [ ] Run validation, mark Task 5 complete, and commit.
+- [x] Add orchestration that performs: inspect → owner-dead proof → snapshot → classify/authorize → cleanup → new attempt authority → restart preparation.
+- [x] Cleanup only the exact governed stale worktree/runtime state proven by Task 1; preserve committed branch history.
+- [x] Add explicit CLI surface to inspect recovery and execute an authorized recovery/resume without hidden destructive defaults.
+- [x] Record every recovery transition/action in the append-only ledger with immutable evidence refs.
+- [x] Add deterministic E2E tests for successful stale recovery, live-owner refusal, ambiguous-owner refusal, dirty-state preservation, missing authority, and cleanup failure.
+- [x] Ensure the workflow ends at a restart-ready/EP-002 execution boundary and cannot reach integration/merge/completion.
+- [x] Run validation, mark Task 5 complete, and commit.
 
 ## Final verification
 
