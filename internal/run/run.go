@@ -19,6 +19,7 @@ import (
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/acceptance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -368,15 +369,16 @@ func ep002State(state domain.State) bool {
 }
 
 type identityValidation struct {
-	RepositoryPath   string            `json:"repository_path"`
-	RepositoryID     string            `json:"repository_identity,omitempty"`
-	HeadSHA          string            `json:"head_sha"`
-	Branch           string            `json:"branch,omitempty"`
-	WorkingTreeClean bool              `json:"working_tree_clean"`
-	Remotes          map[string]string `json:"remotes,omitempty"`
-	PlanSHA256       string            `json:"plan_sha256"`
-	BinarySHA256     string            `json:"ralphex_binary_sha256"`
-	AuthoritySHA256  string            `json:"authority_sha256"`
+	RepositoryPath       string            `json:"repository_path"`
+	RepositoryID         string            `json:"repository_identity,omitempty"`
+	HeadSHA              string            `json:"head_sha"`
+	Branch               string            `json:"branch,omitempty"`
+	WorkingTreeClean     bool              `json:"working_tree_clean"`
+	Remotes              map[string]string `json:"remotes,omitempty"`
+	PlanSHA256           string            `json:"plan_sha256"`
+	BinarySHA256         string            `json:"ralphex_binary_sha256"`
+	ContextCapsuleSHA256 string            `json:"context_capsule_sha256,omitempty"`
+	AuthoritySHA256      string            `json:"authority_sha256"`
 }
 
 func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (identityValidation, error) {
@@ -403,6 +405,18 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	}
 	if validation.BinarySHA256 != binary.BinarySHA256 {
 		return validation, errors.New("Ralphex binary SHA256 changed after authority validation")
+	}
+	if capsule, present := governed.ContextCapsule(); present {
+		validation.ContextCapsuleSHA256, err = hashFile(capsule.Path)
+		if err != nil {
+			return validation, fmt.Errorf("hash context capsule: %w", err)
+		}
+		if validation.ContextCapsuleSHA256 != capsule.SHA256 {
+			return validation, errors.New("context capsule SHA256 changed after authority validation")
+		}
+		if _, err := contextcapsule.VerifyFile(repository.Path, capsule.Path); err != nil {
+			return validation, fmt.Errorf("verify context capsule before execution: %w", err)
+		}
 	}
 	repositoryRoot, err := gitOutput(ctx, repository.Path, "rev-parse", "--show-toplevel")
 	if err != nil {

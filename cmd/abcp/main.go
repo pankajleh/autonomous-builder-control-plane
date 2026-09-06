@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,9 +15,11 @@ import (
 	"syscall"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/recovery"
 	runctl "github.com/pankajleh/autonomous-builder-control-plane/internal/run"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
 )
@@ -54,10 +57,219 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "run":
 		return runCommand(args[1:], stdout, stderr)
+	case "context-build":
+		return contextBuildCommand(args[1:], stdout, stderr)
+	case "context-verify":
+		return contextVerifyCommand(args[1:], stdout, stderr)
+	case "recovery-inspect":
+		return recoveryInspectCommand(args[1:], stdout, stderr)
+	case "recovery-resume":
+		return recoveryResumeCommand(args[1:], stdout, stderr)
 	default:
 		usage(stderr)
 		return 2
 	}
+}
+
+func contextBuildCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("context-build", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	repository := flags.String("repository", "", "path to the governed Git repository root")
+	specPath := flags.String("spec", "", "path to the structured context capsule spec JSON")
+	outputPath := flags.String("output", "", "path for canonical context capsule JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *repository == "" || *specPath == "" || *outputPath == "" {
+		fmt.Fprintln(stderr, "usage: abcp context-build --repository <path> --spec <path> --output <path>")
+		return 2
+	}
+	spec, err := loadJSONFile[contextcapsule.Spec](*specPath, "context capsule spec")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	capsule, data, err := contextcapsule.Build(*repository, spec)
+	if err != nil {
+		fmt.Fprintf(stderr, "build context capsule: %v\n", err)
+		return 1
+	}
+	if err := writeAtomicFile(*outputPath, data, 0o600); err != nil {
+		fmt.Fprintf(stderr, "write context capsule: %v\n", err)
+		return 1
+	}
+	if err := writeJSONOutput(stdout, struct {
+		Path          string `json:"path"`
+		SHA256        string `json:"sha256"`
+		CapsuleSHA256 string `json:"capsule_sha256"`
+	}{Path: *outputPath, SHA256: fmt.Sprintf("%x", sha256.Sum256(data)), CapsuleSHA256: capsule.CapsuleSHA256}); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func contextVerifyCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("context-verify", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	repository := flags.String("repository", "", "path to the governed Git repository root")
+	capsulePath := flags.String("capsule", "", "path to canonical context capsule JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *repository == "" || *capsulePath == "" {
+		fmt.Fprintln(stderr, "usage: abcp context-verify --repository <path> --capsule <path>")
+		return 2
+	}
+	verified, err := contextcapsule.VerifyFile(*repository, *capsulePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "verify context capsule: %v\n", err)
+		return 1
+	}
+	if err := writeJSONOutput(stdout, verified); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func writeAtomicFile(path string, data []byte, mode os.FileMode) error {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	directory := filepath.Dir(absolute)
+	temporary, err := os.CreateTemp(directory, ".abcp-context-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(mode); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, absolute)
+}
+
+func recoveryInspectCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("recovery-inspect", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	ownershipPath := flags.String("ownership", "", "path to governed recovery ownership JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *ownershipPath == "" {
+		fmt.Fprintln(stderr, "usage: abcp recovery-inspect --ownership <path>")
+		return 2
+	}
+	ownership, err := loadJSONFile[recovery.Ownership](*ownershipPath, "recovery ownership")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	inspection := recovery.Inspect(context.Background(), ownership)
+	if err := writeJSONOutput(stdout, inspection); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func recoveryResumeCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("recovery-resume", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	requestPath := flags.String("request", "", "path to an explicitly authorized recovery request")
+	ledgerPath := flags.String("ledger", "", "path to the append-only JSONL ledger")
+	evidenceRoot := flags.String("evidence-root", "", "root directory for immutable recovery evidence")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *requestPath == "" || *ledgerPath == "" || *evidenceRoot == "" {
+		fmt.Fprintln(stderr, "usage: abcp recovery-resume --request <path> --ledger <path> --evidence-root <path>")
+		return 2
+	}
+
+	request, err := loadJSONFile[recovery.WorkflowRequest](*requestPath, "recovery request")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	canonicalLedger, err := canonicalLedgerDestination(*ledgerPath, *evidenceRoot)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	artifacts, err := evidence.NewStore(*evidenceRoot, request.Ownership.Attempt.RunID)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	events, err := ledger.NewJSONLLedger(canonicalLedger)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	workflow, err := recovery.NewWorkflow(events, artifacts, recovery.GovernedCleaner{})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	result, err := workflow.Recover(ctx, request)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err := writeJSONOutput(stdout, result); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func loadJSONFile[T any](path, description string) (T, error) {
+	var value T
+	file, err := os.Open(path)
+	if err != nil {
+		return value, fmt.Errorf("open %s: %w", description, err)
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return value, fmt.Errorf("decode %s: %w", description, err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return value, fmt.Errorf("decode %s: multiple JSON values", description)
+		}
+		return value, fmt.Errorf("decode %s: %w", description, err)
+	}
+	return value, nil
+}
+
+func writeJSONOutput(writer io.Writer, value any) error {
+	encoder := json.NewEncoder(writer)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(value); err != nil {
+		return fmt.Errorf("encode output: %w", err)
+	}
+	return nil
 }
 
 func runCommand(args []string, stdout, stderr io.Writer) int {
@@ -213,5 +425,5 @@ func loadManifest(path string) (authority.Manifest, error) {
 }
 
 func usage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|run>")
+	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|run|recovery-inspect|recovery-resume>")
 }

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -119,6 +120,42 @@ func TestRunnerAppliesGovernedRalphexTimeout(t *testing.T) {
 	result := fixture.execute(t)
 	if result.State != domain.StateFailed || result.Ralphex.Outcome != supervisor.OutcomeTimedOut {
 		t.Fatalf("timed Ralphex result = %#v", result)
+	}
+}
+
+func TestRunnerReverifiesBoundContextCapsuleBeforeRalphexLaunch(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	sourcePath := filepath.Join(manifest.Repository.Path, "context.md")
+	writeTestFile(t, sourcePath, []byte("governed context"), 0o600)
+	runGit(t, manifest.Repository.Path, "add", "context.md")
+	runGit(t, manifest.Repository.Path, "commit", "-m", "context source")
+	manifest.Repository.StartSHA = runGit(t, manifest.Repository.Path, "rev-parse", "HEAD")
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersion,
+		Project:       "ABCP", Plan: "EP-004", RoadmapPhase: "Phase 3", ExecutionPack: "EP-004",
+		Task: "Task 1", Repository: "example/project", BaseSHA: manifest.Repository.StartSHA,
+		Invariants: []string{"Fail closed."}, NonGoals: []string{"No retrieval."}, Sources: []string{"context.md"},
+	}
+	_, capsuleJSON, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capsulePath := filepath.Join(t.TempDir(), "capsule.json")
+	writeTestFile(t, capsulePath, capsuleJSON, 0o600)
+	manifest.ContextCapsule = &authority.ContextCapsuleManifest{Path: capsulePath, SHA256: testHash(t, capsulePath)}
+	fixture.authority, err = authority.New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeTestFile(t, sourcePath, []byte("drift after authority construction"), 0o600)
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "verify context capsule before execution") {
+		t.Fatalf("expected pre-launch capsule verification failure, got result=%+v err=%v", result, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(manifest.Repository.Path, "candidate.txt")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Ralphex launched despite capsule drift: %v", statErr)
 	}
 }
 

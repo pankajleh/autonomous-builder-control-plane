@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
@@ -83,6 +84,81 @@ func TestRunCommandRequiresEveryExplicitPath(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "--evidence-root") {
 		t.Fatalf("usage does not name required evidence root: %q", stderr.String())
+	}
+}
+
+func TestContextBuildAndVerifyCLI(t *testing.T) {
+	repository := filepath.Join(t.TempDir(), "repository")
+	gitCommand(t, "", "init", "-b", "main", repository)
+	gitCommand(t, repository, "config", "user.email", "context-cli@example.test")
+	gitCommand(t, repository, "config", "user.name", "Context CLI Test")
+	gitCommand(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
+	sourcePath := filepath.Join(repository, "authority.md")
+	writeCLIFile(t, sourcePath, []byte("durable authority"), 0o600)
+	gitCommand(t, repository, "add", "authority.md")
+	gitCommand(t, repository, "commit", "-m", "authority")
+	head := gitCommand(t, repository, "rev-parse", "HEAD")
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersion,
+		Project:       "ABCP", Plan: "EP-004", RoadmapPhase: "Phase 3", ExecutionPack: "EP-004",
+		Task: "Task 1", Repository: "example/project", BaseSHA: head,
+		Invariants: []string{"Fail closed."}, NonGoals: []string{"No semantic retrieval."},
+		Sources: []string{"authority.md"},
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specPath := filepath.Join(t.TempDir(), "spec.json")
+	writeCLIFile(t, specPath, specJSON, 0o600)
+	capsulePath := filepath.Join(t.TempDir(), "capsule.json")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runCLI([]string{"context-build", "--repository", repository, "--spec", specPath, "--output", capsulePath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("context-build exited %d: %s", code, stderr.String())
+	}
+	data, err := os.ReadFile(capsulePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := contextcapsule.Parse(data); err != nil {
+		t.Fatalf("context-build did not emit canonical capsule: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runCLI([]string{"context-verify", "--repository", repository, "--capsule", capsulePath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("context-verify exited %d: %s", code, stderr.String())
+	}
+	var verified contextcapsule.Verification
+	if err := json.Unmarshal(stdout.Bytes(), &verified); err != nil {
+		t.Fatalf("decode verification output: %v", err)
+	}
+	if verified.BaseSHA != head || verified.SourcesVerified != 1 || verified.SHA256 != cliFileHash(t, capsulePath) {
+		t.Fatalf("unexpected verification output: %+v", verified)
+	}
+
+	writeCLIFile(t, sourcePath, []byte("drift"), 0o600)
+	stdout.Reset()
+	stderr.Reset()
+	if code := runCLI([]string{"context-verify", "--repository", repository, "--capsule", capsulePath}, &stdout, &stderr); code != 1 {
+		t.Fatalf("context-verify accepted drifted source with exit %d", code)
+	}
+}
+
+func TestContextCommandsRequireStructuredPathArguments(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if code := runCLI([]string{"context-build", "--repository", ".", "--spec", "spec.json"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("context-build missing output exited %d", code)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runCLI([]string{"context-verify", "capsule.json"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("context-verify accepted positional input with exit %d", code)
 	}
 }
 
