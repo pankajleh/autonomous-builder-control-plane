@@ -67,12 +67,12 @@ git diff --check
 - [x] Run validation, mark Task 3 complete, and commit.
 ### Task 4: Add explicit blocker and resume authority records
 
-- [ ] Add typed controller records/events for recovery/blocker decisions using existing domain states and durable evidence refs.
-- [ ] Represent the exact question/required authority for `HUMAN_DECISION_REQUIRED`, required secret identity (never secret value), external dependency, validation unavailable, and policy block.
-- [ ] Add explicit resume/restart authority containing prior run/attempt reference, actor, decision/action, timestamp, policy version, and evidence refs.
-- [ ] Reject resume authority that targets the wrong run/attempt, lacks required actor/action, or attempts a forbidden state transition.
-- [ ] Add tests proving no implicit resume, no secret persistence, actor attribution, and state-machine validation.
-- [ ] Run validation, mark Task 4 complete, and commit.
+- [x] Add typed controller records/events for recovery/blocker decisions using existing domain states and durable evidence refs.
+- [x] Represent the exact question/required authority for `HUMAN_DECISION_REQUIRED`, required secret identity (never secret value), external dependency, validation unavailable, and policy block.
+- [x] Add explicit resume/restart authority containing prior run/attempt reference, actor, decision/action, timestamp, policy version, and evidence refs.
+- [x] Reject resume authority that targets the wrong run/attempt, lacks required actor/action, or attempts a forbidden state transition.
+- [x] Add tests proving no implicit resume, no secret persistence, actor attribution, and state-machine validation.
+- [x] Run validation, mark Task 4 complete, and commit.
 
 ### Task 5: Implement bounded cleanup/restart workflow and CLI
 
