@@ -13,14 +13,14 @@
 
 ### Task 1: Correct Track B determinism and acceptance reliability
 
-- [ ] Verify the bound context capsule before any implementation change.
-- [ ] Make synthetic integration commit identity reproducible across wall-clock time for the same exact baseline, accepted candidate order, candidate commits, and policy inputs; do not rely on two integrations occurring within the same second.
-- [ ] Add a regression that repeats an otherwise identical integration after crossing a wall-clock second boundary and proves identical final integrated commit/result identity where the contract requires determinism.
-- [ ] Remove the inherited flake in `TestRunCapturesExternalSignal`: the test must synchronize process readiness and external SIGTERM delivery so deterministic acceptance cannot randomly observe helper exit 95. Prefer a test-only fix; production supervisor semantics must not change unless evidence proves they are wrong.
-- [ ] Preserve bounded Git output, replacement-object suppression, exact merge-parent verification, source-branch immutability, conflict capture, cleanup/evidence ordering, and Track B scope.
-- [ ] Add/adjust targeted tests for the two controller findings and prove the previous failure mode cannot recur by repeated targeted execution.
-- [ ] Run `gofmt -w cmd internal`, `go test ./...`, repeated targeted supervisor/integration determinism tests, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
-- [ ] Mark only this correction task complete and commit the bounded correction.
+- [x] Verify the bound context capsule before any implementation change.
+- [x] Make synthetic integration commit identity reproducible across wall-clock time for the same exact baseline, accepted candidate order, candidate commits, and policy inputs; do not rely on two integrations occurring within the same second.
+- [x] Add a regression that repeats an otherwise identical integration after crossing a wall-clock second boundary and proves identical final integrated commit/result identity where the contract requires determinism.
+- [x] Remove the inherited flake in `TestRunCapturesExternalSignal`: the test must synchronize process readiness and external SIGTERM delivery so deterministic acceptance cannot randomly observe helper exit 95. Prefer a test-only fix; production supervisor semantics must not change unless evidence proves they are wrong.
+- [x] Preserve bounded Git output, replacement-object suppression, exact merge-parent verification, source-branch immutability, conflict capture, cleanup/evidence ordering, and Track B scope.
+- [x] Add/adjust targeted tests for the two controller findings and prove the previous failure mode cannot recur by repeated targeted execution.
+- [x] Run `gofmt -w cmd internal`, `go test ./...`, repeated targeted supervisor/integration determinism tests, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
+- [x] Mark only this correction task complete and commit the bounded correction.
 
 ## Controller findings being corrected
 

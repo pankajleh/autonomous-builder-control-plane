@@ -13,7 +13,10 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
 )
 
-const noReplaceObjectsOption = "--no-replace-objects"
+const (
+	noReplaceObjectsOption       = "--no-replace-objects"
+	deterministicIntegrationDate = "2000-01-01T00:00:00Z"
+)
 
 type gitResult struct {
 	Argv             []string
@@ -41,8 +44,10 @@ func (runner execGitRunner) Run(ctx context.Context, directory string, arguments
 	command.Dir = directory
 	command.Env = append(gitexec.Environment(),
 		"LC_ALL=C",
-		"GIT_AUTHOR_DATE=2000-01-01T00:00:00Z",
-		"GIT_COMMITTER_DATE=2000-01-01T00:00:00Z",
+		// Synthetic merge identity must depend only on governed inputs, never
+		// on the controller's wall clock.
+		"GIT_AUTHOR_DATE="+deterministicIntegrationDate,
+		"GIT_COMMITTER_DATE="+deterministicIntegrationDate,
 		"GIT_MERGE_AUTOEDIT=no",
 	)
 	stdout := boundedBuffer{limit: runner.stdoutLimitBytes}

@@ -71,16 +71,6 @@ func TestIntegrateCleanCandidatesInGovernedOrderWithoutMutatingSource(t *testing
 	if !result.Cleanup().WorkspaceRemoved {
 		t.Fatal("workspace was not reported removed")
 	}
-	repeated, err := controller.Integrate(context.Background(), Request{
-		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "clean-repeat",
-	})
-	if err != nil {
-		t.Fatalf("repeat Integrate() error = %v", err)
-	}
-	repeatedSteps := repeated.Steps()
-	if repeatedSteps[len(repeatedSteps)-1].AfterSHA != steps[len(steps)-1].AfterSHA {
-		t.Fatalf("final integrated commit is nondeterministic: %s != %s", repeatedSteps[len(repeatedSteps)-1].AfterSHA, steps[len(steps)-1].AfterSHA)
-	}
 	entries, err := os.ReadDir(temporaryRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -95,6 +85,50 @@ func TestIntegrateCleanCandidatesInGovernedOrderWithoutMutatingSource(t *testing
 	commands[0].Stdout = append(commands[0].Stdout, 'x')
 	if result.Commands()[0].Argv[0] != "git" || bytes.Equal(commands[0].Stdout, result.Commands()[0].Stdout) {
 		t.Fatal("command evidence was mutable through an accessor")
+	}
+}
+
+func TestIntegrateCommitIdentityIsIndependentOfWallClockSecond(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+	headA := branchCommit(t, repository, baseline, "candidate-a", "a.txt", "candidate a\n")
+	headB := branchCommit(t, repository, baseline, "candidate-b", "b.txt", "candidate b\n")
+	git(t, repository, "checkout", "--quiet", "main")
+
+	candidateA := acceptedCandidate(t, repository, "candidate-a", baseline, headA, "run-a", time.Date(2026, 9, 6, 1, 0, 0, 0, time.UTC))
+	candidateB := acceptedCandidate(t, repository, "candidate-b", baseline, headB, "run-b", time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC))
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidateB, candidateA})
+	controller := newTestController(t, t.TempDir(), evidenceStore(t))
+
+	first, err := controller.Integrate(context.Background(), Request{
+		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "first-second",
+	})
+	if err != nil {
+		t.Fatalf("first Integrate() error = %v", err)
+	}
+	firstCompletedAt := time.Now()
+	for time.Now().Unix() == firstCompletedAt.Unix() {
+		time.Sleep(time.Millisecond)
+	}
+	second, err := controller.Integrate(context.Background(), Request{
+		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "later-second",
+	})
+	if err != nil {
+		t.Fatalf("second Integrate() error = %v", err)
+	}
+
+	firstSteps := first.Steps()
+	secondSteps := second.Steps()
+	if len(firstSteps) != 2 || len(secondSteps) != 2 {
+		t.Fatalf("integration step counts = (%d, %d), want (2, 2)", len(firstSteps), len(secondSteps))
+	}
+	for index := range firstSteps {
+		if firstSteps[index].BeforeSHA != secondSteps[index].BeforeSHA || firstSteps[index].AfterSHA != secondSteps[index].AfterSHA {
+			t.Fatalf("step %d commit identity changed across wall-clock seconds: (%s, %s) != (%s, %s)", index, firstSteps[index].BeforeSHA, firstSteps[index].AfterSHA, secondSteps[index].BeforeSHA, secondSteps[index].AfterSHA)
+		}
+	}
+	if first.Status() != second.Status() || first.RiskReportSHA256() != second.RiskReportSHA256() {
+		t.Fatalf("governed result identity changed: status (%q, %q), risk report (%q, %q)", first.Status(), second.Status(), first.RiskReportSHA256(), second.RiskReportSHA256())
 	}
 }
 
