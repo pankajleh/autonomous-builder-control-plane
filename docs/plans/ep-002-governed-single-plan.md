@@ -66,13 +66,13 @@ make smoke
 
 ### Task 4: Implement deterministic branch acceptance executor
 
-- [ ] Add `internal/acceptance` that executes configured acceptance commands independently of the Ralphex subprocess result.
-- [ ] For every command capture exact argv, cwd, timestamps, exit/signal semantics, stdout/stderr evidence refs, and policy/class metadata.
-- [ ] Stop and fail acceptance on the first required command failure; never claim branch acceptance from Ralphex narration or dashboard state.
-- [ ] Record final Git `HEAD` SHA and clean/dirty status through structured Git argv execution, not shell parsing.
-- [ ] Define an acceptance result that can only be PASS when all required commands pass and final Git evidence is captured.
-- [ ] Add tests showing all-pass, first-failure stop, evidence capture, and no transition to `BRANCH_ACCEPTED` on failure.
-- [ ] Run the validation baseline, mark Task 4 complete, and commit.
+- [x] Add `internal/acceptance` that executes configured acceptance commands independently of the Ralphex subprocess result.
+- [x] For every command capture exact argv, cwd, timestamps, exit/signal semantics, stdout/stderr evidence refs, and policy/class metadata.
+- [x] Stop and fail acceptance on the first required command failure; never claim branch acceptance from Ralphex narration or dashboard state.
+- [x] Record final Git `HEAD` SHA and clean/dirty status through structured Git argv execution, not shell parsing.
+- [x] Define an acceptance result that can only be PASS when all required commands pass and final Git evidence is captured.
+- [x] Add tests showing all-pass, first-failure stop, evidence capture, and no transition to `BRANCH_ACCEPTED` on failure.
+- [x] Run the validation baseline, mark Task 4 complete, and commit.
 
 ### Task 5: Implement governed single-plan runner and CLI entry point
 
