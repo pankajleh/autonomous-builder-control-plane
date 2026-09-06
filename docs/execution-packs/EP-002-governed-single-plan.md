@@ -65,7 +65,9 @@ A non-zero terminal outcome must not become `IMPLEMENTATION_COMPLETED`.
 
 After Ralphex success, independently execute configured acceptance commands.
 At least one command must be required. Commands run with an allowlisted,
-isolated environment, and the tested checkout must remain clean.
+isolated environment, and the tested checkout must remain clean. Full and
+tasks-only runs must produce a candidate commit beyond the governed start SHA;
+review-only runs may validate the existing commit.
 
 Map:
 

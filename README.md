@@ -151,10 +151,14 @@ requires an explicit new branch name and is unavailable with review mode. The
 controller verifies the Git repository root, complete remote set, repository,
 plan, binary, branch, and clean initial working-tree identities. Ralphex receives
 only the controller's versioned runtime and selected-provider environment
-allowlist. Acceptance runs against the actual clean candidate checkout with its
-own allowlisted isolated environment. Each captured stdout/stderr stream is
-limited to 16 MiB. Success prints `BRANCH_ACCEPTED`. Failures return nonzero and
-preserve the JSONL ledger plus immutable artifacts under
+allowlist, plus a temporary controller-owned configuration directory. Governed
+runs reject repository-local `.ralphex` configuration so ambient settings cannot
+override the manifest. Fetch and push URLs must both match the governed remote
+URL. Acceptance runs against the actual clean candidate checkout with its own
+allowlisted isolated environment, and implementation modes require the candidate
+commit to advance beyond the governed start SHA. Each captured stdout/stderr
+stream is limited to 16 MiB. Success prints `BRANCH_ACCEPTED`. Failures return
+nonzero and preserve the JSONL ledger plus immutable artifacts under
 `<evidence-root>/<run_id>/`.
 
 The ledger path must be outside `<evidence-root>` so append-only events cannot

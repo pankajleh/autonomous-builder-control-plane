@@ -165,6 +165,11 @@ func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 		_ = cancelProcess(cmd)
 		waitErr = <-waited
 	}
+	// The direct child can exit while descendants in its process group remain
+	// alive. Terminate that governed group before returning control to the
+	// caller so descendants cannot outlive terminal classification and mutate
+	// state during later acceptance.
+	_ = cancelProcess(cmd)
 	result.EndedAt = time.Now().UTC()
 	result.StdoutTruncated = stdout.Truncated()
 	result.StderrTruncated = stderr.Truncated()

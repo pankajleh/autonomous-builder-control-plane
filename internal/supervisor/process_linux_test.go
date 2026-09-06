@@ -70,6 +70,26 @@ func TestCancellationTerminatesDescendantProcess(t *testing.T) {
 	}
 }
 
+func TestSuccessfulParentExitTerminatesDescendantProcess(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "descendant.pid")
+	command, _ := helperCommand(t, "success")
+	command.Argv = []string{os.Args[0], "-test.run=^TestSupervisorSuccessfulParentHelper$"}
+	command.Env = append(os.Environ(),
+		"GO_WANT_SUPERVISOR_SUCCESS_PARENT=1",
+		"GO_WANT_SUPERVISOR_SUCCESS_CHILD=",
+		"GO_WANT_SUPERVISOR_SUCCESS_PID_PATH="+pidPath,
+	)
+	result, err := New().Run(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != OutcomeSucceeded {
+		t.Fatalf("outcome = %q, want %q", result.Outcome, OutcomeSucceeded)
+	}
+	descendantPID := readProcessID(t, pidPath)
+	waitForProcessExit(t, descendantPID, "successful parent exit")
+}
+
 func TestRunBoundsOutputPipeRetainedByEscapedDescendant(t *testing.T) {
 	pidPath := filepath.Join(t.TempDir(), "escaped-descendant.pid")
 	command, _ := helperCommand(t, "success")
@@ -143,6 +163,50 @@ func TestSupervisorProcessTreeHelper(t *testing.T) {
 	}
 	if err := child.Wait(); err != nil {
 		os.Exit(98)
+	}
+}
+
+func TestSupervisorSuccessfulParentHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_SUPERVISOR_SUCCESS_CHILD") == "1" {
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+	if os.Getenv("GO_WANT_SUPERVISOR_SUCCESS_PARENT") != "1" {
+		return
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestSupervisorSuccessfulParentHelper$")
+	child.Env = append(os.Environ(), "GO_WANT_SUPERVISOR_SUCCESS_PARENT=", "GO_WANT_SUPERVISOR_SUCCESS_CHILD=1")
+	if err := child.Start(); err != nil {
+		os.Exit(99)
+	}
+	if err := os.WriteFile(os.Getenv("GO_WANT_SUPERVISOR_SUCCESS_PID_PATH"), []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+		os.Exit(100)
+	}
+	os.Exit(0)
+}
+
+func readProcessID(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pid
+}
+
+func waitForProcessExit(t *testing.T, pid int, context string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for processIsRunning(pid) {
+		if time.Now().After(deadline) {
+			t.Fatalf("descendant process %d survived %s", pid, context)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

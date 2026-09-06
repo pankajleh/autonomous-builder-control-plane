@@ -30,7 +30,7 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	startSHA := gitCommand(t, repository, "rev-parse", "HEAD")
 
 	binaryPath := filepath.Join(t.TempDir(), "fake-ralphex")
-	writeCLIFile(t, binaryPath, []byte("#!/bin/sh\nprintf 'cli fake ralphex\\n'\n"), 0o700)
+	writeCLIFile(t, binaryPath, []byte("#!/bin/sh\nprintf 'cli fake ralphex\\n'\nprintf 'candidate\\n' > candidate.txt\ngit add candidate.txt || exit 20\ngit commit -qm 'candidate implementation' || exit 21\n"), 0o700)
 	truePath, err := exec.LookPath("true")
 	if err != nil {
 		t.Fatal(err)

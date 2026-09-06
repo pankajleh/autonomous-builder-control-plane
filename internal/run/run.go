@@ -131,7 +131,12 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	}
 	result.State = domain.StateAuthorityValidated
 
-	invocation, err := r.invocation()
+	configDir, err := os.MkdirTemp("", "abcp-ralphex-config-")
+	if err != nil {
+		return r.fail(result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("create isolated Ralphex config directory: %w", err), nil)
+	}
+	defer os.RemoveAll(configDir)
+	invocation, err := r.invocation(configDir)
 	if err != nil {
 		return r.fail(result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
@@ -269,7 +274,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	return result, nil
 }
 
-func (r *Runner) invocation() (ralphex.Invocation, error) {
+func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
 	policy := r.governed.Executor()
 	executor := strings.ToLower(strings.TrimSpace(policy.Executor))
 	if executor != "" && executor != "claude" && executor != "codex" {
@@ -278,6 +283,7 @@ func (r *Runner) invocation() (ralphex.Invocation, error) {
 	return ralphex.Invocation{
 		BinaryPath:   r.governed.Ralphex().BinaryPath,
 		PlanPath:     r.governed.Plan().Path,
+		ConfigDir:    configDir,
 		Mode:         r.governed.Ralphex().Mode,
 		Codex:        executor == "codex",
 		Worktree:     r.governed.Worktree().Enabled,
@@ -445,6 +451,11 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	if !validation.WorkingTreeClean {
 		return validation, errors.New("governed repository working tree is not clean")
 	}
+	if _, localConfigErr := os.Lstat(filepath.Join(repository.Path, ".ralphex")); localConfigErr == nil {
+		return validation, errors.New("repository-local .ralphex configuration is not allowed for governed execution")
+	} else if !errors.Is(localConfigErr, os.ErrNotExist) {
+		return validation, fmt.Errorf("inspect repository-local Ralphex configuration: %w", localConfigErr)
+	}
 
 	names := make([]string, 0, len(repository.Remotes))
 	for name := range repository.Remotes {
@@ -475,6 +486,13 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 		}
 		if actual != repository.Remotes[name] {
 			return validation, fmt.Errorf("repository remote %q does not match governed URL", name)
+		}
+		push, pushErr := gitOutput(ctx, repository.Path, "remote", "get-url", "--push", "--all", name)
+		if pushErr != nil {
+			return validation, fmt.Errorf("resolve repository remote %q push URL: %w", name, pushErr)
+		}
+		if push != repository.Remotes[name] {
+			return validation, fmt.Errorf("repository remote %q push URL does not match governed URL", name)
 		}
 		validation.Remotes[name] = actual
 	}
@@ -559,6 +577,9 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 		if err := requireDescendsFrom(ctx, repository.Path, repository.StartSHA, headSHA); err != nil {
 			return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q does not descend from governed start SHA: %w", currentBranch, err)
 		}
+		if r.governed.Ralphex().Mode != ralphex.ModeReview && headSHA == repository.StartSHA {
+			return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q did not advance beyond governed start SHA", currentBranch)
+		}
 		branch = currentBranch
 		return materializeAcceptanceTarget(ctx, repository.Path, branch, headSHA)
 	}
@@ -569,6 +590,9 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 	}
 	if err := requireDescendsFrom(ctx, repository.Path, repository.StartSHA, headSHA); err != nil {
 		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q does not descend from governed start SHA: %w", branch, err)
+	}
+	if r.governed.Ralphex().Mode != ralphex.ModeReview && headSHA == repository.StartSHA {
+		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q did not advance beyond governed start SHA", branch)
 	}
 
 	return materializeAcceptanceTarget(ctx, repository.Path, branch, headSHA)
