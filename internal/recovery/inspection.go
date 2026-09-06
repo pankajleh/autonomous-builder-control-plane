@@ -71,12 +71,22 @@ type WorktreeIdentity struct {
 	Branch         string `json:"branch"`
 }
 
+// RuntimeIdentity pins the controller-owned runtime boundary and the exact
+// progress files belonging to an attempt. Recovery requests cannot add paths
+// beyond this durable ownership record.
+type RuntimeIdentity struct {
+	RootPath      string   `json:"root_path"`
+	ProgressRoot  string   `json:"progress_root"`
+	ProgressPaths []string `json:"progress_paths,omitempty"`
+}
+
 // Ownership is the controller-owned process and worktree metadata for one
 // governed attempt.
 type Ownership struct {
 	Attempt  AttemptIdentity  `json:"attempt"`
 	Process  ProcessIdentity  `json:"process"`
 	Worktree WorktreeIdentity `json:"worktree"`
+	Runtime  RuntimeIdentity  `json:"runtime,omitempty"`
 }
 
 // Inspection is a read-only classification. Reason is safe diagnostic text;
@@ -94,6 +104,16 @@ type Inspection struct {
 // CaptureOwnership validates attempt metadata and canonical worktree paths,
 // then captures a strong platform process identity.
 func CaptureOwnership(attempt AttemptIdentity, worktree WorktreeIdentity, pid int) (Ownership, error) {
+	return captureOwnership(attempt, worktree, RuntimeIdentity{}, pid)
+}
+
+// CaptureOwnershipWithRuntime captures ownership including the exact
+// controller-governed progress files that recovery may preserve and remove.
+func CaptureOwnershipWithRuntime(attempt AttemptIdentity, worktree WorktreeIdentity, runtime RuntimeIdentity, pid int) (Ownership, error) {
+	return captureOwnership(attempt, worktree, runtime, pid)
+}
+
+func captureOwnership(attempt AttemptIdentity, worktree WorktreeIdentity, runtime RuntimeIdentity, pid int) (Ownership, error) {
 	if err := validateAttempt(attempt); err != nil {
 		return Ownership{}, err
 	}
@@ -104,11 +124,15 @@ func CaptureOwnership(attempt AttemptIdentity, worktree WorktreeIdentity, pid in
 	if !present {
 		return Ownership{}, errors.New("governed worktree does not exist")
 	}
+	canonicalRuntime, err := validateRuntimePaths(runtime, canonical)
+	if err != nil {
+		return Ownership{}, err
+	}
 	process, err := CaptureProcessIdentity(pid)
 	if err != nil {
 		return Ownership{}, fmt.Errorf("capture process identity: %w", err)
 	}
-	return Ownership{Attempt: attempt, Process: process, Worktree: canonical}, nil
+	return Ownership{Attempt: attempt, Process: process, Worktree: canonical, Runtime: canonicalRuntime}, nil
 }
 
 // CaptureProcessIdentity records the platform-specific strong identity for a
@@ -153,6 +177,12 @@ func Inspect(ctx context.Context, ownership Ownership) Inspection {
 		return result
 	}
 	result.Ownership.Worktree = worktree
+	runtime, err := validateRuntimePaths(ownership.Runtime, worktree)
+	if err != nil {
+		result.Reason = err.Error()
+		return result
+	}
+	result.Ownership.Runtime = runtime
 
 	branch, err := inspectRegisteredWorktree(ctx, worktree)
 	if err != nil {
@@ -194,6 +224,96 @@ func Inspect(ctx context.Context, ownership Ownership) Inspection {
 	result.OwnerProof = OwnerProofMatching
 	result.Reason = "recorded process identity is live"
 	return result
+}
+
+func validateRuntimePaths(runtime RuntimeIdentity, worktree WorktreeIdentity) (RuntimeIdentity, error) {
+	if runtime.RootPath == "" && runtime.ProgressRoot == "" && len(runtime.ProgressPaths) == 0 {
+		return RuntimeIdentity{}, nil
+	}
+	if runtime.RootPath == "" || runtime.ProgressRoot == "" || len(runtime.ProgressPaths) == 0 {
+		return RuntimeIdentity{}, errors.New("runtime root, progress root, and at least one progress path are required together")
+	}
+	for name, path := range map[string]string{
+		"runtime root": runtime.RootPath, "progress root": runtime.ProgressRoot,
+	} {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return RuntimeIdentity{}, fmt.Errorf("%s must be an absolute clean path", name)
+		}
+	}
+	if err := rejectSensitiveRecoveryTarget(runtime.RootPath); err != nil {
+		return RuntimeIdentity{}, err
+	}
+	withinRepository, _ := pathContained(worktree.RepositoryPath, runtime.RootPath)
+	withinWorktreeRoot, _ := pathContained(worktree.RootPath, runtime.RootPath)
+	if !withinRepository && !withinWorktreeRoot {
+		return RuntimeIdentity{}, errors.New("runtime root escapes the authorized repository/worktree boundary")
+	}
+	rootInfo, err := os.Lstat(runtime.RootPath)
+	if err != nil {
+		return RuntimeIdentity{}, fmt.Errorf("inspect runtime root: %w", err)
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return RuntimeIdentity{}, errors.New("runtime root must be a real directory, not a symlink")
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(runtime.RootPath)
+	if err != nil || resolvedRoot != runtime.RootPath {
+		return RuntimeIdentity{}, errors.New("runtime root must not traverse symlinks")
+	}
+	contained, err := pathContained(runtime.RootPath, runtime.ProgressRoot)
+	if err != nil || !contained {
+		return RuntimeIdentity{}, errors.New("progress root escapes the authorized runtime boundary")
+	}
+	if err := rejectSensitiveRecoveryTarget(runtime.ProgressRoot); err != nil {
+		return RuntimeIdentity{}, err
+	}
+	canonicalRoot, err := validateProgressRoot(runtime.ProgressRoot)
+	if err != nil {
+		return RuntimeIdentity{}, err
+	}
+	paths := make([]string, 0, len(runtime.ProgressPaths))
+	seen := make(map[string]struct{}, len(runtime.ProgressPaths))
+	for _, path := range runtime.ProgressPaths {
+		canonicalPath, _, _, err := validateProgressPath(canonicalRoot, path)
+		if err != nil {
+			return RuntimeIdentity{}, err
+		}
+		if err := rejectSensitiveRecoveryTarget(canonicalPath); err != nil {
+			return RuntimeIdentity{}, err
+		}
+		if _, exists := seen[canonicalPath]; exists {
+			return RuntimeIdentity{}, fmt.Errorf("duplicate governed progress path %q", path)
+		}
+		seen[canonicalPath] = struct{}{}
+		paths = append(paths, canonicalPath)
+	}
+	return RuntimeIdentity{RootPath: runtime.RootPath, ProgressRoot: canonicalRoot, ProgressPaths: paths}, nil
+}
+
+func rejectSensitiveRecoveryTarget(path string) error {
+	clean := filepath.Clean(path)
+	if clean == string(filepath.Separator) {
+		return errors.New("recovery target must not be the filesystem root")
+	}
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		home = filepath.Clean(home)
+		if clean == home {
+			return errors.New("recovery target must not be the system home directory")
+		}
+		if relative, relErr := filepath.Rel(home, clean); relErr == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			first, _, _ := strings.Cut(relative, string(filepath.Separator))
+			if strings.HasPrefix(first, ".") {
+				return errors.New("recovery target must not address a secret-like system-home path")
+			}
+		}
+	}
+	for _, component := range strings.Split(clean, string(filepath.Separator)) {
+		switch strings.ToLower(component) {
+		case ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".secrets", "secrets":
+			return errors.New("recovery target must not address a secret-like path")
+		}
+	}
+	return nil
 }
 
 func validateAttempt(attempt AttemptIdentity) error {

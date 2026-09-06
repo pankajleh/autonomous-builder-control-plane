@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -36,13 +37,15 @@ type EventAppender interface {
 // before cleanup and converted to a durable ResumeAuthority only after the
 // governed stale state has been cleaned successfully.
 type RecoveryAuthorization struct {
-	AuthorizedAttempt AttemptIdentity `json:"authorized_attempt"`
-	Actor             string          `json:"actor"`
-	Decision          string          `json:"decision"`
-	Action            ResumeAction    `json:"action"`
-	Timestamp         time.Time       `json:"timestamp"`
-	PolicyVersion     string          `json:"policy_version"`
-	Boundary          domain.State    `json:"boundary"`
+	AuthorizedAttempt    AttemptIdentity `json:"authorized_attempt"`
+	CleanupWorktreePath  string          `json:"cleanup_worktree_path"`
+	CleanupProgressPaths []string        `json:"cleanup_progress_paths,omitempty"`
+	Actor                string          `json:"actor"`
+	Decision             string          `json:"decision"`
+	Action               ResumeAction    `json:"action"`
+	Timestamp            time.Time       `json:"timestamp"`
+	PolicyVersion        string          `json:"policy_version"`
+	Boundary             domain.State    `json:"boundary"`
 }
 
 // WorkflowRequest contains the exact stale attempt, evidence sources,
@@ -50,8 +53,6 @@ type RecoveryAuthorization struct {
 type WorkflowRequest struct {
 	SnapshotID    string                 `json:"snapshot_id"`
 	Ownership     Ownership              `json:"ownership"`
-	ProgressRoot  string                 `json:"progress_root,omitempty"`
-	ProgressPaths []string               `json:"progress_paths,omitempty"`
 	Limits        SnapshotLimits         `json:"limits,omitempty"`
 	StateFrom     domain.State           `json:"state_from"`
 	Failure       blocker.FailureInput   `json:"failure"`
@@ -64,8 +65,7 @@ type WorkflowRequest struct {
 type CleanupRequest struct {
 	Ownership     Ownership
 	Snapshot      PublishedSnapshot
-	ProgressRoot  string
-	ProgressPaths []string
+	Authorization RecoveryAuthorization
 	Limits        SnapshotLimits
 }
 
@@ -102,14 +102,17 @@ func (GovernedCleaner) Cleanup(ctx context.Context, request CleanupRequest) (Cle
 	if !positiveOwnerDead(inspection) {
 		return report, fmt.Errorf("cleanup requires current positive owner-dead proof: classification=%s proof=%s", inspection.Classification, inspection.OwnerProof)
 	}
+	if err := validateCleanupAuthorization(request.Authorization, inspection.Ownership); err != nil {
+		return report, err
+	}
 	if request.Snapshot.Metadata.Attempt != request.Ownership.Attempt ||
 		request.Snapshot.Metadata.Repository != inspection.Ownership.Worktree.RepositoryPath ||
 		request.Snapshot.Metadata.Worktree != inspection.Ownership.Worktree.Path ||
 		request.Snapshot.Metadata.Branch != inspection.Ownership.Worktree.Branch ||
-		request.Snapshot.Metadata.OwnerProof.Ownership != inspection.Ownership {
+		!ownershipEqual(request.Snapshot.Metadata.OwnerProof.Ownership, inspection.Ownership) {
 		return report, errors.New("cleanup target does not match the published recovery snapshot")
 	}
-	if err := validatePublishedRef(request.Snapshot.MetadataRef, "recovery-snapshot-metadata"); err != nil {
+	if err := verifyPublishedSnapshot(request.Snapshot); err != nil {
 		return report, fmt.Errorf("cleanup snapshot proof: %w", err)
 	}
 
@@ -142,7 +145,14 @@ func (GovernedCleaner) Cleanup(ctx context.Context, request CleanupRequest) (Cle
 	if err := verifySnapshotCapture("diff", diff, request.Snapshot.Metadata.Diff); err != nil {
 		return report, err
 	}
-	progress, _, err := captureProgress(request.ProgressRoot, request.ProgressPaths, limits.ProgressBytes)
+	untracked, _, err := captureUntracked(ctx, inspection.Ownership.Worktree.Path, limits.UntrackedBytes)
+	if err != nil {
+		return report, fmt.Errorf("verify cleanup untracked files: %w", err)
+	}
+	if err := verifySnapshotCapture("untracked", untracked, request.Snapshot.Metadata.Untracked); err != nil {
+		return report, err
+	}
+	progress, _, err := captureProgress(inspection.Ownership.Runtime.ProgressRoot, inspection.Ownership.Runtime.ProgressPaths, limits.ProgressBytes)
 	if err != nil {
 		return report, fmt.Errorf("verify cleanup progress: %w", err)
 	}
@@ -158,7 +168,12 @@ func (GovernedCleaner) Cleanup(ctx context.Context, request CleanupRequest) (Cle
 	}
 	report.WorktreeRemoved = true
 
-	for _, path := range request.ProgressPaths {
+	for _, path := range inspection.Ownership.Runtime.ProgressPaths {
+		insideRemovedWorktree, _ := pathContained(inspection.Ownership.Worktree.Path, path)
+		if insideRemovedWorktree {
+			report.RemovedProgressPaths = append(report.RemovedProgressPaths, path)
+			continue
+		}
 		if err := os.Remove(path); err != nil {
 			return report, fmt.Errorf("remove governed progress file %q: %w", path, err)
 		}
@@ -174,6 +189,86 @@ func (GovernedCleaner) Cleanup(ctx context.Context, request CleanupRequest) (Cle
 		return report, errors.New("cleanup did not preserve governed branch history")
 	}
 	return report, nil
+}
+
+func validateCleanupAuthorization(authorization RecoveryAuthorization, ownership Ownership) error {
+	if authorization.CleanupWorktreePath != ownership.Worktree.Path {
+		return errors.New("recovery authorization does not cover the exact governed worktree")
+	}
+	if !equalStringSlices(authorization.CleanupProgressPaths, ownership.Runtime.ProgressPaths) {
+		return errors.New("recovery authorization does not cover every governed progress target exactly")
+	}
+	return nil
+}
+
+func ownershipEqual(left, right Ownership) bool {
+	return left.Attempt == right.Attempt && left.Process == right.Process && left.Worktree == right.Worktree &&
+		left.Runtime.RootPath == right.Runtime.RootPath && left.Runtime.ProgressRoot == right.Runtime.ProgressRoot &&
+		equalStringSlices(left.Runtime.ProgressPaths, right.Runtime.ProgressPaths)
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func verifyPublishedSnapshot(snapshot PublishedSnapshot) error {
+	artifacts := []struct {
+		name     string
+		kind     string
+		metadata ArtifactMetadata
+	}{
+		{"status", "recovery-git-status", snapshot.Metadata.Status},
+		{"diff", "recovery-git-diff", snapshot.Metadata.Diff},
+		{"untracked", "recovery-git-untracked", snapshot.Metadata.Untracked},
+		{"progress", "recovery-ralphex-progress", snapshot.Metadata.Progress},
+	}
+	for _, artifact := range artifacts {
+		if artifact.metadata.Truncated || artifact.metadata.SourceBytes != artifact.metadata.CapturedBytes {
+			return fmt.Errorf("%s recovery artifact is incomplete or truncated", artifact.name)
+		}
+		if err := verifyEvidenceFile(artifact.metadata.Ref, artifact.kind, artifact.metadata.CapturedBytes); err != nil {
+			return fmt.Errorf("verify %s recovery artifact: %w", artifact.name, err)
+		}
+	}
+	metadataBytes, err := json.Marshal(snapshot.Metadata)
+	if err != nil {
+		return fmt.Errorf("marshal recovery snapshot metadata: %w", err)
+	}
+	if err := validatePublishedRef(snapshot.MetadataRef, "recovery-snapshot-metadata"); err != nil {
+		return err
+	}
+	publishedBytes, err := os.ReadFile(snapshot.MetadataRef.URI)
+	if err != nil {
+		return fmt.Errorf("read recovery snapshot metadata: %w", err)
+	}
+	digest := sha256.Sum256(publishedBytes)
+	if hex.EncodeToString(digest[:]) != snapshot.MetadataRef.SHA256 || !bytes.Equal(publishedBytes, metadataBytes) {
+		return errors.New("published recovery snapshot metadata does not match its immutable evidence reference")
+	}
+	return nil
+}
+
+func verifyEvidenceFile(ref ledger.EvidenceRef, kind string, expectedBytes int64) error {
+	if err := validatePublishedRef(ref, kind); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(ref.URI)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(data)
+	if int64(len(data)) != expectedBytes || hex.EncodeToString(digest[:]) != ref.SHA256 {
+		return errors.New("published bytes do not match immutable evidence reference")
+	}
+	return nil
 }
 
 func verifySnapshotCapture(name string, capture boundedCapture, metadata ArtifactMetadata) error {
@@ -263,15 +358,14 @@ func (workflow *Workflow) Recover(ctx context.Context, request WorkflowRequest) 
 	}
 
 	result.Snapshot, err = workflow.snapshotter.Capture(ctx, SnapshotRequest{
-		SnapshotID: request.SnapshotID, Ownership: request.Ownership,
-		ProgressRoot: request.ProgressRoot, ProgressPaths: request.ProgressPaths, Limits: request.Limits,
+		SnapshotID: request.SnapshotID, Ownership: request.Ownership, Limits: request.Limits,
 	})
 	if err != nil {
 		return result, fmt.Errorf("publish pre-cleanup recovery snapshot: %w", err)
 	}
 	snapshotRefs := []ledger.EvidenceRef{
 		result.Snapshot.Metadata.Status.Ref, result.Snapshot.Metadata.Diff.Ref,
-		result.Snapshot.Metadata.Progress.Ref, result.Snapshot.MetadataRef,
+		result.Snapshot.Metadata.Untracked.Ref, result.Snapshot.Metadata.Progress.Ref, result.Snapshot.MetadataRef,
 	}
 	result.EvidenceRefs = append(result.EvidenceRefs, snapshotRefs...)
 	if err := workflow.appendAction(request.Ownership.Attempt, EventRecoverySnapshotPublished, "recovery-snapshotter", map[string]any{
@@ -305,18 +399,24 @@ func (workflow *Workflow) Recover(ctx context.Context, request WorkflowRequest) 
 	if request.Authorization.Action != ResumeActionRestart {
 		return result, errors.New("stale worktree cleanup requires restart authority for a new attempt")
 	}
+	if err := validateCleanupAuthorization(*request.Authorization, result.Inspection.Ownership); err != nil {
+		return result, fmt.Errorf("validate recovery cleanup authority: %w", err)
+	}
+	if err := verifyPublishedSnapshot(result.Snapshot); err != nil {
+		return result, fmt.Errorf("recovery snapshot cannot authorize cleanup: %w", err)
+	}
 	if err := workflow.appendAction(request.Ownership.Attempt, EventRecoveryCleanupAuthorized, request.Authorization.Actor, map[string]any{
 		"authorized_attempt": request.Authorization.AuthorizedAttempt,
 		"decision":           request.Authorization.Decision,
 		"worktree":           request.Ownership.Worktree.Path,
-		"progress_paths":     append([]string(nil), request.ProgressPaths...),
+		"progress_paths":     append([]string(nil), result.Inspection.Ownership.Runtime.ProgressPaths...),
 	}, result.EvidenceRefs); err != nil {
 		return result, err
 	}
 
 	result.Cleanup, err = workflow.cleaner.Cleanup(ctx, CleanupRequest{
 		Ownership: request.Ownership, Snapshot: result.Snapshot,
-		ProgressRoot: request.ProgressRoot, ProgressPaths: request.ProgressPaths, Limits: request.Limits,
+		Authorization: *request.Authorization, Limits: request.Limits,
 	})
 	if err != nil {
 		failureRef, evidenceErr := workflow.writeJSON("recovery-"+request.SnapshotID+"-cleanup-failed.json", "recovery-cleanup-failure", struct {

@@ -20,15 +20,15 @@ Do not add Phase 3+ capability. Do not change context-capsule behavior except wh
 
 ### Task 1: Correct recovery evidence and cleanup safety
 
-- [ ] Preserve untracked, non-ignored file contents before any destructive cleanup. Use repository/worktree-contained, symlink-rejecting, bounded capture with immutable evidence metadata and re-verification before deletion.
-- [ ] If complete preservation cannot be proven, fail closed and do not remove the worktree.
-- [ ] Prevent destructive cleanup when any required snapshot artifact is truncated. Truncation may remain recorded as evidence but must not authorize cleanup.
-- [ ] Bind progress capture/deletion to controller-owned governed attempt metadata rather than arbitrary request paths. Reject progress roots outside the authorized runtime/worktree boundary and reject symlink/path escape/system-home targets.
-- [ ] Ensure every deletable progress target is explicitly covered by recorded recovery authority; no request-only destructive target may be acted on.
-- [ ] Add regression tests for untracked file preservation, untracked symlink rejection, truncation refusal, arbitrary progress-root refusal, secret-like home path refusal, and exact authorized progress deletion.
-- [ ] Keep cleanup branch-history preservation and owner-dead proof unchanged.
-- [ ] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
-- [ ] Mark this task complete and commit only the bounded correction.
+- [x] Preserve untracked, non-ignored file contents before any destructive cleanup. Use repository/worktree-contained, symlink-rejecting, bounded capture with immutable evidence metadata and re-verification before deletion.
+- [x] If complete preservation cannot be proven, fail closed and do not remove the worktree.
+- [x] Prevent destructive cleanup when any required snapshot artifact is truncated. Truncation may remain recorded as evidence but must not authorize cleanup.
+- [x] Bind progress capture/deletion to controller-owned governed attempt metadata rather than arbitrary request paths. Reject progress roots outside the authorized runtime/worktree boundary and reject symlink/path escape/system-home targets.
+- [x] Ensure every deletable progress target is explicitly covered by recorded recovery authority; no request-only destructive target may be acted on.
+- [x] Add regression tests for untracked file preservation, untracked symlink rejection, truncation refusal, arbitrary progress-root refusal, secret-like home path refusal, and exact authorized progress deletion.
+- [x] Keep cleanup branch-history preservation and owner-dead proof unchanged.
+- [x] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
+- [x] Mark this task complete and commit only the bounded correction.
 
 ## Acceptance
 

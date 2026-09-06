@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,11 +21,12 @@ import (
 )
 
 const (
-	defaultStatusLimit   int64 = 1 << 20
-	defaultDiffLimit     int64 = 8 << 20
-	defaultProgressLimit int64 = 2 << 20
-	defaultMetadataLimit int64 = 1 << 20
-	maximumArtifactLimit int64 = 64 << 20
+	defaultStatusLimit    int64 = 1 << 20
+	defaultDiffLimit      int64 = 8 << 20
+	defaultUntrackedLimit int64 = 16 << 20
+	defaultProgressLimit  int64 = 2 << 20
+	defaultMetadataLimit  int64 = 1 << 20
+	maximumArtifactLimit  int64 = 64 << 20
 )
 
 // ArtifactWriter publishes immutable, content-addressed evidence. The
@@ -35,21 +38,19 @@ type ArtifactWriter interface {
 // SnapshotLimits bounds every recovery artifact held in memory or published.
 // A zero value selects the conservative default for that artifact.
 type SnapshotLimits struct {
-	StatusBytes   int64 `json:"status_bytes"`
-	DiffBytes     int64 `json:"diff_bytes"`
-	ProgressBytes int64 `json:"progress_bytes"`
-	MetadataBytes int64 `json:"metadata_bytes"`
+	StatusBytes    int64 `json:"status_bytes"`
+	DiffBytes      int64 `json:"diff_bytes"`
+	UntrackedBytes int64 `json:"untracked_bytes"`
+	ProgressBytes  int64 `json:"progress_bytes"`
+	MetadataBytes  int64 `json:"metadata_bytes"`
 }
 
-// SnapshotRequest identifies one immutable snapshot. ProgressRoot is the
-// controller-authorized Ralphex progress directory; every ProgressPath must
-// be a regular file contained beneath it.
+// SnapshotRequest identifies one immutable snapshot. Progress inputs are
+// derived exclusively from Ownership.Runtime.
 type SnapshotRequest struct {
-	SnapshotID    string
-	Ownership     Ownership
-	ProgressRoot  string
-	ProgressPaths []string
-	Limits        SnapshotLimits
+	SnapshotID string
+	Ownership  Ownership
+	Limits     SnapshotLimits
 }
 
 // ArtifactMetadata records both the bytes available at the source and the
@@ -71,23 +72,36 @@ type ProgressFileMetadata struct {
 	ArchiveOffset int64     `json:"archive_offset"`
 }
 
+// UntrackedFileMetadata binds each preserved non-ignored untracked file to
+// its worktree-relative identity, metadata, contents, and archive position.
+type UntrackedFileMetadata struct {
+	Path          string    `json:"path"`
+	Size          int64     `json:"size"`
+	Mode          uint32    `json:"mode"`
+	ModifiedAt    time.Time `json:"modified_at"`
+	SHA256        string    `json:"sha256"`
+	ArchiveOffset int64     `json:"archive_offset"`
+}
+
 // SnapshotMetadata is published last. Its existence proves that every
 // referenced artifact was durably published before a cleanup/restart action.
 type SnapshotMetadata struct {
-	SchemaVersion int                    `json:"schema_version"`
-	SnapshotID    string                 `json:"snapshot_id"`
-	CapturedAt    time.Time              `json:"captured_at"`
-	Attempt       AttemptIdentity        `json:"attempt"`
-	Repository    string                 `json:"repository"`
-	Worktree      string                 `json:"worktree"`
-	Branch        string                 `json:"branch"`
-	HeadSHA       string                 `json:"head_sha"`
-	Dirty         bool                   `json:"dirty"`
-	OwnerProof    Inspection             `json:"owner_proof"`
-	Status        ArtifactMetadata       `json:"status"`
-	Diff          ArtifactMetadata       `json:"diff"`
-	Progress      ArtifactMetadata       `json:"progress"`
-	ProgressFiles []ProgressFileMetadata `json:"progress_files,omitempty"`
+	SchemaVersion  int                     `json:"schema_version"`
+	SnapshotID     string                  `json:"snapshot_id"`
+	CapturedAt     time.Time               `json:"captured_at"`
+	Attempt        AttemptIdentity         `json:"attempt"`
+	Repository     string                  `json:"repository"`
+	Worktree       string                  `json:"worktree"`
+	Branch         string                  `json:"branch"`
+	HeadSHA        string                  `json:"head_sha"`
+	Dirty          bool                    `json:"dirty"`
+	OwnerProof     Inspection              `json:"owner_proof"`
+	Status         ArtifactMetadata        `json:"status"`
+	Diff           ArtifactMetadata        `json:"diff"`
+	Untracked      ArtifactMetadata        `json:"untracked"`
+	UntrackedFiles []UntrackedFileMetadata `json:"untracked_files,omitempty"`
+	Progress       ArtifactMetadata        `json:"progress"`
+	ProgressFiles  []ProgressFileMetadata  `json:"progress_files,omitempty"`
 }
 
 // PublishedSnapshot is the proof token passed to a protected action only
@@ -156,7 +170,11 @@ func (s *Snapshotter) Capture(ctx context.Context, request SnapshotRequest) (Pub
 	if err != nil {
 		return PublishedSnapshot{}, fmt.Errorf("capture recovery diff: %w", err)
 	}
-	progress, progressFiles, err := captureProgress(request.ProgressRoot, request.ProgressPaths, limits.ProgressBytes)
+	untracked, untrackedFiles, err := captureUntracked(ctx, inspection.Ownership.Worktree.Path, limits.UntrackedBytes)
+	if err != nil {
+		return PublishedSnapshot{}, fmt.Errorf("capture recovery untracked files: %w", err)
+	}
+	progress, progressFiles, err := captureProgress(inspection.Ownership.Runtime.ProgressRoot, inspection.Ownership.Runtime.ProgressPaths, limits.ProgressBytes)
 	if err != nil {
 		return PublishedSnapshot{}, fmt.Errorf("capture Ralphex progress: %w", err)
 	}
@@ -184,6 +202,13 @@ func (s *Snapshotter) Capture(ctx context.Context, request SnapshotRequest) (Pub
 	if err := validatePublishedRef(diffRef, "recovery-git-diff"); err != nil {
 		return PublishedSnapshot{}, fmt.Errorf("publish recovery diff: %w", err)
 	}
+	untrackedRef, err := s.artifacts.WriteBytes(prefix+"-untracked.tar", "recovery-git-untracked", untracked.data)
+	if err != nil {
+		return PublishedSnapshot{}, fmt.Errorf("publish recovery untracked files: %w", err)
+	}
+	if err := validatePublishedRef(untrackedRef, "recovery-git-untracked"); err != nil {
+		return PublishedSnapshot{}, fmt.Errorf("publish recovery untracked files: %w", err)
+	}
 	progressRef, err := s.artifacts.WriteBytes(prefix+"-progress.tar", "recovery-ralphex-progress", progress.data)
 	if err != nil {
 		return PublishedSnapshot{}, fmt.Errorf("publish Ralphex progress: %w", err)
@@ -193,20 +218,22 @@ func (s *Snapshotter) Capture(ctx context.Context, request SnapshotRequest) (Pub
 	}
 
 	metadata := SnapshotMetadata{
-		SchemaVersion: 1,
-		SnapshotID:    request.SnapshotID,
-		CapturedAt:    s.now().UTC(),
-		Attempt:       inspection.Ownership.Attempt,
-		Repository:    inspection.Ownership.Worktree.RepositoryPath,
-		Worktree:      inspection.Ownership.Worktree.Path,
-		Branch:        inspection.Ownership.Worktree.Branch,
-		HeadSHA:       headSHA,
-		Dirty:         status.total > 0,
-		OwnerProof:    inspection,
-		Status:        artifactMetadata(statusRef, status),
-		Diff:          artifactMetadata(diffRef, diff),
-		Progress:      artifactMetadata(progressRef, progress),
-		ProgressFiles: progressFiles,
+		SchemaVersion:  2,
+		SnapshotID:     request.SnapshotID,
+		CapturedAt:     s.now().UTC(),
+		Attempt:        inspection.Ownership.Attempt,
+		Repository:     inspection.Ownership.Worktree.RepositoryPath,
+		Worktree:       inspection.Ownership.Worktree.Path,
+		Branch:         inspection.Ownership.Worktree.Branch,
+		HeadSHA:        headSHA,
+		Dirty:          status.total > 0,
+		OwnerProof:     inspection,
+		Status:         artifactMetadata(statusRef, status),
+		Diff:           artifactMetadata(diffRef, diff),
+		Untracked:      artifactMetadata(untrackedRef, untracked),
+		UntrackedFiles: untrackedFiles,
+		Progress:       artifactMetadata(progressRef, progress),
+		ProgressFiles:  progressFiles,
 	}
 	metadataBytes, err := json.Marshal(metadata)
 	if err != nil {
@@ -334,6 +361,91 @@ func captureProgress(root string, paths []string, limit int64) (boundedCapture, 
 	return capture, files, nil
 }
 
+func captureUntracked(ctx context.Context, worktree string, limit int64) (boundedCapture, []UntrackedFileMetadata, error) {
+	capture := boundedCapture{limit: limit}
+	listing, err := captureGitOutput(ctx, worktree, maximumArtifactLimit, "ls-files", "--others", "--exclude-standard", "-z", "--")
+	if err != nil {
+		return boundedCapture{}, nil, err
+	}
+	if listing.truncated {
+		return boundedCapture{}, nil, errors.New("untracked file listing exceeded safety bound")
+	}
+	if len(listing.data) == 0 {
+		return capture, nil, nil
+	}
+
+	archive := tar.NewWriter(&capture)
+	files := make([]UntrackedFileMetadata, 0)
+	seen := make(map[string]struct{})
+	for _, raw := range bytes.Split(listing.data, []byte{0}) {
+		if len(raw) == 0 {
+			continue
+		}
+		relative := filepath.FromSlash(string(raw))
+		if relative == "." || relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return boundedCapture{}, nil, fmt.Errorf("unsafe untracked path %q", raw)
+		}
+		path := filepath.Join(worktree, relative)
+		contained, err := pathContained(worktree, path)
+		if err != nil || !contained || path == worktree {
+			return boundedCapture{}, nil, fmt.Errorf("untracked path %q escapes the governed worktree", relative)
+		}
+		present, err := rejectSymlinkComponents(worktree, path)
+		if err != nil {
+			return boundedCapture{}, nil, fmt.Errorf("validate untracked path %q: %w", relative, err)
+		}
+		if !present {
+			return boundedCapture{}, nil, fmt.Errorf("untracked path %q disappeared while snapshotting", relative)
+		}
+		if _, duplicate := seen[path]; duplicate {
+			return boundedCapture{}, nil, fmt.Errorf("duplicate untracked path %q", relative)
+		}
+		seen[path] = struct{}{}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return boundedCapture{}, nil, fmt.Errorf("inspect untracked path %q: %w", relative, err)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return boundedCapture{}, nil, fmt.Errorf("untracked path %q must be a regular file, not a symlink", relative)
+		}
+		header := &tar.Header{
+			Name: filepath.ToSlash(relative), Mode: int64(info.Mode().Perm()), Size: info.Size(),
+			ModTime: info.ModTime().UTC(), Format: tar.FormatPAX,
+		}
+		offset := capture.total
+		if err := archive.WriteHeader(header); err != nil {
+			return boundedCapture{}, nil, fmt.Errorf("archive untracked file %q: %w", relative, err)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return boundedCapture{}, nil, fmt.Errorf("open untracked file %q: %w", relative, err)
+		}
+		openedInfo, statErr := file.Stat()
+		if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+			file.Close()
+			return boundedCapture{}, nil, fmt.Errorf("untracked file %q changed identity while snapshotting", relative)
+		}
+		digest := sha256.New()
+		copied, copyErr := io.Copy(io.MultiWriter(archive, digest), file)
+		closeErr := file.Close()
+		currentInfo, lstatErr := os.Lstat(path)
+		if copyErr != nil || closeErr != nil || lstatErr != nil {
+			return boundedCapture{}, nil, fmt.Errorf("archive untracked file %q: %w", relative, errors.Join(copyErr, closeErr, lstatErr))
+		}
+		if copied != info.Size() || !os.SameFile(info, currentInfo) || currentInfo.Size() != info.Size() || !currentInfo.ModTime().Equal(info.ModTime()) {
+			return boundedCapture{}, nil, fmt.Errorf("untracked file %q changed while snapshotting", relative)
+		}
+		files = append(files, UntrackedFileMetadata{
+			Path: filepath.ToSlash(relative), Size: info.Size(), Mode: uint32(info.Mode().Perm()),
+			ModifiedAt: info.ModTime().UTC(), SHA256: hex.EncodeToString(digest.Sum(nil)), ArchiveOffset: offset,
+		})
+	}
+	if err := archive.Close(); err != nil {
+		return boundedCapture{}, nil, fmt.Errorf("finalize untracked archive: %w", err)
+	}
+	return capture, files, nil
+}
+
 func validateProgressRoot(root string) (string, error) {
 	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return "", errors.New("progress root must be an absolute clean path")
@@ -389,6 +501,7 @@ func normalizeSnapshotLimits(limits SnapshotLimits) (SnapshotLimits, error) {
 	}{
 		{"status", &limits.StatusBytes, defaultStatusLimit},
 		{"diff", &limits.DiffBytes, defaultDiffLimit},
+		{"untracked", &limits.UntrackedBytes, defaultUntrackedLimit},
 		{"progress", &limits.ProgressBytes, defaultProgressLimit},
 		{"metadata", &limits.MetadataBytes, defaultMetadataLimit},
 	}

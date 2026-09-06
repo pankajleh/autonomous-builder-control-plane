@@ -72,7 +72,8 @@ func TestRecoveryCLIInspectsAndExecutesExplicitAuthorizedRecovery(t *testing.T) 
 		}},
 		Authorization: &recovery.RecoveryAuthorization{
 			AuthorizedAttempt: authorized, Actor: "repository-owner",
-			Decision: "replace stale CLI attempt", Action: recovery.ResumeActionRestart,
+			CleanupWorktreePath: worktree,
+			Decision:            "replace stale CLI attempt", Action: recovery.ResumeActionRestart,
 			Timestamp:     time.Date(2026, 9, 6, 15, 0, 0, 0, time.UTC),
 			PolicyVersion: "recovery-v1", Boundary: domain.StateExecutionStarting,
 		},

@@ -23,15 +23,18 @@ import (
 
 func TestSnapshotPreservesDirtyStateAndProgress(t *testing.T) {
 	fixture := newWorktreeFixture(t)
-	ownership := deadOwnership(t, fixture)
 	writeTestRecoveryFile(t, filepath.Join(fixture.worktree, "README.md"), []byte("fixture\ndirty recovery work\n"))
-	progressRoot := filepath.Join(t.TempDir(), "progress")
-	if err := os.Mkdir(progressRoot, 0o700); err != nil {
+	runtimeRoot := filepath.Join(fixture.root, "runtime")
+	progressRoot := filepath.Join(runtimeRoot, "progress")
+	if err := os.MkdirAll(progressRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	progressPath := filepath.Join(progressRoot, "attempt.log")
 	progressContents := []byte("task 2 was in progress\n")
 	writeTestRecoveryFile(t, progressPath, progressContents)
+	ownership := deadOwnershipWithRuntime(t, fixture, RuntimeIdentity{
+		RootPath: runtimeRoot, ProgressRoot: progressRoot, ProgressPaths: []string{progressPath},
+	})
 
 	store, err := evidence.NewStore(t.TempDir(), ownership.Attempt.RunID)
 	if err != nil {
@@ -45,10 +48,8 @@ func TestSnapshotPreservesDirtyStateAndProgress(t *testing.T) {
 	snapshotter.now = func() time.Time { return capturedAt }
 
 	published, err := snapshotter.Capture(context.Background(), SnapshotRequest{
-		SnapshotID:    "attempt-1-terminal",
-		Ownership:     ownership,
-		ProgressRoot:  progressRoot,
-		ProgressPaths: []string{progressPath},
+		SnapshotID: "attempt-1-terminal",
+		Ownership:  ownership,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -130,13 +131,17 @@ func TestSnapshotCleanStatePublishesEmptyStatusAndDiff(t *testing.T) {
 	if diff := readVerifiedRecoveryArtifact(t, published.Metadata.Diff.Ref); len(diff) != 0 {
 		t.Fatalf("clean diff = %q", diff)
 	}
+	if untracked := readVerifiedRecoveryArtifact(t, published.Metadata.Untracked.Ref); len(untracked) != 0 {
+		t.Fatalf("absent untracked archive = %q", untracked)
+	}
 	if progress := readVerifiedRecoveryArtifact(t, published.Metadata.Progress.Ref); len(progress) != 0 {
 		t.Fatalf("absent progress = %q", progress)
 	}
 	for name, artifact := range map[string]ArtifactMetadata{
-		"status":   published.Metadata.Status,
-		"diff":     published.Metadata.Diff,
-		"progress": published.Metadata.Progress,
+		"status":    published.Metadata.Status,
+		"diff":      published.Metadata.Diff,
+		"untracked": published.Metadata.Untracked,
+		"progress":  published.Metadata.Progress,
 	} {
 		if artifact.SourceBytes != 0 || artifact.CapturedBytes != 0 || artifact.Truncated {
 			t.Fatalf("clean %s metadata = %#v", name, artifact)
@@ -161,7 +166,10 @@ func TestSnapshotArtifactsAreHashAddressedAndImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	refs := []ledger.EvidenceRef{first.Metadata.Status.Ref, first.Metadata.Diff.Ref, first.Metadata.Progress.Ref, first.MetadataRef}
+	refs := []ledger.EvidenceRef{
+		first.Metadata.Status.Ref, first.Metadata.Diff.Ref, first.Metadata.Untracked.Ref,
+		first.Metadata.Progress.Ref, first.MetadataRef,
+	}
 	before := make(map[string][]byte, len(refs))
 	for _, ref := range refs {
 		before[ref.URI] = readVerifiedRecoveryArtifact(t, ref)
@@ -184,17 +192,20 @@ func TestSnapshotArtifactsAreHashAddressedAndImmutable(t *testing.T) {
 
 func TestSnapshotBoundsArtifactsAndRecordsTruncation(t *testing.T) {
 	fixture := newWorktreeFixture(t)
-	ownership := deadOwnership(t, fixture)
 	writeTestRecoveryFile(t, filepath.Join(fixture.worktree, "README.md"), bytes.Repeat([]byte("large dirty line\n"), 128))
 	for index := 0; index < 12; index++ {
 		writeTestRecoveryFile(t, filepath.Join(fixture.worktree, strings.Repeat("x", 20)+string(rune('a'+index))+".txt"), []byte("untracked\n"))
 	}
-	progressRoot := filepath.Join(t.TempDir(), "progress")
-	if err := os.Mkdir(progressRoot, 0o700); err != nil {
+	runtimeRoot := filepath.Join(fixture.root, "runtime")
+	progressRoot := filepath.Join(runtimeRoot, "progress")
+	if err := os.MkdirAll(progressRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	progressPath := filepath.Join(progressRoot, "large.log")
 	writeTestRecoveryFile(t, progressPath, bytes.Repeat([]byte("progress data\n"), 128))
+	ownership := deadOwnershipWithRuntime(t, fixture, RuntimeIdentity{
+		RootPath: runtimeRoot, ProgressRoot: progressRoot, ProgressPaths: []string{progressPath},
+	})
 	store, err := evidence.NewStore(t.TempDir(), ownership.Attempt.RunID)
 	if err != nil {
 		t.Fatal(err)
@@ -203,14 +214,12 @@ func TestSnapshotBoundsArtifactsAndRecordsTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	limits := SnapshotLimits{StatusBytes: 32, DiffBytes: 64, ProgressBytes: 96}
+	limits := SnapshotLimits{StatusBytes: 32, DiffBytes: 64, UntrackedBytes: 96, ProgressBytes: 96}
 
 	published, err := snapshotter.Capture(context.Background(), SnapshotRequest{
-		SnapshotID:    "bounded",
-		Ownership:     ownership,
-		ProgressRoot:  progressRoot,
-		ProgressPaths: []string{progressPath},
-		Limits:        limits,
+		SnapshotID: "bounded",
+		Ownership:  ownership,
+		Limits:     limits,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -219,9 +228,10 @@ func TestSnapshotBoundsArtifactsAndRecordsTruncation(t *testing.T) {
 		metadata ArtifactMetadata
 		limit    int64
 	}{
-		"status":   {published.Metadata.Status, limits.StatusBytes},
-		"diff":     {published.Metadata.Diff, limits.DiffBytes},
-		"progress": {published.Metadata.Progress, limits.ProgressBytes},
+		"status":    {published.Metadata.Status, limits.StatusBytes},
+		"diff":      {published.Metadata.Diff, limits.DiffBytes},
+		"untracked": {published.Metadata.Untracked, limits.UntrackedBytes},
+		"progress":  {published.Metadata.Progress, limits.ProgressBytes},
 	} {
 		if !check.metadata.Truncated || check.metadata.SourceBytes <= check.limit || check.metadata.CapturedBytes != check.limit {
 			t.Fatalf("%s truncation metadata = %#v, limit %d", name, check.metadata, check.limit)
@@ -312,6 +322,24 @@ func deadOwnership(t *testing.T, fixture worktreeFixture) Ownership {
 	t.Helper()
 	process := startRecoveryHelper(t)
 	ownership := fixture.ownership(t, process.Process.Pid)
+	if err := process.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Wait(); err == nil {
+		t.Fatal("killed recovery owner exited successfully")
+	}
+	return ownership
+}
+
+func deadOwnershipWithRuntime(t *testing.T, fixture worktreeFixture, runtime RuntimeIdentity) Ownership {
+	t.Helper()
+	process := startRecoveryHelper(t)
+	ownership, err := CaptureOwnershipWithRuntime(testAttempt(), WorktreeIdentity{
+		RepositoryPath: fixture.repository, RootPath: fixture.root, Path: fixture.worktree, Branch: fixture.branch,
+	}, runtime, process.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := process.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
