@@ -83,6 +83,9 @@ func TestNewSupportsRalphexModes(t *testing.T) {
 		t.Run(string(mode), func(t *testing.T) {
 			manifest := fixtureManifest(t)
 			manifest.Ralphex.Mode = mode
+			if mode == ralphex.ModeReview {
+				manifest.Worktree = WorktreePolicy{}
+			}
 			authority, err := New(manifest)
 			if err != nil {
 				t.Fatal(err)
@@ -94,12 +97,30 @@ func TestNewSupportsRalphexModes(t *testing.T) {
 	}
 }
 
+func TestNewRejectsReviewWorktree(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Ralphex.Mode = ralphex.ModeReview
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "review mode") {
+		t.Fatalf("expected review worktree rejection, got %v", err)
+	}
+}
+
 func TestNewRejectsUnsupportedMode(t *testing.T) {
 	manifest := fixtureManifest(t)
 	manifest.Ralphex.Mode = "turbo"
 	_, err := New(manifest)
 	if err == nil || !strings.Contains(err.Error(), "unsupported ralphex mode") {
 		t.Fatalf("expected unsupported mode error, got %v", err)
+	}
+}
+
+func TestNewRequiresExplicitBranchForWorktree(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Worktree.Branch = ""
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "worktree.branch") {
+		t.Fatalf("expected missing worktree branch error, got %v", err)
 	}
 }
 
@@ -212,7 +233,7 @@ func fixtureManifest(t *testing.T) Manifest {
 			ReviewModel:  "gpt-review",
 			ReviewEffort: "medium",
 		},
-		Worktree: WorktreePolicy{Enabled: true},
+		Worktree: WorktreePolicy{Enabled: true, Branch: "governed-plan"},
 		Acceptance: []AcceptanceCommand{{
 			Name:     "unit tests",
 			Class:    "unit",

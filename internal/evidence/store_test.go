@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -89,6 +91,59 @@ func TestWriteBytesDoesNotOverwriteArtifact(t *testing.T) {
 	}
 	if !reflect.DeepEqual(written, first) {
 		t.Fatalf("artifact mutated to %q, want %q", written, first)
+	}
+}
+
+func TestWriteBytesConcurrentPublishHasSingleWinner(t *testing.T) {
+	store, err := NewStore(t.TempDir(), "run-concurrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const writers = 32
+	start := make(chan struct{})
+	type result struct {
+		payload []byte
+		ref     string
+		err     error
+	}
+	results := make(chan result, writers)
+	var group sync.WaitGroup
+	for index := 0; index < writers; index++ {
+		payload := []byte("writer-" + strconv.Itoa(index))
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			ref, writeErr := store.WriteBytes("shared.txt", "concurrency-test", payload)
+			results <- result{payload: payload, ref: ref.URI, err: writeErr}
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+
+	var winner result
+	winners := 0
+	for got := range results {
+		if got.err == nil {
+			winner = got
+			winners++
+			continue
+		}
+		if !errors.Is(got.err, ErrArtifactExists) {
+			t.Fatalf("concurrent writer returned %v, want ErrArtifactExists", got.err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("successful writers = %d, want exactly one", winners)
+	}
+	written, err := os.ReadFile(winner.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(written, winner.payload) {
+		t.Fatalf("stored bytes = %q, winner supplied %q", written, winner.payload)
 	}
 }
 

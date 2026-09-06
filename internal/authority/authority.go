@@ -62,7 +62,8 @@ type ExecutorPolicy struct {
 
 // WorktreePolicy records how Ralphex should isolate the governed run.
 type WorktreePolicy struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool   `json:"enabled"`
+	Branch  string `json:"branch,omitempty"`
 }
 
 // AcceptanceCommand is one controller-owned deterministic acceptance check.
@@ -133,12 +134,6 @@ func New(input Manifest) (Authority, error) {
 		canonicalJSON: canonicalJSON,
 		sha256:        hex.EncodeToString(digest[:]),
 	}, nil
-}
-
-// Validate is an explicit alias for New for callers that prefer validator
-// terminology when loading an untrusted manifest.
-func Validate(input Manifest) (Authority, error) {
-	return New(input)
 }
 
 // Manifest returns a deep copy of the canonical validated manifest.
@@ -227,6 +222,18 @@ func validateRequired(manifest Manifest) error {
 	case ralphex.ModeFull, ralphex.ModeTasksOnly, ralphex.ModeReview:
 	default:
 		return fmt.Errorf("unsupported ralphex mode %q", manifest.Ralphex.Mode)
+	}
+	if manifest.Worktree.Enabled && manifest.Worktree.Branch == "" {
+		return errors.New("worktree.branch is required when worktree is enabled")
+	}
+	if manifest.Worktree.Enabled && manifest.Ralphex.Mode == ralphex.ModeReview {
+		return errors.New("worktree is not supported in review mode")
+	}
+	if !manifest.Worktree.Enabled && manifest.Worktree.Branch != "" {
+		return errors.New("worktree.branch requires worktree.enabled")
+	}
+	if manifest.Worktree.Branch != strings.TrimSpace(manifest.Worktree.Branch) || strings.HasPrefix(manifest.Worktree.Branch, "-") {
+		return errors.New("worktree.branch must be a non-option Git branch name without surrounding whitespace")
 	}
 	if len(manifest.Acceptance) == 0 {
 		return errors.New("at least one acceptance command is required")

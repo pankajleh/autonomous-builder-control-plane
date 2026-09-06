@@ -1,6 +1,6 @@
 # EP-002 — Governed Single-Plan Execution
 
-**Status:** Ready after EP-001 review  
+**Status:** Implementation complete; code review and live pinned-Ralphex acceptance pending
 **Goal:** Launch one real Ralphex plan under control-plane authority and independently accept/reject its branch.
 
 ## Scope
@@ -19,7 +19,7 @@ Introduce a typed manifest containing:
 - expected Ralphex source SHA metadata
 - mode
 - executor/model/effort policy
-- worktree policy
+- worktree policy with an explicit candidate branch when enabled
 - acceptance commands
 - policy version
 

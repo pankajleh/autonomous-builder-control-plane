@@ -51,14 +51,19 @@ Ubuntu + Git + GitHub
 
 ## Repository status
 
-This repository starts implementation with a deliberately small foundation slice:
+EP-002 governed single-plan execution is code-complete and under review. The
+repository now includes:
 
 1. an explicit control-plane state machine;
 2. an append-only JSONL event ledger;
-3. a Ralphex invocation contract and command builder;
-4. tests for state-transition authority and durable event append semantics.
+3. validated immutable run authority and immutable evidence artifacts;
+4. supervised, bounded-output Ralphex subprocess execution;
+5. deterministic acceptance of the exact candidate branch produced by Ralphex;
+6. an explicit governed-run CLI.
 
-The initial slice has no dependency on external packages so it can compile and test on a clean Ubuntu host with Go alone.
+The implementation has no dependency on external Go packages. Real pinned
+Ralphex acceptance on the Ubuntu behavior-lab host remains pending after code
+review.
 
 ## Canonical documentation
 
@@ -71,6 +76,8 @@ The initial slice has no dependency on external packages so it can compile and t
 - [Integration Controller](docs/architecture/INTEGRATION_CONTROLLER.md)
 - [Implementation Roadmap](docs/roadmap/IMPLEMENTATION_ROADMAP.md)
 - [Execution Pack EP-001](docs/execution-packs/EP-001-foundation.md)
+- [Execution Pack EP-002](docs/execution-packs/EP-002-governed-single-plan.md)
+- [EP-002 Implementation Plan](docs/plans/ep-002-governed-single-plan.md)
 
 ## Build and test
 
@@ -79,6 +86,69 @@ go test ./...
 go run ./cmd/abcp version
 ```
 
+## Governed single-plan run
+
+Launch a governed run with explicit authority, ledger, and evidence locations:
+
+```bash
+go run ./cmd/abcp run \
+  --manifest /path/to/authority.json \
+  --ledger /path/to/events.jsonl \
+  --evidence-root /path/to/evidence
+```
+
+Example authority manifest:
+
+```json
+{
+  "run_id": "feature-123",
+  "repository": {
+    "path": "/srv/project",
+    "identity": "example/project",
+    "remotes": {"origin": "https://example.invalid/project.git"},
+    "default_branch": "main",
+    "start_sha": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "plan": {
+    "path": "docs/plans/feature.md",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "ralphex": {
+    "binary_path": "/opt/ralphex/bin/ralphex",
+    "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source_sha": "pinned-source-revision",
+    "mode": "full"
+  },
+  "executor": {
+    "executor": "codex",
+    "task_model": "gpt-5.6-sol",
+    "task_effort": "high",
+    "review_model": "gpt-5.6-sol",
+    "review_effort": "high"
+  },
+  "worktree": {
+    "enabled": true,
+    "branch": "feature-123"
+  },
+  "acceptance": [
+    {"name": "tests", "class": "unit", "required": true, "argv": ["go", "test", "./..."]}
+  ],
+  "policy_version": "branch-v1"
+}
+```
+
+Supported Ralphex modes are `full`, `tasks-only`, and `review`. Worktree mode
+requires an explicit new branch name and is unavailable with review mode. The
+controller verifies repository, plan, binary, branch, and remote identities;
+runs acceptance against the actual candidate checkout; and limits each captured
+stdout/stderr stream to 16 MiB. Success prints `BRANCH_ACCEPTED`. Failures return
+nonzero and preserve the JSONL ledger plus immutable artifacts under
+`<evidence-root>/<run_id>/`.
+
 ## Non-goals
 
 This project must not rebuild capabilities already demonstrated to work reliably in Ralphex, Codex/Claude, Git, or Linux. In particular, it does not implement its own coding agent, its own worktree manager, its own branch commit engine, or another native review framework unless future evidence shows a material gap.
+
+Ralphex still owns implementation worktrees and candidate commits. The
+controller only materializes a temporary detached candidate checkout after
+Ralphex cleanup so independent acceptance runs against the correct branch.

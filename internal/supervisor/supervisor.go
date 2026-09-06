@@ -16,11 +16,16 @@ import (
 type Outcome string
 
 const (
-	OutcomeSucceeded Outcome = "succeeded"
-	OutcomeExited    Outcome = "exited_nonzero"
-	OutcomeSignaled  Outcome = "signaled"
-	OutcomeCanceled  Outcome = "canceled"
-	OutcomeTimedOut  Outcome = "timed_out"
+	OutcomeSucceeded   Outcome = "succeeded"
+	OutcomeExited      Outcome = "exited_nonzero"
+	OutcomeSignaled    Outcome = "signaled"
+	OutcomeCanceled    Outcome = "canceled"
+	OutcomeTimedOut    Outcome = "timed_out"
+	OutcomeOutputLimit Outcome = "output_limit_exceeded"
+
+	// DefaultOutputLimitBytes bounds each captured stream when a command does
+	// not provide a smaller explicit limit.
+	DefaultOutputLimitBytes int64 = 16 << 20
 )
 
 // ArtifactWriter is the immutable evidence operation required by a command.
@@ -44,8 +49,11 @@ type Command struct {
 	Cwd     string
 	Env     []string
 	Timeout time.Duration
-	Stdout  EvidenceSink
-	Stderr  EvidenceSink
+	// OutputLimitBytes bounds stdout and stderr independently. Zero selects
+	// DefaultOutputLimitBytes.
+	OutputLimitBytes int64
+	Stdout           EvidenceSink
+	Stderr           EvidenceSink
 }
 
 // Result records the governed process and its immutable output evidence.
@@ -61,6 +69,9 @@ type Result struct {
 	Cwd               string
 	StdoutRef         ledger.EvidenceRef
 	StderrRef         ledger.EvidenceRef
+	OutputLimitBytes  int64
+	StdoutTruncated   bool
+	StderrTruncated   bool
 }
 
 // Runner executes structured commands.
@@ -105,8 +116,14 @@ func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 		return cancelProcess(cmd)
 	}
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
+	limit := command.OutputLimitBytes
+	if limit == 0 {
+		limit = DefaultOutputLimitBytes
+	}
+	result.OutputLimitBytes = limit
+	limitExceeded := make(chan struct{}, 1)
+	stdout := newBoundedBuffer(limit, limitExceeded)
+	stderr := newBoundedBuffer(limit, limitExceeded)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
@@ -118,9 +135,24 @@ func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 	result.PID = cmd.Process.Pid
 	result.ProcessGroupID = processGroupID(cmd)
 
-	waitErr := cmd.Wait()
+	waited := make(chan error, 1)
+	go func() {
+		waited <- cmd.Wait()
+	}()
+	waitErr := error(nil)
+	outputLimited := false
+	select {
+	case waitErr = <-waited:
+		outputLimited = stdout.Truncated() || stderr.Truncated()
+	case <-limitExceeded:
+		outputLimited = true
+		_ = cancelProcess(cmd)
+		waitErr = <-waited
+	}
 	result.EndedAt = time.Now().UTC()
-	classify(&result, runCtx, cmd, waitErr)
+	result.StdoutTruncated = stdout.Truncated()
+	result.StderrTruncated = stderr.Truncated()
+	classify(&result, runCtx, cmd, waitErr, outputLimited)
 
 	stdoutRef, err := command.Stdout.Writer.WriteBytes(command.Stdout.Name, command.Stdout.Kind, stdout.Bytes())
 	if err != nil {
@@ -146,6 +178,9 @@ func validate(command Command) error {
 	if command.Timeout < 0 {
 		return errors.New("command timeout must not be negative")
 	}
+	if command.OutputLimitBytes < 0 {
+		return errors.New("command output limit must not be negative")
+	}
 	if err := validateSink("stdout", command.Stdout); err != nil {
 		return err
 	}
@@ -165,10 +200,14 @@ func validateSink(stream string, sink EvidenceSink) error {
 	return nil
 }
 
-func classify(result *Result, ctx context.Context, cmd *exec.Cmd, waitErr error) {
+func classify(result *Result, ctx context.Context, cmd *exec.Cmd, waitErr error, outputLimited bool) {
 	result.ExitCode = cmd.ProcessState.ExitCode()
 	if waitErr == nil {
-		result.Outcome = OutcomeSucceeded
+		if outputLimited {
+			result.Outcome = OutcomeOutputLimit
+		} else {
+			result.Outcome = OutcomeSucceeded
+		}
 		return
 	}
 
@@ -183,9 +222,53 @@ func classify(result *Result, ctx context.Context, cmd *exec.Cmd, waitErr error)
 		result.Outcome = OutcomeCanceled
 		return
 	}
+	if outputLimited {
+		result.Outcome = OutcomeOutputLimit
+		return
+	}
 	if result.TerminatingSignal != "" {
 		result.Outcome = OutcomeSignaled
 		return
 	}
 	result.Outcome = OutcomeExited
+}
+
+type boundedBuffer struct {
+	buffer    bytes.Buffer
+	remaining int64
+	truncated bool
+	exceeded  chan<- struct{}
+}
+
+func newBoundedBuffer(limit int64, exceeded chan<- struct{}) boundedBuffer {
+	return boundedBuffer{remaining: limit, exceeded: exceeded}
+}
+
+func (b *boundedBuffer) Write(data []byte) (int, error) {
+	written := len(data)
+	if int64(len(data)) <= b.remaining {
+		_, _ = b.buffer.Write(data)
+		b.remaining -= int64(len(data))
+		return written, nil
+	}
+	if b.remaining > 0 {
+		_, _ = b.buffer.Write(data[:b.remaining])
+		b.remaining = 0
+	}
+	if !b.truncated {
+		b.truncated = true
+		select {
+		case b.exceeded <- struct{}{}:
+		default:
+		}
+	}
+	return written, nil
+}
+
+func (b *boundedBuffer) Bytes() []byte {
+	return b.buffer.Bytes()
+}
+
+func (b *boundedBuffer) Truncated() bool {
+	return b.truncated
 }

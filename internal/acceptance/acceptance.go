@@ -14,7 +14,6 @@ import (
 	"unicode"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
-	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
 )
@@ -50,6 +49,7 @@ type CommandResult struct {
 // GitEvidence is the controller-captured final repository state. Both Git
 // operations are structured argv executions with their own process evidence.
 type GitEvidence struct {
+	Branch        string
 	HeadSHA       string
 	Dirty         bool
 	HeadProcess   supervisor.Result
@@ -64,6 +64,7 @@ type Result struct {
 	commands      []CommandResult
 	git           GitEvidence
 	gitCaptured   bool
+	gitAttempted  bool
 	failureReason string
 }
 
@@ -120,13 +121,28 @@ func (r Result) FailureReason() string {
 	return r.failureReason
 }
 
-// BranchAcceptedState exposes the only successful state conclusion this
-// package can make. A failed result cannot yield BRANCH_ACCEPTED.
-func (r Result) BranchAcceptedState() (domain.State, bool) {
-	if !r.Passed() {
-		return "", false
+// EvidenceRefs returns every successfully published artifact, including
+// partial command or Git evidence from an unavailable acceptance attempt.
+func (r Result) EvidenceRefs() []ledger.EvidenceRef {
+	var refs []ledger.EvidenceRef
+	for _, command := range r.commands {
+		refs = appendValidRefs(refs, command.Process.StdoutRef, command.Process.StderrRef, command.MetadataRef)
 	}
-	return domain.StateBranchAccepted, true
+	if r.gitAttempted {
+		refs = appendValidRefs(refs,
+			r.git.HeadProcess.StdoutRef, r.git.HeadProcess.StderrRef,
+			r.git.StatusProcess.StdoutRef, r.git.StatusProcess.StderrRef,
+			r.git.MetadataRef,
+		)
+	}
+	return refs
+}
+
+// Target identifies the checkout and candidate branch being accepted.
+type Target struct {
+	RepositoryPath string `json:"repository_path"`
+	Branch         string `json:"branch"`
+	HeadSHA        string `json:"head_sha"`
 }
 
 // Executor runs acceptance commands and captures immutable evidence.
@@ -143,7 +159,7 @@ func New(runner CommandRunner, artifacts supervisor.ArtifactWriter) *Executor {
 // Run executes the commands frozen in governed authority. Required command
 // failure stops evaluation immediately. Optional failures remain recorded but
 // do not prevent PASS when all required checks and final Git capture succeed.
-func (e *Executor) Run(ctx context.Context, governed authority.Authority) (Result, error) {
+func (e *Executor) Run(ctx context.Context, governed authority.Authority, target Target) (Result, error) {
 	result := Result{status: StatusUnavailable}
 	if ctx == nil {
 		return result, errors.New("context is required")
@@ -155,19 +171,14 @@ func (e *Executor) Run(ctx context.Context, governed authority.Authority) (Resul
 		return result, errors.New("evidence writer is required")
 	}
 
-	repository := governed.Repository().Path
+	repository := target.RepositoryPath
 	commands := governed.Acceptance()
-	if repository == "" || len(commands) == 0 {
-		return result, errors.New("validated authority with repository and acceptance commands is required")
+	if repository == "" || target.Branch == "" || target.HeadSHA == "" || len(commands) == 0 {
+		return result, errors.New("validated authority with candidate repository, branch, HEAD, and acceptance commands is required")
 	}
 
 	for index, configured := range commands {
 		process, err := e.runCommand(ctx, repository, index, configured)
-		if err != nil {
-			result.failureReason = fmt.Sprintf("acceptance command %d unavailable: %v", index+1, err)
-			return result, fmt.Errorf("run acceptance command %d: %w", index+1, err)
-		}
-
 		record := CommandResult{
 			Index:         index + 1,
 			Name:          configured.Name,
@@ -176,13 +187,17 @@ func (e *Executor) Run(ctx context.Context, governed authority.Authority) (Resul
 			PolicyVersion: governed.PolicyVersion(),
 			Process:       process,
 		}
+		result.commands = append(result.commands, record)
+		if err != nil {
+			result.failureReason = fmt.Sprintf("acceptance command %d unavailable: %v", index+1, err)
+			return result, fmt.Errorf("run acceptance command %d: %w", index+1, err)
+		}
 		metadataRef, err := e.writeCommandMetadata(record)
 		if err != nil {
 			result.failureReason = fmt.Sprintf("acceptance command %d metadata unavailable: %v", index+1, err)
 			return result, err
 		}
-		record.MetadataRef = metadataRef
-		result.commands = append(result.commands, record)
+		result.commands[len(result.commands)-1].MetadataRef = metadataRef
 
 		if configured.Required && process.Outcome != supervisor.OutcomeSucceeded {
 			result.status = StatusFail
@@ -191,7 +206,9 @@ func (e *Executor) Run(ctx context.Context, governed authority.Authority) (Resul
 		}
 	}
 
-	gitEvidence, err := e.captureGit(ctx, repository, governed.PolicyVersion())
+	result.gitAttempted = true
+	gitEvidence, err := e.captureGit(ctx, repository, target.Branch, target.HeadSHA, governed.PolicyVersion())
+	result.git = gitEvidence
 	if err != nil {
 		result.failureReason = fmt.Sprintf("final Git evidence unavailable: %v", err)
 		return result, err
@@ -254,48 +271,52 @@ func (e *Executor) writeCommandMetadata(record CommandResult) (ledger.EvidenceRe
 	return ref, nil
 }
 
-func (e *Executor) captureGit(ctx context.Context, repository, policyVersion string) (GitEvidence, error) {
+func (e *Executor) captureGit(ctx context.Context, repository, branch, expectedHeadSHA, policyVersion string) (GitEvidence, error) {
+	gitEvidence := GitEvidence{Branch: branch}
 	head, err := e.runGit(ctx, repository, "head", []string{"git", "rev-parse", "--verify", "HEAD"})
+	gitEvidence.HeadProcess = head
 	if err != nil {
-		return GitEvidence{}, fmt.Errorf("capture HEAD: %w", err)
+		return gitEvidence, fmt.Errorf("capture HEAD: %w", err)
 	}
 	if head.Outcome != supervisor.OutcomeSucceeded {
-		return GitEvidence{}, fmt.Errorf("capture HEAD: git outcome %s", head.Outcome)
+		return gitEvidence, fmt.Errorf("capture HEAD: git outcome %s", head.Outcome)
 	}
 	headBytes, err := readVerifiedArtifact(head.StdoutRef)
 	if err != nil {
-		return GitEvidence{}, fmt.Errorf("read HEAD evidence: %w", err)
+		return gitEvidence, fmt.Errorf("read HEAD evidence: %w", err)
 	}
 	headSHA := strings.TrimSpace(string(headBytes))
 	if !validGitSHA(headSHA) {
-		return GitEvidence{}, fmt.Errorf("capture HEAD: invalid Git object ID %q", headSHA)
+		return gitEvidence, fmt.Errorf("capture HEAD: invalid Git object ID %q", headSHA)
+	}
+	gitEvidence.HeadSHA = headSHA
+	if headSHA != expectedHeadSHA {
+		return gitEvidence, fmt.Errorf("capture HEAD: candidate changed from %s to %s during acceptance", expectedHeadSHA, headSHA)
 	}
 
 	status, err := e.runGit(ctx, repository, "status", []string{"git", "status", "--porcelain=v1", "--untracked-files=normal"})
+	gitEvidence.StatusProcess = status
 	if err != nil {
-		return GitEvidence{}, fmt.Errorf("capture status: %w", err)
+		return gitEvidence, fmt.Errorf("capture status: %w", err)
 	}
 	if status.Outcome != supervisor.OutcomeSucceeded {
-		return GitEvidence{}, fmt.Errorf("capture status: git outcome %s", status.Outcome)
+		return gitEvidence, fmt.Errorf("capture status: git outcome %s", status.Outcome)
 	}
 	statusBytes, err := readVerifiedArtifact(status.StdoutRef)
 	if err != nil {
-		return GitEvidence{}, fmt.Errorf("read status evidence: %w", err)
+		return gitEvidence, fmt.Errorf("read status evidence: %w", err)
 	}
 
-	gitEvidence := GitEvidence{
-		HeadSHA:       headSHA,
-		Dirty:         len(statusBytes) > 0,
-		HeadProcess:   head,
-		StatusProcess: status,
-	}
+	gitEvidence.Dirty = len(statusBytes) > 0
 	metadata, err := json.Marshal(struct {
+		Branch        string            `json:"branch,omitempty"`
 		HeadSHA       string            `json:"head_sha"`
 		Dirty         bool              `json:"dirty"`
 		PolicyVersion string            `json:"policy_version"`
 		HeadProcess   supervisor.Result `json:"head_process"`
 		StatusProcess supervisor.Result `json:"status_process"`
 	}{
+		Branch:        gitEvidence.Branch,
 		HeadSHA:       gitEvidence.HeadSHA,
 		Dirty:         gitEvidence.Dirty,
 		PolicyVersion: policyVersion,
@@ -303,13 +324,22 @@ func (e *Executor) captureGit(ctx context.Context, repository, policyVersion str
 		StatusProcess: gitEvidence.StatusProcess,
 	})
 	if err != nil {
-		return GitEvidence{}, fmt.Errorf("marshal final Git metadata: %w", err)
+		return gitEvidence, fmt.Errorf("marshal final Git metadata: %w", err)
 	}
 	gitEvidence.MetadataRef, err = e.artifacts.WriteBytes("acceptance-final-git.json", "acceptance-final-git", metadata)
 	if err != nil {
-		return GitEvidence{}, fmt.Errorf("publish final Git metadata: %w", err)
+		return gitEvidence, fmt.Errorf("publish final Git metadata: %w", err)
 	}
 	return gitEvidence, nil
+}
+
+func appendValidRefs(refs []ledger.EvidenceRef, candidates ...ledger.EvidenceRef) []ledger.EvidenceRef {
+	for _, ref := range candidates {
+		if validEvidenceRef(ref) {
+			refs = append(refs, ref)
+		}
+	}
+	return refs
 }
 
 func (e *Executor) runGit(ctx context.Context, repository, label string, argv []string) (supervisor.Result, error) {

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
@@ -93,6 +95,37 @@ func TestRunnerRalphexFailureRecordsEvidenceWithoutImplementationCompleted(t *te
 	assertEventEvidence(t, events)
 }
 
+func TestRunnerRalphexCancellationRecordsCancelledWithoutCompletion(t *testing.T) {
+	readyPath := filepath.Join(t.TempDir(), "ralphex-ready")
+	script := fmt.Sprintf("#!/bin/sh\nprintf ready > %s\nwhile :; do sleep 60; done\n", readyPath)
+	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, commandPath(t, "true"))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	type response struct {
+		result Result
+		err    error
+	}
+	done := make(chan response, 1)
+	runner := fixture.runner(t)
+	go func() {
+		result, err := runner.Run(ctx)
+		done <- response{result: result, err: err}
+	}()
+	waitForRunFile(t, readyPath)
+	cancel()
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.result.State != domain.StateCancelled || got.result.Ralphex.Outcome != supervisor.OutcomeCanceled {
+		t.Fatalf("canceled run result = %#v", got.result)
+	}
+	want := []domain.State{domain.StateRunCreated, domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateImplementing, domain.StateCancelled}
+	if states := eventStates(readEvents(t, fixture.ledgerPath)); !reflect.DeepEqual(states, want) {
+		t.Fatalf("canceled Ralphex states = %#v, want %#v", states, want)
+	}
+}
+
 func TestRunnerAcceptanceFailureStopsBeforeBranchAccepted(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "false"))
 	result := fixture.execute(t)
@@ -117,6 +150,75 @@ func TestRunnerAcceptanceFailureStopsBeforeBranchAccepted(t *testing.T) {
 		t.Fatalf("event state order mismatch\nwant: %#v\n got: %#v", wantStates, got)
 	}
 	assertEventEvidence(t, events)
+}
+
+func TestRunnerAcceptanceCancellationRecordsCancelled(t *testing.T) {
+	readyPath := filepath.Join(t.TempDir(), "acceptance-ready")
+	t.Setenv("GO_WANT_RUN_WAIT_HELPER", "1")
+	fixture := newRunFixture(t, 0, os.Args[0], "-test.run=^TestRunnerWaitHelper$", "--", readyPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	type response struct {
+		result Result
+		err    error
+	}
+	done := make(chan response, 1)
+	runner := fixture.runner(t)
+	go func() {
+		result, err := runner.Run(ctx)
+		done <- response{result: result, err: err}
+	}()
+	waitForRunFile(t, readyPath)
+	cancel()
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.result.State != domain.StateCancelled {
+		t.Fatalf("acceptance cancellation state = %s, want CANCELLED", got.result.State)
+	}
+	want := []domain.State{
+		domain.StateRunCreated, domain.StateAuthorityValidated, domain.StateExecutionStarting,
+		domain.StateImplementing, domain.StateImplementationCompleted,
+		domain.StateBranchAcceptancePending, domain.StateCancelled,
+	}
+	if states := eventStates(readEvents(t, fixture.ledgerPath)); !reflect.DeepEqual(states, want) {
+		t.Fatalf("acceptance cancellation states = %#v, want %#v", states, want)
+	}
+}
+
+func TestRunnerWorktreeAcceptsActualCandidateBranch(t *testing.T) {
+	worktreePath := filepath.Join(t.TempDir(), "fake-ralphex-worktree")
+	script := fmt.Sprintf(`#!/bin/sh
+branch=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--branch" ]; then branch="$2"; shift 2; else shift; fi
+done
+git worktree add -q -b "$branch" %s HEAD || exit 20
+printf 'candidate only\n' > %s/candidate.txt
+git -C %s add candidate.txt || exit 21
+git -C %s commit -qm 'candidate implementation' || exit 22
+git worktree remove -f %s || exit 23
+`, worktreePath, worktreePath, worktreePath, worktreePath, worktreePath)
+	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{Enabled: true, Branch: "candidate-branch"}, commandPath(t, "test"), "-f", "candidate.txt")
+	result := fixture.execute(t)
+	if !result.Accepted() {
+		t.Fatalf("worktree candidate was not accepted: %#v", result)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.authority.Repository().Path, "candidate.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("default checkout unexpectedly contains candidate file: %v", err)
+	}
+	gitEvidence, ok := result.Acceptance.FinalGit()
+	if !ok || gitEvidence.Branch != "candidate-branch" {
+		t.Fatalf("candidate Git evidence = %#v, captured=%t", gitEvidence, ok)
+	}
+	wantHead := runGit(t, fixture.authority.Repository().Path, "rev-parse", "candidate-branch")
+	if gitEvidence.HeadSHA != wantHead {
+		t.Fatalf("accepted HEAD = %s, want candidate %s", gitEvidence.HeadSHA, wantHead)
+	}
+	if records := result.Acceptance.Commands(); len(records) != 1 || records[0].Process.Cwd == fixture.authority.Repository().Path {
+		t.Fatalf("acceptance did not run in isolated candidate checkout: %#v", records)
+	}
 }
 
 func TestRunnerRejectsIdentityChangedAfterValidation(t *testing.T) {
@@ -157,6 +259,12 @@ type runFixture struct {
 
 func newRunFixture(t *testing.T, ralphexExit int, acceptanceArgv ...string) runFixture {
 	t.Helper()
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'fake ralphex stdout\\n'\nprintf 'fake ralphex stderr\\n' >&2\nexit %s\n", strconv.Itoa(ralphexExit))
+	return newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, acceptanceArgv...)
+}
+
+func newRunFixtureWithScript(t *testing.T, script string, worktree authority.WorktreePolicy, acceptanceArgv ...string) runFixture {
+	t.Helper()
 	repository := filepath.Join(t.TempDir(), "repository")
 	runGit(t, "", "init", "-b", "main", repository)
 	runGit(t, repository, "config", "user.email", "controller@example.test")
@@ -169,11 +277,10 @@ func newRunFixture(t *testing.T, ralphexExit int, acceptanceArgv ...string) runF
 	startSHA := runGit(t, repository, "rev-parse", "HEAD")
 
 	binaryPath := filepath.Join(t.TempDir(), "fake-ralphex")
-	script := fmt.Sprintf("#!/bin/sh\nprintf 'fake ralphex stdout\\n'\nprintf 'fake ralphex stderr\\n' >&2\nexit %s\n", strconv.Itoa(ralphexExit))
 	writeTestFile(t, binaryPath, []byte(script), 0o700)
 
 	manifest := authority.Manifest{
-		RunID: "run-" + strconv.Itoa(ralphexExit),
+		RunID: "run-fixture",
 		Repository: authority.RepositoryManifest{
 			Path:          repository,
 			Identity:      "example/project",
@@ -186,6 +293,7 @@ func newRunFixture(t *testing.T, ralphexExit int, acceptanceArgv ...string) runF
 			BinaryPath: binaryPath, BinarySHA256: testHash(t, binaryPath), SourceSHA: "source-test", Mode: ralphex.ModeTasksOnly,
 		},
 		Executor: authority.ExecutorPolicy{Executor: "codex", TaskModel: "test-model", TaskEffort: "high"},
+		Worktree: worktree,
 		Acceptance: []authority.AcceptanceCommand{{
 			Name: "deterministic check", Class: "unit", Required: true, Argv: acceptanceArgv,
 		}},
@@ -200,6 +308,44 @@ func newRunFixture(t *testing.T, ralphexExit int, acceptanceArgv ...string) runF
 		authority:  governed,
 		ledgerPath: filepath.Join(root, "events", "run.jsonl"),
 		evidence:   filepath.Join(root, "evidence"),
+	}
+}
+
+func TestRunnerWaitHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_RUN_WAIT_HELPER") != "1" {
+		return
+	}
+	separator := -1
+	for index, argument := range os.Args {
+		if argument == "--" {
+			separator = index
+			break
+		}
+	}
+	if separator < 0 || separator+1 >= len(os.Args) {
+		os.Exit(90)
+	}
+	if err := os.WriteFile(os.Args[separator+1], []byte("ready"), 0o600); err != nil {
+		os.Exit(91)
+	}
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
+func waitForRunFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %q", path)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

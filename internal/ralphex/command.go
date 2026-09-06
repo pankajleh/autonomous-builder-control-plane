@@ -20,6 +20,7 @@ type Invocation struct {
 	Mode         Mode
 	Codex        bool
 	Worktree     bool
+	Branch       string
 	TaskModel    string
 	TaskEffort   string
 	ReviewModel  string
@@ -41,6 +42,12 @@ func (i Invocation) Argv() ([]string, error) {
 	}
 	if i.Mode == ModeReview && i.Worktree {
 		return nil, fmt.Errorf("worktree is not valid for review-only invocation")
+	}
+	if i.Worktree && i.Branch == "" {
+		return nil, fmt.Errorf("branch override is required for worktree invocation")
+	}
+	if i.Branch != "" && !i.Worktree {
+		return nil, fmt.Errorf("branch override requires worktree invocation")
 	}
 
 	argv := []string{i.BinaryPath}
@@ -72,6 +79,7 @@ func (i Invocation) Argv() ([]string, error) {
 	}
 	if i.Worktree {
 		argv = append(argv, "--worktree")
+		argv = append(argv, "--branch", i.Branch)
 	}
 	argv = append(argv, i.PlanPath)
 	return argv, nil

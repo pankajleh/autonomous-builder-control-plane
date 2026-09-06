@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/acceptance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
@@ -48,6 +50,7 @@ type Result struct {
 	Acceptance            acceptance.Result
 	AuthorityEvidenceRef  ledger.EvidenceRef
 	ValidationEvidenceRef ledger.EvidenceRef
+	CandidateEvidenceRef  ledger.EvidenceRef
 	FailureReason         string
 }
 
@@ -182,14 +185,40 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		return result, err
 	}
 	result.State = domain.StateImplementationCompleted
+	target, cleanup, err := r.prepareAcceptanceTarget(ctx)
+	if err != nil {
+		return r.fail(result, domain.StateImplementationCompleted, "acceptance-controller", err, implementationRefs)
+	}
+	candidateRef, err := r.writeJSON("candidate-branch.json", "candidate-branch", target)
+	if err != nil {
+		cleanupErr := cleanup()
+		return r.fail(result, domain.StateImplementationCompleted, "acceptance-controller", errors.Join(err, cleanupErr), implementationRefs)
+	}
+	result.CandidateEvidenceRef = candidateRef
+	implementationRefs = append(implementationRefs, candidateRef)
 	if err := r.transition(domain.StateImplementationCompleted, domain.StateBranchAcceptancePending, "acceptance-controller", nil, implementationRefs); err != nil {
-		return result, err
+		return result, errors.Join(err, cleanup())
 	}
 	result.State = domain.StateBranchAcceptancePending
 
-	accepted, acceptanceErr := acceptance.New(r.processes, r.artifacts).Run(ctx, r.governed)
+	accepted, acceptanceErr := acceptance.New(r.processes, r.artifacts).Run(ctx, r.governed, target)
+	cleanupErr := cleanup()
+	if cleanupErr != nil {
+		acceptanceErr = errors.Join(acceptanceErr, cleanupErr)
+	}
 	result.Acceptance = accepted
 	acceptanceRefs := collectAcceptanceRefs(accepted)
+	acceptanceRefs = append(acceptanceRefs, candidateRef)
+	if ctx.Err() != nil {
+		result.State = domain.StateCancelled
+		result.FailureReason = ctx.Err().Error()
+		if err := r.transition(domain.StateBranchAcceptancePending, domain.StateCancelled, "acceptance-controller", map[string]any{
+			"status": accepted.Status(), "reason": result.FailureReason,
+		}, acceptanceRefs); err != nil {
+			return result, errors.Join(acceptanceErr, err)
+		}
+		return result, cleanupErr
+	}
 	if acceptanceErr != nil {
 		result.State = domain.StateValidationUnavailable
 		result.FailureReason = accepted.FailureReason()
@@ -235,6 +264,7 @@ func (r *Runner) invocation() (ralphex.Invocation, error) {
 		Mode:         r.governed.Ralphex().Mode,
 		Codex:        executor == "codex",
 		Worktree:     r.governed.Worktree().Enabled,
+		Branch:       r.governed.Worktree().Branch,
 		TaskModel:    policy.TaskModel,
 		TaskEffort:   policy.TaskEffort,
 		ReviewModel:  policy.ReviewModel,
@@ -338,6 +368,20 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	if validation.BinarySHA256 != binary.BinarySHA256 {
 		return validation, errors.New("Ralphex binary SHA256 changed after authority validation")
 	}
+	if governed.Worktree().Enabled {
+		branch := governed.Worktree().Branch
+		checked, checkErr := gitOutput(ctx, repository.Path, "check-ref-format", "--branch", branch)
+		if checkErr != nil || checked != branch {
+			return validation, fmt.Errorf("invalid governed worktree branch %q", branch)
+		}
+		exists, existsErr := localBranchExists(ctx, repository.Path, branch)
+		if existsErr != nil {
+			return validation, fmt.Errorf("inspect governed worktree branch: %w", existsErr)
+		}
+		if exists {
+			return validation, fmt.Errorf("governed worktree branch %q already exists", branch)
+		}
+	}
 
 	validation.HeadSHA, err = gitOutput(ctx, repository.Path, "rev-parse", "--verify", "HEAD")
 	if err != nil {
@@ -393,6 +437,72 @@ func gitOutput(ctx context.Context, repository string, args ...string) (string, 
 	return strings.TrimSpace(string(output)), nil
 }
 
+func localBranchExists(ctx context.Context, repository, branch string) (bool, error) {
+	command := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	command.Dir = repository
+	err := command.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) && exitError.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target, func() error, error) {
+	repository := r.governed.Repository()
+	branch := r.governed.Worktree().Branch
+	if !r.governed.Worktree().Enabled {
+		currentBranch, err := gitOutput(ctx, repository.Path, "symbolic-ref", "--quiet", "--short", "HEAD")
+		if err != nil {
+			return acceptance.Target{}, func() error { return nil }, fmt.Errorf("discover candidate branch: %w", err)
+		}
+		headSHA, err := gitOutput(ctx, repository.Path, "rev-parse", "--verify", "HEAD")
+		if err != nil {
+			return acceptance.Target{}, func() error { return nil }, fmt.Errorf("discover candidate HEAD: %w", err)
+		}
+		return acceptance.Target{RepositoryPath: repository.Path, Branch: currentBranch, HeadSHA: headSHA}, func() error { return nil }, nil
+	}
+
+	headSHA, err := gitOutput(ctx, repository.Path, "rev-parse", "--verify", "refs/heads/"+branch+"^{commit}")
+	if err != nil {
+		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("resolve candidate branch %q: %w", branch, err)
+	}
+	ancestor := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", repository.StartSHA, headSHA)
+	ancestor.Dir = repository.Path
+	if err := ancestor.Run(); err != nil {
+		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q does not descend from governed start SHA: %w", branch, err)
+	}
+
+	temporaryRoot, err := os.MkdirTemp("", "abcp-acceptance-")
+	if err != nil {
+		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("create acceptance checkout root: %w", err)
+	}
+	checkout := filepath.Join(temporaryRoot, "checkout")
+	add := exec.CommandContext(ctx, "git", "worktree", "add", "--detach", checkout, headSHA)
+	add.Dir = repository.Path
+	if output, addErr := add.CombinedOutput(); addErr != nil {
+		_ = os.RemoveAll(temporaryRoot)
+		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("materialize candidate checkout: %w: %s", addErr, strings.TrimSpace(string(output)))
+	}
+
+	cleanup := func() error {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		remove := exec.CommandContext(cleanupCtx, "git", "worktree", "remove", "--force", checkout)
+		remove.Dir = repository.Path
+		removeErr := remove.Run()
+		filesystemErr := os.RemoveAll(temporaryRoot)
+		if removeErr != nil || filesystemErr != nil {
+			return fmt.Errorf("remove temporary acceptance checkout: %w", errors.Join(removeErr, filesystemErr))
+		}
+		return nil
+	}
+	return acceptance.Target{RepositoryPath: checkout, Branch: branch, HeadSHA: headSHA}, cleanup, nil
+}
+
 func processRefs(process supervisor.Result) []ledger.EvidenceRef {
 	refs := make([]ledger.EvidenceRef, 0, 2)
 	if process.StdoutRef.URI != "" {
@@ -405,16 +515,5 @@ func processRefs(process supervisor.Result) []ledger.EvidenceRef {
 }
 
 func collectAcceptanceRefs(result acceptance.Result) []ledger.EvidenceRef {
-	var refs []ledger.EvidenceRef
-	for _, command := range result.Commands() {
-		refs = append(refs, command.Process.StdoutRef, command.Process.StderrRef, command.MetadataRef)
-	}
-	if git, ok := result.FinalGit(); ok {
-		refs = append(refs,
-			git.HeadProcess.StdoutRef, git.HeadProcess.StderrRef,
-			git.StatusProcess.StdoutRef, git.StatusProcess.StderrRef,
-			git.MetadataRef,
-		)
-	}
-	return refs
+	return result.EvidenceRefs()
 }

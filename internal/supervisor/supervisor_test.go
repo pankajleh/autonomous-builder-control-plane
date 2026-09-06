@@ -104,6 +104,25 @@ func TestRunCapturesTimeout(t *testing.T) {
 	}
 }
 
+func TestRunTerminatesAndBoundsExcessiveOutput(t *testing.T) {
+	command, _ := helperCommand(t, "spam")
+	command.OutputLimitBytes = 64
+	result, err := New().Run(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != OutcomeOutputLimit || !result.StdoutTruncated || result.OutputLimitBytes != 64 {
+		t.Fatalf("output-limit result = %#v", result)
+	}
+	data, err := os.ReadFile(result.StdoutRef.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 64 {
+		t.Fatalf("captured stdout bytes = %d, want 64", len(data))
+	}
+}
+
 func TestRunValidatesStructuredInput(t *testing.T) {
 	valid, _ := helperCommand(t, "success")
 	tests := map[string]func(*Command){
@@ -111,6 +130,7 @@ func TestRunValidatesStructuredInput(t *testing.T) {
 		"executable":    func(command *Command) { command.Argv[0] = "" },
 		"cwd":           func(command *Command) { command.Cwd = "" },
 		"timeout":       func(command *Command) { command.Timeout = -time.Second },
+		"output limit":  func(command *Command) { command.OutputLimitBytes = -1 },
 		"stdout writer": func(command *Command) { command.Stdout.Writer = nil },
 		"stdout name":   func(command *Command) { command.Stdout.Name = "" },
 		"stdout kind":   func(command *Command) { command.Stdout.Kind = "" },
@@ -194,6 +214,11 @@ func TestSupervisorHelperProcess(t *testing.T) {
 		for {
 			time.Sleep(time.Hour)
 		}
+	case "spam":
+		for index := 0; index < 1024; index++ {
+			fmt.Fprint(os.Stdout, "0123456789abcdef")
+		}
+		os.Exit(0)
 	default:
 		os.Exit(93)
 	}

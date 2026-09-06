@@ -16,6 +16,7 @@ A governed invocation includes:
 - mode;
 - executor (`codex` or default Claude);
 - worktree flag;
+- explicit candidate branch override for worktree runs;
 - config directory;
 - task/review model + effort policy;
 - timeout;

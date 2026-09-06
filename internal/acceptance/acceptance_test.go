@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,8 +16,8 @@ import (
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/acceptance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
-	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
 )
@@ -46,16 +47,13 @@ func TestExecutorPassesAllRequiredCommandsAndCapturesEvidence(t *testing.T) {
 	store := newEvidenceStore(t)
 	t.Setenv("GO_WANT_ACCEPTANCE_HELPER", "1")
 
-	result, err := acceptance.New(supervisor.New(), store).Run(context.Background(), governed)
+	target := acceptanceTarget(t, repository)
+	result, err := acceptance.New(supervisor.New(), store).Run(context.Background(), governed, target)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Status() != acceptance.StatusPass || !result.Passed() {
 		t.Fatalf("acceptance result = %s (%s), want PASS", result.Status(), result.FailureReason())
-	}
-	state, ok := result.BranchAcceptedState()
-	if !ok || state != domain.StateBranchAccepted {
-		t.Fatalf("accepted state = %q, %t; want %q, true", state, ok, domain.StateBranchAccepted)
 	}
 
 	records := result.Commands()
@@ -83,6 +81,9 @@ func TestExecutorPassesAllRequiredCommandsAndCapturesEvidence(t *testing.T) {
 	}
 	if gitEvidence.HeadSHA != gitOutput(t, repository, "rev-parse", "HEAD") {
 		t.Fatalf("final HEAD = %q, want repository HEAD", gitEvidence.HeadSHA)
+	}
+	if gitEvidence.Branch != target.Branch {
+		t.Fatalf("final branch = %q, want %q", gitEvidence.Branch, target.Branch)
 	}
 	if !gitEvidence.Dirty {
 		t.Fatal("final Git status did not record the untracked file")
@@ -119,7 +120,7 @@ func TestExecutorStopsAtFirstRequiredFailureAndCannotAcceptBranch(t *testing.T) 
 	store := newEvidenceStore(t)
 	t.Setenv("GO_WANT_ACCEPTANCE_HELPER", "1")
 
-	result, err := acceptance.New(supervisor.New(), store).Run(context.Background(), governed)
+	result, err := acceptance.New(supervisor.New(), store).Run(context.Background(), governed, acceptanceTarget(t, repository))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,9 +135,6 @@ func TestExecutorStopsAtFirstRequiredFailureAndCannotAcceptBranch(t *testing.T) 
 	}
 	if _, ok := result.FinalGit(); ok {
 		t.Fatal("final Git capture ran after a required command failure")
-	}
-	if state, ok := result.BranchAcceptedState(); ok || state != "" {
-		t.Fatalf("failed acceptance yielded state %q, %t", state, ok)
 	}
 	if _, err := os.Stat(filepath.Join(store.RunDir(), "acceptance-git-head-stdout.log")); !os.IsNotExist(err) {
 		t.Fatalf("Git HEAD command ran after required failure: %v", err)
@@ -154,7 +152,7 @@ func TestExecutorContinuesAfterOptionalFailure(t *testing.T) {
 	store := newEvidenceStore(t)
 	t.Setenv("GO_WANT_ACCEPTANCE_HELPER", "1")
 
-	result, err := acceptance.New(supervisor.New(), store).Run(context.Background(), governed)
+	result, err := acceptance.New(supervisor.New(), store).Run(context.Background(), governed, acceptanceTarget(t, repository))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,15 +172,50 @@ func TestExecutorRejectsMissingDependencies(t *testing.T) {
 	governed := newAuthority(t, repository, []authority.AcceptanceCommand{{Required: true, Argv: helperArgv("pass", "ok")}})
 	store := newEvidenceStore(t)
 
-	if _, err := acceptance.New(nil, store).Run(context.Background(), governed); err == nil {
+	target := acceptanceTarget(t, repository)
+	if _, err := acceptance.New(nil, store).Run(context.Background(), governed, target); err == nil {
 		t.Fatal("executor accepted a nil command runner")
 	}
-	if _, err := acceptance.New(supervisor.New(), nil).Run(context.Background(), governed); err == nil {
+	if _, err := acceptance.New(supervisor.New(), nil).Run(context.Background(), governed, target); err == nil {
 		t.Fatal("executor accepted a nil evidence writer")
 	}
-	if _, err := acceptance.New(supervisor.New(), store).Run(nil, governed); err == nil {
+	if _, err := acceptance.New(supervisor.New(), store).Run(nil, governed, target); err == nil {
 		t.Fatal("executor accepted a nil context")
 	}
+}
+
+func TestExecutorPreservesProcessEvidenceWhenMetadataPublicationFails(t *testing.T) {
+	repository := newGitRepository(t)
+	governed := newAuthority(t, repository, []authority.AcceptanceCommand{{Required: true, Argv: helperArgv("pass", "partial")}})
+	store := newEvidenceStore(t)
+	t.Setenv("GO_WANT_ACCEPTANCE_HELPER", "1")
+	writer := failingArtifactWriter{delegate: store, failName: "acceptance-command-001.json"}
+
+	result, err := acceptance.New(supervisor.New(), writer).Run(context.Background(), governed, acceptanceTarget(t, repository))
+	if err == nil {
+		t.Fatal("expected metadata publication failure")
+	}
+	refs := result.EvidenceRefs()
+	if len(refs) != 2 {
+		t.Fatalf("partial evidence refs = %#v, want stdout and stderr", refs)
+	}
+	for _, ref := range refs {
+		if _, statErr := os.Stat(ref.URI); statErr != nil {
+			t.Fatalf("partial evidence %q is unavailable: %v", ref.URI, statErr)
+		}
+	}
+}
+
+type failingArtifactWriter struct {
+	delegate supervisor.ArtifactWriter
+	failName string
+}
+
+func (w failingArtifactWriter) WriteBytes(name, kind string, data []byte) (ledger.EvidenceRef, error) {
+	if name == w.failName {
+		return ledger.EvidenceRef{}, errors.New("injected artifact failure")
+	}
+	return w.delegate.WriteBytes(name, kind, data)
 }
 
 func TestAcceptanceHelperProcess(t *testing.T) {
@@ -302,6 +335,15 @@ func gitOutput(t *testing.T, repository string, arguments ...string) string {
 		t.Fatalf("git %s failed: %v", strings.Join(arguments, " "), err)
 	}
 	return strings.TrimSpace(string(output))
+}
+
+func acceptanceTarget(t *testing.T, repository string) acceptance.Target {
+	t.Helper()
+	return acceptance.Target{
+		RepositoryPath: repository,
+		Branch:         gitOutput(t, repository, "symbolic-ref", "--quiet", "--short", "HEAD"),
+		HeadSHA:        gitOutput(t, repository, "rev-parse", "--verify", "HEAD"),
+	}
 }
 
 func fileSHA256(t *testing.T, path string) string {

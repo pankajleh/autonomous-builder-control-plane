@@ -13,6 +13,7 @@ func TestInvocationArgv(t *testing.T) {
 		Mode:         ModeTasksOnly,
 		Codex:        true,
 		Worktree:     true,
+		Branch:       "feature-branch",
 		TaskModel:    "gpt-task",
 		TaskEffort:   "high",
 		ReviewModel:  "gpt-review",
@@ -29,11 +30,23 @@ func TestInvocationArgv(t *testing.T) {
 		"--task-model", "gpt-task:high",
 		"--review-model", "gpt-review:medium",
 		"--tasks-only",
-		"--worktree",
+		"--worktree", "--branch", "feature-branch",
 		"docs/plans/feature.md",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("argv mismatch\nwant: %#v\n got: %#v", want, got)
+	}
+}
+
+func TestInvocationRejectsBranchWithoutWorktree(t *testing.T) {
+	_, err := (Invocation{
+		BinaryPath: "/opt/ralphex",
+		PlanPath:   "docs/plans/feature.md",
+		Mode:       ModeFull,
+		Branch:     "feature-branch",
+	}).Argv()
+	if err == nil {
+		t.Fatal("expected branch override without worktree to be rejected")
 	}
 }
 
