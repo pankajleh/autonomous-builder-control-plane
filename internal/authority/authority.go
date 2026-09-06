@@ -14,19 +14,21 @@ import (
 	"strings"
 	"time"
 
+	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
 // Manifest is the mutable, serializable input used to construct an Authority.
 type Manifest struct {
-	RunID         string              `json:"run_id"`
-	Repository    RepositoryManifest  `json:"repository"`
-	Plan          PlanManifest        `json:"plan"`
-	Ralphex       RalphexManifest     `json:"ralphex"`
-	Executor      ExecutorPolicy      `json:"executor"`
-	Worktree      WorktreePolicy      `json:"worktree"`
-	Acceptance    []AcceptanceCommand `json:"acceptance"`
-	PolicyVersion string              `json:"policy_version"`
+	RunID          string                  `json:"run_id"`
+	Repository     RepositoryManifest      `json:"repository"`
+	Plan           PlanManifest            `json:"plan"`
+	ContextCapsule *ContextCapsuleManifest `json:"context_capsule,omitempty"`
+	Ralphex        RalphexManifest         `json:"ralphex"`
+	Executor       ExecutorPolicy          `json:"executor"`
+	Worktree       WorktreePolicy          `json:"worktree"`
+	Acceptance     []AcceptanceCommand     `json:"acceptance"`
+	PolicyVersion  string                  `json:"policy_version"`
 }
 
 // RepositoryManifest pins the governed repository and its starting identity.
@@ -41,6 +43,13 @@ type RepositoryManifest struct {
 
 // PlanManifest identifies the exact plan bytes authorized for the run.
 type PlanManifest struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+}
+
+// ContextCapsuleManifest optionally binds a run to one exact verified capsule.
+// It is omitted for manifests created before the context-capsule policy.
+type ContextCapsuleManifest struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
 }
@@ -115,6 +124,24 @@ func New(input Manifest) (Authority, error) {
 		return Authority{}, fmt.Errorf("plan path: %w", err)
 	}
 	manifest.Plan.Path = planPath
+	if manifest.ContextCapsule != nil {
+		capsulePath := manifest.ContextCapsule.Path
+		if !filepath.IsAbs(capsulePath) {
+			capsulePath = filepath.Join(repositoryPath, capsulePath)
+		}
+		if _, err := contextcapsule.VerifyFile(repositoryPath, capsulePath); err != nil {
+			return Authority{}, fmt.Errorf("verify context capsule: %w", err)
+		}
+		capsulePath, err = canonicalFileNoSymlink(capsulePath)
+		if err != nil {
+			return Authority{}, fmt.Errorf("context capsule path: %w", err)
+		}
+		manifest.ContextCapsule.Path = capsulePath
+		manifest.ContextCapsule.SHA256, err = validateFileHash(capsulePath, manifest.ContextCapsule.SHA256)
+		if err != nil {
+			return Authority{}, fmt.Errorf("context capsule SHA256: %w", err)
+		}
+	}
 
 	binaryPath, err := canonicalFile(manifest.Ralphex.BinaryPath)
 	if err != nil {
@@ -179,6 +206,14 @@ func (a Authority) Plan() PlanManifest {
 	return a.manifest.Plan
 }
 
+// ContextCapsule returns the optional canonical capsule binding.
+func (a Authority) ContextCapsule() (ContextCapsuleManifest, bool) {
+	if a.manifest.ContextCapsule == nil {
+		return ContextCapsuleManifest{}, false
+	}
+	return *a.manifest.ContextCapsule, true
+}
+
 // Ralphex returns the canonical Ralphex identity and mode.
 func (a Authority) Ralphex() RalphexManifest {
 	return a.manifest.Ralphex
@@ -229,6 +264,14 @@ func validateRequired(manifest Manifest) error {
 	}
 	if manifest.Plan.SHA256 == "" {
 		missing = append(missing, "plan.sha256")
+	}
+	if manifest.ContextCapsule != nil {
+		if manifest.ContextCapsule.Path == "" {
+			missing = append(missing, "context_capsule.path")
+		}
+		if manifest.ContextCapsule.SHA256 == "" {
+			missing = append(missing, "context_capsule.sha256")
+		}
 	}
 	if manifest.Ralphex.BinaryPath == "" {
 		missing = append(missing, "ralphex.binary_path")
@@ -419,6 +462,21 @@ func canonicalFile(path string) (string, error) {
 	return canonical, nil
 }
 
+func canonicalFileNoSymlink(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(absolute)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("must not be a symlink")
+	}
+	return canonicalFile(absolute)
+}
+
 func canonicalPath(path string) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
@@ -469,6 +527,10 @@ func validateFileHash(path, expected string) (string, error) {
 func cloneManifest(input Manifest) Manifest {
 	clone := input
 	clone.Repository = cloneRepository(input.Repository)
+	if input.ContextCapsule != nil {
+		binding := *input.ContextCapsule
+		clone.ContextCapsule = &binding
+	}
 	clone.Acceptance = cloneAcceptance(input.Acceptance)
 	return clone
 }

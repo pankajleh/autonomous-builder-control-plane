@@ -4,10 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
@@ -305,6 +307,91 @@ func TestNewRejectsHashMismatch(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "mismatch") {
 		t.Fatalf("expected hash mismatch error, got %v", err)
 	}
+}
+
+func TestNewValidatesOptionalContextCapsuleBinding(t *testing.T) {
+	manifest := boundCapsuleManifest(t)
+	governed, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, present := governed.ContextCapsule()
+	if !present || binding.SHA256 != manifest.ContextCapsule.SHA256 {
+		t.Fatalf("canonical authority lost capsule binding: %+v, %t", binding, present)
+	}
+	manifest.ContextCapsule.Path = "mutated"
+	if got, _ := governed.ContextCapsule(); got.Path == "mutated" {
+		t.Fatal("authority exposed mutable capsule binding")
+	}
+}
+
+func TestNewRejectsContextCapsuleHashMismatch(t *testing.T) {
+	manifest := boundCapsuleManifest(t)
+	manifest.ContextCapsule.SHA256 = strings.Repeat("0", 64)
+	if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "context capsule SHA256") {
+		t.Fatalf("expected capsule binding hash rejection, got %v", err)
+	}
+}
+
+func TestNewRejectsContextCapsuleSourceDrift(t *testing.T) {
+	manifest := boundCapsuleManifest(t)
+	writeFile(t, filepath.Join(manifest.Repository.Path, "source.md"), []byte("drifted"), 0o600)
+	if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "source") {
+		t.Fatalf("expected capsule source-drift rejection, got %v", err)
+	}
+}
+
+func TestNewPreservesPrePolicyManifestShape(t *testing.T) {
+	manifest := fixtureManifest(t)
+	governed, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := governed.ContextCapsule(); present {
+		t.Fatal("pre-policy manifest unexpectedly gained a capsule binding")
+	}
+	if strings.Contains(string(governed.CanonicalJSON()), "context_capsule") {
+		t.Fatal("optional capsule field changed canonical pre-policy manifest JSON")
+	}
+}
+
+func boundCapsuleManifest(t *testing.T) Manifest {
+	t.Helper()
+	manifest := fixtureManifest(t)
+	writeFile(t, filepath.Join(manifest.Repository.Path, "source.md"), []byte("governed source"), 0o600)
+	gitAuthorityCommand(t, manifest.Repository.Path, "init", "-b", "main")
+	gitAuthorityCommand(t, manifest.Repository.Path, "config", "user.email", "authority@example.test")
+	gitAuthorityCommand(t, manifest.Repository.Path, "config", "user.name", "Authority Test")
+	gitAuthorityCommand(t, manifest.Repository.Path, "remote", "add", "origin", "https://example.test/example/project.git")
+	gitAuthorityCommand(t, manifest.Repository.Path, "add", "plan.md", "source.md")
+	gitAuthorityCommand(t, manifest.Repository.Path, "commit", "-m", "governed inputs")
+	head := gitAuthorityCommand(t, manifest.Repository.Path, "rev-parse", "HEAD")
+	manifest.Repository.StartSHA = head
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersion,
+		Project:       "ABCP", Plan: "EP-004", RoadmapPhase: "Phase 3", ExecutionPack: "EP-004",
+		Task: "Task 1", Repository: "example/project", BaseSHA: head,
+		Invariants: []string{"Fail closed."}, NonGoals: []string{"No retrieval."}, Sources: []string{"source.md"},
+	}
+	_, data, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capsulePath := filepath.Join(t.TempDir(), "context-capsule.json")
+	writeFile(t, capsulePath, data, 0o600)
+	manifest.ContextCapsule = &ContextCapsuleManifest{Path: capsulePath, SHA256: fileHash(t, capsulePath)}
+	return manifest
+}
+
+func gitAuthorityCommand(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = directory
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func fixtureManifest(t *testing.T) Manifest {

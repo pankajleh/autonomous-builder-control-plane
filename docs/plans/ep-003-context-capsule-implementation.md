@@ -23,15 +23,15 @@ Provide a deterministic compact context capsule that fresh Ralphex/Codex/Claude 
 - Governed run authority can bind a capsule path/hash and verify it before Ralphex launch.
 ### Task 1: Implement deterministic context capsules
 
-- [ ] Add `internal/context` with typed capsule/spec/source/outcome models and canonical JSON hashing.
-- [ ] Add builder/validator that resolves only repository-contained regular files, hashes exact bytes, verifies repository/base SHA, rejects duplicates/path escape/symlinks, and enforces conservative size/count bounds.
-- [ ] Keep capsule content compact: explicit invariants/non-goals/outcomes plus source references; do not copy entire source documents into the capsule.
-- [ ] Add CLI commands to build and verify capsules using explicit input/output paths and structured arguments only.
-- [ ] Extend governed authority with an optional context-capsule path + SHA256 binding; when present, validate it before execution. Preserve backward compatibility for pre-policy manifests.
-- [ ] Add tests for deterministic generation, changed source, wrong base SHA, traversal/symlink, duplicate source, oversize capsule, authority hash binding, and CLI build/verify.
-- [ ] Document the operating rule: starting EP-004, every executable plan must point fresh tasks to its verified capsule before task work begins.
-- [ ] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
-- [ ] Mark this task complete and commit only this bounded addendum.
+- [x] Add `internal/context` with typed capsule/spec/source/outcome models and canonical JSON hashing.
+- [x] Add builder/validator that resolves only repository-contained regular files, hashes exact bytes, verifies repository/base SHA, rejects duplicates/path escape/symlinks, and enforces conservative size/count bounds.
+- [x] Keep capsule content compact: explicit invariants/non-goals/outcomes plus source references; do not copy entire source documents into the capsule.
+- [x] Add CLI commands to build and verify capsules using explicit input/output paths and structured arguments only.
+- [x] Extend governed authority with an optional context-capsule path + SHA256 binding; when present, validate it before execution. Preserve backward compatibility for pre-policy manifests.
+- [x] Add tests for deterministic generation, changed source, wrong base SHA, traversal/symlink, duplicate source, oversize capsule, authority hash binding, and CLI build/verify.
+- [x] Document the operating rule: starting EP-004, every executable plan must point fresh tasks to its verified capsule before task work begins.
+- [x] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
+- [x] Mark this task complete and commit only this bounded addendum.
 
 ## Acceptance
 

@@ -27,7 +27,9 @@ Every fresh task receives a compact context capsule made of three layers:
 - **Execution-pack context** — roadmap phase, parent goal, in-scope deliverables, explicit non-goals, relevant components, and expected end state.
 - **Task context** — exact objective, relevant files/contracts, predecessor outputs, edge cases, and acceptance criteria.
 
-The default is relevant context, not the entire architecture corpus.## Capsule requirements
+The default is relevant context, not the entire architecture corpus.
+
+## Capsule requirements
 
 Each capsule must record:
 
@@ -40,7 +42,7 @@ Each capsule must record:
 - context policy version;
 - capsule SHA256.
 
-The run authority should eventually bind `context_capsule_sha256`; until that field exists, the capsule remains a governed input recorded with the run.
+Run authority may bind `context_capsule.path` and `context_capsule.sha256`. When present, the controller verifies the exact capsule bytes, its internal canonical hash, repository/base SHA, and every source hash before launching Ralphex. Manifests from before this policy may omit the binding.
 
 ## Token-efficiency rules
 
@@ -54,12 +56,12 @@ The run authority should eventually bind `context_capsule_sha256`; until that fi
 
 Before implementation, every fresh task must read its capsule, verify the referenced repository/base identity, and inspect the task's relevant source files. If a referenced source hash no longer matches, execution must stop for re-authorization rather than silently using newer context.
 
-The intended invariant is: **durable external project memory + small fresh agent sessions**, not one indefinitely growing model conversation.## Immediate operating rule (before a context compiler exists)
+The intended invariant is: **durable external project memory + small fresh agent sessions**, not one indefinitely growing model conversation.
 
-Starting with EP-004, every Ralphex plan must contain a compact `Context Authority` section near the top. Because Ralphex starts fresh task sessions from the plan, that section is the mandatory context capsule until ABCP generates capsules automatically.
+## Immediate operating rule
 
-It must name the roadmap phase, execution pack, base SHA, canonical architecture documents relevant to that EP, global invariants, explicit non-goals, and the predecessor task-output/commit information needed by later tasks.
+Starting with EP-004, every executable Ralphex plan must point fresh tasks to the context capsule path and SHA256 bound by governed run authority. Before any task work begins, each fresh task must read that capsule and run independent capsule verification against the governed repository. A missing binding, failed verification, or drift is a blocker; the task must not continue with unverified context.
 
-Every task section must instruct the fresh agent to read and obey `Context Authority` before changing files. The agent may open deeper referenced documents on demand; they are not pasted wholesale into every prompt.
+Every task section must include that startup instruction before its implementation steps. The capsule supplies compact invariants, non-goals, predecessor outcomes, and hashed source references; the agent may open those referenced documents on demand, but entire documents are not pasted into the capsule.
 
-A future context compiler may generate the same contract and hashes mechanically, but automation must preserve this behavior rather than change its authority semantics.
+Capsules are built from structured specs with `abcp context-build --repository <path> --spec <path> --output <path>` and independently checked with `abcp context-verify --repository <path> --capsule <path>`. Source selection remains explicit and deterministic; no semantic retrieval is performed.

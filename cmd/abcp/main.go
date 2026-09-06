@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -55,6 +57,10 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "run":
 		return runCommand(args[1:], stdout, stderr)
+	case "context-build":
+		return contextBuildCommand(args[1:], stdout, stderr)
+	case "context-verify":
+		return contextVerifyCommand(args[1:], stdout, stderr)
 	case "recovery-inspect":
 		return recoveryInspectCommand(args[1:], stdout, stderr)
 	case "recovery-resume":
@@ -63,6 +69,98 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 2
 	}
+}
+
+func contextBuildCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("context-build", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	repository := flags.String("repository", "", "path to the governed Git repository root")
+	specPath := flags.String("spec", "", "path to the structured context capsule spec JSON")
+	outputPath := flags.String("output", "", "path for canonical context capsule JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *repository == "" || *specPath == "" || *outputPath == "" {
+		fmt.Fprintln(stderr, "usage: abcp context-build --repository <path> --spec <path> --output <path>")
+		return 2
+	}
+	spec, err := loadJSONFile[contextcapsule.Spec](*specPath, "context capsule spec")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	capsule, data, err := contextcapsule.Build(*repository, spec)
+	if err != nil {
+		fmt.Fprintf(stderr, "build context capsule: %v\n", err)
+		return 1
+	}
+	if err := writeAtomicFile(*outputPath, data, 0o600); err != nil {
+		fmt.Fprintf(stderr, "write context capsule: %v\n", err)
+		return 1
+	}
+	if err := writeJSONOutput(stdout, struct {
+		Path          string `json:"path"`
+		SHA256        string `json:"sha256"`
+		CapsuleSHA256 string `json:"capsule_sha256"`
+	}{Path: *outputPath, SHA256: fmt.Sprintf("%x", sha256.Sum256(data)), CapsuleSHA256: capsule.CapsuleSHA256}); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func contextVerifyCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("context-verify", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	repository := flags.String("repository", "", "path to the governed Git repository root")
+	capsulePath := flags.String("capsule", "", "path to canonical context capsule JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *repository == "" || *capsulePath == "" {
+		fmt.Fprintln(stderr, "usage: abcp context-verify --repository <path> --capsule <path>")
+		return 2
+	}
+	verified, err := contextcapsule.VerifyFile(*repository, *capsulePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "verify context capsule: %v\n", err)
+		return 1
+	}
+	if err := writeJSONOutput(stdout, verified); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func writeAtomicFile(path string, data []byte, mode os.FileMode) error {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	directory := filepath.Dir(absolute)
+	temporary, err := os.CreateTemp(directory, ".abcp-context-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(mode); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, absolute)
 }
 
 func recoveryInspectCommand(args []string, stdout, stderr io.Writer) int {
@@ -327,5 +425,5 @@ func loadManifest(path string) (authority.Manifest, error) {
 }
 
 func usage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|run|recovery-inspect|recovery-resume>")
+	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|run|recovery-inspect|recovery-resume>")
 }
