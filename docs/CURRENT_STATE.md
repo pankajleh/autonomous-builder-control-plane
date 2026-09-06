@@ -2,31 +2,26 @@
 
 **Date:** 2026-09-06  
 **Repository:** `autonomous-builder-control-plane`  
-**Phase:** Foundation implementation started
+**Phase:** EP-002 implementation kickoff
 
 ## Completed
 
 - Ralphex behavior audit EXP-00 through EXP-09 documented.
 - Architecture decision: Ralphex is the inner orchestrator, not global authority.
-- Control-plane architecture documented.
+- Canonical audit, architecture, ADRs and roadmap merged to `main` in PR #1.
 - State machine documented and implemented.
 - Append-only JSONL event ledger implemented.
 - Ralphex command-construction contract implemented.
-- Foundation tests passing with Go standard library only.
+- EP-001 foundation tests and smoke checks pass with Go standard library only.
 
-## Current implementation evidence
+## Foundation evidence
 
 ```bash
 go test ./...
+make smoke
 ```
 
-passes for:
-
-- `internal/domain`
-- `internal/ledger`
-- `internal/ralphex`
-
-Smoke behavior:
+Expected smoke behavior:
 
 ```text
 abcp version
@@ -39,8 +34,20 @@ abcp validate-transition IMPLEMENTATION_COMPLETED READY_FOR_MERGE
 → rejected
 ```
 
-## Next implementation pack
+## Active implementation
 
 `EP-002 — Governed Single-Plan Execution`
 
-The next slice should add an immutable authority manifest, a supervised Ralphex subprocess launcher, evidence capture, and controller-owned post-Ralphex acceptance for one plan on one repository.
+Ralphex execution plan:
+
+`docs/plans/ep-002-governed-single-plan.md`
+
+EP-002 adds:
+
+- validated immutable run authority manifest;
+- immutable evidence artifact store;
+- supervised Ralphex subprocess execution;
+- deterministic controller-owned branch acceptance;
+- governed single-plan runner and CLI.
+
+EP-002 explicitly does **not** add recovery, multi-plan scheduling, integration/merge authority, GitHub lifecycle automation, or production completion.
