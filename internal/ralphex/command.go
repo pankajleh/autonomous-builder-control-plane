@@ -25,6 +25,7 @@ type Invocation struct {
 	TaskEffort   string
 	ReviewModel  string
 	ReviewEffort string
+	WaitOnLimit  string
 }
 
 func (i Invocation) Argv() ([]string, error) {
@@ -56,6 +57,9 @@ func (i Invocation) Argv() ([]string, error) {
 	}
 	if i.Codex {
 		argv = append(argv, "--codex")
+	}
+	if i.WaitOnLimit != "" {
+		argv = append(argv, "--wait", i.WaitOnLimit)
 	}
 	taskModel, err := modelSpec(i.TaskModel, i.TaskEffort)
 	if err != nil {

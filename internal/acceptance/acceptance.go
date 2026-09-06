@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
@@ -46,7 +47,7 @@ type CommandResult struct {
 	MetadataRef   ledger.EvidenceRef
 }
 
-// GitEvidence is the controller-captured final repository state. Both Git
+// GitEvidence is the controller-captured final repository state. All Git
 // operations are structured argv executions with their own process evidence.
 type GitEvidence struct {
 	Branch        string
@@ -54,6 +55,7 @@ type GitEvidence struct {
 	Dirty         bool
 	HeadProcess   supervisor.Result
 	StatusProcess supervisor.Result
+	BranchProcess supervisor.Result
 	MetadataRef   ledger.EvidenceRef
 }
 
@@ -82,10 +84,12 @@ func (r Result) Passed() bool {
 	if r.status != StatusPass || !r.gitCaptured || r.git.HeadSHA == "" || !validEvidenceRef(r.git.MetadataRef) {
 		return false
 	}
-	if r.git.HeadProcess.Outcome != supervisor.OutcomeSucceeded || r.git.StatusProcess.Outcome != supervisor.OutcomeSucceeded {
+	if r.git.HeadProcess.Outcome != supervisor.OutcomeSucceeded || r.git.StatusProcess.Outcome != supervisor.OutcomeSucceeded ||
+		r.git.BranchProcess.Outcome != supervisor.OutcomeSucceeded {
 		return false
 	}
-	if !completeProcessEvidence(r.git.HeadProcess) || !completeProcessEvidence(r.git.StatusProcess) {
+	if !completeProcessEvidence(r.git.HeadProcess) || !completeProcessEvidence(r.git.StatusProcess) ||
+		!completeProcessEvidence(r.git.BranchProcess) {
 		return false
 	}
 	for _, command := range r.commands {
@@ -132,6 +136,7 @@ func (r Result) EvidenceRefs() []ledger.EvidenceRef {
 		refs = appendValidRefs(refs,
 			r.git.HeadProcess.StdoutRef, r.git.HeadProcess.StderrRef,
 			r.git.StatusProcess.StdoutRef, r.git.StatusProcess.StderrRef,
+			r.git.BranchProcess.StdoutRef, r.git.BranchProcess.StderrRef,
 			r.git.MetadataRef,
 		)
 	}
@@ -226,9 +231,14 @@ func (e *Executor) Run(ctx context.Context, governed authority.Authority, target
 
 func (e *Executor) runCommand(ctx context.Context, repository string, index int, configured authority.AcceptanceCommand) (supervisor.Result, error) {
 	prefix := fmt.Sprintf("acceptance-command-%03d", index+1)
+	timeout, err := time.ParseDuration(configured.Timeout)
+	if err != nil {
+		return supervisor.Result{}, fmt.Errorf("parse governed timeout: %w", err)
+	}
 	return e.runner.Run(ctx, supervisor.Command{
-		Argv: append([]string(nil), configured.Argv...),
-		Cwd:  repository,
+		Argv:    append([]string(nil), configured.Argv...),
+		Cwd:     repository,
+		Timeout: timeout,
 		Stdout: supervisor.EvidenceSink{
 			Writer: e.artifacts,
 			Name:   prefix + "-stdout.log",
@@ -308,6 +318,24 @@ func (e *Executor) captureGit(ctx context.Context, repository, branch, expectedH
 	}
 
 	gitEvidence.Dirty = len(statusBytes) > 0
+	branchRef := "refs/heads/" + branch
+	branchProcess, err := e.runGit(ctx, repository, "branch", []string{"git", "show-ref", "--verify", "--hash", branchRef})
+	gitEvidence.BranchProcess = branchProcess
+	if err != nil {
+		return gitEvidence, fmt.Errorf("capture candidate branch: %w", err)
+	}
+	if branchProcess.Outcome != supervisor.OutcomeSucceeded {
+		return gitEvidence, fmt.Errorf("capture candidate branch: git outcome %s", branchProcess.Outcome)
+	}
+	branchBytes, err := readVerifiedArtifact(branchProcess.StdoutRef)
+	if err != nil {
+		return gitEvidence, fmt.Errorf("read candidate branch evidence: %w", err)
+	}
+	branchSHA := strings.TrimSpace(string(branchBytes))
+	if !validGitSHA(branchSHA) || branchSHA != expectedHeadSHA {
+		return gitEvidence, fmt.Errorf("candidate branch %q points to %q, expected %s", branch, branchSHA, expectedHeadSHA)
+	}
+
 	metadata, err := json.Marshal(struct {
 		Branch        string            `json:"branch,omitempty"`
 		HeadSHA       string            `json:"head_sha"`
@@ -315,6 +343,7 @@ func (e *Executor) captureGit(ctx context.Context, repository, branch, expectedH
 		PolicyVersion string            `json:"policy_version"`
 		HeadProcess   supervisor.Result `json:"head_process"`
 		StatusProcess supervisor.Result `json:"status_process"`
+		BranchProcess supervisor.Result `json:"branch_process"`
 	}{
 		Branch:        gitEvidence.Branch,
 		HeadSHA:       gitEvidence.HeadSHA,
@@ -322,6 +351,7 @@ func (e *Executor) captureGit(ctx context.Context, repository, branch, expectedH
 		PolicyVersion: policyVersion,
 		HeadProcess:   gitEvidence.HeadProcess,
 		StatusProcess: gitEvidence.StatusProcess,
+		BranchProcess: gitEvidence.BranchProcess,
 	})
 	if err != nil {
 		return gitEvidence, fmt.Errorf("marshal final Git metadata: %w", err)
@@ -403,5 +433,6 @@ func cloneCommandResult(command CommandResult) CommandResult {
 func cloneGitEvidence(git GitEvidence) GitEvidence {
 	git.HeadProcess.Argv = append([]string(nil), git.HeadProcess.Argv...)
 	git.StatusProcess.Argv = append([]string(nil), git.StatusProcess.Argv...)
+	git.BranchProcess.Argv = append([]string(nil), git.BranchProcess.Argv...)
 	return git
 }

@@ -25,6 +25,8 @@ func TestNewRejectsMissingRequiredFields(t *testing.T) {
 		{name: "plan hash", field: "plan.sha256", clear: func(m *Manifest) { m.Plan.SHA256 = "" }},
 		{name: "binary path", field: "ralphex.binary_path", clear: func(m *Manifest) { m.Ralphex.BinaryPath = "" }},
 		{name: "binary hash", field: "ralphex.binary_sha256", clear: func(m *Manifest) { m.Ralphex.BinarySHA256 = "" }},
+		{name: "Ralphex timeout", field: "ralphex.timeout", clear: func(m *Manifest) { m.Ralphex.Timeout = "" }},
+		{name: "wait on limit", field: "ralphex.wait_on_limit", clear: func(m *Manifest) { m.Ralphex.WaitOnLimit = "" }},
 	}
 
 	for _, test := range tests {
@@ -45,6 +47,27 @@ func TestNewRejectsEmptyAcceptanceArgv(t *testing.T) {
 	_, err := New(manifest)
 	if err == nil || !strings.Contains(err.Error(), "argv") {
 		t.Fatalf("expected empty argv error, got %v", err)
+	}
+}
+
+func TestNewRejectsInvalidTimingPolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{name: "zero Ralphex timeout", mutate: func(m *Manifest) { m.Ralphex.Timeout = "0s" }},
+		{name: "negative wait on limit", mutate: func(m *Manifest) { m.Ralphex.WaitOnLimit = "-1s" }},
+		{name: "missing acceptance timeout", mutate: func(m *Manifest) { m.Acceptance[0].Timeout = "" }},
+		{name: "invalid acceptance timeout", mutate: func(m *Manifest) { m.Acceptance[0].Timeout = "later" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := fixtureManifest(t)
+			test.mutate(&manifest)
+			if _, err := New(manifest); err == nil {
+				t.Fatal("authority accepted invalid timing policy")
+			}
+		})
 	}
 }
 
@@ -139,6 +162,9 @@ func TestNewCanonicalizesPathsAndProducesStableHash(t *testing.T) {
 	}
 
 	secondInput := cloneManifest(manifest)
+	secondInput.Ralphex.Timeout = "600s"
+	secondInput.Ralphex.WaitOnLimit = "0"
+	secondInput.Acceptance[0].Timeout = "300s"
 	secondInput.Repository.Remotes = map[string]string{
 		"origin":   "https://example.test/origin.git",
 		"upstream": "https://example.test/upstream.git",
@@ -225,6 +251,8 @@ func fixtureManifest(t *testing.T) Manifest {
 			BinarySHA256: fileHash(t, binaryPath),
 			SourceSHA:    "abcdef0123456789",
 			Mode:         ralphex.ModeFull,
+			Timeout:      "10m",
+			WaitOnLimit:  "0s",
 		},
 		Executor: ExecutorPolicy{
 			Executor:     "codex",
@@ -238,6 +266,7 @@ func fixtureManifest(t *testing.T) Manifest {
 			Name:     "unit tests",
 			Class:    "unit",
 			Required: true,
+			Timeout:  "5m",
 			Argv:     []string{"go", "test", "./..."},
 		}},
 		PolicyVersion: "branch-v1",

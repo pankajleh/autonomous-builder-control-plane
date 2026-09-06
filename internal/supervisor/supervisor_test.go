@@ -33,6 +33,9 @@ func TestRunCapturesSuccessfulCommand(t *testing.T) {
 	if result.StartedAt.IsZero() || result.EndedAt.Before(result.StartedAt) {
 		t.Fatalf("invalid timestamps: %s to %s", result.StartedAt, result.EndedAt)
 	}
+	if result.WaitDelay != DefaultWaitDelay {
+		t.Fatalf("wait delay = %s, want default %s", result.WaitDelay, DefaultWaitDelay)
+	}
 	if !reflect.DeepEqual(result.Argv, command.Argv) || result.Cwd != command.Cwd {
 		t.Fatalf("recorded command = %#v in %q, want %#v in %q", result.Argv, result.Cwd, command.Argv, command.Cwd)
 	}
@@ -130,6 +133,7 @@ func TestRunValidatesStructuredInput(t *testing.T) {
 		"executable":    func(command *Command) { command.Argv[0] = "" },
 		"cwd":           func(command *Command) { command.Cwd = "" },
 		"timeout":       func(command *Command) { command.Timeout = -time.Second },
+		"wait delay":    func(command *Command) { command.WaitDelay = -time.Second },
 		"output limit":  func(command *Command) { command.OutputLimitBytes = -1 },
 		"stdout writer": func(command *Command) { command.Stdout.Writer = nil },
 		"stdout name":   func(command *Command) { command.Stdout.Name = "" },

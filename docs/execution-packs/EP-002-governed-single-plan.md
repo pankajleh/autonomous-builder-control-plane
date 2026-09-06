@@ -18,9 +18,10 @@ Introduce a typed manifest containing:
 - Ralphex binary path + SHA256
 - expected Ralphex source SHA metadata
 - mode
+- Ralphex process timeout and rate-limit wait policy
 - executor/model/effort policy
 - worktree policy with an explicit candidate branch when enabled
-- acceptance commands
+- acceptance commands with explicit timeouts
 - policy version
 
 The manifest becomes immutable after authority validation.

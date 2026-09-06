@@ -134,7 +134,11 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	if err != nil {
 		return r.fail(result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
-	if err := r.transition(domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner", map[string]any{"argv": argv}, nil); err != nil {
+	ralphexTimeout, err := time.ParseDuration(r.governed.Ralphex().Timeout)
+	if err != nil {
+		return r.fail(result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("parse governed Ralphex timeout: %w", err), nil)
+	}
+	if err := r.transition(domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner", map[string]any{"argv": argv, "timeout": r.governed.Ralphex().Timeout}, nil); err != nil {
 		return result, err
 	}
 	result.State = domain.StateExecutionStarting
@@ -144,10 +148,11 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	result.State = domain.StateImplementing
 
 	process, processErr := r.processes.Run(ctx, supervisor.Command{
-		Argv:   argv,
-		Cwd:    r.governed.Repository().Path,
-		Stdout: supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stdout.log", Kind: "ralphex-stdout"},
-		Stderr: supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stderr.log", Kind: "ralphex-stderr"},
+		Argv:    argv,
+		Cwd:     r.governed.Repository().Path,
+		Timeout: ralphexTimeout,
+		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stdout.log", Kind: "ralphex-stdout"},
+		Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stderr.log", Kind: "ralphex-stderr"},
 	})
 	result.Ralphex = process
 	if processErr != nil {
@@ -269,6 +274,7 @@ func (r *Runner) invocation() (ralphex.Invocation, error) {
 		TaskEffort:   policy.TaskEffort,
 		ReviewModel:  policy.ReviewModel,
 		ReviewEffort: policy.ReviewEffort,
+		WaitOnLimit:  r.governed.Ralphex().WaitOnLimit,
 	}, nil
 }
 
@@ -463,6 +469,9 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 		if err != nil {
 			return acceptance.Target{}, func() error { return nil }, fmt.Errorf("discover candidate HEAD: %w", err)
 		}
+		if err := requireDescendsFrom(ctx, repository.Path, repository.StartSHA, headSHA); err != nil {
+			return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q does not descend from governed start SHA: %w", currentBranch, err)
+		}
 		return acceptance.Target{RepositoryPath: repository.Path, Branch: currentBranch, HeadSHA: headSHA}, func() error { return nil }, nil
 	}
 
@@ -470,9 +479,7 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 	if err != nil {
 		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("resolve candidate branch %q: %w", branch, err)
 	}
-	ancestor := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", repository.StartSHA, headSHA)
-	ancestor.Dir = repository.Path
-	if err := ancestor.Run(); err != nil {
+	if err := requireDescendsFrom(ctx, repository.Path, repository.StartSHA, headSHA); err != nil {
 		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q does not descend from governed start SHA: %w", branch, err)
 	}
 
@@ -501,6 +508,12 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 		return nil
 	}
 	return acceptance.Target{RepositoryPath: checkout, Branch: branch, HeadSHA: headSHA}, cleanup, nil
+}
+
+func requireDescendsFrom(ctx context.Context, repository, startSHA, headSHA string) error {
+	ancestor := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", startSHA, headSHA)
+	ancestor.Dir = repository
+	return ancestor.Run()
 }
 
 func processRefs(process supervisor.Result) []ledger.EvidenceRef {

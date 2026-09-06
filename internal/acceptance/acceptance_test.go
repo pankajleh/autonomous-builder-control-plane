@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/acceptance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
@@ -34,12 +35,14 @@ func TestExecutorPassesAllRequiredCommandsAndCapturesEvidence(t *testing.T) {
 			Name:     "unit tests",
 			Class:    "unit",
 			Required: true,
+			Timeout:  "5s",
 			Argv:     helperArgv("pass", "unit output"),
 		},
 		{
 			Name:     "smoke test",
 			Class:    "smoke",
 			Required: true,
+			Timeout:  "5s",
 			Argv:     helperArgv("pass", "smoke output"),
 		},
 	}
@@ -68,6 +71,9 @@ func TestExecutorPassesAllRequiredCommandsAndCapturesEvidence(t *testing.T) {
 		if record.Process.Outcome != supervisor.OutcomeSucceeded || record.Process.ExitCode != 0 {
 			t.Fatalf("command %d process = %#v, want success", index+1, record.Process)
 		}
+		if record.Process.Timeout != 5*time.Second {
+			t.Fatalf("command %d timeout = %s, want 5s", index+1, record.Process.Timeout)
+		}
 		if !reflect.DeepEqual(record.Process.Argv, commands[index].Argv) || record.Process.Cwd != repository {
 			t.Fatalf("command %d identity = %#v in %q", index+1, record.Process.Argv, record.Process.Cwd)
 		}
@@ -94,9 +100,53 @@ func TestExecutorPassesAllRequiredCommandsAndCapturesEvidence(t *testing.T) {
 	if !reflect.DeepEqual(gitEvidence.StatusProcess.Argv, []string{"git", "status", "--porcelain=v1", "--untracked-files=normal"}) {
 		t.Fatalf("status argv = %#v", gitEvidence.StatusProcess.Argv)
 	}
+	if !reflect.DeepEqual(gitEvidence.BranchProcess.Argv, []string{"git", "show-ref", "--verify", "--hash", "refs/heads/" + target.Branch}) {
+		t.Fatalf("branch argv = %#v", gitEvidence.BranchProcess.Argv)
+	}
 	assertEvidenceContains(t, gitEvidence.HeadProcess.StdoutRef.URI, gitEvidence.HeadSHA+"\n")
 	assertEvidenceContains(t, gitEvidence.StatusProcess.StdoutRef.URI, "?? untracked.txt\n")
 	assertMetadata(t, gitEvidence.MetadataRef.URI, "\"dirty\":true", "acceptance-policy-v1")
+}
+
+func TestExecutorRejectsCandidateBranchMovedAwayFromTestedCommit(t *testing.T) {
+	repository := newGitRepository(t)
+	firstSHA := gitOutput(t, repository, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repository, "second.txt"), []byte("second\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository, "add", "second.txt")
+	commit := exec.Command("git", "-c", "user.name=Acceptance Test", "-c", "user.email=acceptance@example.invalid", "commit", "-qm", "second")
+	commit.Dir = repository
+	if output, err := commit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %v: %s", err, output)
+	}
+	testedSHA := gitOutput(t, repository, "rev-parse", "HEAD")
+	branch := gitOutput(t, repository, "symbolic-ref", "--quiet", "--short", "HEAD")
+	checkout := filepath.Join(t.TempDir(), "candidate")
+	runGit(t, repository, "worktree", "add", "--detach", checkout, testedSHA)
+	t.Cleanup(func() {
+		command := exec.Command("git", "worktree", "remove", "--force", checkout)
+		command.Dir = repository
+		_ = command.Run()
+	})
+
+	commands := []authority.AcceptanceCommand{{
+		Name: "move branch", Required: true, Timeout: "5s",
+		Argv: []string{"git", "update-ref", "refs/heads/" + branch, firstSHA},
+	}}
+	governed := newAuthority(t, repository, commands)
+	store := newEvidenceStore(t)
+	result, err := acceptance.New(supervisor.New(), store).Run(context.Background(), governed, acceptance.Target{
+		RepositoryPath: checkout,
+		Branch:         branch,
+		HeadSHA:        testedSHA,
+	})
+	if err == nil || !strings.Contains(err.Error(), "candidate branch") {
+		t.Fatalf("expected moved-branch rejection, got %v", err)
+	}
+	if result.Passed() {
+		t.Fatal("acceptance passed after candidate branch moved")
+	}
 }
 
 func TestExecutorStopsAtFirstRequiredFailureAndCannotAcceptBranch(t *testing.T) {
@@ -107,12 +157,14 @@ func TestExecutorStopsAtFirstRequiredFailureAndCannotAcceptBranch(t *testing.T) 
 			Name:     "failing test",
 			Class:    "unit",
 			Required: true,
+			Timeout:  "5s",
 			Argv:     helperArgv("fail"),
 		},
 		{
 			Name:     "must not run",
 			Class:    "smoke",
 			Required: true,
+			Timeout:  "5s",
 			Argv:     helperArgv("mark", marker),
 		},
 	}
@@ -145,8 +197,8 @@ func TestExecutorContinuesAfterOptionalFailure(t *testing.T) {
 	repository := newGitRepository(t)
 	marker := filepath.Join(t.TempDir(), "required-command-ran")
 	commands := []authority.AcceptanceCommand{
-		{Name: "advisory", Class: "static", Required: false, Argv: helperArgv("fail")},
-		{Name: "required", Class: "unit", Required: true, Argv: helperArgv("mark", marker)},
+		{Name: "advisory", Class: "static", Required: false, Timeout: "5s", Argv: helperArgv("fail")},
+		{Name: "required", Class: "unit", Required: true, Timeout: "5s", Argv: helperArgv("mark", marker)},
 	}
 	governed := newAuthority(t, repository, commands)
 	store := newEvidenceStore(t)
@@ -167,9 +219,28 @@ func TestExecutorContinuesAfterOptionalFailure(t *testing.T) {
 	}
 }
 
+func TestExecutorAppliesGovernedCommandTimeout(t *testing.T) {
+	repository := newGitRepository(t)
+	commands := []authority.AcceptanceCommand{{
+		Name: "bounded check", Required: true, Timeout: "50ms", Argv: helperArgv("wait"),
+	}}
+	governed := newAuthority(t, repository, commands)
+	store := newEvidenceStore(t)
+	t.Setenv("GO_WANT_ACCEPTANCE_HELPER", "1")
+
+	result, err := acceptance.New(supervisor.New(), store).Run(context.Background(), governed, acceptanceTarget(t, repository))
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := result.Commands()
+	if result.Passed() || len(records) != 1 || records[0].Process.Outcome != supervisor.OutcomeTimedOut {
+		t.Fatalf("timed acceptance result = %#v, records=%#v", result, records)
+	}
+}
+
 func TestExecutorRejectsMissingDependencies(t *testing.T) {
 	repository := newGitRepository(t)
-	governed := newAuthority(t, repository, []authority.AcceptanceCommand{{Required: true, Argv: helperArgv("pass", "ok")}})
+	governed := newAuthority(t, repository, []authority.AcceptanceCommand{{Required: true, Timeout: "5s", Argv: helperArgv("pass", "ok")}})
 	store := newEvidenceStore(t)
 
 	target := acceptanceTarget(t, repository)
@@ -186,7 +257,7 @@ func TestExecutorRejectsMissingDependencies(t *testing.T) {
 
 func TestExecutorPreservesProcessEvidenceWhenMetadataPublicationFails(t *testing.T) {
 	repository := newGitRepository(t)
-	governed := newAuthority(t, repository, []authority.AcceptanceCommand{{Required: true, Argv: helperArgv("pass", "partial")}})
+	governed := newAuthority(t, repository, []authority.AcceptanceCommand{{Required: true, Timeout: "5s", Argv: helperArgv("pass", "partial")}})
 	store := newEvidenceStore(t)
 	t.Setenv("GO_WANT_ACCEPTANCE_HELPER", "1")
 	writer := failingArtifactWriter{delegate: store, failName: "acceptance-command-001.json"}
@@ -254,6 +325,10 @@ func TestAcceptanceHelperProcess(t *testing.T) {
 			os.Exit(93)
 		}
 		os.Exit(0)
+	case "wait":
+		for {
+			time.Sleep(time.Hour)
+		}
 	default:
 		os.Exit(94)
 	}
@@ -298,6 +373,8 @@ func newAuthority(t *testing.T, repository string, commands []authority.Acceptan
 			BinaryPath:   os.Args[0],
 			BinarySHA256: fileSHA256(t, os.Args[0]),
 			Mode:         ralphex.ModeFull,
+			Timeout:      "5s",
+			WaitOnLimit:  "0s",
 		},
 		Acceptance:    commands,
 		PolicyVersion: "acceptance-policy-v1",

@@ -38,8 +38,8 @@ func TestRunCLIEndToEnd(t *testing.T) {
 			Path: repository, DefaultBranch: "main", StartSHA: startSHA,
 		},
 		Plan:          authority.PlanManifest{Path: planPath, SHA256: cliFileHash(t, planPath)},
-		Ralphex:       authority.RalphexManifest{BinaryPath: binaryPath, BinarySHA256: cliFileHash(t, binaryPath), Mode: ralphex.ModeFull},
-		Acceptance:    []authority.AcceptanceCommand{{Required: true, Argv: []string{truePath}}},
+		Ralphex:       authority.RalphexManifest{BinaryPath: binaryPath, BinarySHA256: cliFileHash(t, binaryPath), Mode: ralphex.ModeFull, Timeout: "5s", WaitOnLimit: "0s"},
+		Acceptance:    []authority.AcceptanceCommand{{Required: true, Timeout: "5s", Argv: []string{truePath}}},
 		PolicyVersion: "cli-v1",
 	}
 	manifestBytes, err := json.Marshal(manifest)

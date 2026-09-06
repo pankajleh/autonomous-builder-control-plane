@@ -22,10 +22,14 @@ const (
 	OutcomeCanceled    Outcome = "canceled"
 	OutcomeTimedOut    Outcome = "timed_out"
 	OutcomeOutputLimit Outcome = "output_limit_exceeded"
+	OutcomeWaitDelay   Outcome = "pipe_wait_delay_exceeded"
 
 	// DefaultOutputLimitBytes bounds each captured stream when a command does
 	// not provide a smaller explicit limit.
 	DefaultOutputLimitBytes int64 = 16 << 20
+	// DefaultWaitDelay bounds waiting for output pipes retained by descendants
+	// after the directly supervised process has exited.
+	DefaultWaitDelay time.Duration = 2 * time.Second
 )
 
 // ArtifactWriter is the immutable evidence operation required by a command.
@@ -49,6 +53,9 @@ type Command struct {
 	Cwd     string
 	Env     []string
 	Timeout time.Duration
+	// WaitDelay bounds exec.Cmd pipe draining after process exit or context
+	// cancellation. Zero selects DefaultWaitDelay.
+	WaitDelay time.Duration
 	// OutputLimitBytes bounds stdout and stderr independently. Zero selects
 	// DefaultOutputLimitBytes.
 	OutputLimitBytes int64
@@ -70,6 +77,8 @@ type Result struct {
 	StdoutRef         ledger.EvidenceRef
 	StderrRef         ledger.EvidenceRef
 	OutputLimitBytes  int64
+	Timeout           time.Duration
+	WaitDelay         time.Duration
 	StdoutTruncated   bool
 	StderrTruncated   bool
 }
@@ -97,6 +106,7 @@ func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 		ExitCode: -1,
 		Argv:     append([]string(nil), command.Argv...),
 		Cwd:      command.Cwd,
+		Timeout:  command.Timeout,
 	}
 
 	runCtx := ctx
@@ -115,6 +125,12 @@ func (r *Runner) Run(ctx context.Context, command Command) (Result, error) {
 	cmd.Cancel = func() error {
 		return cancelProcess(cmd)
 	}
+	waitDelay := command.WaitDelay
+	if waitDelay == 0 {
+		waitDelay = DefaultWaitDelay
+	}
+	cmd.WaitDelay = waitDelay
+	result.WaitDelay = waitDelay
 
 	limit := command.OutputLimitBytes
 	if limit == 0 {
@@ -178,6 +194,9 @@ func validate(command Command) error {
 	if command.Timeout < 0 {
 		return errors.New("command timeout must not be negative")
 	}
+	if command.WaitDelay < 0 {
+		return errors.New("command wait delay must not be negative")
+	}
 	if command.OutputLimitBytes < 0 {
 		return errors.New("command output limit must not be negative")
 	}
@@ -224,6 +243,10 @@ func classify(result *Result, ctx context.Context, cmd *exec.Cmd, waitErr error,
 	}
 	if outputLimited {
 		result.Outcome = OutcomeOutputLimit
+		return
+	}
+	if errors.Is(waitErr, exec.ErrWaitDelay) {
+		result.Outcome = OutcomeWaitDelay
 		return
 	}
 	if result.TerminatingSignal != "" {

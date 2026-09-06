@@ -70,6 +70,59 @@ func TestCancellationTerminatesDescendantProcess(t *testing.T) {
 	}
 }
 
+func TestRunBoundsOutputPipeRetainedByEscapedDescendant(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "escaped-descendant.pid")
+	command, _ := helperCommand(t, "success")
+	command.Argv = []string{os.Args[0], "-test.run=^TestSupervisorInheritedPipeHelper$"}
+	command.Env = append(os.Environ(),
+		"GO_WANT_SUPERVISOR_PIPE_PARENT=1",
+		"GO_WANT_SUPERVISOR_PIPE_PID_PATH="+pidPath,
+	)
+	command.WaitDelay = 100 * time.Millisecond
+	started := time.Now()
+	result, err := New().Run(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != OutcomeWaitDelay {
+		t.Fatalf("outcome = %q, want %q", result.Outcome, OutcomeWaitDelay)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("retained output pipe blocked supervisor for %s", elapsed)
+	}
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descendantPID, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = syscall.Kill(descendantPID, syscall.SIGKILL)
+}
+
+func TestSupervisorInheritedPipeHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_SUPERVISOR_PIPE_CHILD") == "1" {
+		time.Sleep(10 * time.Second)
+		return
+	}
+	if os.Getenv("GO_WANT_SUPERVISOR_PIPE_PARENT") != "1" {
+		return
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestSupervisorInheritedPipeHelper$")
+	child.Env = append(os.Environ(), "GO_WANT_SUPERVISOR_PIPE_PARENT=", "GO_WANT_SUPERVISOR_PIPE_CHILD=1")
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := child.Start(); err != nil {
+		os.Exit(93)
+	}
+	if err := os.WriteFile(os.Getenv("GO_WANT_SUPERVISOR_PIPE_PID_PATH"), []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+		os.Exit(94)
+	}
+	os.Exit(0)
+}
+
 func TestSupervisorProcessTreeHelper(t *testing.T) {
 	if os.Getenv("GO_WANT_SUPERVISOR_TREE_CHILD") == "1" {
 		for {

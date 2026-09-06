@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
@@ -49,6 +50,8 @@ type RalphexManifest struct {
 	BinarySHA256 string       `json:"binary_sha256"`
 	SourceSHA    string       `json:"source_sha,omitempty"`
 	Mode         ralphex.Mode `json:"mode"`
+	Timeout      string       `json:"timeout"`
+	WaitOnLimit  string       `json:"wait_on_limit"`
 }
 
 // ExecutorPolicy records the selected executor and model/effort settings.
@@ -71,6 +74,7 @@ type AcceptanceCommand struct {
 	Name     string   `json:"name,omitempty"`
 	Class    string   `json:"class,omitempty"`
 	Required bool     `json:"required"`
+	Timeout  string   `json:"timeout"`
 	Argv     []string `json:"argv"`
 }
 
@@ -121,6 +125,11 @@ func New(input Manifest) (Authority, error) {
 	manifest.Ralphex.BinarySHA256, err = validateFileHash(binaryPath, manifest.Ralphex.BinarySHA256)
 	if err != nil {
 		return Authority{}, fmt.Errorf("ralphex binary SHA256: %w", err)
+	}
+	manifest.Ralphex.Timeout = canonicalDuration(manifest.Ralphex.Timeout)
+	manifest.Ralphex.WaitOnLimit = canonicalDuration(manifest.Ralphex.WaitOnLimit)
+	for index := range manifest.Acceptance {
+		manifest.Acceptance[index].Timeout = canonicalDuration(manifest.Acceptance[index].Timeout)
 	}
 
 	canonicalJSON, err := json.Marshal(manifest)
@@ -214,6 +223,12 @@ func validateRequired(manifest Manifest) error {
 	if manifest.Ralphex.BinarySHA256 == "" {
 		missing = append(missing, "ralphex.binary_sha256")
 	}
+	if manifest.Ralphex.Timeout == "" {
+		missing = append(missing, "ralphex.timeout")
+	}
+	if manifest.Ralphex.WaitOnLimit == "" {
+		missing = append(missing, "ralphex.wait_on_limit")
+	}
 	if len(missing) > 0 {
 		return fmt.Errorf("required authority fields missing: %s", strings.Join(missing, ", "))
 	}
@@ -222,6 +237,12 @@ func validateRequired(manifest Manifest) error {
 	case ralphex.ModeFull, ralphex.ModeTasksOnly, ralphex.ModeReview:
 	default:
 		return fmt.Errorf("unsupported ralphex mode %q", manifest.Ralphex.Mode)
+	}
+	if err := validateDuration("ralphex.timeout", manifest.Ralphex.Timeout, false); err != nil {
+		return err
+	}
+	if err := validateDuration("ralphex.wait_on_limit", manifest.Ralphex.WaitOnLimit, true); err != nil {
+		return err
 	}
 	if manifest.Worktree.Enabled && manifest.Worktree.Branch == "" {
 		return errors.New("worktree.branch is required when worktree is enabled")
@@ -239,6 +260,12 @@ func validateRequired(manifest Manifest) error {
 		return errors.New("at least one acceptance command is required")
 	}
 	for index, command := range manifest.Acceptance {
+		if command.Timeout == "" {
+			return fmt.Errorf("acceptance command %d timeout is required", index)
+		}
+		if err := validateDuration(fmt.Sprintf("acceptance command %d timeout", index), command.Timeout, false); err != nil {
+			return err
+		}
 		if len(command.Argv) == 0 {
 			return fmt.Errorf("acceptance command %d argv must not be empty", index)
 		}
@@ -249,6 +276,26 @@ func validateRequired(manifest Manifest) error {
 		}
 	}
 	return nil
+}
+
+func validateDuration(field, value string, allowZero bool) error {
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return fmt.Errorf("%s must be a valid duration: %w", field, err)
+	}
+	if duration < 0 || (!allowZero && duration == 0) {
+		requirement := "positive"
+		if allowZero {
+			requirement = "non-negative"
+		}
+		return fmt.Errorf("%s must be %s", field, requirement)
+	}
+	return nil
+}
+
+func canonicalDuration(value string) string {
+	duration, _ := time.ParseDuration(value)
+	return duration.String()
 }
 
 func canonicalDirectory(path string) (string, error) {

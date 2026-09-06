@@ -117,7 +117,9 @@ Example authority manifest:
     "binary_path": "/opt/ralphex/bin/ralphex",
     "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "source_sha": "pinned-source-revision",
-    "mode": "full"
+    "mode": "full",
+    "timeout": "2h",
+    "wait_on_limit": "30m"
   },
   "executor": {
     "executor": "codex",
@@ -131,13 +133,15 @@ Example authority manifest:
     "branch": "feature-123"
   },
   "acceptance": [
-    {"name": "tests", "class": "unit", "required": true, "argv": ["go", "test", "./..."]}
+    {"name": "tests", "class": "unit", "required": true, "timeout": "10m", "argv": ["go", "test", "./..."]}
   ],
   "policy_version": "branch-v1"
 }
 ```
 
-Supported Ralphex modes are `full`, `tasks-only`, and `review`. Worktree mode
+Timeouts use Go duration syntax and must be positive; `wait_on_limit` may be
+`0s` to disable retries explicitly. Supported Ralphex modes are `full`,
+`tasks-only`, and `review`. Worktree mode
 requires an explicit new branch name and is unavailable with review mode. The
 controller verifies repository, plan, binary, branch, and remote identities;
 runs acceptance against the actual candidate checkout; and limits each captured

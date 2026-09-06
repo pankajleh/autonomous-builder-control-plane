@@ -18,6 +18,7 @@ func TestInvocationArgv(t *testing.T) {
 		TaskEffort:   "high",
 		ReviewModel:  "gpt-review",
 		ReviewEffort: "medium",
+		WaitOnLimit:  "30m0s",
 	}
 	got, err := inv.Argv()
 	if err != nil {
@@ -27,6 +28,7 @@ func TestInvocationArgv(t *testing.T) {
 		"/opt/ralphex",
 		"--config-dir", "/etc/abcp/ralphex",
 		"--codex",
+		"--wait", "30m0s",
 		"--task-model", "gpt-task:high",
 		"--review-model", "gpt-review:medium",
 		"--tasks-only",

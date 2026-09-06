@@ -36,10 +36,13 @@ func TestRunnerSuccessReachesBranchAcceptedWithOrderedEvidence(t *testing.T) {
 	}
 	wantArgv := []string{
 		fixture.authority.Ralphex().BinaryPath,
-		"--codex", "--task-model", "test-model:high", "--tasks-only", fixture.authority.Plan().Path,
+		"--codex", "--wait", "0s", "--task-model", "test-model:high", "--tasks-only", fixture.authority.Plan().Path,
 	}
 	if !reflect.DeepEqual(result.Ralphex.Argv, wantArgv) {
 		t.Fatalf("Ralphex argv mismatch\nwant: %#v\n got: %#v", wantArgv, result.Ralphex.Argv)
+	}
+	if result.Ralphex.Timeout != 5*time.Second {
+		t.Fatalf("Ralphex timeout = %s, want 5s", result.Ralphex.Timeout)
 	}
 
 	events := readEvents(t, fixture.ledgerPath)
@@ -93,6 +96,21 @@ func TestRunnerRalphexFailureRecordsEvidenceWithoutImplementationCompleted(t *te
 		t.Fatalf("Ralphex failure should reference stdout, stderr, and metadata: %#v", terminal.EvidenceRefs)
 	}
 	assertEventEvidence(t, events)
+}
+
+func TestRunnerAppliesGovernedRalphexTimeout(t *testing.T) {
+	fixture := newRunFixtureWithScript(t, "#!/bin/sh\nwhile :; do sleep 60; done\n", authority.WorktreePolicy{}, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	manifest.Ralphex.Timeout = "50ms"
+	governed, err := authority.New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.authority = governed
+	result := fixture.execute(t)
+	if result.State != domain.StateFailed || result.Ralphex.Outcome != supervisor.OutcomeTimedOut {
+		t.Fatalf("timed Ralphex result = %#v", result)
+	}
 }
 
 func TestRunnerRalphexCancellationRecordsCancelledWithoutCompletion(t *testing.T) {
@@ -221,6 +239,25 @@ git worktree remove -f %s || exit 23
 	}
 }
 
+func TestRunnerRejectsNonWorktreeCandidateOutsideGovernedHistory(t *testing.T) {
+	script := `#!/bin/sh
+git switch --orphan unrelated >/dev/null 2>&1 || exit 20
+git rm -rf --cached . >/dev/null 2>&1 || true
+rm -f plan.md
+printf 'unrelated\n' > unrelated.txt
+git add unrelated.txt || exit 22
+git commit -qm 'unrelated root' || exit 23
+`
+	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, commandPath(t, "true"))
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "does not descend from governed start SHA") {
+		t.Fatalf("expected unauthorized-history rejection, got %v", err)
+	}
+	if result.Accepted() || result.State != domain.StateFailed {
+		t.Fatalf("unrelated candidate result = %#v", result)
+	}
+}
+
 func TestRunnerRejectsIdentityChangedAfterValidation(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	if err := os.WriteFile(fixture.authority.Plan().Path, []byte("changed plan\n"), 0o600); err != nil {
@@ -290,12 +327,12 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 		},
 		Plan: authority.PlanManifest{Path: planPath, SHA256: testHash(t, planPath)},
 		Ralphex: authority.RalphexManifest{
-			BinaryPath: binaryPath, BinarySHA256: testHash(t, binaryPath), SourceSHA: "source-test", Mode: ralphex.ModeTasksOnly,
+			BinaryPath: binaryPath, BinarySHA256: testHash(t, binaryPath), SourceSHA: "source-test", Mode: ralphex.ModeTasksOnly, Timeout: "5s", WaitOnLimit: "0s",
 		},
 		Executor: authority.ExecutorPolicy{Executor: "codex", TaskModel: "test-model", TaskEffort: "high"},
 		Worktree: worktree,
 		Acceptance: []authority.AcceptanceCommand{{
-			Name: "deterministic check", Class: "unit", Required: true, Argv: acceptanceArgv,
+			Name: "deterministic check", Class: "unit", Required: true, Timeout: "5s", Argv: acceptanceArgv,
 		}},
 		PolicyVersion: "branch-test-v1",
 	}

@@ -37,7 +37,7 @@ make smoke
 
 ### Task 1: Implement validated immutable run authority
 
-- [x] Add an `internal/authority` package with typed manifest input for run ID, canonical repository path, repository identity/remotes, default branch, start SHA, plan path + SHA256, Ralphex binary path + SHA256, expected Ralphex source SHA metadata, execution mode, executor/model/effort policy, worktree policy, acceptance commands, and policy version.
+- [x] Add an `internal/authority` package with typed manifest input for run ID, canonical repository path, repository identity/remotes, default branch, start SHA, plan path + SHA256, Ralphex binary path + SHA256, expected Ralphex source SHA metadata, execution mode, executor/model/effort policy, timeout/wait-on-limit policy, worktree policy, timed acceptance commands, and policy version.
 - [x] Add validation that rejects missing run ID, repository path, start SHA, plan path/hash, Ralphex binary path/hash, unsupported mode, and empty acceptance argv.
 - [x] Canonicalize repository, plan and Ralphex binary paths before producing validated authority; ensure the plan resolves within the governed repository.
 - [x] Produce a validated immutable/value authority representation only through a constructor/validator; do not expose mutating setters.
