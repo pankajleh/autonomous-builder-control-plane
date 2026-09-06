@@ -105,7 +105,7 @@ Example authority manifest:
   "repository": {
     "path": "/srv/project",
     "identity": "example/project",
-    "remotes": {"origin": "https://example.invalid/project.git"},
+    "remotes": {"origin": "https://example.invalid/example/project.git"},
     "default_branch": "main",
     "start_sha": "0123456789abcdef0123456789abcdef01234567"
   },
@@ -139,15 +139,22 @@ Example authority manifest:
 }
 ```
 
+Repository identity, complete remotes, and the default branch are required;
+the identity must match the repository path encoded by at least one remote.
 Timeouts use Go duration syntax and must be positive; `wait_on_limit` may be
-`0s` to disable retries explicitly. Supported Ralphex modes are `full`,
+`0s` to disable retries explicitly. At least one acceptance command must be
+required. Supported Ralphex modes are `full`,
 `tasks-only`, and `review`. Worktree mode
 requires an explicit new branch name and is unavailable with review mode. The
-controller verifies repository, plan, binary, branch, and remote identities;
-runs acceptance against the actual candidate checkout; and limits each captured
+controller verifies the Git repository root, complete remote set, repository,
+plan, binary, and branch identities; runs acceptance against the actual clean
+candidate checkout with an allowlisted isolated environment; and limits each captured
 stdout/stderr stream to 16 MiB. Success prints `BRANCH_ACCEPTED`. Failures return
 nonzero and preserve the JSONL ledger plus immutable artifacts under
 `<evidence-root>/<run_id>/`.
+
+The ledger path must be outside `<evidence-root>/<run_id>/` so append-only
+events cannot overlap immutable evidence artifacts.
 
 ## Non-goals
 

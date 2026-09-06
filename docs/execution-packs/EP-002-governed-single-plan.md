@@ -64,6 +64,8 @@ A non-zero terminal outcome must not become `IMPLEMENTATION_COMPLETED`.
 ### 5. Deterministic branch acceptance
 
 After Ralphex success, independently execute configured acceptance commands.
+At least one command must be required. Commands run with an allowlisted,
+isolated environment, and the tested checkout must remain clean.
 
 Map:
 

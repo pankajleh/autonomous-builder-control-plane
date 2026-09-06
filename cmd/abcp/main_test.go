@@ -20,6 +20,7 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	gitCommand(t, "", "init", "-b", "main", repository)
 	gitCommand(t, repository, "config", "user.email", "cli@example.test")
 	gitCommand(t, repository, "config", "user.name", "CLI Test")
+	gitCommand(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
 	planPath := filepath.Join(repository, "plan.md")
 	writeCLIFile(t, planPath, []byte("# CLI plan\n"), 0o600)
 	gitCommand(t, repository, "add", "plan.md")
@@ -35,7 +36,7 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	manifest := authority.Manifest{
 		RunID: "cli-run",
 		Repository: authority.RepositoryManifest{
-			Path: repository, DefaultBranch: "main", StartSHA: startSHA,
+			Path: repository, Identity: "example/project", Remotes: map[string]string{"origin": "https://example.test/example/project.git"}, DefaultBranch: "main", StartSHA: startSHA,
 		},
 		Plan:          authority.PlanManifest{Path: planPath, SHA256: cliFileHash(t, planPath)},
 		Ralphex:       authority.RalphexManifest{BinaryPath: binaryPath, BinarySHA256: cliFileHash(t, binaryPath), Mode: ralphex.ModeFull, Timeout: "5s", WaitOnLimit: "0s"},
@@ -80,6 +81,25 @@ func TestRunCommandRequiresEveryExplicitPath(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "--evidence-root") {
 		t.Fatalf("usage does not name required evidence root: %q", stderr.String())
+	}
+}
+
+func TestCanonicalLedgerDestinationRejectsEvidenceOverlap(t *testing.T) {
+	runDir := filepath.Join(t.TempDir(), "evidence", "run-123")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := canonicalLedgerDestination(filepath.Join(runDir, "authority.json"), runDir); err == nil || !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("expected ledger/evidence overlap rejection, got %v", err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "ledger", "events.jsonl")
+	canonical, err := canonicalLedgerDestination(outside, runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical != outside {
+		t.Fatalf("canonical ledger path = %q, want %q", canonical, outside)
 	}
 }
 

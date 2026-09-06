@@ -20,6 +20,9 @@ func TestNewRejectsMissingRequiredFields(t *testing.T) {
 	}{
 		{name: "run ID", field: "run_id", clear: func(m *Manifest) { m.RunID = "" }},
 		{name: "repository path", field: "repository.path", clear: func(m *Manifest) { m.Repository.Path = "" }},
+		{name: "repository identity", field: "repository.identity", clear: func(m *Manifest) { m.Repository.Identity = "" }},
+		{name: "repository remotes", field: "repository.remotes", clear: func(m *Manifest) { m.Repository.Remotes = nil }},
+		{name: "default branch", field: "repository.default_branch", clear: func(m *Manifest) { m.Repository.DefaultBranch = "" }},
 		{name: "start SHA", field: "repository.start_sha", clear: func(m *Manifest) { m.Repository.StartSHA = "" }},
 		{name: "plan path", field: "plan.path", clear: func(m *Manifest) { m.Plan.Path = "" }},
 		{name: "plan hash", field: "plan.sha256", clear: func(m *Manifest) { m.Plan.SHA256 = "" }},
@@ -47,6 +50,24 @@ func TestNewRejectsEmptyAcceptanceArgv(t *testing.T) {
 	_, err := New(manifest)
 	if err == nil || !strings.Contains(err.Error(), "argv") {
 		t.Fatalf("expected empty argv error, got %v", err)
+	}
+}
+
+func TestNewRejectsAcceptancePolicyWithoutRequiredCommand(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Acceptance[0].Required = false
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "required acceptance") {
+		t.Fatalf("expected required acceptance error, got %v", err)
+	}
+}
+
+func TestNewRejectsRepositoryIdentityNotBoundToRemote(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Repository.Identity = "different/project"
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "does not match any governed remote") {
+		t.Fatalf("expected repository identity mismatch, got %v", err)
 	}
 }
 
@@ -158,7 +179,7 @@ func TestNewCanonicalizesPathsAndProducesStableHash(t *testing.T) {
 	firstInput.Plan.Path = filepath.Join("docs", "..", "plan.md")
 	firstInput.Repository.Remotes = map[string]string{
 		"upstream": "https://example.test/upstream.git",
-		"origin":   "https://example.test/origin.git",
+		"origin":   "https://example.test/example/project.git",
 	}
 
 	secondInput := cloneManifest(manifest)
@@ -166,7 +187,7 @@ func TestNewCanonicalizesPathsAndProducesStableHash(t *testing.T) {
 	secondInput.Ralphex.WaitOnLimit = "0"
 	secondInput.Acceptance[0].Timeout = "300s"
 	secondInput.Repository.Remotes = map[string]string{
-		"origin":   "https://example.test/origin.git",
+		"origin":   "https://example.test/example/project.git",
 		"upstream": "https://example.test/upstream.git",
 	}
 
@@ -238,7 +259,7 @@ func fixtureManifest(t *testing.T) Manifest {
 		Repository: RepositoryManifest{
 			Path:          repository,
 			Identity:      "example/project",
-			Remotes:       map[string]string{"origin": "https://example.test/origin.git"},
+			Remotes:       map[string]string{"origin": "https://example.test/example/project.git"},
 			DefaultBranch: "main",
 			StartSHA:      "0123456789abcdef",
 		},

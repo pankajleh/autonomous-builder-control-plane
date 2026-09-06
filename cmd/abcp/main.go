@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
@@ -81,12 +84,17 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "validate authority: %v\n", err)
 		return 1
 	}
-	events, err := ledger.NewJSONLLedger(*ledgerPath)
+	artifacts, err := evidence.NewStore(*evidenceRoot, governed.RunID())
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	artifacts, err := evidence.NewStore(*evidenceRoot, governed.RunID())
+	canonicalLedger, err := canonicalLedgerDestination(*ledgerPath, artifacts.RunDir())
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	events, err := ledger.NewJSONLLedger(canonicalLedger)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -115,6 +123,41 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, result.State)
 	return 0
+}
+
+func canonicalLedgerDestination(path, evidenceRunDir string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve ledger path: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
+		return "", fmt.Errorf("create ledger directory: %w", err)
+	}
+	canonicalParent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return "", fmt.Errorf("canonicalize ledger directory: %w", err)
+	}
+	canonical := filepath.Join(canonicalParent, filepath.Base(absolute))
+	if info, statErr := os.Lstat(absolute); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		canonical, err = filepath.EvalSymlinks(absolute)
+		if err != nil {
+			return "", fmt.Errorf("canonicalize ledger symlink: %w", err)
+		}
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return "", fmt.Errorf("inspect ledger path: %w", statErr)
+	}
+	evidenceRunDir, err = filepath.EvalSymlinks(evidenceRunDir)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize evidence run directory: %w", err)
+	}
+	relative, err := filepath.Rel(evidenceRunDir, canonical)
+	if err != nil {
+		return "", fmt.Errorf("compare ledger and evidence paths: %w", err)
+	}
+	if relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New("ledger path must be outside the run evidence directory")
+	}
+	return canonical, nil
 }
 
 func loadManifest(path string) (authority.Manifest, error) {

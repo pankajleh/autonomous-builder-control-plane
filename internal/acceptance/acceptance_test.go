@@ -25,10 +25,6 @@ import (
 
 func TestExecutorPassesAllRequiredCommandsAndCapturesEvidence(t *testing.T) {
 	repository := newGitRepository(t)
-	dirtyPath := filepath.Join(repository, "untracked.txt")
-	if err := os.WriteFile(dirtyPath, []byte("dirty\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 
 	commands := []authority.AcceptanceCommand{
 		{
@@ -65,7 +61,7 @@ func TestExecutorPassesAllRequiredCommandsAndCapturesEvidence(t *testing.T) {
 	}
 	for index, record := range records {
 		if record.Index != index+1 || record.Name != commands[index].Name || record.Class != commands[index].Class ||
-			!record.Required || record.PolicyVersion != "acceptance-policy-v1" {
+			!record.Required || record.PolicyVersion != "acceptance-policy-v1" || record.EnvironmentPolicy != acceptance.EnvironmentPolicy {
 			t.Fatalf("command %d metadata = %#v", index+1, record)
 		}
 		if record.Process.Outcome != supervisor.OutcomeSucceeded || record.Process.ExitCode != 0 {
@@ -91,8 +87,8 @@ func TestExecutorPassesAllRequiredCommandsAndCapturesEvidence(t *testing.T) {
 	if gitEvidence.Branch != target.Branch {
 		t.Fatalf("final branch = %q, want %q", gitEvidence.Branch, target.Branch)
 	}
-	if !gitEvidence.Dirty {
-		t.Fatal("final Git status did not record the untracked file")
+	if gitEvidence.Dirty {
+		t.Fatal("final Git status unexpectedly recorded a dirty checkout")
 	}
 	if !reflect.DeepEqual(gitEvidence.HeadProcess.Argv, []string{"git", "rev-parse", "--verify", "HEAD"}) {
 		t.Fatalf("HEAD argv = %#v", gitEvidence.HeadProcess.Argv)
@@ -104,8 +100,52 @@ func TestExecutorPassesAllRequiredCommandsAndCapturesEvidence(t *testing.T) {
 		t.Fatalf("branch argv = %#v", gitEvidence.BranchProcess.Argv)
 	}
 	assertEvidenceContains(t, gitEvidence.HeadProcess.StdoutRef.URI, gitEvidence.HeadSHA+"\n")
-	assertEvidenceContains(t, gitEvidence.StatusProcess.StdoutRef.URI, "?? untracked.txt\n")
-	assertMetadata(t, gitEvidence.MetadataRef.URI, "\"dirty\":true", "acceptance-policy-v1")
+	assertEvidenceContains(t, gitEvidence.StatusProcess.StdoutRef.URI, "")
+	assertMetadata(t, gitEvidence.MetadataRef.URI, "\"dirty\":false", "acceptance-policy-v1")
+}
+
+func TestExecutorRejectsDirtyCheckoutAfterCommands(t *testing.T) {
+	repository := newGitRepository(t)
+	commands := []authority.AcceptanceCommand{{
+		Name: "mutating check", Required: true, Timeout: "5s", Argv: helperArgv("write", "plan.md"),
+	}}
+	governed := newAuthority(t, repository, commands)
+	store := newEvidenceStore(t)
+
+	result, err := acceptance.New(supervisor.New(), store).Run(context.Background(), governed, acceptanceTarget(t, repository))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status() != acceptance.StatusFail || result.Passed() || !strings.Contains(result.FailureReason(), "dirty") {
+		t.Fatalf("dirty acceptance result = %s, passed=%t, reason=%q", result.Status(), result.Passed(), result.FailureReason())
+	}
+	gitEvidence, ok := result.FinalGit()
+	if !ok || !gitEvidence.Dirty {
+		t.Fatalf("dirty final Git evidence = %#v, captured=%t", gitEvidence, ok)
+	}
+}
+
+func TestExecutorUsesAllowlistedIsolatedEnvironment(t *testing.T) {
+	repository := newGitRepository(t)
+	t.Setenv("ABCP_TEST_SECRET", "must-not-reach-acceptance")
+	commands := []authority.AcceptanceCommand{{
+		Name: "environment check", Required: true, Timeout: "5s", Argv: helperArgv("environment"),
+	}}
+	governed := newAuthority(t, repository, commands)
+	store := newEvidenceStore(t)
+
+	result, err := acceptance.New(supervisor.New(), store).Run(context.Background(), governed, acceptanceTarget(t, repository))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Passed() {
+		t.Fatalf("isolated environment check failed: %s", result.FailureReason())
+	}
+	record := result.Commands()[0]
+	if record.EnvironmentPolicy != acceptance.EnvironmentPolicy {
+		t.Fatalf("environment policy = %q, want %q", record.EnvironmentPolicy, acceptance.EnvironmentPolicy)
+	}
+	assertMetadata(t, record.MetadataRef.URI, acceptance.EnvironmentPolicy)
 }
 
 func TestExecutorRejectsCandidateBranchMovedAwayFromTestedCommit(t *testing.T) {
@@ -290,9 +330,6 @@ func (w failingArtifactWriter) WriteBytes(name, kind string, data []byte) (ledge
 }
 
 func TestAcceptanceHelperProcess(t *testing.T) {
-	if os.Getenv("GO_WANT_ACCEPTANCE_HELPER") != "1" {
-		return
-	}
 	separator := -1
 	for index, argument := range os.Args {
 		if argument == "--" {
@@ -300,7 +337,10 @@ func TestAcceptanceHelperProcess(t *testing.T) {
 			break
 		}
 	}
-	if separator < 0 || separator+1 >= len(os.Args) {
+	if separator < 0 {
+		return
+	}
+	if separator+1 >= len(os.Args) {
 		os.Exit(90)
 	}
 
@@ -329,6 +369,19 @@ func TestAcceptanceHelperProcess(t *testing.T) {
 		for {
 			time.Sleep(time.Hour)
 		}
+	case "write":
+		if separator+2 >= len(os.Args) {
+			os.Exit(95)
+		}
+		if err := os.WriteFile(os.Args[separator+2], []byte("modified by acceptance\n"), 0o600); err != nil {
+			os.Exit(96)
+		}
+		os.Exit(0)
+	case "environment":
+		if os.Getenv("ABCP_TEST_SECRET") != "" || os.Getenv("HOME") == "" || os.Getenv("GOCACHE") == "" {
+			os.Exit(97)
+		}
+		os.Exit(0)
 	default:
 		os.Exit(94)
 	}
@@ -347,6 +400,7 @@ func newGitRepository(t *testing.T) string {
 		t.Fatal(err)
 	}
 	runGit(t, repository, "init", "-q")
+	runGit(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
 	runGit(t, repository, "add", "plan.md")
 	command := exec.Command("git", "-c", "user.name=Acceptance Test", "-c", "user.email=acceptance@example.invalid", "commit", "-qm", "initial")
 	command.Dir = repository
@@ -362,8 +416,11 @@ func newAuthority(t *testing.T, repository string, commands []authority.Acceptan
 	governed, err := authority.New(authority.Manifest{
 		RunID: "acceptance-test",
 		Repository: authority.RepositoryManifest{
-			Path:     repository,
-			StartSHA: gitOutput(t, repository, "rev-parse", "HEAD"),
+			Path:          repository,
+			Identity:      "example/project",
+			Remotes:       map[string]string{"origin": "https://example.test/example/project.git"},
+			DefaultBranch: gitOutput(t, repository, "symbolic-ref", "--quiet", "--short", "HEAD"),
+			StartSHA:      gitOutput(t, repository, "rev-parse", "HEAD"),
 		},
 		Plan: authority.PlanManifest{
 			Path:   planPath,

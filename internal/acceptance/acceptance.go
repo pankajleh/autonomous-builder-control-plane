@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -26,6 +27,10 @@ const (
 	StatusPass        Status = "PASS"
 	StatusFail        Status = "FAIL"
 	StatusUnavailable Status = "UNAVAILABLE"
+
+	// EnvironmentPolicy identifies the fixed allowlist and isolated directories
+	// used for controller-owned acceptance commands.
+	EnvironmentPolicy = "acceptance-env-v1"
 )
 
 // CommandRunner is the structured subprocess operation used by the executor.
@@ -38,13 +43,14 @@ type CommandRunner interface {
 // metadata. Process contains the exact argv, cwd, timestamps, exit/signal
 // semantics, and stdout/stderr evidence references.
 type CommandResult struct {
-	Index         int
-	Name          string
-	Class         string
-	Required      bool
-	PolicyVersion string
-	Process       supervisor.Result
-	MetadataRef   ledger.EvidenceRef
+	Index             int
+	Name              string
+	Class             string
+	Required          bool
+	PolicyVersion     string
+	EnvironmentPolicy string
+	Process           supervisor.Result
+	MetadataRef       ledger.EvidenceRef
 }
 
 // GitEvidence is the controller-captured final repository state. All Git
@@ -81,7 +87,7 @@ func (r Result) Status() Status {
 // Passed reports whether every required command passed and complete final Git
 // evidence was captured.
 func (r Result) Passed() bool {
-	if r.status != StatusPass || !r.gitCaptured || r.git.HeadSHA == "" || !validEvidenceRef(r.git.MetadataRef) {
+	if r.status != StatusPass || !r.gitCaptured || r.git.HeadSHA == "" || r.git.Dirty || !validEvidenceRef(r.git.MetadataRef) {
 		return false
 	}
 	if r.git.HeadProcess.Outcome != supervisor.OutcomeSucceeded || r.git.StatusProcess.Outcome != supervisor.OutcomeSucceeded ||
@@ -92,6 +98,7 @@ func (r Result) Passed() bool {
 		!completeProcessEvidence(r.git.BranchProcess) {
 		return false
 	}
+	requiredPassed := false
 	for _, command := range r.commands {
 		if !validEvidenceRef(command.MetadataRef) || !completeProcessEvidence(command.Process) {
 			return false
@@ -99,8 +106,9 @@ func (r Result) Passed() bool {
 		if command.Required && command.Process.Outcome != supervisor.OutcomeSucceeded {
 			return false
 		}
+		requiredPassed = requiredPassed || command.Required
 	}
-	return true
+	return requiredPassed
 }
 
 // Commands returns a copy of the configured command records.
@@ -181,16 +189,22 @@ func (e *Executor) Run(ctx context.Context, governed authority.Authority, target
 	if repository == "" || target.Branch == "" || target.HeadSHA == "" || len(commands) == 0 {
 		return result, errors.New("validated authority with candidate repository, branch, HEAD, and acceptance commands is required")
 	}
+	environment, cleanupEnvironment, err := acceptanceEnvironment()
+	if err != nil {
+		return result, err
+	}
+	defer cleanupEnvironment()
 
 	for index, configured := range commands {
-		process, err := e.runCommand(ctx, repository, index, configured)
+		process, err := e.runCommand(ctx, repository, environment, index, configured)
 		record := CommandResult{
-			Index:         index + 1,
-			Name:          configured.Name,
-			Class:         configured.Class,
-			Required:      configured.Required,
-			PolicyVersion: governed.PolicyVersion(),
-			Process:       process,
+			Index:             index + 1,
+			Name:              configured.Name,
+			Class:             configured.Class,
+			Required:          configured.Required,
+			PolicyVersion:     governed.PolicyVersion(),
+			EnvironmentPolicy: EnvironmentPolicy,
+			Process:           process,
 		}
 		result.commands = append(result.commands, record)
 		if err != nil {
@@ -220,6 +234,11 @@ func (e *Executor) Run(ctx context.Context, governed authority.Authority, target
 	}
 	result.git = gitEvidence
 	result.gitCaptured = true
+	if gitEvidence.Dirty {
+		result.status = StatusFail
+		result.failureReason = "candidate checkout is dirty after acceptance"
+		return result, nil
+	}
 	result.status = StatusPass
 	if !result.Passed() {
 		result.status = StatusUnavailable
@@ -229,7 +248,7 @@ func (e *Executor) Run(ctx context.Context, governed authority.Authority, target
 	return result, nil
 }
 
-func (e *Executor) runCommand(ctx context.Context, repository string, index int, configured authority.AcceptanceCommand) (supervisor.Result, error) {
+func (e *Executor) runCommand(ctx context.Context, repository string, environment []string, index int, configured authority.AcceptanceCommand) (supervisor.Result, error) {
 	prefix := fmt.Sprintf("acceptance-command-%03d", index+1)
 	timeout, err := time.ParseDuration(configured.Timeout)
 	if err != nil {
@@ -238,6 +257,7 @@ func (e *Executor) runCommand(ctx context.Context, repository string, index int,
 	return e.runner.Run(ctx, supervisor.Command{
 		Argv:    append([]string(nil), configured.Argv...),
 		Cwd:     repository,
+		Env:     append([]string(nil), environment...),
 		Timeout: timeout,
 		Stdout: supervisor.EvidenceSink{
 			Writer: e.artifacts,
@@ -254,21 +274,23 @@ func (e *Executor) runCommand(ctx context.Context, repository string, index int,
 
 func (e *Executor) writeCommandMetadata(record CommandResult) (ledger.EvidenceRef, error) {
 	data, err := json.Marshal(struct {
-		Index         int                  `json:"index"`
-		Name          string               `json:"name,omitempty"`
-		Class         string               `json:"class,omitempty"`
-		Required      bool                 `json:"required"`
-		PolicyVersion string               `json:"policy_version"`
-		Process       supervisor.Result    `json:"process"`
-		EvidenceRefs  []ledger.EvidenceRef `json:"evidence_refs"`
+		Index             int                  `json:"index"`
+		Name              string               `json:"name,omitempty"`
+		Class             string               `json:"class,omitempty"`
+		Required          bool                 `json:"required"`
+		PolicyVersion     string               `json:"policy_version"`
+		EnvironmentPolicy string               `json:"environment_policy"`
+		Process           supervisor.Result    `json:"process"`
+		EvidenceRefs      []ledger.EvidenceRef `json:"evidence_refs"`
 	}{
-		Index:         record.Index,
-		Name:          record.Name,
-		Class:         record.Class,
-		Required:      record.Required,
-		PolicyVersion: record.PolicyVersion,
-		Process:       record.Process,
-		EvidenceRefs:  []ledger.EvidenceRef{record.Process.StdoutRef, record.Process.StderrRef},
+		Index:             record.Index,
+		Name:              record.Name,
+		Class:             record.Class,
+		Required:          record.Required,
+		PolicyVersion:     record.PolicyVersion,
+		EnvironmentPolicy: record.EnvironmentPolicy,
+		Process:           record.Process,
+		EvidenceRefs:      []ledger.EvidenceRef{record.Process.StdoutRef, record.Process.StderrRef},
 	})
 	if err != nil {
 		return ledger.EvidenceRef{}, fmt.Errorf("marshal acceptance command metadata: %w", err)
@@ -279,6 +301,37 @@ func (e *Executor) writeCommandMetadata(record CommandResult) (ledger.EvidenceRe
 		return ledger.EvidenceRef{}, fmt.Errorf("publish acceptance command metadata: %w", err)
 	}
 	return ref, nil
+}
+
+func acceptanceEnvironment() ([]string, func(), error) {
+	root, err := os.MkdirTemp("", "abcp-acceptance-env-")
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("create isolated acceptance environment: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(root) }
+	directories := map[string]string{
+		"HOME":            filepath.Join(root, "home"),
+		"TMPDIR":          filepath.Join(root, "tmp"),
+		"XDG_CACHE_HOME":  filepath.Join(root, "cache"),
+		"XDG_CONFIG_HOME": filepath.Join(root, "config"),
+		"GOCACHE":         filepath.Join(root, "go-build"),
+	}
+	for _, directory := range directories {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			cleanup()
+			return nil, func() {}, fmt.Errorf("create isolated acceptance environment: %w", err)
+		}
+	}
+	environment := make([]string, 0, len(directories)+6)
+	for _, key := range []string{"HOME", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "GOCACHE"} {
+		environment = append(environment, key+"="+directories[key])
+	}
+	for _, key := range []string{"PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
+		if value, ok := os.LookupEnv(key); ok {
+			environment = append(environment, key+"="+value)
+		}
+	}
+	return environment, cleanup, nil
 }
 
 func (e *Executor) captureGit(ctx context.Context, repository, branch, expectedHeadSHA, policyVersion string) (GitEvidence, error) {

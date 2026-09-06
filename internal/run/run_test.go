@@ -275,6 +275,63 @@ func TestRunnerRejectsIdentityChangedAfterValidation(t *testing.T) {
 	}
 }
 
+func TestRunnerCancellationDuringIdentityValidationRecordsCancelled(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := fixture.runner(t).Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.StateCancelled {
+		t.Fatalf("identity-validation cancellation state = %s, want CANCELLED", result.State)
+	}
+	want := []domain.State{domain.StateRunCreated, domain.StateCancelled}
+	if states := eventStates(readEvents(t, fixture.ledgerPath)); !reflect.DeepEqual(states, want) {
+		t.Fatalf("identity-validation cancellation states = %#v, want %#v", states, want)
+	}
+}
+
+func TestRunnerRejectsRepositorySubdirectoryAsGovernedRoot(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	subdirectory := filepath.Join(manifest.Repository.Path, "subdirectory")
+	if err := os.Mkdir(subdirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(subdirectory, "plan.md")
+	if err := os.Rename(manifest.Plan.Path, planPath); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Repository.Path = subdirectory
+	manifest.Plan.Path = planPath
+	manifest.Plan.SHA256 = testHash(t, planPath)
+	governed, err := authority.New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.authority = governed
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not Git repository root") {
+		t.Fatalf("expected repository-root rejection, got %v", err)
+	}
+	if result.State != domain.StateFailed {
+		t.Fatalf("subdirectory repository state = %s, want FAILED", result.State)
+	}
+}
+
+func TestRunnerRejectsAdditionalUnpinnedRemote(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	runGit(t, fixture.authority.Repository().Path, "remote", "add", "unexpected", "https://example.test/unexpected.git")
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "remote set") {
+		t.Fatalf("expected complete remote-set rejection, got %v", err)
+	}
+	if result.State != domain.StateFailed {
+		t.Fatalf("additional-remote state = %s, want FAILED", result.State)
+	}
+}
+
 func TestEP002StateCapExcludesIntegrationAndCompletion(t *testing.T) {
 	for _, state := range []domain.State{
 		domain.StateIntegrationPending,
@@ -306,7 +363,7 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 	runGit(t, "", "init", "-b", "main", repository)
 	runGit(t, repository, "config", "user.email", "controller@example.test")
 	runGit(t, repository, "config", "user.name", "Controller Test")
-	runGit(t, repository, "remote", "add", "origin", "https://example.test/project.git")
+	runGit(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
 	planPath := filepath.Join(repository, "plan.md")
 	writeTestFile(t, planPath, []byte("# governed plan\n"), 0o600)
 	runGit(t, repository, "add", "plan.md")
@@ -321,7 +378,7 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 		Repository: authority.RepositoryManifest{
 			Path:          repository,
 			Identity:      "example/project",
-			Remotes:       map[string]string{"origin": "https://example.test/project.git"},
+			Remotes:       map[string]string{"origin": "https://example.test/example/project.git"},
 			DefaultBranch: "main",
 			StartSHA:      startSHA,
 		},
@@ -349,9 +406,6 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 }
 
 func TestRunnerWaitHelper(t *testing.T) {
-	if os.Getenv("GO_WANT_RUN_WAIT_HELPER") != "1" {
-		return
-	}
 	separator := -1
 	for index, argument := range os.Args {
 		if argument == "--" {
@@ -359,7 +413,10 @@ func TestRunnerWaitHelper(t *testing.T) {
 			break
 		}
 	}
-	if separator < 0 || separator+1 >= len(os.Args) {
+	if separator < 0 {
+		return
+	}
+	if separator+1 >= len(os.Args) {
 		os.Exit(90)
 	}
 	if err := os.WriteFile(os.Args[separator+1], []byte("ready"), 0o600); err != nil {

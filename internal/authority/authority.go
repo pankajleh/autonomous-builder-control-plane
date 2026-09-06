@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -208,6 +209,15 @@ func validateRequired(manifest Manifest) error {
 	if manifest.Repository.Path == "" {
 		missing = append(missing, "repository.path")
 	}
+	if manifest.Repository.Identity == "" {
+		missing = append(missing, "repository.identity")
+	}
+	if len(manifest.Repository.Remotes) == 0 {
+		missing = append(missing, "repository.remotes")
+	}
+	if manifest.Repository.DefaultBranch == "" {
+		missing = append(missing, "repository.default_branch")
+	}
 	if manifest.Repository.StartSHA == "" {
 		missing = append(missing, "repository.start_sha")
 	}
@@ -259,7 +269,9 @@ func validateRequired(manifest Manifest) error {
 	if len(manifest.Acceptance) == 0 {
 		return errors.New("at least one acceptance command is required")
 	}
+	hasRequiredAcceptance := false
 	for index, command := range manifest.Acceptance {
+		hasRequiredAcceptance = hasRequiredAcceptance || command.Required
 		if command.Timeout == "" {
 			return fmt.Errorf("acceptance command %d timeout is required", index)
 		}
@@ -275,7 +287,41 @@ func validateRequired(manifest Manifest) error {
 			}
 		}
 	}
+	if !hasRequiredAcceptance {
+		return errors.New("at least one required acceptance command is required")
+	}
+	if manifest.Repository.Identity != strings.TrimSpace(manifest.Repository.Identity) {
+		return errors.New("repository.identity must not contain surrounding whitespace")
+	}
+	if manifest.Repository.DefaultBranch != strings.TrimSpace(manifest.Repository.DefaultBranch) {
+		return errors.New("repository.default_branch must not contain surrounding whitespace")
+	}
+	identityMatched := false
+	for name, remoteURL := range manifest.Repository.Remotes {
+		if name == "" || name != strings.TrimSpace(name) || strings.ContainsAny(name, "\r\n") {
+			return errors.New("repository remote names must be non-empty and contain no surrounding whitespace or newlines")
+		}
+		if remoteURL == "" || remoteURL != strings.TrimSpace(remoteURL) || strings.ContainsAny(remoteURL, "\r\n") {
+			return fmt.Errorf("repository remote %q URL must be non-empty and contain no surrounding whitespace or newlines", name)
+		}
+		identityMatched = identityMatched || remoteIdentity(remoteURL) == manifest.Repository.Identity
+	}
+	if !identityMatched {
+		return fmt.Errorf("repository.identity %q does not match any governed remote URL", manifest.Repository.Identity)
+	}
 	return nil
+}
+
+func remoteIdentity(remoteURL string) string {
+	path := remoteURL
+	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Scheme != "" {
+		path = parsed.Path
+	} else if colon := strings.IndexByte(remoteURL, ':'); colon >= 0 && !strings.Contains(remoteURL[:colon], "/") {
+		// Git's SCP-like syntax, for example git@example.test:owner/repository.git.
+		path = remoteURL[colon+1:]
+	}
+	path = strings.Trim(strings.ReplaceAll(path, "\\", "/"), "/")
+	return strings.TrimSuffix(path, ".git")
 }
 
 func validateDuration(field, value string, allowZero bool) error {

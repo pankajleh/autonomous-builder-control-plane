@@ -39,6 +39,7 @@ make smoke
 
 - [x] Add an `internal/authority` package with typed manifest input for run ID, canonical repository path, repository identity/remotes, default branch, start SHA, plan path + SHA256, Ralphex binary path + SHA256, expected Ralphex source SHA metadata, execution mode, executor/model/effort policy, timeout/wait-on-limit policy, worktree policy, timed acceptance commands, and policy version.
 - [x] Add validation that rejects missing run ID, repository path, start SHA, plan path/hash, Ralphex binary path/hash, unsupported mode, and empty acceptance argv.
+- [x] Require repository identity, complete remotes, default branch, and at least one required acceptance command; verify the canonical Git root and exact remote set before execution.
 - [x] Canonicalize repository, plan and Ralphex binary paths before producing validated authority; ensure the plan resolves within the governed repository.
 - [x] Produce a validated immutable/value authority representation only through a constructor/validator; do not expose mutating setters.
 - [x] Add deterministic canonical serialization and SHA256 authority hash; same semantic manifest must hash identically.
@@ -71,6 +72,7 @@ make smoke
 - [x] Stop and fail acceptance on the first required command failure; never claim branch acceptance from Ralphex narration or dashboard state.
 - [x] Record final Git `HEAD` SHA and clean/dirty status through structured Git argv execution, not shell parsing.
 - [x] Define an acceptance result that can only be PASS when all required commands pass and final Git evidence is captured.
+- [x] Run acceptance with an allowlisted isolated environment and reject a checkout left dirty by validation commands.
 - [x] Add tests showing all-pass, first-failure stop, evidence capture, and no transition to `BRANCH_ACCEPTED` on failure.
 - [x] Run the validation baseline, mark Task 4 complete, and commit.
 
@@ -83,6 +85,7 @@ make smoke
 - [x] Run controller acceptance after Ralphex success; emit `BRANCH_ACCEPTED` only when acceptance PASS evidence exists.
 - [x] Ensure EP-002 cannot transition to `INTEGRATION_PENDING`, `READY_FOR_MERGE`, `MERGED` or `COMPLETED` from this runner.
 - [x] Add CLI command `abcp run --manifest <path> --ledger <path> --evidence-root <path>` (or an equally explicit structured interface) that loads the manifest, validates authority and runs the governed lifecycle without hidden defaults for repository/plan/Ralphex identity.
+- [x] Reject ledger destinations that overlap the run evidence namespace.
 - [x] Add end-to-end deterministic tests with a disposable Git repository and fake Ralphex executable proving success to `BRANCH_ACCEPTED`, Ralphex failure, acceptance failure, and preserved evidence/event ordering.
 - [x] Run the validation baseline, mark Task 5 complete, and commit.
 

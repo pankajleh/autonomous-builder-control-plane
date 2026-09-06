@@ -107,6 +107,9 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 
 	validation, err := validatePinnedIdentity(ctx, r.governed)
 	if err != nil {
+		if ctx.Err() != nil {
+			return r.cancel(result, domain.StateRunCreated, "authority-validator", err, []ledger.EvidenceRef{authorityRef})
+		}
 		result.State = domain.StateFailed
 		result.FailureReason = err.Error()
 		if appendErr := r.transition(domain.StateRunCreated, domain.StateFailed, "authority-validator", map[string]any{"reason": err.Error()}, []ledger.EvidenceRef{authorityRef}); appendErr != nil {
@@ -192,6 +195,9 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	result.State = domain.StateImplementationCompleted
 	target, cleanup, err := r.prepareAcceptanceTarget(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return r.cancel(result, domain.StateImplementationCompleted, "acceptance-controller", err, implementationRefs)
+		}
 		return r.fail(result, domain.StateImplementationCompleted, "acceptance-controller", err, implementationRefs)
 	}
 	candidateRef, err := r.writeJSON("candidate-branch.json", "candidate-branch", target)
@@ -318,6 +324,15 @@ func (r *Runner) fail(result Result, from domain.State, source string, cause err
 	return result, cause
 }
 
+func (r *Runner) cancel(result Result, from domain.State, source string, cause error, refs []ledger.EvidenceRef) (Result, error) {
+	result.State = domain.StateCancelled
+	result.FailureReason = cause.Error()
+	if err := r.transition(from, domain.StateCancelled, source, map[string]any{"reason": cause.Error()}, refs); err != nil {
+		return result, errors.Join(cause, err)
+	}
+	return result, nil
+}
+
 func (r *Runner) writeJSON(name, kind string, value any) (ledger.EvidenceRef, error) {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -354,7 +369,6 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	binary := governed.Ralphex()
 	validation := identityValidation{
 		RepositoryPath:  repository.Path,
-		RepositoryID:    repository.Identity,
 		Remotes:         make(map[string]string),
 		AuthoritySHA256: governed.SHA256(),
 	}
@@ -373,6 +387,17 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	}
 	if validation.BinarySHA256 != binary.BinarySHA256 {
 		return validation, errors.New("Ralphex binary SHA256 changed after authority validation")
+	}
+	repositoryRoot, err := gitOutput(ctx, repository.Path, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return validation, fmt.Errorf("resolve repository root: %w", err)
+	}
+	repositoryRoot, err = filepath.EvalSymlinks(repositoryRoot)
+	if err != nil {
+		return validation, fmt.Errorf("canonicalize repository root: %w", err)
+	}
+	if filepath.Clean(repositoryRoot) != repository.Path {
+		return validation, fmt.Errorf("governed repository path %q is not Git repository root %q", repository.Path, repositoryRoot)
 	}
 	if governed.Worktree().Enabled {
 		branch := governed.Worktree().Branch
@@ -411,6 +436,23 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	actualNamesOutput, err := gitOutput(ctx, repository.Path, "remote")
+	if err != nil {
+		return validation, fmt.Errorf("enumerate repository remotes: %w", err)
+	}
+	var actualNames []string
+	if actualNamesOutput != "" {
+		actualNames = strings.Split(actualNamesOutput, "\n")
+	}
+	sort.Strings(actualNames)
+	if len(actualNames) != len(names) {
+		return validation, fmt.Errorf("repository remote set does not match governed remotes")
+	}
+	for index := range names {
+		if actualNames[index] != names[index] {
+			return validation, fmt.Errorf("repository remote set does not match governed remotes")
+		}
+	}
 	for _, name := range names {
 		actual, remoteErr := gitOutput(ctx, repository.Path, "remote", "get-url", "--all", name)
 		if remoteErr != nil {
@@ -421,6 +463,7 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 		}
 		validation.Remotes[name] = actual
 	}
+	validation.RepositoryID = repository.Identity
 	return validation, nil
 }
 
