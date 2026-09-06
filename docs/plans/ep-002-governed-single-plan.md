@@ -37,13 +37,13 @@ make smoke
 
 ### Task 1: Implement validated immutable run authority
 
-- [ ] Add an `internal/authority` package with typed manifest input for run ID, canonical repository path, repository identity/remotes, default branch, start SHA, plan path + SHA256, Ralphex binary path + SHA256, expected Ralphex source SHA metadata, execution mode, executor/model/effort policy, worktree policy, acceptance commands, and policy version.
-- [ ] Add validation that rejects missing run ID, repository path, start SHA, plan path/hash, Ralphex binary path/hash, unsupported mode, and empty acceptance argv.
-- [ ] Canonicalize repository, plan and Ralphex binary paths before producing validated authority; ensure the plan resolves within the governed repository.
-- [ ] Produce a validated immutable/value authority representation only through a constructor/validator; do not expose mutating setters.
-- [ ] Add deterministic canonical serialization and SHA256 authority hash; same semantic manifest must hash identically.
-- [ ] Add unit tests for required-field rejection, path-boundary rejection, supported modes, and stable hashing.
-- [ ] Run the validation baseline, mark Task 1 complete, and commit.
+- [x] Add an `internal/authority` package with typed manifest input for run ID, canonical repository path, repository identity/remotes, default branch, start SHA, plan path + SHA256, Ralphex binary path + SHA256, expected Ralphex source SHA metadata, execution mode, executor/model/effort policy, worktree policy, acceptance commands, and policy version.
+- [x] Add validation that rejects missing run ID, repository path, start SHA, plan path/hash, Ralphex binary path/hash, unsupported mode, and empty acceptance argv.
+- [x] Canonicalize repository, plan and Ralphex binary paths before producing validated authority; ensure the plan resolves within the governed repository.
+- [x] Produce a validated immutable/value authority representation only through a constructor/validator; do not expose mutating setters.
+- [x] Add deterministic canonical serialization and SHA256 authority hash; same semantic manifest must hash identically.
+- [x] Add unit tests for required-field rejection, path-boundary rejection, supported modes, and stable hashing.
+- [x] Run the validation baseline, mark Task 1 complete, and commit.
 
 ### Task 2: Implement immutable evidence artifact store
 
