@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06  
 **Repository:** `autonomous-builder-control-plane`  
-**Phase:** EP-002 implementation kickoff
+**Phase:** EP-002 code review and live acceptance
 
 ## Completed
 
@@ -13,6 +13,8 @@
 - Append-only JSONL event ledger implemented.
 - Ralphex command-construction contract implemented.
 - EP-001 foundation tests and smoke checks pass with Go standard library only.
+- EP-002 authority, evidence, process supervision, candidate-branch discovery,
+  independent acceptance, and governed CLI implementation are code-complete.
 
 ## Foundation evidence
 
@@ -34,7 +36,7 @@ abcp validate-transition IMPLEMENTATION_COMPLETED READY_FOR_MERGE
 → rejected
 ```
 
-## Active implementation
+## Active verification
 
 `EP-002 — Governed Single-Plan Execution`
 
@@ -42,12 +44,16 @@ Ralphex execution plan:
 
 `docs/plans/ep-002-governed-single-plan.md`
 
-EP-002 adds:
+EP-002 now provides:
 
 - validated immutable run authority manifest;
 - immutable evidence artifact store;
 - supervised Ralphex subprocess execution;
 - deterministic controller-owned branch acceptance;
 - governed single-plan runner and CLI.
+
+Code-review fixes and the deterministic fake-Ralphex suite pass locally. One
+real pinned Ralphex plan must still run on the Ubuntu behavior-lab host before
+live acceptance is complete.
 
 EP-002 explicitly does **not** add recovery, multi-plan scheduling, integration/merge authority, GitHub lifecycle automation, or production completion.

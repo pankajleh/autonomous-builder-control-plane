@@ -16,7 +16,8 @@ A governed invocation includes:
 - mode;
 - executor (`codex` or default Claude);
 - worktree flag;
-- config directory;
+- explicit candidate branch override for worktree runs;
+- controller-owned isolated config directory;
 - task/review model + effort policy;
 - timeout;
 - `wait_on_limit` policy;
@@ -25,6 +26,8 @@ A governed invocation includes:
 ## 3. Command construction
 
 Arguments are built as structured `[]string`. Never concatenate user-controlled plan paths into a shell command string.
+Governed runs reject repository-local `.ralphex` configuration so it cannot
+override authority after the isolated directory is selected.
 
 Examples:
 

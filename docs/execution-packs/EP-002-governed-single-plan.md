@@ -1,6 +1,6 @@
 # EP-002 — Governed Single-Plan Execution
 
-**Status:** Ready after EP-001 review  
+**Status:** Implementation complete; code review and live pinned-Ralphex acceptance pending
 **Goal:** Launch one real Ralphex plan under control-plane authority and independently accept/reject its branch.
 
 ## Scope
@@ -18,9 +18,10 @@ Introduce a typed manifest containing:
 - Ralphex binary path + SHA256
 - expected Ralphex source SHA metadata
 - mode
+- Ralphex process timeout and rate-limit wait policy
 - executor/model/effort policy
-- worktree policy
-- acceptance commands
+- worktree policy with an explicit candidate branch when enabled
+- acceptance commands with explicit timeouts
 - policy version
 
 The manifest becomes immutable after authority validation.
@@ -63,6 +64,10 @@ A non-zero terminal outcome must not become `IMPLEMENTATION_COMPLETED`.
 ### 5. Deterministic branch acceptance
 
 After Ralphex success, independently execute configured acceptance commands.
+At least one command must be required. Commands run with an allowlisted,
+isolated environment, and the tested checkout must remain clean. Full and
+tasks-only runs must produce a candidate commit beyond the governed start SHA;
+review-only runs may validate the existing commit.
 
 Map:
 

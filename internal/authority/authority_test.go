@@ -1,0 +1,372 @@
+package authority
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
+)
+
+func TestNewRejectsMissingRequiredFields(t *testing.T) {
+	valid := fixtureManifest(t)
+	tests := []struct {
+		name  string
+		field string
+		clear func(*Manifest)
+	}{
+		{name: "run ID", field: "run_id", clear: func(m *Manifest) { m.RunID = "" }},
+		{name: "repository path", field: "repository.path", clear: func(m *Manifest) { m.Repository.Path = "" }},
+		{name: "repository identity", field: "repository.identity", clear: func(m *Manifest) { m.Repository.Identity = "" }},
+		{name: "repository remotes", field: "repository.remotes", clear: func(m *Manifest) { m.Repository.Remotes = nil }},
+		{name: "default branch", field: "repository.default_branch", clear: func(m *Manifest) { m.Repository.DefaultBranch = "" }},
+		{name: "start SHA", field: "repository.start_sha", clear: func(m *Manifest) { m.Repository.StartSHA = "" }},
+		{name: "plan path", field: "plan.path", clear: func(m *Manifest) { m.Plan.Path = "" }},
+		{name: "plan hash", field: "plan.sha256", clear: func(m *Manifest) { m.Plan.SHA256 = "" }},
+		{name: "binary path", field: "ralphex.binary_path", clear: func(m *Manifest) { m.Ralphex.BinaryPath = "" }},
+		{name: "binary hash", field: "ralphex.binary_sha256", clear: func(m *Manifest) { m.Ralphex.BinarySHA256 = "" }},
+		{name: "Ralphex timeout", field: "ralphex.timeout", clear: func(m *Manifest) { m.Ralphex.Timeout = "" }},
+		{name: "wait on limit", field: "ralphex.wait_on_limit", clear: func(m *Manifest) { m.Ralphex.WaitOnLimit = "" }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := cloneManifest(valid)
+			test.clear(&manifest)
+			_, err := New(manifest)
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("expected error naming %s, got %v", test.field, err)
+			}
+		})
+	}
+}
+
+func TestNewRejectsEmptyAcceptanceArgv(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Acceptance[0].Argv = nil
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "argv") {
+		t.Fatalf("expected empty argv error, got %v", err)
+	}
+}
+
+func TestNewRejectsAcceptancePolicyWithoutRequiredCommand(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Acceptance[0].Required = false
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "required acceptance") {
+		t.Fatalf("expected required acceptance error, got %v", err)
+	}
+}
+
+func TestNewRejectsRepositoryIdentityNotBoundToRemote(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Repository.Identity = "different/project"
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "does not match any governed remote") {
+		t.Fatalf("expected repository identity mismatch, got %v", err)
+	}
+}
+
+func TestNewRejectsCredentialBearingRemoteURLs(t *testing.T) {
+	remoteURLs := []string{
+		"https://user:token@example.test/example/project.git",
+		"https://token@example.test/example/project.git",
+		"https://example.test/example/project.git?access_token=secret",
+	}
+	for _, remoteURL := range remoteURLs {
+		t.Run(remoteURL, func(t *testing.T) {
+			manifest := fixtureManifest(t)
+			manifest.Repository.Remotes["origin"] = remoteURL
+			_, err := New(manifest)
+			if err == nil || !strings.Contains(err.Error(), "credentials") {
+				t.Fatalf("expected credential-bearing remote rejection, got %v", err)
+			}
+		})
+	}
+}
+
+func TestNewAllowsSSHRemoteUsername(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Repository.Remotes["origin"] = "ssh://git@example.test/example/project.git"
+	if _, err := New(manifest); err != nil {
+		t.Fatalf("SSH username should not be treated as a persisted secret: %v", err)
+	}
+}
+
+func TestNewRejectsInvalidTimingPolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{name: "zero Ralphex timeout", mutate: func(m *Manifest) { m.Ralphex.Timeout = "0s" }},
+		{name: "negative wait on limit", mutate: func(m *Manifest) { m.Ralphex.WaitOnLimit = "-1s" }},
+		{name: "missing acceptance timeout", mutate: func(m *Manifest) { m.Acceptance[0].Timeout = "" }},
+		{name: "invalid acceptance timeout", mutate: func(m *Manifest) { m.Acceptance[0].Timeout = "later" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := fixtureManifest(t)
+			test.mutate(&manifest)
+			if _, err := New(manifest); err == nil {
+				t.Fatal("authority accepted invalid timing policy")
+			}
+		})
+	}
+}
+
+func TestNewRejectsPlanOutsideRepository(t *testing.T) {
+	manifest := fixtureManifest(t)
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	writeFile(t, outside, []byte("outside"), 0o600)
+	manifest.Plan.Path = outside
+	manifest.Plan.SHA256 = fileHash(t, outside)
+
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "outside governed repository") {
+		t.Fatalf("expected path-boundary error, got %v", err)
+	}
+}
+
+func TestNewRejectsPlanSymlinkOutsideRepository(t *testing.T) {
+	manifest := fixtureManifest(t)
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	writeFile(t, outside, []byte("outside"), 0o600)
+	link := filepath.Join(manifest.Repository.Path, "linked-plan.md")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Plan.Path = "linked-plan.md"
+	manifest.Plan.SHA256 = fileHash(t, outside)
+
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "outside governed repository") {
+		t.Fatalf("expected symlink path-boundary error, got %v", err)
+	}
+}
+
+func TestNewSupportsRalphexModes(t *testing.T) {
+	for _, mode := range []ralphex.Mode{ralphex.ModeFull, ralphex.ModeTasksOnly, ralphex.ModeReview} {
+		t.Run(string(mode), func(t *testing.T) {
+			manifest := fixtureManifest(t)
+			manifest.Ralphex.Mode = mode
+			if mode == ralphex.ModeReview {
+				manifest.Worktree = WorktreePolicy{}
+			}
+			authority, err := New(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := authority.Ralphex().Mode; got != mode {
+				t.Fatalf("mode mismatch: got %q, want %q", got, mode)
+			}
+		})
+	}
+}
+
+func TestNewRejectsReviewWorktree(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Ralphex.Mode = ralphex.ModeReview
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "review mode") {
+		t.Fatalf("expected review worktree rejection, got %v", err)
+	}
+}
+
+func TestNewRejectsUnsupportedMode(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Ralphex.Mode = "turbo"
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "unsupported ralphex mode") {
+		t.Fatalf("expected unsupported mode error, got %v", err)
+	}
+}
+
+func TestNewRequiresExplicitBranchForWorktree(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Worktree.Branch = ""
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "worktree.branch") {
+		t.Fatalf("expected missing worktree branch error, got %v", err)
+	}
+}
+
+func TestNewCanonicalizesPathsAndProducesStableHash(t *testing.T) {
+	manifest := fixtureManifest(t)
+	repositoryLink := filepath.Join(t.TempDir(), "repository-link")
+	if err := os.Symlink(manifest.Repository.Path, repositoryLink); err != nil {
+		t.Fatal(err)
+	}
+	firstInput := cloneManifest(manifest)
+	firstInput.Repository.Path = repositoryLink
+	firstInput.Plan.Path = filepath.Join("docs", "..", "plan.md")
+	firstInput.Repository.Remotes = map[string]string{
+		"upstream": "https://example.test/upstream.git",
+		"origin":   "https://example.test/example/project.git",
+	}
+
+	secondInput := cloneManifest(manifest)
+	secondInput.Ralphex.Timeout = "600s"
+	secondInput.Ralphex.WaitOnLimit = "0"
+	secondInput.Acceptance[0].Timeout = "300s"
+	secondInput.Repository.Remotes = map[string]string{
+		"origin":   "https://example.test/example/project.git",
+		"upstream": "https://example.test/upstream.git",
+	}
+
+	first, err := New(firstInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(secondInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SHA256() != second.SHA256() {
+		t.Fatalf("same semantic manifest hashed differently:\n%s\n%s", first.SHA256(), second.SHA256())
+	}
+	if string(first.CanonicalJSON()) != string(second.CanonicalJSON()) {
+		t.Fatalf("canonical serialization differs:\n%s\n%s", first.CanonicalJSON(), second.CanonicalJSON())
+	}
+	if got := first.Repository().Path; got != manifest.Repository.Path {
+		t.Fatalf("repository path was not canonicalized: got %q", got)
+	}
+	if got := first.Plan().Path; got != filepath.Join(manifest.Repository.Path, "plan.md") {
+		t.Fatalf("plan path was not canonicalized: got %q", got)
+	}
+}
+
+func TestNewValidatesAndCanonicalizesExecutorPolicy(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Executor.Executor = "  CODEX  "
+	canonical, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := canonical.Executor().Executor; got != "codex" {
+		t.Fatalf("canonical executor = %q, want codex", got)
+	}
+
+	equivalent := cloneManifest(manifest)
+	equivalent.Executor.Executor = "codex"
+	plain, err := New(equivalent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.SHA256() != plain.SHA256() {
+		t.Fatalf("equivalent executor policies produced different hashes: %s != %s", canonical.SHA256(), plain.SHA256())
+	}
+
+	invalid := cloneManifest(manifest)
+	invalid.Executor.Executor = "bogus"
+	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "unsupported executor") {
+		t.Fatalf("expected unsupported executor rejection, got %v", err)
+	}
+
+	invalid = cloneManifest(manifest)
+	invalid.Executor.TaskModel = "model:high"
+	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "task_model") {
+		t.Fatalf("expected invalid task model rejection, got %v", err)
+	}
+}
+
+func TestAuthorityDoesNotExposeMutableState(t *testing.T) {
+	manifest := fixtureManifest(t)
+	authority, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHash := authority.SHA256()
+	wantJSON := string(authority.CanonicalJSON())
+
+	manifest.Repository.Remotes["origin"] = "changed"
+	manifest.Acceptance[0].Argv[0] = "changed"
+	copyManifest := authority.Manifest()
+	copyManifest.Repository.Remotes["origin"] = "changed-again"
+	copyManifest.Acceptance[0].Argv[0] = "changed-again"
+	bytes := authority.CanonicalJSON()
+	bytes[0] = '['
+
+	if authority.SHA256() != wantHash || string(authority.CanonicalJSON()) != wantJSON {
+		t.Fatal("validated authority changed through mutable input or accessor")
+	}
+	if got := authority.Acceptance()[0].Argv[0]; got != "go" {
+		t.Fatalf("acceptance argv mutated: got %q", got)
+	}
+}
+
+func TestNewRejectsHashMismatch(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Plan.SHA256 = strings.Repeat("0", 64)
+	_, err := New(manifest)
+	if err == nil || !strings.Contains(err.Error(), "mismatch") {
+		t.Fatalf("expected hash mismatch error, got %v", err)
+	}
+}
+
+func fixtureManifest(t *testing.T) Manifest {
+	t.Helper()
+	repository := t.TempDir()
+	planPath := filepath.Join(repository, "plan.md")
+	binaryPath := filepath.Join(t.TempDir(), "ralphex")
+	writeFile(t, planPath, []byte("# governed plan\n"), 0o600)
+	writeFile(t, binaryPath, []byte("#!/bin/sh\nexit 0\n"), 0o700)
+	return Manifest{
+		RunID: "run-123",
+		Repository: RepositoryManifest{
+			Path:          repository,
+			Identity:      "example/project",
+			Remotes:       map[string]string{"origin": "https://example.test/example/project.git"},
+			DefaultBranch: "main",
+			StartSHA:      "0123456789abcdef",
+		},
+		Plan: PlanManifest{
+			Path:   "plan.md",
+			SHA256: fileHash(t, planPath),
+		},
+		Ralphex: RalphexManifest{
+			BinaryPath:   binaryPath,
+			BinarySHA256: fileHash(t, binaryPath),
+			SourceSHA:    "abcdef0123456789",
+			Mode:         ralphex.ModeFull,
+			Timeout:      "10m",
+			WaitOnLimit:  "0s",
+		},
+		Executor: ExecutorPolicy{
+			Executor:     "codex",
+			TaskModel:    "gpt-test",
+			TaskEffort:   "high",
+			ReviewModel:  "gpt-review",
+			ReviewEffort: "medium",
+		},
+		Worktree: WorktreePolicy{Enabled: true, Branch: "governed-plan"},
+		Acceptance: []AcceptanceCommand{{
+			Name:     "unit tests",
+			Class:    "unit",
+			Required: true,
+			Timeout:  "5m",
+			Argv:     []string{"go", "test", "./..."},
+		}},
+		PolicyVersion: "branch-v1",
+	}
+}
+
+func writeFile(t *testing.T, path string, contents []byte, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, contents, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fileHash(t *testing.T, path string) string {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	return hex.EncodeToString(digest[:])
+}
