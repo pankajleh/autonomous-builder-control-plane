@@ -21,7 +21,7 @@ Provide a deterministic compact context capsule that fresh Ralphex/Codex/Claude 
 - Capsule generation is deterministic and bounded; no hidden model-generated retrieval.
 - Verification fails closed on source drift, path escape/symlink, wrong base SHA, malformed capsule, or hash mismatch.
 - Governed run authority can bind a capsule path/hash and verify it before Ralphex launch.
-## Task 1: Implement deterministic context capsules
+### Task 1: Implement deterministic context capsules
 
 - [ ] Add `internal/context` with typed capsule/spec/source/outcome models and canonical JSON hashing.
 - [ ] Add builder/validator that resolves only repository-contained regular files, hashes exact bytes, verifies repository/base SHA, rejects duplicates/path escape/symlinks, and enforces conservative size/count bounds.
