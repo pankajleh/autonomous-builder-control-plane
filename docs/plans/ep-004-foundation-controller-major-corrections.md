@@ -6,7 +6,8 @@
 - Execution pack: `docs/execution-packs/EP-004-cross-plan-scheduler-integration.md`.
 - This is a bounded correction of the already controller-accepted EP-004 foundation; do not add later Phase-3 deliverables.
 - Governed base identity: use the exact `base_sha` in the verified capsule/run authority.
-- Fresh tasks must verify the bound context capsule before reading implementation files or making changes.
+- Capsule path: `/home/devagent/abcp-runtime/ep004-foundation-correction/context.json`; its exact SHA256 is bound by governed run authority.
+- Fresh tasks must verify that exact bound context capsule before reading implementation files or making changes.
 - Frozen-boundary intent remains: later parallel tracks consume `internal/scheduler/` read-only after this correction is accepted.
 
 ### Task 1: Correct final-diff provenance and Git safety
