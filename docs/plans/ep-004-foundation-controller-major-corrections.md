@@ -12,19 +12,19 @@
 
 ### Task 1: Correct final-diff provenance and Git safety
 
-- [ ] Before implementation, verify the bound context capsule against the governed repository; stop on any drift.
-- [ ] Bind the full canonical `RiskPolicy` contents into `RiskReport` evidence, not only the human-readable policy identity, so two different root configurations cannot produce indistinguishable policy provenance.
-- [ ] Ensure report canonical JSON/digest changes when canonical risk-policy contents change, even when the resulting risk class and candidate diffs happen to be identical.
-- [ ] Disable Git replacement-object/graft semantics for every scheduler-owned Git command so `refs/replace/*` cannot change ancestry or final-diff results for exact SHAs.
-- [ ] Add regression evidence proving a repository replacement ref cannot suppress or alter the committed final diff observed by the analyzer.
-- [ ] Bound scheduler Git stdout/stderr capture and fail closed on truncation instead of buffering unbounded output in controller memory.
-- [ ] Preserve structured argv evidence and make truncation/limit behavior explicit enough for later audit.
-- [ ] Keep Git execution cancellable; do not silently convert cancellation into a successful or ordinary risk classification.
-- [ ] Harden branch-name validation so names unsafe under `git check-ref-format --branch` (including a leading dash) are rejected before entering the frozen candidate contract.
-- [ ] Add tests for policy-content binding, replacement-ref immunity, bounded/truncated Git output, cancellation behavior where practical, and unsafe branch rejection.
-- [ ] Do not implement disposable integration workspaces, textual conflicts, combined acceptance, semantic conflicts, or `READY_FOR_MERGE` in this correction.
-- [ ] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
-- [ ] Mark only this correction task complete and commit the bounded changes.
+- [x] Before implementation, verify the bound context capsule against the governed repository; stop on any drift.
+- [x] Bind the full canonical `RiskPolicy` contents into `RiskReport` evidence, not only the human-readable policy identity, so two different root configurations cannot produce indistinguishable policy provenance.
+- [x] Ensure report canonical JSON/digest changes when canonical risk-policy contents change, even when the resulting risk class and candidate diffs happen to be identical.
+- [x] Disable Git replacement-object/graft semantics for every scheduler-owned Git command so `refs/replace/*` cannot change ancestry or final-diff results for exact SHAs.
+- [x] Add regression evidence proving a repository replacement ref cannot suppress or alter the committed final diff observed by the analyzer.
+- [x] Bound scheduler Git stdout/stderr capture and fail closed on truncation instead of buffering unbounded output in controller memory.
+- [x] Preserve structured argv evidence and make truncation/limit behavior explicit enough for later audit.
+- [x] Keep Git execution cancellable; do not silently convert cancellation into a successful or ordinary risk classification.
+- [x] Harden branch-name validation so names unsafe under `git check-ref-format --branch` (including a leading dash) are rejected before entering the frozen candidate contract.
+- [x] Add tests for policy-content binding, replacement-ref immunity, bounded/truncated Git output, cancellation behavior where practical, and unsafe branch rejection.
+- [x] Do not implement disposable integration workspaces, textual conflicts, combined acceptance, semantic conflicts, or `READY_FOR_MERGE` in this correction.
+- [x] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
+- [x] Mark only this correction task complete and commit the bounded changes.
 
 ## Controller review findings being corrected
 

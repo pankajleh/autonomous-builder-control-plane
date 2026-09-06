@@ -98,6 +98,27 @@ func TestAcceptedCandidateRejectsIncompleteAcceptanceProvenance(t *testing.T) {
 	}
 }
 
+func TestAcceptedCandidateRejectsUnsafeBranchNames(t *testing.T) {
+	repository := filepath.Clean(t.TempDir())
+	valid := candidateInput(repository, "run-1", "attempt-1", strings.Repeat("a", 40), strings.Repeat("b", 40), time.Unix(1, 0))
+	for _, branch := range []string{"-unsafe", "topic/-unsafe"} {
+		t.Run(branch, func(t *testing.T) {
+			input := cloneCandidateInput(valid)
+			input.Branch = branch
+			_, err := NewAcceptedCandidate(input)
+			if branch == "-unsafe" {
+				if err == nil {
+					t.Fatal("branch rejected by git check-ref-format --branch was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("valid branch %q rejected: %v", branch, err)
+			}
+		})
+	}
+}
+
 func candidateInput(repository, runID, attemptID, startSHA, headSHA string, acceptedAt time.Time) CandidateInput {
 	digest := strings.Repeat("d", 64)
 	return CandidateInput{

@@ -149,7 +149,7 @@ func validObjectID(value string) bool {
 }
 
 func validBranchName(value string) bool {
-	if value == "@" || strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") ||
+	if value == "@" || strings.HasPrefix(value, "-") || strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") ||
 		strings.HasPrefix(value, ".") || strings.HasSuffix(value, ".") || strings.Contains(value, "//") ||
 		strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.ContainsAny(value, " ~^:?*[\\") {
 		return false

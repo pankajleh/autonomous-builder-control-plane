@@ -25,7 +25,10 @@ const (
 	RiskOverlappingPaths RiskClass = "OVERLAPPING_PATHS"
 	RiskProtectedOverlap RiskClass = "CONTRACT_SENSITIVE_OR_SHARED_AUTHORITY_OVERLAP"
 
-	riskSchemaVersion = 1
+	riskSchemaVersion         = 2
+	gitStdoutLimitBytes       = 16 * 1024 * 1024
+	gitStderrLimitBytes       = 1024 * 1024
+	gitNoReplaceObjectsOption = "--no-replace-objects"
 )
 
 // RiskPolicy identifies contract-sensitive and shared-authority path roots.
@@ -33,8 +36,8 @@ const (
 // their descendants.
 type RiskPolicy struct {
 	PolicyIdentity         string   `json:"policy_identity"`
-	ContractSensitivePaths []string `json:"contract_sensitive_paths,omitempty"`
-	SharedAuthorityPaths   []string `json:"shared_authority_paths,omitempty"`
+	ContractSensitivePaths []string `json:"contract_sensitive_paths"`
+	SharedAuthorityPaths   []string `json:"shared_authority_paths"`
 }
 
 // PathChange is one unambiguous path in a committed start..head diff.
@@ -46,10 +49,16 @@ type PathChange struct {
 // GitCommandEvidence proves which structured Git operation produced a result.
 // Output content is represented by hashes; parsed paths are returned separately.
 type GitCommandEvidence struct {
-	Argv         []string `json:"argv"`
-	ExitCode     int      `json:"exit_code"`
-	StdoutSHA256 string   `json:"stdout_sha256"`
-	StderrSHA256 string   `json:"stderr_sha256"`
+	Argv             []string `json:"argv"`
+	ExitCode         int      `json:"exit_code"`
+	StdoutSHA256     string   `json:"stdout_sha256"`
+	StderrSHA256     string   `json:"stderr_sha256"`
+	StdoutBytes      int      `json:"stdout_bytes"`
+	StderrBytes      int      `json:"stderr_bytes"`
+	StdoutLimitBytes int      `json:"stdout_limit_bytes"`
+	StderrLimitBytes int      `json:"stderr_limit_bytes"`
+	StdoutTruncated  bool     `json:"stdout_truncated"`
+	StderrTruncated  bool     `json:"stderr_truncated"`
 }
 
 // CandidateDiffEvidence binds parsed final paths to exact accepted provenance.
@@ -82,12 +91,12 @@ type PairRiskEvidence struct {
 // RiskReport is an immutable deterministic report. It intentionally contains
 // no generation timestamp or worktree status.
 type RiskReport struct {
-	policyIdentity string
-	class          RiskClass
-	candidates     []CandidateDiffEvidence
-	pairs          []PairRiskEvidence
-	canonicalJSON  []byte
-	digest         string
+	policy        RiskPolicy
+	class         RiskClass
+	candidates    []CandidateDiffEvidence
+	pairs         []PairRiskEvidence
+	canonicalJSON []byte
+	digest        string
 }
 
 // Analyzer derives risk from committed Git objects in the candidate repository.
@@ -98,7 +107,10 @@ type Analyzer struct {
 
 // NewAnalyzer validates and freezes a risk policy.
 func NewAnalyzer(policy RiskPolicy) (*Analyzer, error) {
-	return newAnalyzer(policy, execGitRunner{})
+	return newAnalyzer(policy, execGitRunner{
+		stdoutLimitBytes: gitStdoutLimitBytes,
+		stderrLimitBytes: gitStderrLimitBytes,
+	})
 }
 
 func newAnalyzer(policy RiskPolicy, runner gitRunner) (*Analyzer, error) {
@@ -178,18 +190,18 @@ func (a *Analyzer) Analyze(ctx context.Context, candidates []AcceptedCandidate) 
 	}
 
 	report := RiskReport{
-		policyIdentity: a.policy.PolicyIdentity,
-		class:          overall,
-		candidates:     cloneCandidateDiffs(diffs),
-		pairs:          clonePairRisks(pairs),
+		policy:     cloneRiskPolicy(a.policy),
+		class:      overall,
+		candidates: cloneCandidateDiffs(diffs),
+		pairs:      clonePairRisks(pairs),
 	}
 	canonical, err := json.Marshal(struct {
-		SchemaVersion  int                     `json:"schema_version"`
-		PolicyIdentity string                  `json:"policy_identity"`
-		Class          RiskClass               `json:"class"`
-		Candidates     []CandidateDiffEvidence `json:"candidates"`
-		Pairs          []PairRiskEvidence      `json:"pairs"`
-	}{riskSchemaVersion, report.policyIdentity, report.class, report.candidates, report.pairs})
+		SchemaVersion int                     `json:"schema_version"`
+		Policy        RiskPolicy              `json:"policy"`
+		Class         RiskClass               `json:"class"`
+		Candidates    []CandidateDiffEvidence `json:"candidates"`
+		Pairs         []PairRiskEvidence      `json:"pairs"`
+	}{riskSchemaVersion, report.policy, report.class, report.candidates, report.pairs})
 	if err != nil {
 		return RiskReport{}, fmt.Errorf("marshal risk evidence: %w", err)
 	}
@@ -203,7 +215,11 @@ func (a *Analyzer) Analyze(ctx context.Context, candidates []AcceptedCandidate) 
 func (r RiskReport) Class() RiskClass { return r.class }
 
 // PolicyIdentity returns the exact risk policy identity.
-func (r RiskReport) PolicyIdentity() string { return r.policyIdentity }
+func (r RiskReport) PolicyIdentity() string { return r.policy.PolicyIdentity }
+
+// Policy returns a deep copy of the complete canonical risk policy bound into
+// this report's evidence.
+func (r RiskReport) Policy() RiskPolicy { return cloneRiskPolicy(r.policy) }
 
 // CandidateDiffs returns a deep copy of committed-diff evidence.
 func (r RiskReport) CandidateDiffs() []CandidateDiffEvidence {
@@ -280,9 +296,16 @@ func (a *Analyzer) candidateDiff(ctx context.Context, candidate AcceptedCandidat
 }
 
 func (a *Analyzer) run(ctx context.Context, repository string, args ...string) (gitResult, error) {
-	result, err := a.runner.Run(ctx, repository, args...)
+	safeArgs := append([]string{gitNoReplaceObjectsOption}, args...)
+	result, err := a.runner.Run(ctx, repository, safeArgs...)
 	if len(result.Argv) == 0 {
-		result.Argv = append([]string{"git"}, args...)
+		result.Argv = append([]string{"git"}, safeArgs...)
+	}
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+	if result.StdoutTruncated || result.StderrTruncated {
+		return result, gitOutputTruncationError(result)
 	}
 	return result, err
 }
@@ -467,40 +490,63 @@ func clonePairRisks(values []PairRiskEvidence) []PairRiskEvidence {
 	return cloned
 }
 
+func cloneRiskPolicy(policy RiskPolicy) RiskPolicy {
+	policy.ContractSensitivePaths = append(make([]string, 0, len(policy.ContractSensitivePaths)), policy.ContractSensitivePaths...)
+	policy.SharedAuthorityPaths = append(make([]string, 0, len(policy.SharedAuthorityPaths)), policy.SharedAuthorityPaths...)
+	return policy
+}
+
 func commandEvidence(result gitResult) GitCommandEvidence {
 	stdout := sha256.Sum256(result.Stdout)
 	stderr := sha256.Sum256(result.Stderr)
 	return GitCommandEvidence{
 		Argv: append([]string(nil), result.Argv...), ExitCode: result.ExitCode,
 		StdoutSHA256: hex.EncodeToString(stdout[:]), StderrSHA256: hex.EncodeToString(stderr[:]),
+		StdoutBytes: len(result.Stdout), StderrBytes: len(result.Stderr),
+		StdoutLimitBytes: result.StdoutLimitBytes, StderrLimitBytes: result.StderrLimitBytes,
+		StdoutTruncated: result.StdoutTruncated, StderrTruncated: result.StderrTruncated,
 	}
 }
 
 type gitResult struct {
-	Argv     []string
-	Stdout   []byte
-	Stderr   []byte
-	ExitCode int
+	Argv             []string
+	Stdout           []byte
+	Stderr           []byte
+	ExitCode         int
+	StdoutLimitBytes int
+	StderrLimitBytes int
+	StdoutTruncated  bool
+	StderrTruncated  bool
 }
 
 type gitRunner interface {
 	Run(context.Context, string, ...string) (gitResult, error)
 }
 
-type execGitRunner struct{}
+type execGitRunner struct {
+	stdoutLimitBytes int
+	stderrLimitBytes int
+}
 
-func (execGitRunner) Run(ctx context.Context, repository string, args ...string) (gitResult, error) {
+func (runner execGitRunner) Run(ctx context.Context, repository string, args ...string) (gitResult, error) {
 	argv := append([]string{"git"}, args...)
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = repository
 	command.Env = gitexec.Environment()
-	var stdout, stderr bytes.Buffer
+	stdoutLimit, stderrLimit := runner.outputLimits()
+	stdout := boundedBuffer{limit: stdoutLimit}
+	stderr := boundedBuffer{limit: stderrLimit}
 	command.Stdout = &stdout
 	command.Stderr = &stderr
-	result := gitResult{Argv: argv, ExitCode: -1}
+	result := gitResult{Argv: argv, ExitCode: -1, StdoutLimitBytes: stdoutLimit, StderrLimitBytes: stderrLimit}
 	err := command.Run()
-	result.Stdout = append([]byte(nil), stdout.Bytes()...)
-	result.Stderr = append([]byte(nil), stderr.Bytes()...)
+	result.Stdout = stdout.bytes()
+	result.Stderr = stderr.bytes()
+	result.StdoutTruncated = stdout.truncated
+	result.StderrTruncated = stderr.truncated
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
 	if err == nil {
 		result.ExitCode = 0
 		return result, nil
@@ -510,8 +556,53 @@ func (execGitRunner) Run(ctx context.Context, repository string, args ...string)
 		result.ExitCode = exitError.ExitCode()
 		return result, nil
 	}
-	if ctx.Err() != nil {
-		return result, ctx.Err()
-	}
 	return result, err
+}
+
+func (runner execGitRunner) outputLimits() (int, int) {
+	stdoutLimit := runner.stdoutLimitBytes
+	if stdoutLimit <= 0 {
+		stdoutLimit = gitStdoutLimitBytes
+	}
+	stderrLimit := runner.stderrLimitBytes
+	if stderrLimit <= 0 {
+		stderrLimit = gitStderrLimitBytes
+	}
+	return stdoutLimit, stderrLimit
+}
+
+type boundedBuffer struct {
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (buffer *boundedBuffer) Write(value []byte) (int, error) {
+	written := len(value)
+	remaining := buffer.limit - buffer.buffer.Len()
+	if remaining > len(value) {
+		remaining = len(value)
+	}
+	if remaining > 0 {
+		_, _ = buffer.buffer.Write(value[:remaining])
+	}
+	if remaining < len(value) {
+		buffer.truncated = true
+	}
+	return written, nil
+}
+
+func (buffer *boundedBuffer) bytes() []byte {
+	return append([]byte(nil), buffer.buffer.Bytes()...)
+}
+
+func gitOutputTruncationError(result gitResult) error {
+	streams := make([]string, 0, 2)
+	if result.StdoutTruncated {
+		streams = append(streams, fmt.Sprintf("stdout exceeded %d-byte limit", result.StdoutLimitBytes))
+	}
+	if result.StderrTruncated {
+		streams = append(streams, fmt.Sprintf("stderr exceeded %d-byte limit", result.StderrLimitBytes))
+	}
+	return fmt.Errorf("Git command output truncated: %s", strings.Join(streams, "; "))
 }
