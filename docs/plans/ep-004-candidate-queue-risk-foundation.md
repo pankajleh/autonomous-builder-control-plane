@@ -13,19 +13,19 @@
 
 ### Task 1: Implement accepted-candidate queue and final-diff risk foundation
 
-- [ ] Before any implementation, run `/home/devagent/autonomous-builder-control-plane/bin/abcp context-verify --repository /home/devagent/autonomous-builder-control-plane --capsule /home/devagent/abcp-runtime/ep004-foundation/context.json`; stop immediately if verification fails.
-- [ ] Read the capsule-referenced roadmap, state-machine, event/provenance, decision/acceptance, context-policy, current-progress, and EP-004 sources on demand.
-- [ ] Add a controller-owned accepted-candidate model carrying exact project/plan/run/attempt identity, repository, branch, start/head SHA, acceptance evidence references, and acceptance timestamp/policy identity.
-- [ ] Implement an append-only deterministic accepted-candidate queue with stable ordering, duplicate/replay rejection, and immutable returned values.
-- [ ] Implement deterministic final-diff risk analysis from committed Git SHAs only; do not inspect or trust uncommitted worktree state.
-- [ ] At minimum classify disjoint path sets, overlapping path sets, and contract-sensitive/shared-authority overlap, with evidence explaining the classification.
-- [ ] Reject missing objects, non-descendant/invalid candidate history, malformed Git output, ambiguous rename/path state, or acceptance provenance that is incomplete.
-- [ ] Keep the foundation's code ownership under a new scheduler/integration-contract package wherever practical; avoid changing canonical state-machine or acceptance contracts unless an existing contract makes the roadmap deliverable impossible.
-- [ ] Expose a frozen, minimal shared contract for the later integration-workspace and combined-acceptance tracks; document package/file ownership so those tracks can run in parallel without editing the same authoritative contract.
-- [ ] Emit/return risk evidence sufficient for a later integration controller to decide whether candidates may enter `INTEGRATION_PENDING`; this task must not itself grant `READY_FOR_MERGE`.
-- [ ] Add tests for deterministic ordering, duplicate rejection, exact-SHA provenance, disjoint changes, overlapping changes, contract-sensitive overlap, rename/path ambiguity, invalid ancestry, and dirty-worktree irrelevance.
-- [ ] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
-- [ ] Mark only this task complete and commit the bounded implementation.
+- [x] Before any implementation, run `/home/devagent/autonomous-builder-control-plane/bin/abcp context-verify --repository /home/devagent/autonomous-builder-control-plane --capsule /home/devagent/abcp-runtime/ep004-foundation/context.json`; stop immediately if verification fails.
+- [x] Read the capsule-referenced roadmap, state-machine, event/provenance, decision/acceptance, context-policy, current-progress, and EP-004 sources on demand.
+- [x] Add a controller-owned accepted-candidate model carrying exact project/plan/run/attempt identity, repository, branch, start/head SHA, acceptance evidence references, and acceptance timestamp/policy identity.
+- [x] Implement an append-only deterministic accepted-candidate queue with stable ordering, duplicate/replay rejection, and immutable returned values.
+- [x] Implement deterministic final-diff risk analysis from committed Git SHAs only; do not inspect or trust uncommitted worktree state.
+- [x] At minimum classify disjoint path sets, overlapping path sets, and contract-sensitive/shared-authority overlap, with evidence explaining the classification.
+- [x] Reject missing objects, non-descendant/invalid candidate history, malformed Git output, ambiguous rename/path state, or acceptance provenance that is incomplete.
+- [x] Keep the foundation's code ownership under a new scheduler/integration-contract package wherever practical; avoid changing canonical state-machine or acceptance contracts unless an existing contract makes the roadmap deliverable impossible.
+- [x] Expose a frozen, minimal shared contract for the later integration-workspace and combined-acceptance tracks; document package/file ownership so those tracks can run in parallel without editing the same authoritative contract.
+- [x] Emit/return risk evidence sufficient for a later integration controller to decide whether candidates may enter `INTEGRATION_PENDING`; this task must not itself grant `READY_FOR_MERGE`.
+- [x] Add tests for deterministic ordering, duplicate rejection, exact-SHA provenance, disjoint changes, overlapping changes, contract-sensitive overlap, rename/path ambiguity, invalid ancestry, and dirty-worktree irrelevance.
+- [x] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
+- [x] Mark only this task complete and commit the bounded implementation.
 
 ## Parallel fan-out after acceptance
 
