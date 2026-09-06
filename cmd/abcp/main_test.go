@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
@@ -85,16 +86,28 @@ func TestRunCommandRequiresEveryExplicitPath(t *testing.T) {
 }
 
 func TestCanonicalLedgerDestinationRejectsEvidenceOverlap(t *testing.T) {
-	runDir := filepath.Join(t.TempDir(), "evidence", "run-123")
+	evidenceRoot := filepath.Join(t.TempDir(), "evidence")
+	runDir := filepath.Join(evidenceRoot, "run-123")
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := canonicalLedgerDestination(filepath.Join(runDir, "authority.json"), runDir); err == nil || !strings.Contains(err.Error(), "outside") {
+	if _, err := canonicalLedgerDestination(filepath.Join(runDir, "authority.json"), evidenceRoot); err == nil || !strings.Contains(err.Error(), "outside") {
 		t.Fatalf("expected ledger/evidence overlap rejection, got %v", err)
+	}
+	otherRun, err := evidence.NewStore(evidenceRoot, "other-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherArtifact, err := otherRun.WriteBytes("authority.json", "validated-authority", []byte("immutable"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := canonicalLedgerDestination(otherArtifact.URI, evidenceRoot); err == nil || !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("expected cross-run ledger/evidence overlap rejection, got %v", err)
 	}
 
 	outside := filepath.Join(t.TempDir(), "ledger", "events.jsonl")
-	canonical, err := canonicalLedgerDestination(outside, runDir)
+	canonical, err := canonicalLedgerDestination(outside, evidenceRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

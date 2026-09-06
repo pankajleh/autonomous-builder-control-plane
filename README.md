@@ -147,14 +147,16 @@ required. Supported Ralphex modes are `full`,
 `tasks-only`, and `review`. Worktree mode
 requires an explicit new branch name and is unavailable with review mode. The
 controller verifies the Git repository root, complete remote set, repository,
-plan, binary, and branch identities; runs acceptance against the actual clean
-candidate checkout with an allowlisted isolated environment; and limits each captured
-stdout/stderr stream to 16 MiB. Success prints `BRANCH_ACCEPTED`. Failures return
-nonzero and preserve the JSONL ledger plus immutable artifacts under
+plan, binary, branch, and clean initial working-tree identities. Ralphex receives
+only the controller's versioned runtime and selected-provider environment
+allowlist. Acceptance runs against the actual clean candidate checkout with its
+own allowlisted isolated environment. Each captured stdout/stderr stream is
+limited to 16 MiB. Success prints `BRANCH_ACCEPTED`. Failures return nonzero and
+preserve the JSONL ledger plus immutable artifacts under
 `<evidence-root>/<run_id>/`.
 
-The ledger path must be outside `<evidence-root>/<run_id>/` so append-only
-events cannot overlap immutable evidence artifacts.
+The ledger path must be outside `<evidence-root>` so append-only events cannot
+overlap immutable evidence artifacts from any run.
 
 ## Non-goals
 

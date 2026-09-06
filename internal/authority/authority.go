@@ -90,6 +90,9 @@ type Authority struct {
 // New validates, canonicalizes, and freezes a run manifest.
 func New(input Manifest) (Authority, error) {
 	manifest := cloneManifest(input)
+	if err := canonicalizeExecutorPolicy(&manifest.Executor); err != nil {
+		return Authority{}, err
+	}
 	if err := validateRequired(manifest); err != nil {
 		return Authority{}, err
 	}
@@ -308,6 +311,27 @@ func validateRequired(manifest Manifest) error {
 	}
 	if !identityMatched {
 		return fmt.Errorf("repository.identity %q does not match any governed remote URL", manifest.Repository.Identity)
+	}
+	return nil
+}
+
+func canonicalizeExecutorPolicy(policy *ExecutorPolicy) error {
+	policy.Executor = strings.ToLower(strings.TrimSpace(policy.Executor))
+	if policy.Executor == "" {
+		policy.Executor = "claude"
+	}
+	if policy.Executor != "claude" && policy.Executor != "codex" {
+		return fmt.Errorf("unsupported executor %q", policy.Executor)
+	}
+	for field, value := range map[string]string{
+		"executor.task_model":    policy.TaskModel,
+		"executor.task_effort":   policy.TaskEffort,
+		"executor.review_model":  policy.ReviewModel,
+		"executor.review_effort": policy.ReviewEffort,
+	} {
+		if strings.Contains(value, ":") {
+			return fmt.Errorf("%s must not contain ':'", field)
+		}
 	}
 	return nil
 }

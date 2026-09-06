@@ -89,7 +89,7 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	canonicalLedger, err := canonicalLedgerDestination(*ledgerPath, artifacts.RunDir())
+	canonicalLedger, err := canonicalLedgerDestination(*ledgerPath, artifacts.Root())
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -125,7 +125,7 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func canonicalLedgerDestination(path, evidenceRunDir string) (string, error) {
+func canonicalLedgerDestination(path, evidenceRoot string) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("resolve ledger path: %w", err)
@@ -146,16 +146,16 @@ func canonicalLedgerDestination(path, evidenceRunDir string) (string, error) {
 	} else if statErr != nil && !os.IsNotExist(statErr) {
 		return "", fmt.Errorf("inspect ledger path: %w", statErr)
 	}
-	evidenceRunDir, err = filepath.EvalSymlinks(evidenceRunDir)
+	evidenceRoot, err = filepath.EvalSymlinks(evidenceRoot)
 	if err != nil {
-		return "", fmt.Errorf("canonicalize evidence run directory: %w", err)
+		return "", fmt.Errorf("canonicalize evidence root: %w", err)
 	}
-	relative, err := filepath.Rel(evidenceRunDir, canonical)
+	relative, err := filepath.Rel(evidenceRoot, canonical)
 	if err != nil {
 		return "", fmt.Errorf("compare ledger and evidence paths: %w", err)
 	}
 	if relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", errors.New("ledger path must be outside the run evidence directory")
+		return "", errors.New("ledger path must be outside the evidence root")
 	}
 	return canonical, nil
 }

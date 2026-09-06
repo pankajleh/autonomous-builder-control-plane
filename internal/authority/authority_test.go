@@ -213,6 +213,40 @@ func TestNewCanonicalizesPathsAndProducesStableHash(t *testing.T) {
 	}
 }
 
+func TestNewValidatesAndCanonicalizesExecutorPolicy(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Executor.Executor = "  CODEX  "
+	canonical, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := canonical.Executor().Executor; got != "codex" {
+		t.Fatalf("canonical executor = %q, want codex", got)
+	}
+
+	equivalent := cloneManifest(manifest)
+	equivalent.Executor.Executor = "codex"
+	plain, err := New(equivalent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.SHA256() != plain.SHA256() {
+		t.Fatalf("equivalent executor policies produced different hashes: %s != %s", canonical.SHA256(), plain.SHA256())
+	}
+
+	invalid := cloneManifest(manifest)
+	invalid.Executor.Executor = "bogus"
+	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "unsupported executor") {
+		t.Fatalf("expected unsupported executor rejection, got %v", err)
+	}
+
+	invalid = cloneManifest(manifest)
+	invalid.Executor.TaskModel = "model:high"
+	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "task_model") {
+		t.Fatalf("expected invalid task model rejection, got %v", err)
+	}
+}
+
 func TestAuthorityDoesNotExposeMutableState(t *testing.T) {
 	manifest := fixtureManifest(t)
 	authority, err := New(manifest)

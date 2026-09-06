@@ -26,8 +26,9 @@ import (
 )
 
 const (
-	eventStateTransition = "STATE_TRANSITION"
-	actorController      = "control-plane"
+	eventStateTransition     = "STATE_TRANSITION"
+	actorController          = "control-plane"
+	ralphexEnvironmentPolicy = "ralphex-env-v1"
 )
 
 // EventAppender is the durable, append-only operation required by a Runner.
@@ -141,7 +142,9 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	if err != nil {
 		return r.fail(result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("parse governed Ralphex timeout: %w", err), nil)
 	}
-	if err := r.transition(domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner", map[string]any{"argv": argv, "timeout": r.governed.Ralphex().Timeout}, nil); err != nil {
+	if err := r.transition(domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner", map[string]any{
+		"argv": argv, "timeout": r.governed.Ralphex().Timeout, "environment_policy": ralphexEnvironmentPolicy,
+	}, nil); err != nil {
 		return result, err
 	}
 	result.State = domain.StateExecutionStarting
@@ -153,6 +156,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	process, processErr := r.processes.Run(ctx, supervisor.Command{
 		Argv:    argv,
 		Cwd:     r.governed.Repository().Path,
+		Env:     ralphexEnvironment(r.governed.Executor().Executor),
 		Timeout: ralphexTimeout,
 		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stdout.log", Kind: "ralphex-stdout"},
 		Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stderr.log", Kind: "ralphex-stderr"},
@@ -162,9 +166,10 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		return r.fail(result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
 	}
 	metadataRef, err := r.writeJSON("ralphex-process.json", "ralphex-process-metadata", struct {
-		Process      supervisor.Result    `json:"process"`
-		EvidenceRefs []ledger.EvidenceRef `json:"evidence_refs"`
-	}{Process: process, EvidenceRefs: processRefs(process)})
+		Process           supervisor.Result    `json:"process"`
+		EnvironmentPolicy string               `json:"environment_policy"`
+		EvidenceRefs      []ledger.EvidenceRef `json:"evidence_refs"`
+	}{Process: process, EnvironmentPolicy: ralphexEnvironmentPolicy, EvidenceRefs: processRefs(process)})
 	if err != nil {
 		return r.fail(result, domain.StateImplementing, "ralphex-adapter", err, processRefs(process))
 	}
@@ -353,14 +358,15 @@ func ep002State(state domain.State) bool {
 }
 
 type identityValidation struct {
-	RepositoryPath  string            `json:"repository_path"`
-	RepositoryID    string            `json:"repository_identity,omitempty"`
-	HeadSHA         string            `json:"head_sha"`
-	Branch          string            `json:"branch,omitempty"`
-	Remotes         map[string]string `json:"remotes,omitempty"`
-	PlanSHA256      string            `json:"plan_sha256"`
-	BinarySHA256    string            `json:"ralphex_binary_sha256"`
-	AuthoritySHA256 string            `json:"authority_sha256"`
+	RepositoryPath   string            `json:"repository_path"`
+	RepositoryID     string            `json:"repository_identity,omitempty"`
+	HeadSHA          string            `json:"head_sha"`
+	Branch           string            `json:"branch,omitempty"`
+	WorkingTreeClean bool              `json:"working_tree_clean"`
+	Remotes          map[string]string `json:"remotes,omitempty"`
+	PlanSHA256       string            `json:"plan_sha256"`
+	BinarySHA256     string            `json:"ralphex_binary_sha256"`
+	AuthoritySHA256  string            `json:"authority_sha256"`
 }
 
 func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (identityValidation, error) {
@@ -430,6 +436,14 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 			return validation, fmt.Errorf("repository branch %q does not match governed default branch %q", validation.Branch, repository.DefaultBranch)
 		}
 	}
+	status, err := gitOutput(ctx, repository.Path, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil {
+		return validation, fmt.Errorf("inspect repository working tree: %w", err)
+	}
+	validation.WorkingTreeClean = status == ""
+	if !validation.WorkingTreeClean {
+		return validation, errors.New("governed repository working tree is not clean")
+	}
 
 	names := make([]string, 0, len(repository.Remotes))
 	for name := range repository.Remotes {
@@ -465,6 +479,33 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	}
 	validation.RepositoryID = repository.Identity
 	return validation, nil
+}
+
+func ralphexEnvironment(executor string) []string {
+	keys := []string{
+		"HOME", "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
+		"TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR",
+		"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+		"https_proxy", "http_proxy", "all_proxy", "no_proxy",
+	}
+	switch executor {
+	case "codex":
+		keys = append(keys,
+			"CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
+			"AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT",
+		)
+	case "claude":
+		keys = append(keys,
+			"CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+		)
+	}
+	environment := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if value, ok := os.LookupEnv(key); ok {
+			environment = append(environment, key+"="+value)
+		}
+	}
+	return environment
 }
 
 func hashFile(path string) (string, error) {

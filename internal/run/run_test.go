@@ -275,6 +275,50 @@ func TestRunnerRejectsIdentityChangedAfterValidation(t *testing.T) {
 	}
 }
 
+func TestRunnerRejectsDirtyInitialWorkingTree(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	if err := os.WriteFile(filepath.Join(fixture.authority.Repository().Path, "untracked.txt"), []byte("outside authority\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "working tree is not clean") {
+		t.Fatalf("expected dirty working-tree rejection, got %v", err)
+	}
+	if result.State != domain.StateFailed {
+		t.Fatalf("dirty repository state = %s, want FAILED", result.State)
+	}
+	if got := eventStates(readEvents(t, fixture.ledgerPath)); !reflect.DeepEqual(got, []domain.State{domain.StateRunCreated, domain.StateFailed}) {
+		t.Fatalf("unexpected states after dirty repository rejection: %#v", got)
+	}
+}
+
+func TestRunnerUsesAllowlistedRalphexEnvironment(t *testing.T) {
+	t.Setenv("ABCP_TEST_SECRET", "must-not-leak")
+	t.Setenv("OPENAI_API_KEY", "authorized-provider-key")
+	script := `#!/bin/sh
+if [ -n "$ABCP_TEST_SECRET" ]; then exit 41; fi
+if [ "$OPENAI_API_KEY" != "authorized-provider-key" ]; then exit 42; fi
+`
+	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, commandPath(t, "true"))
+	result := fixture.execute(t)
+	if !result.Accepted() {
+		t.Fatalf("allowlisted environment run was not accepted: %#v", result)
+	}
+	metadata, err := os.ReadFile(result.RalphexMetadataRef.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorded struct {
+		EnvironmentPolicy string `json:"environment_policy"`
+	}
+	if err := json.Unmarshal(metadata, &recorded); err != nil {
+		t.Fatal(err)
+	}
+	if recorded.EnvironmentPolicy != ralphexEnvironmentPolicy {
+		t.Fatalf("environment policy = %q, want %q", recorded.EnvironmentPolicy, ralphexEnvironmentPolicy)
+	}
+}
+
 func TestRunnerCancellationDuringIdentityValidationRecordsCancelled(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	ctx, cancel := context.WithCancel(context.Background())
