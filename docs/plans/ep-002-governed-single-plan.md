@@ -56,13 +56,13 @@ make smoke
 
 ### Task 3: Implement supervised subprocess execution
 
-- [ ] Add `internal/supervisor` with structured command input: argv, cwd, environment, timeout/context and evidence sinks.
-- [ ] Launch using `exec.CommandContext`; do not invoke `/bin/sh -c` or equivalent.
-- [ ] Capture PID, Linux process-group identity, start/end timestamps, exit code, terminating signal when applicable, exact argv/cwd, stdout and stderr artifact refs.
-- [ ] Put the child into its own Linux process group so cancellation/timeout can target the governed group rather than only the direct process.
-- [ ] Preserve clear result semantics for exit 0, non-zero exit, context cancellation and signal termination.
-- [ ] Add deterministic tests using temporary harmless helper scripts/processes for success, non-zero exit, stdout/stderr capture and cancellation.
-- [ ] Run the validation baseline, mark Task 3 complete, and commit.
+- [x] Add `internal/supervisor` with structured command input: argv, cwd, environment, timeout/context and evidence sinks.
+- [x] Launch using `exec.CommandContext`; do not invoke `/bin/sh -c` or equivalent.
+- [x] Capture PID, Linux process-group identity, start/end timestamps, exit code, terminating signal when applicable, exact argv/cwd, stdout and stderr artifact refs.
+- [x] Put the child into its own Linux process group so cancellation/timeout can target the governed group rather than only the direct process.
+- [x] Preserve clear result semantics for exit 0, non-zero exit, context cancellation and signal termination.
+- [x] Add deterministic tests using temporary harmless helper scripts/processes for success, non-zero exit, stdout/stderr capture and cancellation.
+- [x] Run the validation baseline, mark Task 3 complete, and commit.
 
 ### Task 4: Implement deterministic branch acceptance executor
 
