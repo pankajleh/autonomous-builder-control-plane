@@ -76,15 +76,15 @@ make smoke
 
 ### Task 5: Implement governed single-plan runner and CLI entry point
 
-- [ ] Add `internal/run` (or equivalently focused orchestration package) that accepts only validated authority plus ledger/evidence/supervisor dependencies.
-- [ ] Persist state/event sequence under controller authority: `RUN_CREATED → AUTHORITY_VALIDATED → EXECUTION_STARTING → IMPLEMENTING` before the Ralphex process and, only on exit 0, `IMPLEMENTATION_COMPLETED → BRANCH_ACCEPTANCE_PENDING`.
-- [ ] Invoke Ralphex through the existing `internal/ralphex.Invocation` structured argv contract; extend that contract only where EP-002 authority requires it.
-- [ ] On Ralphex non-zero/cancelled outcome, record failure evidence and do not emit `IMPLEMENTATION_COMPLETED`.
-- [ ] Run controller acceptance after Ralphex success; emit `BRANCH_ACCEPTED` only when acceptance PASS evidence exists.
-- [ ] Ensure EP-002 cannot transition to `INTEGRATION_PENDING`, `READY_FOR_MERGE`, `MERGED` or `COMPLETED` from this runner.
-- [ ] Add CLI command `abcp run --manifest <path> --ledger <path> --evidence-root <path>` (or an equally explicit structured interface) that loads the manifest, validates authority and runs the governed lifecycle without hidden defaults for repository/plan/Ralphex identity.
-- [ ] Add end-to-end deterministic tests with a disposable Git repository and fake Ralphex executable proving success to `BRANCH_ACCEPTED`, Ralphex failure, acceptance failure, and preserved evidence/event ordering.
-- [ ] Run the validation baseline, mark Task 5 complete, and commit.
+- [x] Add `internal/run` (or equivalently focused orchestration package) that accepts only validated authority plus ledger/evidence/supervisor dependencies.
+- [x] Persist state/event sequence under controller authority: `RUN_CREATED → AUTHORITY_VALIDATED → EXECUTION_STARTING → IMPLEMENTING` before the Ralphex process and, only on exit 0, `IMPLEMENTATION_COMPLETED → BRANCH_ACCEPTANCE_PENDING`.
+- [x] Invoke Ralphex through the existing `internal/ralphex.Invocation` structured argv contract; extend that contract only where EP-002 authority requires it.
+- [x] On Ralphex non-zero/cancelled outcome, record failure evidence and do not emit `IMPLEMENTATION_COMPLETED`.
+- [x] Run controller acceptance after Ralphex success; emit `BRANCH_ACCEPTED` only when acceptance PASS evidence exists.
+- [x] Ensure EP-002 cannot transition to `INTEGRATION_PENDING`, `READY_FOR_MERGE`, `MERGED` or `COMPLETED` from this runner.
+- [x] Add CLI command `abcp run --manifest <path> --ledger <path> --evidence-root <path>` (or an equally explicit structured interface) that loads the manifest, validates authority and runs the governed lifecycle without hidden defaults for repository/plan/Ralphex identity.
+- [x] Add end-to-end deterministic tests with a disposable Git repository and fake Ralphex executable proving success to `BRANCH_ACCEPTED`, Ralphex failure, acceptance failure, and preserved evidence/event ordering.
+- [x] Run the validation baseline, mark Task 5 complete, and commit.
 
 ## Final verification
 

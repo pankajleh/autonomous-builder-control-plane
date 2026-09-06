@@ -2,6 +2,7 @@ package ralphex
 
 import (
 	"fmt"
+	"strings"
 )
 
 type Mode string
@@ -13,12 +14,16 @@ const (
 )
 
 type Invocation struct {
-	BinaryPath string
-	PlanPath   string
-	ConfigDir  string
-	Mode       Mode
-	Codex      bool
-	Worktree   bool
+	BinaryPath   string
+	PlanPath     string
+	ConfigDir    string
+	Mode         Mode
+	Codex        bool
+	Worktree     bool
+	TaskModel    string
+	TaskEffort   string
+	ReviewModel  string
+	ReviewEffort string
 }
 
 func (i Invocation) Argv() ([]string, error) {
@@ -45,6 +50,20 @@ func (i Invocation) Argv() ([]string, error) {
 	if i.Codex {
 		argv = append(argv, "--codex")
 	}
+	taskModel, err := modelSpec(i.TaskModel, i.TaskEffort)
+	if err != nil {
+		return nil, fmt.Errorf("task model policy: %w", err)
+	}
+	if taskModel != "" {
+		argv = append(argv, "--task-model", taskModel)
+	}
+	reviewModel, err := modelSpec(i.ReviewModel, i.ReviewEffort)
+	if err != nil {
+		return nil, fmt.Errorf("review model policy: %w", err)
+	}
+	if reviewModel != "" {
+		argv = append(argv, "--review-model", reviewModel)
+	}
 	switch i.Mode {
 	case ModeTasksOnly:
 		argv = append(argv, "--tasks-only")
@@ -56,4 +75,17 @@ func (i Invocation) Argv() ([]string, error) {
 	}
 	argv = append(argv, i.PlanPath)
 	return argv, nil
+}
+
+func modelSpec(model, effort string) (string, error) {
+	if strings.Contains(model, ":") || strings.Contains(effort, ":") {
+		return "", fmt.Errorf("model and effort must not contain ':'")
+	}
+	if model == "" && effort == "" {
+		return "", nil
+	}
+	if effort == "" {
+		return model, nil
+	}
+	return model + ":" + effort, nil
 }
