@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/acceptance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -194,6 +195,134 @@ func TestEvaluatorRejectsIncompleteOrAmbiguousProvenance(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEvaluatorRejectsUnverifiedIntegrationEvidenceBeforeExecution(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *ledger.EvidenceRef)
+	}{
+		{
+			name: "forged digest",
+			mutate: func(_ *testing.T, ref *ledger.EvidenceRef) {
+				ref.SHA256 = strings.Repeat("0", sha256.Size*2)
+			},
+		},
+		{
+			name: "mutated bytes",
+			mutate: func(t *testing.T, ref *ledger.EvidenceRef) {
+				writeFile(t, ref.URI, `{"status":"forged"}`)
+			},
+		},
+		{
+			name: "missing artifact",
+			mutate: func(t *testing.T, ref *ledger.EvidenceRef) {
+				if err := os.Remove(ref.URI); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unreadable artifact",
+			mutate: func(t *testing.T, ref *ledger.EvidenceRef) {
+				ref.URI = t.TempDir()
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFixture(t, []authority.AcceptanceCommand{{
+				Name: "combined unit", Class: "unit", Required: true, Timeout: "5s", Argv: helperArgv("pass"),
+			}})
+			target := cloneTarget(fixture.target)
+			test.mutate(t, &target.Integration.Evidence[0])
+			store, err := evidence.NewStore(t.TempDir(), "unverified-integration")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = New(supervisor.New(), store).Evaluate(context.Background(), fixture.authority, fixture.policy([]string{"unit"}, nil), target, fixture.candidates, fixture.risk)
+			if err == nil || !strings.Contains(err.Error(), "verify exact artifact bytes") {
+				t.Fatalf("unverified integration evidence error = %v", err)
+			}
+			if entries, readErr := os.ReadDir(store.RunDir()); readErr != nil || len(entries) != 0 {
+				t.Fatalf("unverified input executed controller commands: entries=%d err=%v", len(entries), readErr)
+			}
+		})
+	}
+}
+
+func TestEvaluatorRejectsControllerEvidenceKindCollisionBeforeExecution(t *testing.T) {
+	fixture := newFixture(t, []authority.AcceptanceCommand{{
+		Name: "combined unit", Class: "unit", Required: true, Timeout: "5s", Argv: helperArgv("pass"),
+	}})
+	for _, kind := range []string{"combined-target-git-stdout", "acceptance-command-metadata"} {
+		t.Run(kind, func(t *testing.T) {
+			target := cloneTarget(fixture.target)
+			target.Integration.Evidence[0].Kind = kind
+			store, err := evidence.NewStore(t.TempDir(), "kind-collision")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = New(supervisor.New(), store).Evaluate(context.Background(), fixture.authority, fixture.policy([]string{"unit"}, nil), target, fixture.candidates, fixture.risk)
+			if err == nil || !strings.Contains(err.Error(), "reserved for controller-produced evidence") {
+				t.Fatalf("controller evidence kind collision error = %v", err)
+			}
+			if entries, readErr := os.ReadDir(store.RunDir()); readErr != nil || len(entries) != 0 {
+				t.Fatalf("kind collision executed controller commands: entries=%d err=%v", len(entries), readErr)
+			}
+		})
+	}
+}
+
+func TestEvaluatorVerifiesCleanAcceptanceCommandAndGitEvidence(t *testing.T) {
+	for _, kind := range []string{"acceptance-command-stdout", "acceptance-git-stdout"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := newFixture(t, []authority.AcceptanceCommand{{
+				Name: "combined unit", Class: "unit", Required: true, Timeout: "5s", Argv: helperArgv("pass"),
+			}})
+			store, err := evidence.NewStore(t.TempDir(), "mutated-acceptance")
+			if err != nil {
+				t.Fatal(err)
+			}
+			evaluator := New(supervisor.New(), store)
+			mutator := &mutatingAcceptanceExecutor{delegate: evaluator.acceptance, kind: kind}
+			evaluator.acceptance = mutator
+
+			result, err := evaluator.Evaluate(context.Background(), fixture.authority, fixture.policy([]string{"unit"}, nil), fixture.target, fixture.candidates, fixture.risk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mutator.err != nil || !mutator.mutated {
+				t.Fatalf("acceptance evidence mutation failed: mutated=%t err=%v", mutator.mutated, mutator.err)
+			}
+			if result.Classification() != ClassificationValidationUnavailable || len(result.Causes()) != 1 || result.Causes()[0].Code != "required_validation_unavailable" {
+				t.Fatalf("mutated clean acceptance result = %s, causes=%#v", result.Classification(), result.Causes())
+			}
+		})
+	}
+}
+
+type mutatingAcceptanceExecutor struct {
+	delegate acceptanceExecutor
+	kind     string
+	mutated  bool
+	err      error
+}
+
+func (e *mutatingAcceptanceExecutor) Run(ctx context.Context, governed authority.Authority, target acceptance.Target) (acceptance.Result, error) {
+	result, err := e.delegate.Run(ctx, governed, target)
+	if err != nil {
+		return result, err
+	}
+	for _, ref := range result.EvidenceRefs() {
+		if ref.Kind == e.kind {
+			e.err = os.WriteFile(ref.URI, []byte("mutated after acceptance\n"), 0o600)
+			e.mutated = e.err == nil
+			break
+		}
+	}
+	return result, nil
 }
 
 func TestEvaluatorRejectsAlreadyStaleIntegratedTarget(t *testing.T) {

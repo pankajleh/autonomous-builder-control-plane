@@ -42,6 +42,9 @@ const (
 	resultSchemaVersion    = 1
 	gitOutputLimitBytes    = 1024 * 1024
 	gitNoReplaceObjectsArg = "--no-replace-objects"
+
+	combinedTargetEvidenceKindPrefix = "combined-target-"
+	acceptanceEvidenceKindPrefix     = "acceptance-"
 )
 
 // Policy explicitly partitions required acceptance classes. A failed
@@ -454,6 +457,12 @@ func canonicalTarget(target Target) (Target, error) {
 		if err := validateEvidenceRef(ref); err != nil {
 			return Target{}, fmt.Errorf("integration evidence %d: %w", index, err)
 		}
+		if controllerEvidenceKind(ref.Kind) {
+			return Target{}, fmt.Errorf("integration evidence %d: kind %q is reserved for controller-produced evidence", index, ref.Kind)
+		}
+		if _, err := readVerifiedArtifact(ref); err != nil {
+			return Target{}, fmt.Errorf("integration evidence %d: verify exact artifact bytes: %w", index, err)
+		}
 	}
 	return cloneTarget(target), nil
 }
@@ -536,6 +545,11 @@ func classifyAcceptance(result *Result, runErr error) {
 		return
 	}
 	if result.acceptance.Status() == acceptance.StatusPass && result.acceptance.Passed() {
+		if !completeCleanAcceptanceEvidence(result.acceptance) {
+			result.classification = ClassificationValidationUnavailable
+			result.causes = []Cause{{Code: "required_validation_unavailable", EvidenceRefs: result.acceptance.EvidenceRefs()}}
+			return
+		}
 		result.classification = ClassificationClean
 		result.causes = nil
 		return
@@ -575,6 +589,19 @@ func classifyAcceptance(result *Result, runErr error) {
 	}
 	result.classification = ClassificationFailClosed
 	result.causes = []Cause{{Code: "acceptance_invariants_failed", EvidenceRefs: result.acceptance.EvidenceRefs()}}
+}
+
+func completeCleanAcceptanceEvidence(result acceptance.Result) bool {
+	refs := result.EvidenceRefs()
+	if len(refs) == 0 {
+		return false
+	}
+	for _, ref := range refs {
+		if _, err := readVerifiedArtifact(ref); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func completeFailedCommandEvidence(command acceptance.CommandResult, repository, policyIdentity string) bool {
@@ -719,6 +746,10 @@ func validateEvidenceRef(ref ledger.EvidenceRef) error {
 		return errors.New("evidence URI must not contain credentials, query values, or fragments")
 	}
 	return nil
+}
+
+func controllerEvidenceKind(kind string) bool {
+	return strings.HasPrefix(kind, combinedTargetEvidenceKindPrefix) || strings.HasPrefix(kind, acceptanceEvidenceKindPrefix)
 }
 
 func candidateIdentity(input scheduler.CandidateInput) scheduler.CandidateIdentity {

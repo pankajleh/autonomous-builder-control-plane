@@ -11,12 +11,13 @@
 
 ### Task 1: Correct Track C evidence trust boundary
 
-- [ ] Verify every caller-supplied `Integration.Evidence` reference by reading the exact bytes and matching SHA256 before evaluation can continue; reject unreadable, missing, mutated, or digest-mismatched evidence.
-- [ ] Prevent caller-supplied integration evidence kinds from colliding with controller-produced combined-target or acceptance evidence namespaces, or keep caller integration refs structurally separated so provenance tiers cannot be confused.
-- [ ] On `CLEAN_COMBINED_ACCEPTANCE`, verify the acceptance command/Git evidence bytes and digests rather than trusting structurally complete references only.
-- [ ] Preserve existing fail-closed semantic-conflict/validation-unavailable classification, exact target checkpoints, frozen scheduler contract, and Track D responsibility to bind the exact Track B result.
-- [ ] Add regressions for forged/mutated integration evidence, kind collision, and clean-path acceptance evidence verification.- [ ] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check` with the pinned Go toolchain available on PATH.
-- [ ] Mark only this task complete and commit the bounded correction.
+- [x] Verify every caller-supplied `Integration.Evidence` reference by reading the exact bytes and matching SHA256 before evaluation can continue; reject unreadable, missing, mutated, or digest-mismatched evidence.
+- [x] Prevent caller-supplied integration evidence kinds from colliding with controller-produced combined-target or acceptance evidence namespaces, or keep caller integration refs structurally separated so provenance tiers cannot be confused.
+- [x] On `CLEAN_COMBINED_ACCEPTANCE`, verify the acceptance command/Git evidence bytes and digests rather than trusting structurally complete references only.
+- [x] Preserve existing fail-closed semantic-conflict/validation-unavailable classification, exact target checkpoints, frozen scheduler contract, and Track D responsibility to bind the exact Track B result.
+- [x] Add regressions for forged/mutated integration evidence, kind collision, and clean-path acceptance evidence verification.
+- [x] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check` with the pinned Go toolchain available on PATH.
+- [x] Mark only this task complete and commit the bounded correction.
 
 ## Review finding being corrected
 
