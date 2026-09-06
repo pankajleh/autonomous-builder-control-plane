@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -129,6 +130,64 @@ func TestIntegrateCommitIdentityIsIndependentOfWallClockSecond(t *testing.T) {
 	}
 	if first.Status() != second.Status() || first.RiskReportSHA256() != second.RiskReportSHA256() {
 		t.Fatalf("governed result identity changed: status (%q, %q), risk report (%q, %q)", first.Status(), second.Status(), first.RiskReportSHA256(), second.RiskReportSHA256())
+	}
+}
+
+func TestIntegrateCanonicalResultAndCaptureAreReproducibleAcrossWorkspaces(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+	headA := branchCommit(t, repository, baseline, "candidate-a", "a.txt", "candidate a\n")
+	headB := branchCommit(t, repository, baseline, "candidate-b", "b.txt", "candidate b\n")
+	git(t, repository, "checkout", "--quiet", "main")
+
+	candidateA := acceptedCandidate(t, repository, "candidate-a", baseline, headA, "run-a", time.Date(2026, 9, 6, 1, 0, 0, 0, time.UTC))
+	candidateB := acceptedCandidate(t, repository, "candidate-b", baseline, headB, "run-b", time.Date(2026, 9, 6, 2, 0, 0, 0, time.UTC))
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidateB, candidateA})
+	firstRoot, secondRoot := t.TempDir(), t.TempDir()
+	firstStore, secondStore := evidenceStore(t), evidenceStore(t)
+
+	first, err := newTestController(t, firstRoot, firstStore).Integrate(context.Background(), Request{
+		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "first-run",
+	})
+	if err != nil {
+		t.Fatalf("first Integrate() error = %v", err)
+	}
+	second, err := newTestController(t, secondRoot, secondStore).Integrate(context.Background(), Request{
+		BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "second-run",
+	})
+	if err != nil {
+		t.Fatalf("second Integrate() error = %v", err)
+	}
+
+	if first.SHA256() != second.SHA256() || !bytes.Equal(first.CanonicalJSON(), second.CanonicalJSON()) {
+		t.Fatalf("canonical result changed across disposable workspaces:\n%s\n%s", first.CanonicalJSON(), second.CanonicalJSON())
+	}
+	if first.CaptureRef().SHA256 != second.CaptureRef().SHA256 {
+		t.Fatalf("capture digest changed across disposable workspaces: %q != %q", first.CaptureRef().SHA256, second.CaptureRef().SHA256)
+	}
+	firstCapture, readErr := os.ReadFile(first.CaptureRef().URI)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	secondCapture, readErr := os.ReadFile(second.CaptureRef().URI)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(firstCapture, secondCapture) {
+		t.Fatalf("pre-cleanup capture changed across disposable workspaces:\n%s\n%s", firstCapture, secondCapture)
+	}
+	for _, deterministic := range [][]byte{first.CanonicalJSON(), firstCapture} {
+		for _, operationalPath := range []string{firstRoot, secondRoot, firstStore.Root(), secondStore.Root()} {
+			if bytes.Contains(deterministic, []byte(operationalPath)) {
+				t.Fatalf("deterministic evidence contains operational path %q: %s", operationalPath, deterministic)
+			}
+		}
+	}
+
+	assertCleanupReceipt(t, first.CleanupRef(), firstRoot)
+	assertCleanupReceipt(t, second.CleanupRef(), secondRoot)
+	if first.CleanupRef().SHA256 == second.CleanupRef().SHA256 {
+		t.Fatal("operational cleanup receipts unexpectedly have identical digests")
 	}
 }
 
@@ -344,6 +403,30 @@ func assertEvidence(t *testing.T, ref ledger.EvidenceRef, kind string) {
 	digest := sha256.Sum256(data)
 	if ref.SHA256 != hex.EncodeToString(digest[:]) {
 		t.Fatalf("evidence digest %q does not match bytes", ref.SHA256)
+	}
+}
+
+func assertCleanupReceipt(t *testing.T, ref ledger.EvidenceRef, temporaryRoot string) {
+	t.Helper()
+	assertEvidence(t, ref, cleanupEvidenceKind)
+	data, err := os.ReadFile(ref.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt struct {
+		Cleanup struct {
+			TemporaryRoot    string `json:"temporary_root"`
+			WorkspacePath    string `json:"workspace_path"`
+			WorkspaceID      string `json:"workspace_id"`
+			WorkspaceRemoved bool   `json:"workspace_removed"`
+		} `json:"cleanup"`
+	}
+	if err := json.Unmarshal(data, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Cleanup.TemporaryRoot != temporaryRoot || filepath.Dir(receipt.Cleanup.WorkspacePath) != temporaryRoot ||
+		filepath.Base(receipt.Cleanup.WorkspacePath) != receipt.Cleanup.WorkspaceID || !receipt.Cleanup.WorkspaceRemoved {
+		t.Fatalf("cleanup receipt does not preserve exact operational identity: %#v", receipt.Cleanup)
 	}
 }
 

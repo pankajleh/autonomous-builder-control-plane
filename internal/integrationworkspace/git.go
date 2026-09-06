@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
 )
@@ -16,6 +17,7 @@ import (
 const (
 	noReplaceObjectsOption       = "--no-replace-objects"
 	deterministicIntegrationDate = "2000-01-01T00:00:00Z"
+	gitWaitDelay                 = 2 * time.Second
 )
 
 type gitResult struct {
@@ -36,6 +38,7 @@ type gitRunner interface {
 type execGitRunner struct {
 	stdoutLimitBytes int
 	stderrLimitBytes int
+	waitDelay        time.Duration
 }
 
 func (runner execGitRunner) Run(ctx context.Context, directory string, arguments ...string) (gitResult, error) {
@@ -54,6 +57,13 @@ func (runner execGitRunner) Run(ctx context.Context, directory string, arguments
 	stderr := boundedBuffer{limit: runner.stderrLimitBytes}
 	command.Stdout = &stdout
 	command.Stderr = &stderr
+	configureGitProcess(command)
+	command.Cancel = func() error { return cancelGitProcess(command) }
+	waitDelay := runner.waitDelay
+	if waitDelay == 0 {
+		waitDelay = gitWaitDelay
+	}
+	command.WaitDelay = waitDelay
 	result := gitResult{
 		Argv: argv, ExitCode: -1,
 		StdoutLimitBytes: runner.stdoutLimitBytes, StderrLimitBytes: runner.stderrLimitBytes,

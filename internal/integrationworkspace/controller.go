@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	resultSchemaVersion   = 1
+	resultSchemaVersion   = 2
 	defaultStdoutLimit    = 4 * 1024 * 1024
 	defaultStderrLimit    = 1024 * 1024
 	maximumCandidateCount = 256
@@ -153,10 +153,6 @@ func (controller *Controller) Integrate(ctx context.Context, request Request) (R
 	if err != nil {
 		return controller.finishUnavailable(request.EvidencePrefix, record, fmt.Errorf("create disposable workspace: %w", err))
 	}
-	workspaceID := filepath.Base(workspace)
-	record.Cleanup.TemporaryRoot = controller.temporaryRoot
-	record.Cleanup.WorkspacePath = workspace
-	record.Cleanup.WorkspaceID = workspaceID
 	if err := validateCreatedWorkspace(controller.temporaryRoot, workspace); err != nil {
 		return controller.finishUnavailable(request.EvidencePrefix, record, err)
 	}
@@ -179,32 +175,38 @@ func (controller *Controller) Integrate(ctx context.Context, request Request) (R
 	if err := verifyPublishedEvidence(captureRef, captureEvidenceKind, captureBytes, controller.evidenceRoot, workspace); err != nil {
 		return unavailable(record, fmt.Errorf("verify pre-cleanup evidence; workspace preserved at %s: %w", workspace, err))
 	}
-	record.CaptureRef = captureRef
+	record.CaptureSHA256 = captureRef.SHA256
 
 	if err := controller.cleanupWorkspace(workspace); err != nil {
-		return unavailable(record, err)
+		return unavailableWithEvidence(record, err, captureRef, ledger.EvidenceRef{})
 	}
 	record.Cleanup.WorkspaceRemoved = true
 	cleanupBytes, err := json.Marshal(struct {
-		SchemaVersion int                `json:"schema_version"`
-		CaptureRef    ledger.EvidenceRef `json:"capture_ref"`
-		Cleanup       CleanupEvidence    `json:"cleanup"`
-	}{resultSchemaVersion, captureRef, record.Cleanup})
+		SchemaVersion int                        `json:"schema_version"`
+		CaptureRef    ledger.EvidenceRef         `json:"capture_ref"`
+		Cleanup       operationalCleanupEvidence `json:"cleanup"`
+	}{
+		SchemaVersion: resultSchemaVersion,
+		CaptureRef:    captureRef,
+		Cleanup: operationalCleanupEvidence{
+			TemporaryRoot: controller.temporaryRoot, WorkspacePath: workspace,
+			WorkspaceID: filepath.Base(workspace), WorkspaceRemoved: true,
+		},
+	})
 	if err != nil {
-		return unavailable(record, fmt.Errorf("marshal cleanup evidence: %w", err))
+		return unavailableWithEvidence(record, fmt.Errorf("marshal cleanup evidence: %w", err), captureRef, ledger.EvidenceRef{})
 	}
 	cleanupRef, err := controller.artifacts.WriteBytes(request.EvidencePrefix+"-cleanup.json", cleanupEvidenceKind, cleanupBytes)
 	if err != nil {
-		return unavailable(record, fmt.Errorf("publish cleanup evidence: %w", err))
+		return unavailableWithEvidence(record, fmt.Errorf("publish cleanup evidence: %w", err), captureRef, ledger.EvidenceRef{})
 	}
 	if err := verifyPublishedEvidence(cleanupRef, cleanupEvidenceKind, cleanupBytes, controller.evidenceRoot, ""); err != nil {
-		return unavailable(record, fmt.Errorf("verify cleanup evidence: %w", err))
+		return unavailableWithEvidence(record, fmt.Errorf("verify cleanup evidence: %w", err), captureRef, ledger.EvidenceRef{})
 	}
-	record.CleanupRef = cleanupRef
 	if integrationErr != nil {
-		return newResult(record), integrationErr
+		return newResult(record, captureRef, cleanupRef), integrationErr
 	}
-	return newResult(record), nil
+	return newResult(record, captureRef, cleanupRef), nil
 }
 
 func (controller *Controller) integrateWorkspace(
@@ -534,9 +536,11 @@ func (controller *Controller) finishUnavailable(prefix string, record resultReco
 		return unavailable(record, errors.Join(cause, marshalErr))
 	}
 	ref, publishErr := controller.artifacts.WriteBytes(prefix+"-capture.json", captureEvidenceKind, data)
+	var captureRef ledger.EvidenceRef
 	if publishErr == nil {
 		if verifyErr := verifyPublishedEvidence(ref, captureEvidenceKind, data, controller.evidenceRoot, ""); verifyErr == nil {
-			record.CaptureRef = ref
+			record.CaptureSHA256 = ref.SHA256
+			captureRef = ref
 		} else {
 			publishErr = verifyErr
 		}
@@ -544,18 +548,21 @@ func (controller *Controller) finishUnavailable(prefix string, record resultReco
 	if publishErr != nil {
 		cause = errors.Join(cause, fmt.Errorf("publish unavailable evidence: %w", publishErr))
 	}
-	return newResult(record), cause
+	return newResult(record, captureRef, ledger.EvidenceRef{}), cause
 }
 
 func unavailable(record resultRecord, cause error) (Result, error) {
+	return unavailableWithEvidence(record, cause, ledger.EvidenceRef{}, ledger.EvidenceRef{})
+}
+
+func unavailableWithEvidence(record resultRecord, cause error, captureRef, cleanupRef ledger.EvidenceRef) (Result, error) {
 	record.Status = StatusUnavailable
 	record.Failure = cause.Error()
-	return newResult(record), cause
+	return newResult(record, captureRef, cleanupRef), cause
 }
 
 func captureRecord(record resultRecord) resultRecord {
-	record.CaptureRef = ledger.EvidenceRef{}
-	record.CleanupRef = ledger.EvidenceRef{}
+	record.CaptureSHA256 = ""
 	record.Cleanup.WorkspaceRemoved = false
 	return record
 }

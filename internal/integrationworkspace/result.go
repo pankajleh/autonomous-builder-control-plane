@@ -62,12 +62,19 @@ type CandidateStep struct {
 	CommandEnd    int                         `json:"command_end"`
 }
 
-// CleanupEvidence proves that cleanup targeted only the created workspace and
-// that the path no longer existed before the receipt was published.
+// CleanupEvidence records the deterministic cleanup outcome. The exact
+// disposable path is operational data kept only in the separate cleanup
+// receipt, so random workspace identity cannot affect canonical result bytes.
 type CleanupEvidence struct {
-	TemporaryRoot    string `json:"temporary_root,omitempty"`
-	WorkspacePath    string `json:"workspace_path,omitempty"`
-	WorkspaceID      string `json:"workspace_id,omitempty"`
+	WorkspaceRemoved bool `json:"workspace_removed"`
+}
+
+// operationalCleanupEvidence is intentionally confined to the non-canonical
+// cleanup receipt that is published after the exact workspace is removed.
+type operationalCleanupEvidence struct {
+	TemporaryRoot    string `json:"temporary_root"`
+	WorkspacePath    string `json:"workspace_path"`
+	WorkspaceID      string `json:"workspace_id"`
 	WorkspaceRemoved bool   `json:"workspace_removed"`
 }
 
@@ -81,9 +88,8 @@ type resultRecord struct {
 	Candidates       []scheduler.AcceptedCandidate `json:"candidates,omitempty"`
 	Steps            []CandidateStep               `json:"steps,omitempty"`
 	Commands         []CommandEvidence             `json:"commands,omitempty"`
-	CaptureRef       ledger.EvidenceRef            `json:"capture_ref,omitempty"`
+	CaptureSHA256    string                        `json:"capture_sha256,omitempty"`
 	Cleanup          CleanupEvidence               `json:"cleanup"`
-	CleanupRef       ledger.EvidenceRef            `json:"cleanup_ref,omitempty"`
 }
 
 // Result is an immutable textual integration result. Every accessor returns a
@@ -92,9 +98,11 @@ type Result struct {
 	record        resultRecord
 	canonicalJSON []byte
 	digest        string
+	captureRef    ledger.EvidenceRef
+	cleanupRef    ledger.EvidenceRef
 }
 
-func newResult(record resultRecord) Result {
+func newResult(record resultRecord, captureRef, cleanupRef ledger.EvidenceRef) Result {
 	record = cloneResultRecord(record)
 	canonical, err := json.Marshal(record)
 	if err != nil {
@@ -104,7 +112,10 @@ func newResult(record resultRecord) Result {
 		canonical, _ = json.Marshal(record)
 	}
 	digest := sha256.Sum256(canonical)
-	return Result{record: record, canonicalJSON: canonical, digest: hex.EncodeToString(digest[:])}
+	return Result{
+		record: record, canonicalJSON: canonical, digest: hex.EncodeToString(digest[:]),
+		captureRef: captureRef, cleanupRef: cleanupRef,
+	}
 }
 
 // Status returns the textual integration status.
@@ -134,13 +145,13 @@ func (r Result) Steps() []CandidateStep { return cloneSteps(r.record.Steps) }
 func (r Result) Commands() []CommandEvidence { return cloneCommands(r.record.Commands) }
 
 // CaptureRef returns the immutable evidence published before cleanup.
-func (r Result) CaptureRef() ledger.EvidenceRef { return r.record.CaptureRef }
+func (r Result) CaptureRef() ledger.EvidenceRef { return r.captureRef }
 
 // Cleanup returns the bounded cleanup outcome.
 func (r Result) Cleanup() CleanupEvidence { return r.record.Cleanup }
 
 // CleanupRef returns the immutable cleanup receipt reference.
-func (r Result) CleanupRef() ledger.EvidenceRef { return r.record.CleanupRef }
+func (r Result) CleanupRef() ledger.EvidenceRef { return r.cleanupRef }
 
 // CanonicalJSON returns a defensive copy of the deterministic result bytes.
 func (r Result) CanonicalJSON() []byte { return append([]byte(nil), r.canonicalJSON...) }
