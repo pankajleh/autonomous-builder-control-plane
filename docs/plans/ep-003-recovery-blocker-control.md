@@ -42,12 +42,12 @@ git diff --check
 
 ### Task 1: Implement recovery ownership and stale-state inspection
 
-- [ ] Add a focused recovery package with typed process/worktree ownership metadata for a governed attempt.
-- [ ] On Linux capture process identity strong enough to detect PID reuse (for example PID plus `/proc` start identity) without relying on command text alone.
-- [ ] Inspect governed Ralphex worktree/branch/process state without mutating it and classify active, stale-owner-dead, missing, or ambiguous state.
-- [ ] Keep platform-specific process identity behind small build-tagged files; unsupported proof must fail closed.
-- [ ] Add tests for live owner, dead owner, PID-reuse mismatch, missing worktree, path escape/symlink rejection, and ambiguous proof.
-- [ ] Run validation, mark Task 1 complete, and commit.
+- [x] Add a focused recovery package with typed process/worktree ownership metadata for a governed attempt.
+- [x] On Linux capture process identity strong enough to detect PID reuse (for example PID plus `/proc` start identity) without relying on command text alone.
+- [x] Inspect governed Ralphex worktree/branch/process state without mutating it and classify active, stale-owner-dead, missing, or ambiguous state.
+- [x] Keep platform-specific process identity behind small build-tagged files; unsupported proof must fail closed.
+- [x] Add tests for live owner, dead owner, PID-reuse mismatch, missing worktree, path escape/symlink rejection, and ambiguous proof.
+- [x] Run validation, mark Task 1 complete, and commit.
 ### Task 2: Preserve terminal-failure evidence before cleanup
 
 - [ ] Add immutable recovery snapshot metadata tying run/attempt identity to repository, worktree, branch, HEAD, status, and owner proof.
