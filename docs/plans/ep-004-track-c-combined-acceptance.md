@@ -13,18 +13,19 @@
 
 ### Task 1: Implement combined acceptance and semantic-conflict classification
 
-- [ ] Verify the governed context capsule before reading implementation files or making changes.
-- [ ] Consume `internal/scheduler` candidate/risk contracts read-only and reuse the existing controller-owned `internal/acceptance` executor rather than duplicating branch-acceptance mechanics.
-- [ ] Add a new `internal/combinedacceptance/` package that evaluates a caller-supplied exact integrated target and preserves exact candidate/integration provenance.- [ ] Run combined deterministic acceptance against that exact integrated target with immutable command/Git evidence and fail closed if target identity changes during evaluation.
-- [ ] Define deterministic semantic-conflict classification from combined acceptance evidence and governed policy signals only; no model narrative may substitute for acceptance evidence.
-- [ ] At minimum distinguish clean combined acceptance, deterministic semantic-conflict evidence, and validation-unavailable/fail-closed outcomes suitable for later serial gate assembly.
-- [ ] Preserve enough evidence to explain which required checks or policy signals caused the classification while excluding secrets and unbounded output.
-- [ ] Reject incomplete candidate provenance, incomplete integration provenance, stale/moved integrated heads, ambiguous policy input, or unavailable required validation.
-- [ ] Return immutable evidence/results only; do not perform integration workspace creation, textual conflict resolution, state transitions, or merge authorization.
-- [ ] Add tests for combined PASS, required-check failure, semantic-conflict classification, moved-head rejection, incomplete provenance, deterministic evidence, and immutable returned values.
-- [ ] Keep `internal/scheduler/`, `internal/integrationworkspace/`, canonical state machine, branch acceptance contracts, and merge authority untouched.
-- [ ] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
-- [ ] Mark only this task complete and commit the bounded Track C implementation.
+- [x] Verify the governed context capsule before reading implementation files or making changes.
+- [x] Consume `internal/scheduler` candidate/risk contracts read-only and reuse the existing controller-owned `internal/acceptance` executor rather than duplicating branch-acceptance mechanics.
+- [x] Add a new `internal/combinedacceptance/` package that evaluates a caller-supplied exact integrated target and preserves exact candidate/integration provenance.
+- [x] Run combined deterministic acceptance against that exact integrated target with immutable command/Git evidence and fail closed if target identity changes during evaluation.
+- [x] Define deterministic semantic-conflict classification from combined acceptance evidence and governed policy signals only; no model narrative may substitute for acceptance evidence.
+- [x] At minimum distinguish clean combined acceptance, deterministic semantic-conflict evidence, and validation-unavailable/fail-closed outcomes suitable for later serial gate assembly.
+- [x] Preserve enough evidence to explain which required checks or policy signals caused the classification while excluding secrets and unbounded output.
+- [x] Reject incomplete candidate provenance, incomplete integration provenance, stale/moved integrated heads, ambiguous policy input, or unavailable required validation.
+- [x] Return immutable evidence/results only; do not perform integration workspace creation, textual conflict resolution, state transitions, or merge authorization.
+- [x] Add tests for combined PASS, required-check failure, semantic-conflict classification, moved-head rejection, incomplete provenance, deterministic evidence, and immutable returned values.
+- [x] Keep `internal/scheduler/`, `internal/integrationworkspace/`, canonical state machine, branch acceptance contracts, and merge authority untouched.
+- [x] Run `gofmt -w cmd internal`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
+- [x] Mark only this task complete and commit the bounded Track C implementation.
 
 ## Track boundary
 
