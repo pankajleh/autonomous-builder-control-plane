@@ -9,6 +9,7 @@ Correct the remaining substantive Major found by final independent review of exa
 - Track D correction head `f7c3c1f...` is ABCP `BRANCH_ACCEPTED` and exact-head deterministic validation passed.
 - Final Claude re-review confirmed the prior four Major classes are fixed except one terminal-evidence failure path.
 - The defect: an unverified materialization evidence ref can escape from `UseMaterialized`; then `Gate.finish` re-verification can return while the durable state remains `INTEGRATING`.
+- Governed context capsule: `/home/devagent/abcp-runtime/ep004-track-d-terminal-correction/context.json`; before any task work, run `abcp context-verify` against this repository and stop on any mismatch. The exact capsule SHA256 is bound by the ABCP run authority.
 
 ## Pre-implementation design gate
 - Trust boundary: no evidence ref becomes part of a returned Track B materialization result until its bytes, root containment, type, bound, identity and digest have verified.
