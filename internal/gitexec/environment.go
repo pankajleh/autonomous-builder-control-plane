@@ -7,11 +7,11 @@ import "os"
 
 // Environment returns the allowlisted environment for local controller-owned
 // Git commands. Command-scoped configuration disables executable hooks,
-// fsmonitor helpers, credential helpers, replacement objects, grafts, and host
-// Git configuration.
+// fsmonitor helpers, credential helpers, replacement objects, grafts, lazy
+// promisor fetching, and host Git configuration.
 func Environment() []string {
 	keys := []string{"PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR"}
-	environment := make([]string, 0, len(keys)+13)
+	environment := make([]string, 0, len(keys)+14)
 	for _, key := range keys {
 		if value, ok := os.LookupEnv(key); ok {
 			environment = append(environment, key+"="+value)
@@ -21,6 +21,7 @@ func Environment() []string {
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL="+os.DevNull,
 		"GIT_NO_REPLACE_OBJECTS=1",
+		"GIT_NO_LAZY_FETCH=1",
 		"GIT_GRAFT_FILE=",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_CONFIG_COUNT=3",

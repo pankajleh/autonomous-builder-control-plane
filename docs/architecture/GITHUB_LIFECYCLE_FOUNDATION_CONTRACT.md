@@ -28,7 +28,10 @@ boundary. `DeriveExpectedMergeContent` verifies an immutable
 combined-acceptance target binds the exact Phase 3 integrated head and
 baseline. It then resolves that exact local commit to its tree using an
 explicit, pinned Git executable under `--no-replace-objects` and the governed
-Git environment. The frozen object records `phase3-ready-tree-v1`, the source
+Git environment. That environment disables lazy promisor fetching with
+`GIT_NO_LAZY_FETCH=1`: every required object must already exist locally, and a
+missing object makes derivation fail closed rather than consulting a promisor
+remote. The frozen object records `phase3-ready-tree-v1`, the source
 integrated-head and baseline SHAs, the complete source evidence reference, the
 canonical Git executable path/version/binary SHA-256, and the expected result
 tree SHA. Missing, altered, wrong-kind, wrong-state, wrong-head, wrong-baseline,

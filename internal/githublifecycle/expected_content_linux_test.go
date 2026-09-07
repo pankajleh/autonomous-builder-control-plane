@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -140,6 +141,104 @@ func TestExpectedMergeContentIgnoresReplacementRefs(t *testing.T) {
 	if derived.ExpectedResultTreeSHA().String() != acceptedTree {
 		t.Fatalf("replacement ref influenced tree: got %s want %s", derived.ExpectedResultTreeSHA(), acceptedTree)
 	}
+}
+
+func TestExpectedMergeContentDoesNotLazyFetchMissingPromisorObject(t *testing.T) {
+	fixtureRoot := t.TempDir()
+	source := filepath.Join(fixtureRoot, "source")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "init", "-q")
+	runGit(t, source, "config", "user.name", "ABCP Test")
+	runGit(t, source, "config", "user.email", "abcp@example.invalid")
+	if err := os.WriteFile(filepath.Join(source, "content.txt"), []byte("promisor content\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, source, "add", "content.txt")
+	runGit(t, source, "commit", "-q", "-m", "promisor fixture")
+	headText := strings.TrimSpace(runGit(t, source, "rev-parse", "HEAD"))
+	treeText := strings.TrimSpace(runGit(t, source, "rev-parse", "HEAD^{tree}"))
+
+	origin := filepath.Join(fixtureRoot, "origin.git")
+	runGit(t, fixtureRoot, "clone", "-q", "--bare", source, origin)
+	runGit(t, origin, "config", "uploadpack.allowFilter", "true")
+	partial := filepath.Join(fixtureRoot, "partial")
+	runGit(t, fixtureRoot, "clone", "-q", "--filter=tree:0", "--no-checkout", "file://"+origin, partial)
+	runGit(t, partial, "cat-file", "-e", headText+"^{commit}")
+	assertGitObjectMissingLocally(t, partial, treeText)
+
+	head, err := NewGitSHA(headText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidenceRoot := filepath.Join(fixtureRoot, "evidence")
+	store, err := evidence.NewStore(evidenceRoot, "run-phase3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := []byte(`{"state":"READY_FOR_MERGE","combined":{"target":{"head_sha":"` + head.String() + `","integration":{"integrated_head_sha":"` + head.String() + `","baseline_sha":"` + head.String() + `"}}}}`)
+	ref, err := store.WriteBytes("ready.json", phase3DecisionKind, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := gitObjectInventory(t, partial)
+	if _, err := DeriveExpectedMergeContent(context.Background(), partial, store.Root(), head, head, ref, "git"); err == nil {
+		t.Fatal("derivation fetched a missing promisor object")
+	} else if !strings.Contains(err.Error(), "derive Phase 3 integrated tree") {
+		t.Fatalf("unexpected missing-object error: %v", err)
+	}
+	after := gitObjectInventory(t, partial)
+	if !maps.Equal(before, after) {
+		t.Fatalf("governed derivation materialized objects or packs: before %#v after %#v", before, after)
+	}
+
+	// An ordinary Git lookup can fetch the same object, proving the promisor
+	// remote was available when the governed lookup failed closed.
+	runGit(t, partial, "cat-file", "-e", treeText+"^{tree}")
+	if maps.Equal(after, gitObjectInventory(t, partial)) {
+		t.Fatal("ordinary Git did not materialize the missing promisor object")
+	}
+}
+
+func assertGitObjectMissingLocally(t *testing.T, repository, object string) {
+	t.Helper()
+	command := exec.Command("git", "cat-file", "-e", object+"^{tree}")
+	command.Dir = repository
+	command.Env = append(os.Environ(), "GIT_NO_LAZY_FETCH=1", "LC_ALL=C")
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("partial-clone fixture unexpectedly contains tree %s", object)
+	} else if len(output) == 0 {
+		t.Fatalf("missing-object check returned no diagnostic: %v", err)
+	}
+}
+
+func gitObjectInventory(t *testing.T, repository string) map[string][sha256.Size]byte {
+	t.Helper()
+	root := filepath.Join(repository, ".git", "objects")
+	inventory := make(map[string][sha256.Size]byte)
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		inventory[relative] = sha256.Sum256(content)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return inventory
 }
 
 func runGit(t *testing.T, directory string, args ...string) string {

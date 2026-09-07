@@ -23,12 +23,12 @@ The canonical governed Git environment must set `GIT_NO_LAZY_FETCH=1` in additio
 - no provider/network implementation, PR write, CI poll, merge write, state transition, or Phase 5+ work.
 
 ### Task 1: Disable Git lazy-fetch in the network-free foundation
-- [ ] Add `GIT_NO_LAZY_FETCH=1` to `internal/gitexec.Environment()` so every governed Git subprocess inherits the prohibition.
-- [ ] Preserve all existing Git environment protections and `runPinnedGit` behavior.
-- [ ] Add a regression using a promisor/partial-clone setup with a deliberately missing object. Prove the governed derivation cannot fetch it, returns an error, and does not increase local object/pack materialization.
-- [ ] Preserve and rerun the existing replacement-ref expected-content regression.
-- [ ] Update `GITHUB_LIFECYCLE_FOUNDATION_CONTRACT.md` to state that lazy promisor fetching is disabled and required objects must already be local.
-- [ ] Run `gofmt`, focused tests, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
+- [x] Add `GIT_NO_LAZY_FETCH=1` to `internal/gitexec.Environment()` so every governed Git subprocess inherits the prohibition.
+- [x] Preserve all existing Git environment protections and `runPinnedGit` behavior.
+- [x] Add a regression using a promisor/partial-clone setup with a deliberately missing object. Prove the governed derivation cannot fetch it, returns an error, and does not increase local object/pack materialization.
+- [x] Preserve and rerun the existing replacement-ref expected-content regression.
+- [x] Update `GITHUB_LIFECYCLE_FOUNDATION_CONTRACT.md` to state that lazy promisor fetching is disabled and required objects must already be local.
+- [x] Run `gofmt`, focused tests, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
 
 ## Non-goals
 No change to write-attempt identity, expected-tree authority semantics, resource-limit policy, GitHub provider implementation, PR/CI execution, merge execution, ledger state transitions, Phase 5 API/dashboard, deployment, or production acceptance.
