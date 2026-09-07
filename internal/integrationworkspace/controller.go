@@ -158,13 +158,14 @@ func (controller *Controller) UseMaterialized(
 	if err != nil {
 		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, err, &cleaned, &outcome)
 	}
-	outcome.CaptureRef, err = controller.artifacts.WriteBytes(evidencePrefix+"-materialization.json", materializeEvidenceKind, captureBytes)
+	publishedCaptureRef, err := controller.artifacts.WriteBytes(evidencePrefix+"-materialization.json", materializeEvidenceKind, captureBytes)
 	if err != nil {
 		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, err, &cleaned, &outcome)
 	}
-	if err := verifyPublishedEvidence(outcome.CaptureRef, materializeEvidenceKind, captureBytes, controller.evidenceRoot, workspace); err != nil {
+	if err := verifyPublishedEvidence(publishedCaptureRef, materializeEvidenceKind, captureBytes, controller.evidenceRoot, workspace); err != nil {
 		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, err, &cleaned, &outcome)
 	}
+	outcome.CaptureRef = publishedCaptureRef
 	useErr := use(MaterializedTarget{RepositoryPath: workspace, Branch: branch, HeadSHA: head,
 		Evidence: []ledger.EvidenceRef{expected.CaptureRef(), expected.CleanupRef(), outcome.CaptureRef}})
 	cleanupErr := controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, nil, &cleaned, &outcome)

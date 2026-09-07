@@ -170,6 +170,52 @@ func TestUseMaterializedReproducesBoundResultAndAlwaysCleans(t *testing.T) {
 	assertEvidence(t, materialization.CleanupRef, materializeCleanupEvidenceKind)
 }
 
+func TestUseMaterializedDoesNotExposeUnverifiedPublishedCapture(t *testing.T) {
+	for _, mode := range []string{"mismatched", "oversized"} {
+		t.Run(mode, func(t *testing.T) {
+			repository := newRepository(t)
+			baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+			head := branchCommit(t, repository, baseline, "candidate", "candidate.txt", "candidate\n")
+			git(t, repository, "checkout", "--quiet", "main")
+			candidate := acceptedCandidate(t, repository, "candidate", baseline, head, "run", time.Now().UTC())
+			report := riskReport(t, []scheduler.AcceptedCandidate{candidate})
+			store := evidenceStore(t)
+			writer := &corruptingEvidenceWriter{ArtifactWriter: store, suffix: "-materialization.json", mode: mode}
+			controller := newTestController(t, t.TempDir(), writer)
+			request := Request{BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "bound"}
+			result, err := controller.Integrate(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			materialization, err := controller.UseMaterialized(context.Background(), request, result, "adversarial", func(MaterializedTarget) error {
+				called = true
+				return nil
+			})
+			if err == nil || called {
+				t.Fatalf("unverified materialization result = %#v, called = %v, err = %v", materialization, called, err)
+			}
+			if materialization.CaptureRef.URI != "" {
+				t.Fatalf("unverified capture escaped in result: %#v", materialization.CaptureRef)
+			}
+			assertEvidence(t, materialization.CleanupRef, materializeCleanupEvidenceKind)
+			cleanupBytes, readErr := os.ReadFile(materialization.CleanupRef.URI)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			var cleanup struct {
+				CaptureRef ledger.EvidenceRef `json:"capture_ref"`
+			}
+			if err := json.Unmarshal(cleanupBytes, &cleanup); err != nil {
+				t.Fatal(err)
+			}
+			if cleanup.CaptureRef.URI != "" {
+				t.Fatalf("cleanup evidence exposed rejected capture ref: %s", cleanupBytes)
+			}
+		})
+	}
+}
+
 func TestUseMaterializedRejectsForgedResultAndFailsClosedOnCleanupFailure(t *testing.T) {
 	repository := newRepository(t)
 	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
@@ -423,6 +469,31 @@ func TestGateLifecycleCleansWhenCapturePublicationFails(t *testing.T) {
 type selectiveFailureWriter struct {
 	ArtifactWriter
 	suffix string
+}
+
+type corruptingEvidenceWriter struct {
+	ArtifactWriter
+	suffix string
+	mode   string
+}
+
+func (w *corruptingEvidenceWriter) WriteBytes(name, kind string, data []byte) (ledger.EvidenceRef, error) {
+	ref, err := w.ArtifactWriter.WriteBytes(name, kind, data)
+	if err != nil || !strings.HasSuffix(name, w.suffix) {
+		return ref, err
+	}
+	switch w.mode {
+	case "mismatched":
+		ref.SHA256 = strings.Repeat("0", 64)
+	case "oversized":
+		oversized := make([]byte, maximumExistingEvidenceBytes+1)
+		if err := os.WriteFile(ref.URI, oversized, 0o600); err != nil {
+			return ledger.EvidenceRef{}, err
+		}
+		digest := sha256.Sum256(oversized)
+		ref.SHA256 = hex.EncodeToString(digest[:])
+	}
+	return ref, nil
 }
 
 func (w *selectiveFailureWriter) WriteBytes(name, kind string, data []byte) (ledger.EvidenceRef, error) {

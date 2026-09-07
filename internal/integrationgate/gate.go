@@ -41,6 +41,10 @@ const (
 	maxCandidateEvidenceRefs  = 64
 	maxReviewRequirements     = 256
 	maxReviewEvidenceRefs     = 64
+	maxFallbackEvidenceRefs   = 15
+	maxFallbackRejectedRefs   = 64
+	maxFallbackTextBytes      = 4096
+	fallbackEvidenceKind      = "serial-integration-gate-fallback-decision"
 )
 
 type EventAppender interface{ Append(ledger.Event) error }
@@ -148,24 +152,30 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 	}
 	inputRef, err := g.writeVerified(prepared.EvidencePrefix+"-input.json", gateInputEvidenceKind, inputBytes)
 	if err != nil {
-		result.FailureReason = err.Error()
-		return result, err
+		return g.fallback(prepared, result, domain.StateIntegrationPending, "publish verified gate input", nil, err)
 	}
 	initialHeadRef, err := g.verifySourceHeads(ctx, prepared, "initial")
 	if initialHeadRef.URI != "" {
 		result.SourceVerificationEvidence = append(result.SourceVerificationEvidence, initialHeadRef)
 	}
 	if err != nil {
-		result.FailureReason = err.Error()
-		return result, err
+		var publicationErr *artifactPublicationError
+		if errors.As(err, &publicationErr) {
+			return g.fallback(prepared, result, domain.StateFailed, err.Error(), []ledger.EvidenceRef{inputRef}, err)
+		}
+		finished, finishErr := g.finish(prepared, result, domain.StateFailed, err.Error(), inputRef)
+		if finishErr != nil {
+			return finished, finishErr
+		}
+		return finished, err
 	}
 	initialRefs := []ledger.EvidenceRef{inputRef, initialHeadRef}
-	if err := g.transition(prepared.Authority.RunID(), domain.StateBranchAccepted, domain.StateIntegrationPending, initialRefs, map[string]any{"risk_sha256": prepared.RiskReport.SHA256()}); err != nil {
-		return result, err
+	if err := g.transition(prepared.Authority.RunID(), result.State, domain.StateIntegrationPending, initialRefs, map[string]any{"risk_sha256": prepared.RiskReport.SHA256()}); err != nil {
+		return g.handleTransitionFailure(prepared, result, domain.StateIntegrationPending, "emit integration pending", initialRefs, err)
 	}
 	result.State = domain.StateIntegrationPending
-	if err := g.transition(prepared.Authority.RunID(), domain.StateIntegrationPending, domain.StateIntegrating, initialRefs, nil); err != nil {
-		return result, err
+	if err := g.transition(prepared.Authority.RunID(), result.State, domain.StateIntegrating, initialRefs, nil); err != nil {
+		return g.handleTransitionFailure(prepared, result, domain.StateIntegrating, "emit integrating", initialRefs, err)
 	}
 	result.State = domain.StateIntegrating
 
@@ -211,28 +221,35 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 	result.Materialization = materialization
 	result.Combined = combinedResult
 	if materializeErr != nil {
+		var publicationErr *artifactPublicationError
+		if errors.As(materializeErr, &publicationErr) {
+			return g.fallback(prepared, result, domain.StateValidationUnavailable, materializeErr.Error(), terminalRefs(result, inputRef), materializeErr)
+		}
 		return g.finish(prepared, result, domain.StateValidationUnavailable, materializeErr.Error(), inputRef)
 	}
 	switch combinedResult.Classification() {
 	case combinedacceptance.ClassificationClean:
-		readyHeadRef, headErr := g.verifySourceHeads(ctx, prepared, "ready-for-merge")
-		if readyHeadRef.URI != "" {
-			result.SourceVerificationEvidence = append(result.SourceVerificationEvidence, readyHeadRef)
-		}
-		if headErr != nil {
-			return g.finish(prepared, result, domain.StateValidationUnavailable, headErr.Error(), inputRef)
-		}
 		accepted, finishErr := g.finish(prepared, result, domain.StateIntegrationAccepted, "", inputRef)
 		if finishErr != nil {
 			return accepted, finishErr
 		}
-		refs := collectRefs(inputRef, accepted.DecisionEvidence, accepted.Materialization.CleanupRef, readyHeadRef)
-		if err := g.verifyAllEvidence(refs); err != nil {
-			accepted.FailureReason = err.Error()
-			return accepted, err
+		if accepted.State != domain.StateIntegrationAccepted {
+			return accepted, nil
 		}
-		if err := g.transition(prepared.Authority.RunID(), domain.StateIntegrationAccepted, domain.StateReadyForMerge, refs, map[string]any{"combined_acceptance_sha256": combinedResult.SHA256()}); err != nil {
-			return accepted, err
+		readyHeadRef, headErr := g.verifySourceHeads(ctx, prepared, "ready-for-merge")
+		if readyHeadRef.URI != "" {
+			accepted.SourceVerificationEvidence = append(accepted.SourceVerificationEvidence, readyHeadRef)
+		}
+		if headErr != nil {
+			var publicationErr *artifactPublicationError
+			if errors.As(headErr, &publicationErr) {
+				return g.fallback(prepared, accepted, domain.StateReadyForMerge, headErr.Error(), terminalRefs(accepted, inputRef), headErr)
+			}
+			return g.finish(prepared, accepted, domain.StateFailed, headErr.Error(), inputRef)
+		}
+		refs := collectRefs(inputRef, accepted.DecisionEvidence, accepted.Materialization.CleanupRef, readyHeadRef)
+		if err := g.transition(prepared.Authority.RunID(), accepted.State, domain.StateReadyForMerge, refs, map[string]any{"combined_acceptance_sha256": combinedResult.SHA256()}); err != nil {
+			return g.handleTransitionFailure(prepared, accepted, domain.StateReadyForMerge, "emit ready for merge", refs, err)
 		}
 		accepted.State = domain.StateReadyForMerge
 		return accepted, nil
@@ -244,6 +261,10 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 }
 
 func (g *Gate) finish(request Request, result Result, state domain.State, reason string, inputRef ledger.EvidenceRef) (Result, error) {
+	refs := terminalRefs(result, inputRef)
+	if err := g.verifyTransitionEvidence(refs); err != nil {
+		return g.fallback(request, result, state, reason, refs, err)
+	}
 	record := struct {
 		SchemaVersion      int                                          `json:"schema_version"`
 		State              domain.State                                 `json:"state"`
@@ -261,38 +282,41 @@ func (g *Gate) finish(request Request, result Result, state domain.State, reason
 	}{1, state, request.Authority.SHA256(), request.RiskReport.SHA256(), result.Textual.SHA256(), result.Textual.CanonicalJSON(), result.Combined.SHA256(), result.Combined.CanonicalJSON(), request.ReviewPolicy, request.Reviews, result.Materialization, append([]ledger.EvidenceRef(nil), result.SourceVerificationEvidence...), reason}
 	data, err := json.Marshal(record)
 	if err != nil {
+		result.FailureReason = infrastructureFailure(reason, "marshal normal decision", err)
 		return result, err
 	}
 	decisionRef, err := g.writeVerified(request.EvidencePrefix+"-decision-"+strings.ToLower(string(state))+".json", gateEvidenceKind, data)
 	if err != nil {
+		return g.fallback(request, result, state, reason, refs, err)
+	}
+	refs = collectRefs(append(refs, decisionRef)...)
+	if err := g.transition(request.Authority.RunID(), result.State, state, refs, map[string]any{"reason": reason}); err != nil {
+		var verificationErr *evidenceVerificationError
+		if errors.As(err, &verificationErr) {
+			return g.fallback(request, result, state, reason, refs, err)
+		}
+		result.FailureReason = infrastructureFailure(reason, "append normal transition", err)
 		return result, err
 	}
 	result.DecisionEvidence = decisionRef
 	result.FailureReason = reason
-	refs := collectRefs(inputRef, decisionRef, result.Textual.CaptureRef(), result.Textual.CleanupRef(), result.Materialization.CaptureRef, result.Materialization.CleanupRef)
-	refs = append(refs, result.Combined.EvidenceRefs()...)
-	refs = append(refs, result.SourceVerificationEvidence...)
-	refs = collectRefs(refs...)
-	if err := g.verifyAllEvidence(refs); err != nil {
-		result.FailureReason = err.Error()
-		return result, err
-	}
-	if err := g.transition(request.Authority.RunID(), domain.StateIntegrating, state, refs, map[string]any{"reason": reason}); err != nil {
-		return result, err
-	}
 	result.State = state
 	return result, nil
 }
 
 func (g *Gate) transition(runID string, from, to domain.State, refs []ledger.EvidenceRef, payload map[string]any) error {
+	if err := g.verifyTransitionEvidence(refs); err != nil {
+		return err
+	}
+	return g.appendTransition(runID, from, to, refs, payload)
+}
+
+func (g *Gate) appendTransition(runID string, from, to domain.State, refs []ledger.EvidenceRef, payload map[string]any) error {
 	if err := domain.ValidateTransition(from, to); err != nil {
 		return err
 	}
 	if len(refs) == 0 {
 		return errors.New("every gate transition requires evidence")
-	}
-	if err := g.verifyAllEvidence(refs); err != nil {
-		return err
 	}
 	event, err := ledger.NewEvent(runID, eventStateTransition, "integration-controller", "integration-gate")
 	if err != nil {
@@ -302,14 +326,206 @@ func (g *Gate) transition(runID string, from, to domain.State, refs []ledger.Evi
 	return g.events.Append(event)
 }
 
+type rejectedEvidence struct {
+	URI    string `json:"uri,omitempty"`
+	SHA256 string `json:"sha256,omitempty"`
+	Kind   string `json:"kind,omitempty"`
+	Error  string `json:"error"`
+}
+
+type evidenceVerificationError struct {
+	rejected []rejectedEvidence
+}
+
+func (e *evidenceVerificationError) Error() string {
+	if e == nil || len(e.rejected) == 0 {
+		return "evidence verification failed"
+	}
+	return fmt.Sprintf("evidence verification failed for %d ref(s): %s", len(e.rejected), e.rejected[0].Error)
+}
+
+type artifactPublicationError struct {
+	operation string
+	ref       ledger.EvidenceRef
+	err       error
+}
+
+func (e *artifactPublicationError) Error() string {
+	return fmt.Sprintf("%s: %v", e.operation, e.err)
+}
+
+func (e *artifactPublicationError) Unwrap() error { return e.err }
+
+func (g *Gate) verifyTransitionEvidence(refs []ledger.EvidenceRef) error {
+	if len(refs) == 0 {
+		return &evidenceVerificationError{rejected: []rejectedEvidence{{Error: "complete evidence is required"}}}
+	}
+	var rejected []rejectedEvidence
+	for _, ref := range refs {
+		if _, err := evidence.ReadVerifiedLocal(g.evidenceRoot, ref, maxEvidenceArtifactBytes); err != nil {
+			rejected = append(rejected, rejectedRef(ref, err))
+		}
+	}
+	if len(rejected) != 0 {
+		return &evidenceVerificationError{rejected: rejected}
+	}
+	return nil
+}
+
+func (g *Gate) handleTransitionFailure(request Request, result Result, intended domain.State, original string, refs []ledger.EvidenceRef, err error) (Result, error) {
+	var verificationErr *evidenceVerificationError
+	if errors.As(err, &verificationErr) {
+		return g.fallback(request, result, intended, original, refs, err)
+	}
+	result.FailureReason = infrastructureFailure(original, "append transition", err)
+	return result, err
+}
+
+func (g *Gate) fallback(request Request, result Result, intended domain.State, original string, candidates []ledger.EvidenceRef, trigger error) (Result, error) {
+	if original == "" {
+		original = fmt.Sprintf("intended transition to %s", intended)
+	}
+	target, err := fallbackTarget(result.State)
+	if err != nil {
+		result.FailureReason = infrastructureFailure(original, "select fallback transition", err)
+		return result, err
+	}
+	if err := domain.ValidateTransition(result.State, target); err != nil {
+		result.FailureReason = infrastructureFailure(original, "validate fallback transition", err)
+		return result, err
+	}
+
+	if publicationErr := (*artifactPublicationError)(nil); errors.As(trigger, &publicationErr) && publicationErr.ref.URI != "" {
+		candidates = append(candidates, publicationErr.ref)
+	}
+	verified, rejected := g.reduceFallbackEvidence(collectRefs(candidates...))
+	if verificationErr := (*evidenceVerificationError)(nil); errors.As(trigger, &verificationErr) {
+		for _, item := range verificationErr.rejected {
+			appendRejected(&rejected, item)
+		}
+	}
+	if len(rejected) > maxFallbackRejectedRefs {
+		rejected = rejected[:maxFallbackRejectedRefs]
+	}
+
+	classification := "EVIDENCE_VERIFICATION_FAILURE"
+	var publicationErr *artifactPublicationError
+	if errors.As(trigger, &publicationErr) {
+		classification = "EVIDENCE_PUBLICATION_FAILURE"
+	}
+	record := struct {
+		SchemaVersion               int                `json:"schema_version"`
+		State                       domain.State       `json:"state"`
+		AuthoritySHA256             string             `json:"authority_sha256"`
+		RiskSHA256                  string             `json:"risk_sha256"`
+		TextualSHA256               string             `json:"textual_sha256,omitempty"`
+		CombinedSHA256              string             `json:"combined_sha256,omitempty"`
+		OriginalIntendedState       domain.State       `json:"original_intended_state"`
+		OriginalFailure             string             `json:"original_failure"`
+		FallbackClassification      string             `json:"fallback_classification"`
+		EvidenceVerificationFailure string             `json:"evidence_verification_failure"`
+		RejectedRefs                []rejectedEvidence `json:"rejected_refs"`
+	}{
+		SchemaVersion: 1, State: target, AuthoritySHA256: request.Authority.SHA256(), RiskSHA256: request.RiskReport.SHA256(),
+		TextualSHA256: result.Textual.SHA256(), CombinedSHA256: result.Combined.SHA256(), OriginalIntendedState: intended,
+		OriginalFailure: boundedText(original), FallbackClassification: classification,
+		EvidenceVerificationFailure: boundedText(trigger.Error()), RejectedRefs: rejected,
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		result.FailureReason = infrastructureFailure(original, "marshal fallback decision", err)
+		return result, err
+	}
+	fallbackRef, err := g.writeVerified(request.EvidencePrefix+"-decision-fallback-"+strings.ToLower(string(target))+".json", fallbackEvidenceKind, data)
+	if err != nil {
+		result.FailureReason = infrastructureFailure(original, "publish or verify fallback decision", err)
+		return result, err
+	}
+	refs := collectRefs(append(verified, fallbackRef)...)
+	failureReason := fmt.Sprintf("original cause: %s; fallback classification: %s; evidence failure: %s", boundedText(original), classification, boundedText(trigger.Error()))
+	if err := g.transition(request.Authority.RunID(), result.State, target, refs, map[string]any{"reason": failureReason}); err != nil {
+		result.FailureReason = infrastructureFailure(failureReason, "verify or append one-shot fallback transition", err)
+		return result, err
+	}
+	result.State = target
+	result.DecisionEvidence = fallbackRef
+	result.FailureReason = failureReason
+	return result, nil
+}
+
+func fallbackTarget(state domain.State) (domain.State, error) {
+	switch state {
+	case domain.StateBranchAccepted, domain.StateIntegrationPending, domain.StateIntegrationAccepted:
+		return domain.StateFailed, nil
+	case domain.StateIntegrating:
+		return domain.StateValidationUnavailable, nil
+	default:
+		return "", fmt.Errorf("no evidence fallback is defined from %s", state)
+	}
+}
+
+func (g *Gate) reduceFallbackEvidence(candidates []ledger.EvidenceRef) ([]ledger.EvidenceRef, []rejectedEvidence) {
+	verified := make([]ledger.EvidenceRef, 0, min(len(candidates), maxFallbackEvidenceRefs))
+	var rejected []rejectedEvidence
+	for _, ref := range candidates {
+		if _, err := evidence.ReadVerifiedLocal(g.evidenceRoot, ref, maxEvidenceArtifactBytes); err != nil {
+			appendRejected(&rejected, rejectedRef(ref, err))
+			continue
+		}
+		if len(verified) < maxFallbackEvidenceRefs {
+			verified = append(verified, ref)
+		}
+	}
+	return verified, rejected
+}
+
+func rejectedRef(ref ledger.EvidenceRef, err error) rejectedEvidence {
+	return rejectedEvidence{URI: boundedText(ref.URI), SHA256: boundedText(ref.SHA256), Kind: boundedText(ref.Kind), Error: boundedText(err.Error())}
+}
+
+func appendRejected(values *[]rejectedEvidence, candidate rejectedEvidence) {
+	for _, value := range *values {
+		if value.URI == candidate.URI && value.SHA256 == candidate.SHA256 && value.Kind == candidate.Kind {
+			return
+		}
+	}
+	if len(*values) < maxFallbackRejectedRefs {
+		*values = append(*values, candidate)
+	}
+}
+
+func boundedText(value string) string {
+	if len(value) <= maxFallbackTextBytes {
+		return value
+	}
+	return value[:maxFallbackTextBytes]
+}
+
+func infrastructureFailure(original, operation string, err error) string {
+	if original == "" {
+		original = "none"
+	}
+	return fmt.Sprintf("original cause: %s; infrastructure failure during %s: %v", boundedText(original), operation, err)
+}
+
+func terminalRefs(result Result, inputRef ledger.EvidenceRef) []ledger.EvidenceRef {
+	refs := collectRefs(inputRef, result.DecisionEvidence, result.Textual.CaptureRef(), result.Textual.CleanupRef(), result.Materialization.CaptureRef, result.Materialization.CleanupRef)
+	refs = append(refs, result.Combined.EvidenceRefs()...)
+	refs = append(refs, result.SourceVerificationEvidence...)
+	return collectRefs(refs...)
+}
+
 func (g *Gate) writeVerified(name, kind string, data []byte) (ledger.EvidenceRef, error) {
 	ref, err := g.artifacts.WriteBytes(name, kind, data)
 	if err != nil {
-		return ledger.EvidenceRef{}, err
+		return ledger.EvidenceRef{}, &artifactPublicationError{operation: "write evidence", err: err}
 	}
 	actual, err := evidence.ReadVerifiedLocal(g.evidenceRoot, ref, maxEvidenceArtifactBytes)
-	if err != nil || !bytes.Equal(actual, data) || ref.Kind != kind {
-		return ledger.EvidenceRef{}, errors.New("evidence writer returned unavailable or mismatched evidence")
+	if err != nil {
+		return ref, &artifactPublicationError{operation: "verify published evidence", ref: ref, err: err}
+	}
+	if !bytes.Equal(actual, data) || ref.Kind != kind {
+		return ref, &artifactPublicationError{operation: "verify published evidence", ref: ref, err: errors.New("evidence writer returned mismatched bytes, digest, or kind")}
 	}
 	return ref, nil
 }

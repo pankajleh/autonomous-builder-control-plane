@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -41,7 +42,9 @@ func TestCleanGateOwnsProvenanceAndReachesReadyForMerge(t *testing.T) {
 		if len(event.EvidenceRefs) == 0 {
 			t.Fatalf("transition %s has no evidence", event.StateTo)
 		}
+		assertVerifiedRefs(t, fixture.gate.evidenceRoot, event.EvidenceRefs)
 	}
+	assertLedgerContinuity(t, fixture.events.events)
 	if entries, err := os.ReadDir(fixture.temporaryRoot); err != nil || len(entries) != 0 {
 		t.Fatalf("disposable target remains: %v, %v", entries, err)
 	}
@@ -282,7 +285,7 @@ func TestFinalSourceHeadDriftTerminalizesWithDurableEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.State != domain.StateValidationUnavailable || !strings.Contains(result.FailureReason, "source head changed") {
+	if result.State != domain.StateFailed || !strings.Contains(result.FailureReason, "source head changed") {
 		t.Fatalf("drift result = state %s, reason %q", result.State, result.FailureReason)
 	}
 	terminal := fixture.events.events[len(fixture.events.events)-1]
@@ -299,6 +302,157 @@ func TestFinalSourceHeadDriftTerminalizesWithDurableEvidence(t *testing.T) {
 	if !foundFailureProof {
 		t.Fatal("terminal transition omitted durable final source-head failure proof")
 	}
+	assertLedgerContinuity(t, fixture.events.events)
+	assertVerifiedRefs(t, fixture.gate.evidenceRoot, terminal.EvidenceRefs)
+}
+
+func TestEvidenceVerificationFailuresTerminalizeFromEveryDurableGateState(t *testing.T) {
+	t.Run("branch-accepted", func(t *testing.T) {
+		fixture := newGateFixture(t, false, "pass")
+		fixture.replaceWriter(t, &namedFaultWriter{ArtifactWriter: fixture.store, corruptSuffix: "-input.json"})
+		result, err := fixture.gate.Run(context.Background(), fixture.request)
+		if err != nil || result.State != domain.StateFailed {
+			t.Fatalf("branch fallback = state %s, err %v, reason %q", result.State, err, result.FailureReason)
+		}
+		assertFallbackTerminal(t, fixture)
+	})
+
+	t.Run("integration-pending", func(t *testing.T) {
+		fixture := newGateFixture(t, false, "pass")
+		fixture.gate.events = &mutatingEvents{delegate: fixture.events, after: domain.StateIntegrationPending, mutate: func(event ledger.Event) error {
+			return mutateFirstRefOfKind(event, gateInputEvidenceKind)
+		}}
+		result, err := fixture.gate.Run(context.Background(), fixture.request)
+		if err != nil || result.State != domain.StateFailed {
+			t.Fatalf("pending fallback = state %s, err %v, reason %q", result.State, err, result.FailureReason)
+		}
+		assertFallbackTerminal(t, fixture)
+	})
+
+	t.Run("integrating", func(t *testing.T) {
+		fixture := newGateFixture(t, false, "pass")
+		fixture.gate.workspace = &badMaterializationRefWorkspace{delegate: fixture.gate.workspace}
+		result, err := fixture.gate.Run(context.Background(), fixture.request)
+		if err != nil || result.State != domain.StateValidationUnavailable {
+			t.Fatalf("integrating fallback = state %s, err %v, reason %q", result.State, err, result.FailureReason)
+		}
+		assertFallbackTerminal(t, fixture)
+	})
+
+	t.Run("integration-accepted", func(t *testing.T) {
+		fixture := newGateFixture(t, false, "pass")
+		fixture.gate.events = &mutatingEvents{delegate: fixture.events, after: domain.StateIntegrationAccepted, mutate: func(event ledger.Event) error {
+			return mutateFirstRefOfKind(event, gateEvidenceKind)
+		}}
+		result, err := fixture.gate.Run(context.Background(), fixture.request)
+		if err != nil || result.State != domain.StateFailed {
+			t.Fatalf("accepted fallback = state %s, err %v, reason %q", result.State, err, result.FailureReason)
+		}
+		assertFallbackTerminal(t, fixture)
+	})
+}
+
+func TestNormalDecisionEvidenceFailureUsesHealthyFallbackWriter(t *testing.T) {
+	fixture := newGateFixture(t, false, "pass")
+	fixture.replaceWriter(t, &namedFaultWriter{ArtifactWriter: fixture.store, corruptSuffix: "-decision-integration_accepted.json"})
+	result, err := fixture.gate.Run(context.Background(), fixture.request)
+	if err != nil || result.State != domain.StateValidationUnavailable || !strings.Contains(result.FailureReason, "EVIDENCE_PUBLICATION_FAILURE") {
+		t.Fatalf("normal decision fallback = state %s, err %v, reason %q", result.State, err, result.FailureReason)
+	}
+	assertFallbackTerminal(t, fixture)
+}
+
+func TestFallbackWriterFailureDoesNotFabricateTransition(t *testing.T) {
+	fixture := newGateFixture(t, false, "pass")
+	fixture.replaceWriter(t, &namedFaultWriter{ArtifactWriter: fixture.store, failSuffix: "-decision-fallback-validation_unavailable.json"})
+	fixture.gate.workspace = &badMaterializationRefWorkspace{delegate: fixture.gate.workspace}
+	result, err := fixture.gate.Run(context.Background(), fixture.request)
+	if err == nil || result.State != domain.StateIntegrating || !strings.Contains(result.FailureReason, "infrastructure failure") {
+		t.Fatalf("fallback writer failure = state %s, err %v, reason %q", result.State, err, result.FailureReason)
+	}
+	assertLedgerContinuity(t, fixture.events.events)
+	if states := fixture.events.states(); len(states) == 0 || states[len(states)-1] != domain.StateIntegrating {
+		t.Fatalf("fallback writer failure fabricated terminal state: %v", states)
+	}
+}
+
+func TestLedgerAppendFailureIsNotRetriedOrFallbackEmitted(t *testing.T) {
+	fixture := newGateFixture(t, false, "pass")
+	fixture.gate.events = &failingEvents{delegate: fixture.events, failState: domain.StateIntegrating}
+	result, err := fixture.gate.Run(context.Background(), fixture.request)
+	if err == nil || result.State != domain.StateIntegrationPending || !strings.Contains(result.FailureReason, "infrastructure failure") {
+		t.Fatalf("append failure = state %s, err %v, reason %q", result.State, err, result.FailureReason)
+	}
+	if got := fixture.events.states(); !reflect.DeepEqual(got, []domain.State{domain.StateIntegrationPending}) {
+		t.Fatalf("append failure was retried or terminalized ambiguously: %v", got)
+	}
+	assertLedgerContinuity(t, fixture.events.events)
+}
+
+type badMaterializationRefWorkspace struct{ delegate workspaceController }
+
+func (w *badMaterializationRefWorkspace) Integrate(ctx context.Context, request integrationworkspace.Request) (integrationworkspace.Result, error) {
+	return w.delegate.Integrate(ctx, request)
+}
+
+func (w *badMaterializationRefWorkspace) UseMaterialized(ctx context.Context, request integrationworkspace.Request, expected integrationworkspace.Result, prefix string, use func(integrationworkspace.MaterializedTarget) error) (integrationworkspace.MaterializationEvidence, error) {
+	result, err := w.delegate.UseMaterialized(ctx, request, expected, prefix, use)
+	result.CaptureRef.SHA256 = strings.Repeat("0", 64)
+	return result, err
+}
+
+type namedFaultWriter struct {
+	ArtifactWriter
+	corruptSuffix string
+	failSuffix    string
+}
+
+func (w *namedFaultWriter) WriteBytes(name, kind string, data []byte) (ledger.EvidenceRef, error) {
+	if w.failSuffix != "" && strings.HasSuffix(name, w.failSuffix) {
+		return ledger.EvidenceRef{}, fmt.Errorf("injected scoped fallback publication failure")
+	}
+	ref, err := w.ArtifactWriter.WriteBytes(name, kind, data)
+	if err == nil && w.corruptSuffix != "" && strings.HasSuffix(name, w.corruptSuffix) {
+		ref.SHA256 = strings.Repeat("0", 64)
+	}
+	return ref, err
+}
+
+type mutatingEvents struct {
+	delegate EventAppender
+	after    domain.State
+	mutate   func(ledger.Event) error
+}
+
+type failingEvents struct {
+	delegate  EventAppender
+	failState domain.State
+}
+
+func (f *failingEvents) Append(event ledger.Event) error {
+	if event.StateTo == f.failState {
+		return fmt.Errorf("injected ledger append failure")
+	}
+	return f.delegate.Append(event)
+}
+
+func (m *mutatingEvents) Append(event ledger.Event) error {
+	if err := m.delegate.Append(event); err != nil {
+		return err
+	}
+	if event.StateTo == m.after {
+		return m.mutate(event)
+	}
+	return nil
+}
+
+func mutateFirstRefOfKind(event ledger.Event, kind string) error {
+	for _, ref := range event.EvidenceRefs {
+		if ref.Kind == kind {
+			return os.WriteFile(ref.URI, []byte("mutated after durable append"), 0o600)
+		}
+	}
+	return fmt.Errorf("event %s had no evidence of kind %s", event.StateTo, kind)
 }
 
 type moveSourceAfterMaterializationWorkspace struct {
@@ -371,7 +525,17 @@ type gateFixture struct {
 	gate                            *Gate
 	request                         Request
 	events                          *recordingEvents
+	store                           *evidence.Store
 	repository, base, temporaryRoot string
+}
+
+func (f *gateFixture) replaceWriter(t *testing.T, writer ArtifactWriter) {
+	t.Helper()
+	gate, err := New(Config{TemporaryRoot: f.temporaryRoot, Events: f.events, Artifacts: writer, Processes: supervisor.New()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.gate = gate
 }
 
 func newGateFixture(t *testing.T, conflict bool, mode string) gateFixture {
@@ -440,7 +604,70 @@ func newGateFixture(t *testing.T, conflict bool, mode string) gateFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return gateFixture{gate: gate, request: request, events: events, repository: repository, base: base, temporaryRoot: temporary}
+	return gateFixture{gate: gate, request: request, events: events, store: store, repository: repository, base: base, temporaryRoot: temporary}
+}
+
+func assertFallbackTerminal(t *testing.T, fixture gateFixture) {
+	t.Helper()
+	assertLedgerContinuity(t, fixture.events.events)
+	if len(fixture.events.events) == 0 {
+		t.Fatal("fallback emitted no terminal transition")
+	}
+	terminal := fixture.events.events[len(fixture.events.events)-1]
+	if terminal.StateTo != domain.StateFailed && terminal.StateTo != domain.StateValidationUnavailable {
+		t.Fatalf("fallback ended at nonterminal state %s", terminal.StateTo)
+	}
+	assertVerifiedRefs(t, fixture.gate.evidenceRoot, terminal.EvidenceRefs)
+	if len(terminal.EvidenceRefs) > maxFallbackEvidenceRefs+1 {
+		t.Fatalf("fallback transition evidence is not bounded: %d", len(terminal.EvidenceRefs))
+	}
+	foundFallback := false
+	for _, ref := range terminal.EvidenceRefs {
+		if ref.Kind == fallbackEvidenceKind {
+			foundFallback = true
+			data, err := evidence.ReadVerifiedLocal(fixture.gate.evidenceRoot, ref, maxEvidenceArtifactBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var record struct {
+				AuthoritySHA256             string             `json:"authority_sha256"`
+				RiskSHA256                  string             `json:"risk_sha256"`
+				OriginalIntendedState       domain.State       `json:"original_intended_state"`
+				FallbackClassification      string             `json:"fallback_classification"`
+				EvidenceVerificationFailure string             `json:"evidence_verification_failure"`
+				RejectedRefs                []rejectedEvidence `json:"rejected_refs"`
+			}
+			if err := json.Unmarshal(data, &record); err != nil {
+				t.Fatal(err)
+			}
+			if record.AuthoritySHA256 != fixture.request.Authority.SHA256() || record.RiskSHA256 != fixture.request.RiskReport.SHA256() || record.OriginalIntendedState == "" || record.FallbackClassification == "" || record.EvidenceVerificationFailure == "" || len(record.RejectedRefs) == 0 {
+				t.Fatalf("fallback decision omitted bounded failure provenance: %s", data)
+			}
+		}
+	}
+	if !foundFallback {
+		t.Fatalf("terminal transition omitted fresh fallback decision: %#v", terminal.EvidenceRefs)
+	}
+}
+
+func assertLedgerContinuity(t *testing.T, events []ledger.Event) {
+	t.Helper()
+	previous := domain.StateBranchAccepted
+	for index, event := range events {
+		if event.StateFrom != previous {
+			t.Fatalf("event %d continuity = %s -> %s after %s", index, event.StateFrom, event.StateTo, previous)
+		}
+		previous = event.StateTo
+	}
+}
+
+func assertVerifiedRefs(t *testing.T, root string, refs []ledger.EvidenceRef) {
+	t.Helper()
+	for index, ref := range refs {
+		if _, err := evidence.ReadVerifiedLocal(root, ref, maxEvidenceArtifactBytes); err != nil {
+			t.Fatalf("terminal evidence %d did not verify independently: %#v: %v", index, ref, err)
+		}
+	}
 }
 
 func TestIntegrationGateHelperProcess(t *testing.T) {

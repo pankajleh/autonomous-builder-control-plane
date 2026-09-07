@@ -18,20 +18,20 @@ Correct the remaining substantive Major found by final independent review of exa
 - Post-acceptance invariant: if evidence becomes unverifiable after `INTEGRATION_ACCEPTED` but before `READY_FOR_MERGE`, fail closed to an allowed state rather than leaving an unrecoverable accepted-but-not-ready run.
 - Unavoidable ledger/evidence-store write failure remains a controller infrastructure failure; do not fabricate a transition when durable append itself is unavailable.
 ### Task 1: Eliminate terminal evidence stranding
-- [ ] In `internal/integrationworkspace.UseMaterialized`, hold newly published capture refs in a local variable; assign `outcome.CaptureRef` and expose it to target/cleanup evidence only after secure verification succeeds. Mirror the already-safe `Integrate` publication pattern.
-- [ ] In `internal/integrationgate`, make terminalization resilient to evidence-verification failure after `INTEGRATING`: individually verify candidate refs, exclude failed refs, create a fresh bounded fallback decision artifact that records authority/risk/result digests, failure class, and rejected-ref identities/digest metadata, and emit `VALIDATION_UNAVAILABLE` with only verified refs.
-- [ ] Do not reuse an unverified or missing `inputRef`, decision ref, Track B/C ref, review ref, or source-head ref in fallback transition evidence. The freshly written/verified fallback decision is the minimum durable evidence anchor.
-- [ ] If evidence becomes unverifiable after `INTEGRATION_ACCEPTED` but before `READY_FOR_MERGE`, emit the allowed fail-closed `FAILED` transition using fresh verified failure evidence; never silently strand the run at `INTEGRATION_ACCEPTED`.
-- [ ] Keep normal clean-path evidence complete. Do not weaken Track B/C provenance, review authority, source-head checks, cleanup guarantees, or existing classifications.
-- [ ] Add adversarial regressions for: materialization publication that returns an oversized/mismatched ref; a bad ref reaching terminal `finish`; mutation immediately after `INTEGRATION_ACCEPTED`; and assertions that every emitted terminal evidence ref independently passes `ReadVerifiedLocal`.
-- [ ] Assert no failure path under test ends durably at `INTEGRATING` or `INTEGRATION_ACCEPTED` unless the event ledger itself is the injected unavailable dependency.
-- [ ] Run `gofmt`, focused tests, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`; commit only this bounded correction.
+- [x] In `internal/integrationworkspace.UseMaterialized`, hold newly published capture refs in a local variable; assign `outcome.CaptureRef` and expose it to target/cleanup evidence only after secure verification succeeds. Mirror the already-safe `Integrate` publication pattern.
+- [x] In `internal/integrationgate`, make terminalization resilient to evidence-verification failure after `INTEGRATING`: individually verify candidate refs, exclude failed refs, create a fresh bounded fallback decision artifact that records authority/risk/result digests, failure class, and rejected-ref identities/digest metadata, and emit `VALIDATION_UNAVAILABLE` with only verified refs.
+- [x] Do not reuse an unverified or missing `inputRef`, decision ref, Track B/C ref, review ref, or source-head ref in fallback transition evidence. The freshly written/verified fallback decision is the minimum durable evidence anchor.
+- [x] If evidence becomes unverifiable after `INTEGRATION_ACCEPTED` but before `READY_FOR_MERGE`, emit the allowed fail-closed `FAILED` transition using fresh verified failure evidence; never silently strand the run at `INTEGRATION_ACCEPTED`.
+- [x] Keep normal clean-path evidence complete. Do not weaken Track B/C provenance, review authority, source-head checks, cleanup guarantees, or existing classifications.
+- [x] Add adversarial regressions for: materialization publication that returns an oversized/mismatched ref; a bad ref reaching terminal `finish`; mutation immediately after `INTEGRATION_ACCEPTED`; and assertions that every emitted terminal evidence ref independently passes `ReadVerifiedLocal`.
+- [x] Assert no failure path under test ends durably at `INTEGRATING` or `INTEGRATION_ACCEPTED` unless the event ledger itself is the injected unavailable dependency.
+- [x] Run `gofmt`, focused tests, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`; commit only this bounded correction.
 
 ## Success criteria
-- [ ] No unverified materialization ref escapes Track B lifecycle code.
-- [ ] Evidence validation/resource-bound failures after `INTEGRATING` terminalize with a reduced, fully verified evidence set.
-- [ ] Evidence loss between `INTEGRATION_ACCEPTED` and `READY_FOR_MERGE` cannot strand state.
-- [ ] Exact-head deterministic acceptance remains green.
+- [x] No unverified materialization ref escapes Track B lifecycle code.
+- [x] Evidence validation/resource-bound failures after `INTEGRATING` terminalize with a reduced, fully verified evidence set.
+- [x] Evidence loss between `INTEGRATION_ACCEPTED` and `READY_FOR_MERGE` cannot strand state.
+- [x] Exact-head deterministic acceptance remains green.
 
 ## Non-goals
 No new review architecture, blocker registry, GitHub lifecycle, dashboard/API, deployment, production acceptance, or Phase 4+ work.
