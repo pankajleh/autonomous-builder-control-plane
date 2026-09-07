@@ -1,6 +1,9 @@
 package githublifecycle
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -40,6 +43,53 @@ func (l Limits) Validate() error {
 	}
 	if l.MaxItemsPerPage > l.MaxTotalItems {
 		return errors.New("items per page cannot exceed total items")
+	}
+	return nil
+}
+
+// CanonicalJSON returns the stable, versioned representation of every field
+// governed by Limits. Durations are represented as nanoseconds so the policy
+// identity does not depend on display formatting.
+func (l Limits) CanonicalJSON() ([]byte, error) {
+	if err := l.Validate(); err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		SchemaVersion       int   `json:"schema_version"`
+		MaxPages            int   `json:"max_pages"`
+		MaxItemsPerPage     int   `json:"max_items_per_page"`
+		MaxTotalItems       int   `json:"max_total_items"`
+		MaxTextBytes        int   `json:"max_text_bytes"`
+		MaxEvidenceRefs     int   `json:"max_evidence_refs"`
+		MaxMetadataItems    int   `json:"max_metadata_items"`
+		MaxParents          int   `json:"max_parents"`
+		MaxLineageEntries   int   `json:"max_lineage_entries"`
+		CallTimeoutNanos    int64 `json:"call_timeout_nanos"`
+		MaxReadRetries      int   `json:"max_read_retries"`
+		MaxWriteRetries     int   `json:"max_write_retries"`
+		MaxAmbiguousRetries int   `json:"max_ambiguous_retries"`
+	}{1, l.MaxPages, l.MaxItemsPerPage, l.MaxTotalItems, l.MaxTextBytes, l.MaxEvidenceRefs,
+		l.MaxMetadataItems, l.MaxParents, l.MaxLineageEntries, int64(l.CallTimeout),
+		l.MaxReadRetries, l.MaxWriteRetries, l.MaxAmbiguousRetries})
+}
+
+// SHA256 is the deterministic identity of the complete validated policy.
+func (l Limits) SHA256() (string, error) {
+	data, err := l.CanonicalJSON()
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func requireLimitsSHA(expected Limits, actual string) error {
+	digest, err := expected.SHA256()
+	if err != nil {
+		return err
+	}
+	if actual != digest {
+		return errors.New("resource limits policy identity does not match controller policy")
 	}
 	return nil
 }

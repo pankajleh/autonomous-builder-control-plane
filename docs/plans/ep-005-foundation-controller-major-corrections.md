@@ -42,14 +42,14 @@ Required invariant:
 - no network calls, state transitions, PR writes, merges, or Phase 5+ behavior in this correction.
 
 ### Task 1: Correct the frozen GitHub lifecycle foundation
-- [ ] Add one immutable write-attempt identity to every PR/merge write request and successful result. It must bind typed operation kind, write ID, authority SHA256, and canonical operation-payload SHA256; bind execution errors and reconciliation to the exact same tuple and require `CanRetry` to compare it field-for-field.
-- [ ] Add authority-owned expected merge content derived only from exact Phase 3 READY_FOR_MERGE/integration provenance: versioned `phase3-ready-tree-v1` derivation identity, source integrated-head SHA, source integration evidence identity/ref, pinned replacement-ref-resistant Git identity, and exact expected result tree. Bind it into Authority/write/result/observation and require all merge methods to match that expected tree independently of provider lineage claims.
-- [ ] Give validated resource limits deterministic canonical JSON/SHA256 and bind that identity through provider inputs/snapshots/results. Change all controller validators (`ValidatePullRequest`, `ValidateCI`, `ValidateMergeResult`, `VerifyPostMerge`, `ValidatePullRequestWriteResult`, and PR selection) to accept expected `Limits`, require identity equality, and independently revalidate actual collections/text/evidence/metadata/parents/lineage under those limits.
-- [ ] Update provider interfaces/constructors without adding network implementation.
-- [ ] Update `GITHUB_LIFECYCLE_FOUNDATION_CONTRACT.md` to freeze the corrected contract.
-- [ ] Add adversarial regressions for cross-operation/same-write-ID reconciliation, wrong payload/authority digest, forged/missing write identity, mismatched reconciliation, missing/forged Phase 3 tree derivation, provider-self-certified wrong tree, limits-policy mismatch, looser-provider/stricter-controller validation, and defensive-copy behavior.
-- [ ] Preserve prior exact-head/base-tip/acting-principal/cancellation/retry/strategy-aware tests.
-- [ ] Run `gofmt`, focused tests, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
+- [x] Add one immutable write-attempt identity to every PR/merge write request and successful result. It must bind typed operation kind, write ID, authority SHA256, and canonical operation-payload SHA256; bind execution errors and reconciliation to the exact same tuple and require `CanRetry` to compare it field-for-field.
+- [x] Add authority-owned expected merge content derived only from exact Phase 3 READY_FOR_MERGE/integration provenance: versioned `phase3-ready-tree-v1` derivation identity, source integrated-head SHA, source integration evidence identity/ref, pinned replacement-ref-resistant Git identity, and exact expected result tree. Bind it into Authority/write/result/observation and require all merge methods to match that expected tree independently of provider lineage claims.
+- [x] Give validated resource limits deterministic canonical JSON/SHA256 and bind that identity through provider inputs/snapshots/results. Change all controller validators (`ValidatePullRequest`, `ValidateCI`, `ValidateMergeResult`, `VerifyPostMerge`, `ValidatePullRequestWriteResult`, and PR selection) to accept expected `Limits`, require identity equality, and independently revalidate actual collections/text/evidence/metadata/parents/lineage under those limits.
+- [x] Update provider interfaces/constructors without adding network implementation.
+- [x] Update `GITHUB_LIFECYCLE_FOUNDATION_CONTRACT.md` to freeze the corrected contract.
+- [x] Add adversarial regressions for cross-operation/same-write-ID reconciliation, wrong payload/authority digest, forged/missing write identity, mismatched reconciliation, missing/forged Phase 3 tree derivation, provider-self-certified wrong tree, limits-policy mismatch, looser-provider/stricter-controller validation, and defensive-copy behavior.
+- [x] Preserve prior exact-head/base-tip/acting-principal/cancellation/retry/strategy-aware tests.
+- [x] Run `gofmt`, focused tests, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`.
 
 ## Non-goals
 No GitHub network provider, PR creation/update execution, CI polling, merge execution, ledger state transition, Phase 5 API/dashboard, deployment, or production acceptance.

@@ -24,6 +24,7 @@ type fixture struct {
 	snapshot   SnapshotIdentity
 	authority  Authority
 	limits     Limits
+	mergeWrite MergeInput
 }
 
 func newFixture(t *testing.T, method MergeMethod) fixture {
@@ -43,15 +44,28 @@ func newFixture(t *testing.T, method MergeMethod) fixture {
 	f.headTree = must(NewGitSHA(strings.Repeat("2", 40))).(GitSHA)
 	f.baseSHA = must(NewGitSHA(strings.Repeat("3", 40))).(GitSHA)
 	f.resultSHA = must(NewGitSHA(strings.Repeat("4", 40))).(GitSHA)
-	f.resultTree = must(NewGitSHA(strings.Repeat("5", 40))).(GitSHA)
+	f.resultTree = f.headTree
 	f.pr = must(NewPullRequestIdentity(17, "PR_node_17")).(PullRequestIdentity)
 	f.actor = must(NewAppInstallationIdentity("github-app:builder", 90210)).(ActingIdentity)
 	f.snapshot = must(NewSnapshotIdentity("github", "request-1", time.Now().UnixNano())).(SnapshotIdentity)
+	expected := fakeExpectedContent(t, f.headSHA, f.baseSHA, f.headTree)
 	f.authority = must(NewAuthority(AuthorityInput{
 		Repository: f.repository, BaseBranch: f.base, HeadBranch: f.head, HeadSHA: f.headSHA,
-		ExpectedBaseTipSHA: f.baseSHA, PullRequest: &f.pr, AllowedMergeMethod: method, Actor: f.actor,
+		ExpectedBaseTipSHA: f.baseSHA, PullRequest: &f.pr, AllowedMergeMethod: method, Actor: f.actor, ExpectedContent: expected,
 	})).(Authority)
+	f.mergeWrite = must(NewMergeInput(f.authority, []ledger.EvidenceRef{{URI: "evidence/approval", Kind: "approval", SHA256: strings.Repeat("c", 64)}}, "merge-write-1", f.limits)).(MergeInput)
 	return f
+}
+
+func fakeExpectedContent(t *testing.T, head, base, tree GitSHA) ExpectedMergeContent {
+	t.Helper()
+	ref := ledger.EvidenceRef{URI: "evidence/ready.json", Kind: phase3DecisionKind, SHA256: strings.Repeat("d", 64)}
+	git := PinnedGitIdentity{path: "/usr/bin/git", version: "git version test", binarySHA256: strings.Repeat("e", 64)}
+	canonical, digest, err := canonicalExpectedContent(ExpectedMergeContentPolicy, head, base, ref, git, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ExpectedMergeContent{ExpectedMergeContentPolicy, head, base, ref, git, tree, canonical, digest}
 }
 
 func (f fixture) prInput() PullRequestSnapshotInput {
@@ -68,7 +82,7 @@ func TestAuthorityAndRemoteIdentityDriftFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidatePullRequest(f.authority, valid); err != nil {
+	if err := ValidatePullRequest(f.authority, valid, f.limits); err != nil {
 		t.Fatalf("valid PR: %v", err)
 	}
 
@@ -79,7 +93,7 @@ func TestAuthorityAndRemoteIdentityDriftFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidatePullRequest(f.authority, snapshot); err == nil || !strings.Contains(err.Error(), "head moved") {
+	if err := ValidatePullRequest(f.authority, snapshot, f.limits); err == nil || !strings.Contains(err.Error(), "head moved") {
 		t.Fatalf("expected moved-head failure, got %v", err)
 	}
 
@@ -90,7 +104,7 @@ func TestAuthorityAndRemoteIdentityDriftFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidatePullRequest(f.authority, snapshot); err == nil || !strings.Contains(err.Error(), "base tip moved") {
+	if err := ValidatePullRequest(f.authority, snapshot, f.limits); err == nil || !strings.Contains(err.Error(), "base tip moved") {
 		t.Fatalf("expected moved-base failure, got %v", err)
 	}
 
@@ -100,7 +114,7 @@ func TestAuthorityAndRemoteIdentityDriftFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidatePullRequest(f.authority, snapshot); err == nil || !strings.Contains(err.Error(), "merge method") {
+	if err := ValidatePullRequest(f.authority, snapshot, f.limits); err == nil || !strings.Contains(err.Error(), "merge method") {
 		t.Fatalf("expected changed-method failure, got %v", err)
 	}
 
@@ -119,6 +133,7 @@ func TestAuthorityCopiesOptionalPRAndPreservesExactCase(t *testing.T) {
 	}
 	input := f.authority.Input()
 	input.PullRequest.number = 999
+	input.ExpectedContent.canonical[0] = '!'
 	pr, ok := f.authority.PullRequest()
 	if !ok || pr.Number() != 17 {
 		t.Fatal("authority optional PR identity was aliased")
@@ -137,12 +152,17 @@ func TestAuthorityCopiesOptionalPRAndPreservesExactCase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrongActor, _ := NewUserIdentity("different-user")
-	writeResult, err := NewPullRequestWriteResult(wrongActor, "pr-write-1", snapshot, f.limits)
+	writeInput, err := NewUpsertPullRequestInput(f.authority, "title", "", "pr-write-1", f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidatePullRequestWriteResult(f.authority, writeResult); err == nil {
+	writeResult, err := NewPullRequestWriteResult(writeInput, snapshot, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongActor, _ := NewUserIdentity("different-user")
+	writeResult.attempt.actor = wrongActor
+	if err := ValidatePullRequestWriteResult(writeInput, writeResult, f.limits); err == nil {
 		t.Fatal("pull request write result accepted the wrong acting identity")
 	}
 }
@@ -157,7 +177,7 @@ func TestStaleCIAndAmbiguousPullRequestsAreRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateCI(f.authority, ci); err == nil || !strings.Contains(err.Error(), "stale") {
+	if err := ValidateCI(f.authority, ci, f.limits); err == nil || !strings.Contains(err.Error(), "stale") {
 		t.Fatalf("expected stale CI failure, got %v", err)
 	}
 
@@ -194,6 +214,7 @@ func TestStrategyAwarePostMergeAllowsDivergentSHAWithExactProof(t *testing.T) {
 		AcceptedHeadSHA: f.headSHA, AcceptedHeadTree: f.headTree, BaseBeforeSHA: f.baseSHA,
 		Method: MergeMethodSquash, ResultSHA: f.resultSHA, ResultTree: f.resultTree,
 		Parents: []GitSHA{f.baseSHA}, Lineage: lineage,
+		Attempt: f.mergeWrite.Attempt(), ExpectedContent: f.authority.ExpectedContent(),
 	}
 	merge, err := NewMergeResult(mergeInput, f.limits)
 	if err != nil {
@@ -204,6 +225,7 @@ func TestStrategyAwarePostMergeAllowsDivergentSHAWithExactProof(t *testing.T) {
 		AcceptedHeadSHA: f.headSHA, AcceptedHeadTree: f.headTree, BaseBeforeSHA: f.baseSHA,
 		Method: MergeMethodSquash, ResultSHA: f.resultSHA, BaseAfterSHA: f.resultSHA, ResultTree: f.resultTree,
 		Parents: []GitSHA{f.baseSHA}, Lineage: lineage,
+		Attempt: f.mergeWrite.Attempt(), ExpectedContent: f.authority.ExpectedContent(),
 	}, f.limits)
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +233,7 @@ func TestStrategyAwarePostMergeAllowsDivergentSHAWithExactProof(t *testing.T) {
 	if f.resultSHA == f.headSHA {
 		t.Fatal("fixture must exercise a synthesized SHA")
 	}
-	if err := VerifyPostMerge(f.authority, merge, observation); err != nil {
+	if err := VerifyPostMerge(f.mergeWrite, merge, observation, f.limits); err != nil {
 		t.Fatalf("valid divergent post-merge proof: %v", err)
 	}
 
@@ -223,18 +245,14 @@ func TestStrategyAwarePostMergeAllowsDivergentSHAWithExactProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateMergeResult(f.authority, badMerge); err == nil || !strings.Contains(err.Error(), "tree") {
+	if err := ValidateMergeResult(f.mergeWrite, badMerge, f.limits); err == nil || !strings.Contains(err.Error(), "tree") {
 		t.Fatalf("expected incorrect tree-lineage failure, got %v", err)
 	}
 
 	wrongActor, _ := NewUserIdentity("different-user")
 	wrongActorInput := mergeInput
 	wrongActorInput.Actor = wrongActor
-	wrongActorResult, err := NewMergeResult(wrongActorInput, f.limits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ValidateMergeResult(f.authority, wrongActorResult); err == nil || !strings.Contains(err.Error(), "actor") {
+	if _, err := NewMergeResult(wrongActorInput, f.limits); err == nil || !strings.Contains(err.Error(), "attempt") {
 		t.Fatalf("expected wrong actor failure, got %v", err)
 	}
 }
@@ -246,12 +264,13 @@ func TestMergeCommitRequiresExactOrderedLineage(t *testing.T) {
 		AcceptedHeadSHA: f.headSHA, AcceptedHeadTree: f.headTree, BaseBeforeSHA: f.baseSHA,
 		Method: MergeMethodMerge, ResultSHA: f.resultSHA, ResultTree: f.resultTree,
 		Parents: []GitSHA{f.baseSHA, f.headSHA},
+		Attempt: f.mergeWrite.Attempt(), ExpectedContent: f.authority.ExpectedContent(),
 	}
 	result, err := NewMergeResult(input, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateMergeResult(f.authority, result); err != nil {
+	if err := ValidateMergeResult(f.mergeWrite, result, f.limits); err != nil {
 		t.Fatal(err)
 	}
 	input.Parents = []GitSHA{f.headSHA, f.baseSHA}
@@ -259,7 +278,7 @@ func TestMergeCommitRequiresExactOrderedLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateMergeResult(f.authority, result); err == nil {
+	if err := ValidateMergeResult(f.mergeWrite, result, f.limits); err == nil {
 		t.Fatal("reversed merge parents accepted")
 	}
 }
@@ -279,13 +298,14 @@ func TestRebaseRequiresContinuousOrderedLineage(t *testing.T) {
 		AcceptedHeadSHA: f.headSHA, AcceptedHeadTree: f.headTree, BaseBeforeSHA: f.baseSHA,
 		Method: MergeMethodRebase, ResultSHA: f.resultSHA, ResultTree: f.resultTree,
 		Parents: []GitSHA{firstResult}, Lineage: lineage,
+		Attempt: f.mergeWrite.Attempt(), ExpectedContent: f.authority.ExpectedContent(),
 	}
 	result, err := NewMergeResult(input, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lineage[0].Parents[0] = f.headSHA
-	if err := ValidateMergeResult(f.authority, result); err != nil {
+	if err := ValidateMergeResult(f.mergeWrite, result, f.limits); err != nil {
 		t.Fatalf("valid copied rebase lineage: %v", err)
 	}
 	broken := input
@@ -295,52 +315,51 @@ func TestRebaseRequiresContinuousOrderedLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateMergeResult(f.authority, brokenResult); err == nil || !strings.Contains(err.Error(), "chain") {
+	if err := ValidateMergeResult(f.mergeWrite, brokenResult, f.limits); err == nil || !strings.Contains(err.Error(), "chain") {
 		t.Fatalf("expected broken rebase lineage failure, got %v", err)
 	}
 }
 
 func TestSubmittedCancellationAndDeadlineAreAmbiguousAndNotRetried(t *testing.T) {
 	f := newFixture(t, MergeMethodMerge)
-	attempt, err := NewWriteAttempt(f.repository, f.actor, "merge-write-1", f.limits)
-	if err != nil {
-		t.Fatal(err)
-	}
+	attempt := f.mergeWrite.Attempt()
 	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
-		failure := NewWriteExecutionError("merge", attempt, true, cause)
+		failure := NewWriteExecutionError(attempt, true, cause)
 		if failure.Class() != FailureAmbiguousWrite || !failure.Submitted() {
 			t.Fatalf("submitted %v was not ambiguous", cause)
 		}
-		if CanRetry(failure, 0, f.limits, nil) {
+		if CanRetry(failure, 0, f.limits, &attempt, nil) {
 			t.Fatal("ambiguous write retried without reconciliation")
 		}
 	}
-	preSubmit := NewWriteExecutionError("merge", attempt, false, context.DeadlineExceeded)
+	preSubmit := NewWriteExecutionError(attempt, false, context.DeadlineExceeded)
 	if preSubmit.Class() != FailureProviderUnavailable {
 		t.Fatalf("pre-submit class = %s", preSubmit.Class())
 	}
 
 	evidence := []ledger.EvidenceRef{{URI: "evidence/reconcile.json", Kind: "reconciliation", SHA256: strings.Repeat("a", 64)}}
-	reconciled, err := NewReconciliationResult(f.repository, f.actor, "merge-write-1", ReconciliationNotApplied, evidence, f.limits)
+	reconciled, err := NewReconciliationResult(attempt, ReconciliationNotApplied, evidence, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	failure := NewWriteExecutionError("merge", attempt, true, errors.New("lost response"))
-	if !CanRetry(failure, 0, f.limits, &reconciled) {
+	failure := NewWriteExecutionError(attempt, true, errors.New("lost response"))
+	if !CanRetry(failure, 0, f.limits, &attempt, &reconciled) {
 		t.Fatal("proved-not-applied write did not receive bounded retry authority")
 	}
-	unknown, err := NewReconciliationResult(f.repository, f.actor, "merge-write-1", ReconciliationUnknown, evidence, f.limits)
+	unknown, err := NewReconciliationResult(attempt, ReconciliationUnknown, evidence, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if CanRetry(failure, 0, f.limits, &unknown) {
+	if CanRetry(failure, 0, f.limits, &attempt, &unknown) {
 		t.Fatal("unknown reconciliation authorized retry")
 	}
-	other, err := NewReconciliationResult(f.repository, f.actor, "other-write", ReconciliationNotApplied, evidence, f.limits)
+	otherAttempt := attempt
+	otherAttempt.writeID = "other-write"
+	other, err := NewReconciliationResult(otherAttempt, ReconciliationNotApplied, evidence, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if CanRetry(failure, 0, f.limits, &other) {
+	if CanRetry(failure, 0, f.limits, &attempt, &other) {
 		t.Fatal("mismatched reconciliation authorized retry")
 	}
 }
@@ -360,7 +379,7 @@ func TestBoundsUnsafeIdentifiersAndSubstantiveClasses(t *testing.T) {
 			t.Fatalf("unsafe SHA %q accepted", sha)
 		}
 	}
-	if _, err := NewUpsertPullRequestInput(f.authority, strings.Repeat("x", f.limits.MaxTextBytes+1), "", f.limits); err == nil {
+	if _, err := NewUpsertPullRequestInput(f.authority, strings.Repeat("x", f.limits.MaxTextBytes+1), "", "pr-write", f.limits); err == nil {
 		t.Fatal("oversized text accepted")
 	}
 	invalidLimits := f.limits
@@ -382,7 +401,7 @@ func TestBoundsUnsafeIdentifiersAndSubstantiveClasses(t *testing.T) {
 		t.Fatal("availability mislabeled substantive")
 	}
 	policyFailure, err := NewSubstantiveError("approval", FailurePolicy, errors.New("approval missing"))
-	if err != nil || policyFailure.Class() != FailurePolicy || CanRetry(policyFailure, 0, f.limits, nil) {
+	if err != nil || policyFailure.Class() != FailurePolicy || CanRetry(policyFailure, 0, f.limits, nil, nil) {
 		t.Fatal("policy failure classification/retry is incorrect")
 	}
 }
@@ -431,7 +450,7 @@ func TestSnapshotsAreCopySafeAndCanonical(t *testing.T) {
 func TestMergeInputDefensivelyCopiesEvidence(t *testing.T) {
 	f := newFixture(t, MergeMethodMerge)
 	evidence := []ledger.EvidenceRef{{URI: "evidence/approval", Kind: "approval", SHA256: strings.Repeat("c", 64)}}
-	input, err := NewMergeInput(f.authority, f.headTree, evidence, f.limits)
+	input, err := NewMergeInput(f.authority, evidence, "merge-write-copy", f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -49,6 +49,7 @@ type PullRequestSnapshotInput struct {
 	Reviews      []Review
 	EvidenceRefs []ledger.EvidenceRef
 	Metadata     map[string]string
+	LimitsSHA256 string
 }
 
 // PullRequestSnapshot is a bounded canonical observation of one remote PR.
@@ -58,9 +59,11 @@ type PullRequestSnapshot struct {
 
 func NewPullRequestSnapshot(input PullRequestSnapshotInput, limits Limits) (PullRequestSnapshot, error) {
 	input = clonePRInput(input)
-	if err := limits.Validate(); err != nil {
+	limitsSHA, err := limits.SHA256()
+	if err != nil {
 		return PullRequestSnapshot{}, err
 	}
+	input.LimitsSHA256 = limitsSHA
 	if !input.Snapshot.valid() || !input.Repository.valid() || !input.PullRequest.valid() ||
 		!input.BaseBranch.valid() || !input.BaseTipSHA.valid() || !input.HeadBranch.valid() || !input.HeadSHA.valid() {
 		return PullRequestSnapshot{}, errors.New("pull request snapshot contains an invalid identity")
@@ -141,6 +144,7 @@ type CISnapshotInput struct {
 	Checks       []Check
 	EvidenceRefs []ledger.EvidenceRef
 	Metadata     map[string]string
+	LimitsSHA256 string
 }
 
 // CISnapshot is bounded check evidence tied to exactly one candidate SHA.
@@ -150,9 +154,11 @@ type CISnapshot struct {
 
 func NewCISnapshot(input CISnapshotInput, limits Limits) (CISnapshot, error) {
 	input = cloneCIInput(input)
-	if err := limits.Validate(); err != nil {
+	limitsSHA, err := limits.SHA256()
+	if err != nil {
 		return CISnapshot{}, err
 	}
+	input.LimitsSHA256 = limitsSHA
 	if !input.Snapshot.valid() || !input.Repository.valid() || !input.HeadSHA.valid() {
 		return CISnapshot{}, errors.New("CI snapshot contains an invalid identity")
 	}
@@ -206,10 +212,15 @@ type PullRequestPage struct {
 	items     []PullRequestSnapshot
 	canonical []byte
 	digest    string
+	limitsSHA string
 }
 
 func NewPullRequestPage(page, total int, items []PullRequestSnapshot, limits Limits) (PullRequestPage, error) {
 	if err := validatePage(limits, page, len(items), total); err != nil {
+		return PullRequestPage{}, err
+	}
+	limitsSHA, err := limits.SHA256()
+	if err != nil {
 		return PullRequestPage{}, err
 	}
 	copyItems := append([]PullRequestSnapshot(nil), items...)
@@ -217,6 +228,9 @@ func NewPullRequestPage(page, total int, items []PullRequestSnapshot, limits Lim
 	for index, item := range copyItems {
 		if !item.valid() {
 			return PullRequestPage{}, fmt.Errorf("pull request item %d is incomplete", index)
+		}
+		if err := requireLimitsSHA(limits, item.immutable.data.LimitsSHA256); err != nil {
+			return PullRequestPage{}, fmt.Errorf("pull request item %d: %w", index, err)
 		}
 		input := item.immutable.data
 		key := fmt.Sprintf("%s\x00%d\x00%s", input.Repository.String(), input.PullRequest.Number(), input.PullRequest.NodeID())
@@ -231,14 +245,15 @@ func NewPullRequestPage(page, total int, items []PullRequestSnapshot, limits Lim
 		wires[index] = item.CanonicalJSON()
 	}
 	canonical, digest, err := canonicalJSON(struct {
-		Page  int               `json:"page"`
-		Total int               `json:"total"`
-		Items []json.RawMessage `json:"items"`
-	}{page, total, wires})
+		Page         int               `json:"page"`
+		Total        int               `json:"total"`
+		Items        []json.RawMessage `json:"items"`
+		LimitsSHA256 string            `json:"limits_sha256"`
+	}{page, total, wires, limitsSHA})
 	if err != nil {
 		return PullRequestPage{}, err
 	}
-	return PullRequestPage{page: page, total: total, items: copyItems, canonical: canonical, digest: digest}, nil
+	return PullRequestPage{page: page, total: total, items: copyItems, canonical: canonical, digest: digest, limitsSHA: limitsSHA}, nil
 }
 
 func (p PullRequestPage) Items() []PullRequestSnapshot {
@@ -246,6 +261,7 @@ func (p PullRequestPage) Items() []PullRequestSnapshot {
 }
 func (p PullRequestPage) CanonicalJSON() []byte { return append([]byte(nil), p.canonical...) }
 func (p PullRequestPage) SHA256() string        { return p.digest }
+func (p PullRequestPage) LimitsSHA256() string  { return p.limitsSHA }
 func (p PullRequestPage) MarshalJSON() ([]byte, error) {
 	if len(p.canonical) == 0 {
 		return nil, errors.New("pull request page is incomplete")
@@ -400,7 +416,8 @@ func prWire(input PullRequestSnapshotInput) any {
 		Reviews      []reviewWire         `json:"reviews"`
 		EvidenceRefs []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
 		Metadata     map[string]string    `json:"metadata,omitempty"`
-	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), pullRequestWire(input.PullRequest), input.BaseBranch.String(), input.BaseTipSHA.String(), input.HeadBranch.String(), input.HeadSHA.String(), input.State, input.MergeMethod, reviews, input.EvidenceRefs, input.Metadata}
+		LimitsSHA256 string               `json:"limits_sha256"`
+	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), pullRequestWire(input.PullRequest), input.BaseBranch.String(), input.BaseTipSHA.String(), input.HeadBranch.String(), input.HeadSHA.String(), input.State, input.MergeMethod, reviews, input.EvidenceRefs, input.Metadata, input.LimitsSHA256}
 }
 func ciWire(input CISnapshotInput) any {
 	checks := make([]checkWire, len(input.Checks))
@@ -414,5 +431,6 @@ func ciWire(input CISnapshotInput) any {
 		Checks       []checkWire          `json:"checks"`
 		EvidenceRefs []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
 		Metadata     map[string]string    `json:"metadata,omitempty"`
-	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), input.HeadSHA.String(), checks, input.EvidenceRefs, input.Metadata}
+		LimitsSHA256 string               `json:"limits_sha256"`
+	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), input.HeadSHA.String(), checks, input.EvidenceRefs, input.Metadata, input.LimitsSHA256}
 }

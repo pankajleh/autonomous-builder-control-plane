@@ -2,20 +2,20 @@ package githublifecycle
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
 
-// FindPullRequestsInput is structured read authority; it cannot carry a URL or
-// shell fragment.
 type FindPullRequestsInput struct {
-	Repository Repository
-	BaseBranch Branch
-	HeadBranch Branch
-	Page       int
-	PerPage    int
+	Repository   Repository
+	BaseBranch   Branch
+	HeadBranch   Branch
+	Page         int
+	PerPage      int
+	LimitsSHA256 string
 }
 
 func NewFindPullRequestsInput(repository Repository, base, head Branch, page, perPage int, limits Limits) (FindPullRequestsInput, error) {
@@ -25,14 +25,16 @@ func NewFindPullRequestsInput(repository Repository, base, head Branch, page, pe
 	if err := validatePage(limits, page, perPage, perPage); err != nil {
 		return FindPullRequestsInput{}, err
 	}
-	return FindPullRequestsInput{Repository: repository, BaseBranch: base, HeadBranch: head, Page: page, PerPage: perPage}, nil
+	digest, _ := limits.SHA256()
+	return FindPullRequestsInput{repository, base, head, page, perPage, digest}, nil
 }
 
 type GetCIInput struct {
-	Repository Repository
-	HeadSHA    GitSHA
-	Page       int
-	PerPage    int
+	Repository   Repository
+	HeadSHA      GitSHA
+	Page         int
+	PerPage      int
+	LimitsSHA256 string
 }
 
 func NewGetCIInput(repository Repository, head GitSHA, page, perPage int, limits Limits) (GetCIInput, error) {
@@ -42,131 +44,282 @@ func NewGetCIInput(repository Repository, head GitSHA, page, perPage int, limits
 	if err := validatePage(limits, page, perPage, perPage); err != nil {
 		return GetCIInput{}, err
 	}
-	return GetCIInput{Repository: repository, HeadSHA: head, Page: page, PerPage: perPage}, nil
+	digest, _ := limits.SHA256()
+	return GetCIInput{repository, head, page, perPage, digest}, nil
 }
 
-// UpsertPullRequestInput binds a write to exact branch/SHA authority and the
-// authenticated non-secret actor. Title/body are bounded display data only.
+type OperationKind string
+
+const (
+	OperationPullRequestUpsert OperationKind = "pr_upsert"
+	OperationMerge             OperationKind = "merge"
+)
+
+func (k OperationKind) valid() bool { return k == OperationPullRequestUpsert || k == OperationMerge }
+
+// WriteAttempt is the immutable identity of one exact mutation. PayloadSHA256
+// covers the canonical provider input excluding the attempt itself.
+type WriteAttempt struct {
+	repository      Repository
+	actor           ActingIdentity
+	operation       OperationKind
+	writeID         string
+	authoritySHA256 string
+	payloadSHA256   string
+	limitsSHA256    string
+}
+
+func newWriteAttempt(operation OperationKind, authority Authority, writeID, payloadSHA256 string, limits Limits) (WriteAttempt, error) {
+	limitsSHA, err := limits.SHA256()
+	if err != nil {
+		return WriteAttempt{}, err
+	}
+	if !operation.valid() || requireAuthority(authority) != nil || !validOpaqueID(writeID, limits.MaxTextBytes) ||
+		len(payloadSHA256) != sha256.Size*2 || !isLowerHex(payloadSHA256) {
+		return WriteAttempt{}, errors.New("write attempt operation, authority, identity, and payload digest are required")
+	}
+	authoritySHA, err := authority.SHA256()
+	if err != nil {
+		return WriteAttempt{}, err
+	}
+	return WriteAttempt{authority.Repository(), authority.Actor(), operation, writeID, authoritySHA, payloadSHA256, limitsSHA}, nil
+}
+
+func (a WriteAttempt) Repository() Repository   { return a.repository }
+func (a WriteAttempt) Actor() ActingIdentity    { return a.actor }
+func (a WriteAttempt) Operation() OperationKind { return a.operation }
+func (a WriteAttempt) WriteID() string          { return a.writeID }
+func (a WriteAttempt) AuthoritySHA256() string  { return a.authoritySHA256 }
+func (a WriteAttempt) PayloadSHA256() string    { return a.payloadSHA256 }
+func (a WriteAttempt) LimitsSHA256() string     { return a.limitsSHA256 }
+func (a WriteAttempt) CanonicalJSON() ([]byte, error) {
+	if !a.structurallyValid() {
+		return nil, errors.New("write attempt is incomplete")
+	}
+	data, _, err := canonicalJSON(attemptWire(a))
+	return data, err
+}
+func (a WriteAttempt) MarshalJSON() ([]byte, error) { return a.CanonicalJSON() }
+func (a WriteAttempt) structurallyValid() bool {
+	return a.repository.valid() && a.actor.valid() && a.operation.valid() && validOpaqueID(a.writeID, 4096) &&
+		len(a.authoritySHA256) == sha256.Size*2 && isLowerHex(a.authoritySHA256) &&
+		len(a.payloadSHA256) == sha256.Size*2 && isLowerHex(a.payloadSHA256) &&
+		len(a.limitsSHA256) == sha256.Size*2 && isLowerHex(a.limitsSHA256)
+}
+func (a WriteAttempt) valid(limits Limits) bool {
+	return a.structurallyValid() && validOpaqueID(a.writeID, limits.MaxTextBytes) && requireLimitsSHA(limits, a.limitsSHA256) == nil
+}
+func (a WriteAttempt) matchesAuthority(authority Authority) bool {
+	digest, err := authority.SHA256()
+	return err == nil && a.repository == authority.Repository() && a.actor == authority.Actor() && a.authoritySHA256 == digest
+}
+
+type writeAttemptWire struct {
+	Repository      repoWire      `json:"repository"`
+	Actor           actorWire     `json:"actor"`
+	Operation       OperationKind `json:"operation_kind"`
+	WriteID         string        `json:"write_id"`
+	AuthoritySHA256 string        `json:"authority_sha256"`
+	PayloadSHA256   string        `json:"canonical_payload_sha256"`
+	LimitsSHA256    string        `json:"limits_sha256"`
+}
+
+func attemptWire(a WriteAttempt) writeAttemptWire {
+	return writeAttemptWire{repositoryWire(a.repository), actingWire(a.actor), a.operation, a.writeID, a.authoritySHA256, a.payloadSHA256, a.limitsSHA256}
+}
+
 type UpsertPullRequestInput struct {
-	authority Authority
-	title     string
-	body      string
+	authority        Authority
+	title            string
+	body             string
+	attempt          WriteAttempt
+	canonicalPayload []byte
+	limitsSHA256     string
 }
 
-func NewUpsertPullRequestInput(authority Authority, title, body string, limits Limits) (UpsertPullRequestInput, error) {
+func NewUpsertPullRequestInput(authority Authority, title, body, writeID string, limits Limits) (UpsertPullRequestInput, error) {
 	if err := requireAuthority(authority); err != nil {
 		return UpsertPullRequestInput{}, err
 	}
-	if err := limits.Validate(); err != nil {
+	limitsSHA, err := limits.SHA256()
+	if err != nil {
 		return UpsertPullRequestInput{}, err
 	}
 	if !validText(title, limits.MaxTextBytes, false) || !validText(body, limits.MaxTextBytes, true) {
 		return UpsertPullRequestInput{}, errors.New("pull request title or body exceeds bounded safe text limits")
 	}
-	return UpsertPullRequestInput{authority: authority, title: title, body: body}, nil
+	payload, payloadSHA, err := canonicalJSON(struct {
+		Authority    Authority `json:"authority"`
+		Title        string    `json:"title"`
+		Body         string    `json:"body"`
+		LimitsSHA256 string    `json:"limits_sha256"`
+	}{authority, title, body, limitsSHA})
+	if err != nil {
+		return UpsertPullRequestInput{}, err
+	}
+	attempt, err := newWriteAttempt(OperationPullRequestUpsert, authority, writeID, payloadSHA, limits)
+	if err != nil {
+		return UpsertPullRequestInput{}, err
+	}
+	return UpsertPullRequestInput{authority, title, body, attempt, payload, limitsSHA}, nil
 }
 
-func (i UpsertPullRequestInput) Authority() Authority { return i.authority }
-func (i UpsertPullRequestInput) Title() string        { return i.title }
-func (i UpsertPullRequestInput) Body() string         { return i.body }
+func (i UpsertPullRequestInput) Authority() Authority  { return i.authority }
+func (i UpsertPullRequestInput) Title() string         { return i.title }
+func (i UpsertPullRequestInput) Body() string          { return i.body }
+func (i UpsertPullRequestInput) Attempt() WriteAttempt { return i.attempt }
+func (i UpsertPullRequestInput) LimitsSHA256() string  { return i.limitsSHA256 }
+func (i UpsertPullRequestInput) CanonicalPayload() []byte {
+	return append([]byte(nil), i.canonicalPayload...)
+}
 
-// MergeInput carries exact accepted content, expected base tip, allowed method,
-// PR identity, and authenticated actor through its immutable Authority.
 type MergeInput struct {
 	authority        Authority
-	acceptedHeadTree GitSHA
+	expectedContent  ExpectedMergeContent
 	approvalEvidence []ledger.EvidenceRef
+	attempt          WriteAttempt
+	canonicalPayload []byte
+	limitsSHA256     string
 }
 
-func NewMergeInput(authority Authority, acceptedHeadTree GitSHA, evidence []ledger.EvidenceRef, limits Limits) (MergeInput, error) {
+func NewMergeInput(authority Authority, evidenceRefs []ledger.EvidenceRef, writeID string, limits Limits) (MergeInput, error) {
 	if err := requireAuthority(authority); err != nil {
 		return MergeInput{}, err
 	}
 	if _, ok := authority.PullRequest(); !ok {
 		return MergeInput{}, errors.New("merge input requires an exact pull request identity")
 	}
-	if !acceptedHeadTree.valid() {
-		return MergeInput{}, errors.New("accepted head tree is invalid")
+	limitsSHA, err := limits.SHA256()
+	if err != nil {
+		return MergeInput{}, err
 	}
-	copyEvidence := append([]ledger.EvidenceRef(nil), evidence...)
+	copyEvidence := append([]ledger.EvidenceRef(nil), evidenceRefs...)
 	if len(copyEvidence) == 0 {
 		return MergeInput{}, errors.New("merge approval evidence is required")
 	}
 	if err := canonicalizeEvidence(&copyEvidence, limits); err != nil {
 		return MergeInput{}, err
 	}
-	return MergeInput{authority: authority, acceptedHeadTree: acceptedHeadTree, approvalEvidence: copyEvidence}, nil
+	expected := authority.ExpectedContent()
+	payload, payloadSHA, err := canonicalJSON(struct {
+		Authority       Authority            `json:"authority"`
+		ExpectedContent ExpectedMergeContent `json:"expected_merge_content"`
+		Evidence        []ledger.EvidenceRef `json:"approval_evidence"`
+		LimitsSHA256    string               `json:"limits_sha256"`
+	}{authority, expected, copyEvidence, limitsSHA})
+	if err != nil {
+		return MergeInput{}, err
+	}
+	attempt, err := newWriteAttempt(OperationMerge, authority, writeID, payloadSHA, limits)
+	if err != nil {
+		return MergeInput{}, err
+	}
+	return MergeInput{authority, expected, copyEvidence, attempt, payload, limitsSHA}, nil
 }
 
-func (i MergeInput) Authority() Authority     { return i.authority }
-func (i MergeInput) AcceptedHeadTree() GitSHA { return i.acceptedHeadTree }
+func (i MergeInput) Authority() Authority { return i.authority }
+func (i MergeInput) ExpectedContent() ExpectedMergeContent {
+	return cloneExpectedContent(i.expectedContent)
+}
+func (i MergeInput) Attempt() WriteAttempt    { return i.attempt }
+func (i MergeInput) LimitsSHA256() string     { return i.limitsSHA256 }
+func (i MergeInput) CanonicalPayload() []byte { return append([]byte(nil), i.canonicalPayload...) }
 func (i MergeInput) Evidence() []ledger.EvidenceRef {
 	return append([]ledger.EvidenceRef(nil), i.approvalEvidence...)
 }
 
 type ObservePostMergeInput struct {
-	authority Authority
-	merge     MergeResult
+	mergeInput MergeInput
+	merge      MergeResult
+	limitsSHA  string
 }
 
-func NewObservePostMergeInput(authority Authority, merge MergeResult) (ObservePostMergeInput, error) {
-	if err := ValidateMergeResult(authority, merge); err != nil {
+func NewObservePostMergeInput(input MergeInput, merge MergeResult, limits Limits) (ObservePostMergeInput, error) {
+	if err := ValidateMergeResult(input, merge, limits); err != nil {
 		return ObservePostMergeInput{}, err
 	}
-	return ObservePostMergeInput{authority: authority, merge: merge}, nil
+	digest, _ := limits.SHA256()
+	return ObservePostMergeInput{input, merge, digest}, nil
 }
 
-func (i ObservePostMergeInput) Authority() Authority { return i.authority }
-func (i ObservePostMergeInput) Merge() MergeResult   { return i.merge }
+func (i ObservePostMergeInput) Authority() Authority  { return i.mergeInput.authority }
+func (i ObservePostMergeInput) Merge() MergeResult    { return i.merge }
+func (i ObservePostMergeInput) Attempt() WriteAttempt { return i.mergeInput.attempt }
+func (i ObservePostMergeInput) LimitsSHA256() string  { return i.limitsSHA }
 
 type ReconcileWriteInput struct {
-	repository Repository
-	actor      ActingIdentity
-	writeID    string
+	attempt   WriteAttempt
+	limitsSHA string
 }
 
-func NewReconcileWriteInput(repository Repository, actor ActingIdentity, writeID string, limits Limits) (ReconcileWriteInput, error) {
-	if err := limits.Validate(); err != nil {
-		return ReconcileWriteInput{}, err
+func NewReconcileWriteInput(attempt WriteAttempt, limits Limits) (ReconcileWriteInput, error) {
+	if !attempt.valid(limits) {
+		return ReconcileWriteInput{}, errors.New("reconciliation input write attempt is invalid")
 	}
-	if !repository.valid() || !actor.valid() || !validOpaqueID(writeID, limits.MaxTextBytes) {
-		return ReconcileWriteInput{}, errors.New("reconciliation input identity is invalid")
-	}
-	return ReconcileWriteInput{repository: repository, actor: actor, writeID: writeID}, nil
+	digest, _ := limits.SHA256()
+	return ReconcileWriteInput{attempt, digest}, nil
 }
 
-func (i ReconcileWriteInput) Repository() Repository { return i.repository }
-func (i ReconcileWriteInput) Actor() ActingIdentity  { return i.actor }
-func (i ReconcileWriteInput) WriteID() string        { return i.writeID }
+func (i ReconcileWriteInput) Attempt() WriteAttempt { return i.attempt }
+func (i ReconcileWriteInput) LimitsSHA256() string  { return i.limitsSHA }
 
 type PullRequestWriteResult struct {
-	actor    ActingIdentity
-	writeID  string
-	snapshot PullRequestSnapshot
+	attempt   WriteAttempt
+	snapshot  PullRequestSnapshot
+	limitsSHA string
 }
 
-func NewPullRequestWriteResult(actor ActingIdentity, writeID string, snapshot PullRequestSnapshot, limits Limits) (PullRequestWriteResult, error) {
-	if err := limits.Validate(); err != nil {
+func NewPullRequestWriteResult(input UpsertPullRequestInput, snapshot PullRequestSnapshot, limits Limits) (PullRequestWriteResult, error) {
+	if err := validateUpsertInput(input, limits); err != nil {
 		return PullRequestWriteResult{}, err
 	}
-	if !actor.valid() || !validOpaqueID(writeID, limits.MaxTextBytes) || !snapshot.valid() {
-		return PullRequestWriteResult{}, errors.New("pull request write result identity is invalid")
+	if err := ValidatePullRequest(input.authority, snapshot, limits); err != nil {
+		return PullRequestWriteResult{}, err
 	}
-	return PullRequestWriteResult{actor: actor, writeID: writeID, snapshot: snapshot}, nil
+	digest, _ := limits.SHA256()
+	return PullRequestWriteResult{input.attempt, snapshot, digest}, nil
 }
 
-func (r PullRequestWriteResult) Actor() ActingIdentity         { return r.actor }
-func (r PullRequestWriteResult) WriteID() string               { return r.writeID }
+func (r PullRequestWriteResult) Attempt() WriteAttempt         { return r.attempt }
 func (r PullRequestWriteResult) Snapshot() PullRequestSnapshot { return r.snapshot }
+func (r PullRequestWriteResult) LimitsSHA256() string          { return r.limitsSHA }
 
-func ValidatePullRequestWriteResult(authority Authority, result PullRequestWriteResult) error {
-	if err := requireAuthority(authority); err != nil {
+func ValidatePullRequestWriteResult(input UpsertPullRequestInput, result PullRequestWriteResult, limits Limits) error {
+	if err := validateUpsertInput(input, limits); err != nil {
 		return err
 	}
-	if result.actor != authority.Actor() {
-		return errors.New("pull request write acting identity does not match authority")
+	if result.attempt != input.attempt || result.attempt.operation != OperationPullRequestUpsert {
+		return errors.New("pull request write result replaced or mismatched the write attempt")
 	}
-	return ValidatePullRequest(authority, result.snapshot)
+	if err := requireLimitsSHA(limits, result.limitsSHA); err != nil {
+		return err
+	}
+	return ValidatePullRequest(input.authority, result.snapshot, limits)
+}
+
+func validateUpsertInput(input UpsertPullRequestInput, limits Limits) error {
+	if err := requireAuthority(input.authority); err != nil {
+		return err
+	}
+	if err := requireLimitsSHA(limits, input.limitsSHA256); err != nil {
+		return err
+	}
+	if !validText(input.title, limits.MaxTextBytes, false) || !validText(input.body, limits.MaxTextBytes, true) {
+		return errors.New("pull request payload fails bounded text revalidation")
+	}
+	if !input.attempt.valid(limits) || !input.attempt.matchesAuthority(input.authority) || input.attempt.operation != OperationPullRequestUpsert {
+		return errors.New("pull request write attempt is invalid")
+	}
+	payload, payloadSHA, err := canonicalJSON(struct {
+		Authority    Authority `json:"authority"`
+		Title        string    `json:"title"`
+		Body         string    `json:"body"`
+		LimitsSHA256 string    `json:"limits_sha256"`
+	}{input.authority, input.title, input.body, input.limitsSHA256})
+	if err != nil || payloadSHA != input.attempt.payloadSHA256 || string(payload) != string(input.canonicalPayload) {
+		return errors.New("pull request canonical payload does not match write attempt")
+	}
+	return nil
 }
 
 type ReconciliationDisposition string
@@ -178,42 +331,34 @@ const (
 )
 
 type ReconciliationResult struct {
-	repository  Repository
-	actor       ActingIdentity
-	writeID     string
+	attempt     WriteAttempt
 	disposition ReconciliationDisposition
 	evidence    []ledger.EvidenceRef
+	limitsSHA   string
 }
 
-func NewReconciliationResult(repository Repository, actor ActingIdentity, writeID string, disposition ReconciliationDisposition, evidence []ledger.EvidenceRef, limits Limits) (ReconciliationResult, error) {
-	if err := limits.Validate(); err != nil {
-		return ReconciliationResult{}, err
+func NewReconciliationResult(attempt WriteAttempt, disposition ReconciliationDisposition, evidenceRefs []ledger.EvidenceRef, limits Limits) (ReconciliationResult, error) {
+	if !attempt.valid(limits) || (disposition != ReconciliationApplied && disposition != ReconciliationNotApplied && disposition != ReconciliationUnknown) {
+		return ReconciliationResult{}, errors.New("reconciliation result attempt or disposition is invalid")
 	}
-	copyEvidence := append([]ledger.EvidenceRef(nil), evidence...)
-	if !repository.valid() || !actor.valid() || !validOpaqueID(writeID, limits.MaxTextBytes) ||
-		(disposition != ReconciliationApplied && disposition != ReconciliationNotApplied && disposition != ReconciliationUnknown) {
-		return ReconciliationResult{}, errors.New("reconciliation result identity or disposition is invalid")
-	}
+	copyEvidence := append([]ledger.EvidenceRef(nil), evidenceRefs...)
 	if len(copyEvidence) == 0 {
 		return ReconciliationResult{}, errors.New("reconciliation evidence is required")
 	}
 	if err := canonicalizeEvidence(&copyEvidence, limits); err != nil {
 		return ReconciliationResult{}, err
 	}
-	return ReconciliationResult{repository: repository, actor: actor, writeID: writeID, disposition: disposition, evidence: copyEvidence}, nil
+	digest, _ := limits.SHA256()
+	return ReconciliationResult{attempt, disposition, copyEvidence, digest}, nil
 }
 
-func (r ReconciliationResult) Repository() Repository                 { return r.repository }
-func (r ReconciliationResult) Actor() ActingIdentity                  { return r.actor }
-func (r ReconciliationResult) WriteID() string                        { return r.writeID }
+func (r ReconciliationResult) Attempt() WriteAttempt                  { return r.attempt }
 func (r ReconciliationResult) Disposition() ReconciliationDisposition { return r.disposition }
+func (r ReconciliationResult) LimitsSHA256() string                   { return r.limitsSHA }
 func (r ReconciliationResult) Evidence() []ledger.EvidenceRef {
 	return append([]ledger.EvidenceRef(nil), r.evidence...)
 }
 
-// Provider is the complete network boundary frozen by the foundation. Every
-// method is deadline/cancellation controlled by context.Context. Implementers
-// must enforce Limits before returning any result.
 type Provider interface {
 	FindPullRequests(context.Context, FindPullRequestsInput) (PullRequestPage, error)
 	GetCI(context.Context, GetCIInput) (CISnapshot, error)
@@ -234,52 +379,32 @@ const (
 	FailureInvalidRemote       FailureClass = "invalid_remote_evidence"
 )
 
-// OperationError separates execution availability from substantive governed
-// failure. Submitted writes are always classified ambiguous, irrespective of
-// the underlying cancellation, deadline, transport, or provider error.
 type OperationError struct {
-	class     FailureClass
-	operation string
-	write     bool
-	submitted bool
-	cause     error
-	attempt   *WriteAttempt
+	class      FailureClass
+	operation  string
+	write      bool
+	submitted  bool
+	cause      error
+	attempt    WriteAttempt
+	hasAttempt bool
 }
 
-// WriteAttempt is non-secret provenance for one idempotency identity. It is
-// required before reconciliation can authorize replay of an ambiguous write.
-type WriteAttempt struct {
-	repository Repository
-	actor      ActingIdentity
-	writeID    string
-}
-
-func NewWriteAttempt(repository Repository, actor ActingIdentity, writeID string, limits Limits) (WriteAttempt, error) {
-	if err := limits.Validate(); err != nil {
-		return WriteAttempt{}, err
-	}
-	if !repository.valid() || !actor.valid() || !validOpaqueID(writeID, limits.MaxTextBytes) {
-		return WriteAttempt{}, errors.New("write-attempt repository, actor, and identity are required")
-	}
-	return WriteAttempt{repository: repository, actor: actor, writeID: writeID}, nil
-}
-
-func NewWriteExecutionError(operation string, attempt WriteAttempt, submitted bool, cause error) *OperationError {
-	result := NewExecutionError(operation, true, submitted, cause)
-	copyAttempt := attempt
-	result.attempt = &copyAttempt
-	return result
-}
-
-func NewExecutionError(operation string, write, submitted bool, cause error) *OperationError {
+func NewWriteExecutionError(attempt WriteAttempt, submitted bool, cause error) *OperationError {
 	if cause == nil {
 		cause = errors.New("provider execution failed")
 	}
 	class := FailureProviderUnavailable
-	if write && submitted {
+	if submitted {
 		class = FailureAmbiguousWrite
 	}
-	return &OperationError{class: class, operation: operation, write: write, submitted: submitted, cause: cause}
+	return &OperationError{class: class, operation: string(attempt.operation), write: true, submitted: submitted, cause: cause, attempt: attempt, hasAttempt: true}
+}
+
+func NewReadExecutionError(operation string, cause error) *OperationError {
+	if cause == nil {
+		cause = errors.New("provider execution failed")
+	}
+	return &OperationError{class: FailureProviderUnavailable, operation: operation, cause: cause}
 }
 
 func NewSubstantiveError(operation string, class FailureClass, cause error) (*OperationError, error) {
@@ -312,24 +437,28 @@ func (e *OperationError) Class() FailureClass {
 }
 func (e *OperationError) Submitted() bool { return e != nil && e.submitted }
 func (e *OperationError) Write() bool     { return e != nil && e.write }
+func (e *OperationError) Attempt() (WriteAttempt, bool) {
+	if e == nil || !e.hasAttempt {
+		return WriteAttempt{}, false
+	}
+	return e.attempt, true
+}
 
-// CanRetry returns explicit retry authority. An ambiguous write is forbidden
-// until matching reconciliation proves it was not applied; applied or unknown
-// outcomes never authorize replay.
-func CanRetry(failure *OperationError, attempts int, limits Limits, reconciliation *ReconciliationResult) bool {
+func CanRetry(failure *OperationError, attempts int, limits Limits, expected *WriteAttempt, reconciliation *ReconciliationResult) bool {
 	if failure == nil || attempts < 0 || limits.Validate() != nil {
 		return false
 	}
 	switch failure.class {
 	case FailureAmbiguousWrite:
-		if reconciliation == nil || failure.attempt == nil || reconciliation.disposition != ReconciliationNotApplied ||
-			reconciliation.repository != failure.attempt.repository || reconciliation.actor != failure.attempt.actor || reconciliation.writeID != failure.attempt.writeID {
+		if expected == nil || reconciliation == nil || !failure.hasAttempt || failure.attempt != *expected || !failure.attempt.valid(limits) ||
+			reconciliation.disposition != ReconciliationNotApplied || reconciliation.attempt != failure.attempt ||
+			requireLimitsSHA(limits, reconciliation.limitsSHA) != nil || canonicalizeEvidenceCopy(reconciliation.evidence, limits) != nil {
 			return false
 		}
 		return attempts < limits.MaxWriteRetries
 	case FailureProviderUnavailable:
 		if failure.write {
-			return attempts < limits.MaxWriteRetries
+			return expected != nil && failure.hasAttempt && failure.attempt == *expected && failure.attempt.valid(limits) && attempts < limits.MaxWriteRetries
 		}
 		return attempts < limits.MaxReadRetries
 	default:
@@ -337,8 +466,7 @@ func CanRetry(failure *OperationError, attempts int, limits Limits, reconciliati
 	}
 }
 
-// ContextError is a convenience that preserves the critical submitted-write
-// rule for context cancellation and deadline errors.
-func ContextError(operation string, write, submitted bool, err error) *OperationError {
-	return NewExecutionError(operation, write, submitted, err)
+func canonicalizeEvidenceCopy(refs []ledger.EvidenceRef, limits Limits) error {
+	copyRefs := append([]ledger.EvidenceRef(nil), refs...)
+	return canonicalizeEvidence(&copyRefs, limits)
 }

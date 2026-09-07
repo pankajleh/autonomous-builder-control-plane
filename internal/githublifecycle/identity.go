@@ -182,6 +182,7 @@ type AuthorityInput struct {
 	PullRequest        *PullRequestIdentity
 	AllowedMergeMethod MergeMethod
 	Actor              ActingIdentity
+	ExpectedContent    ExpectedMergeContent
 }
 
 // Authority is immutable and safe to copy.
@@ -189,8 +190,11 @@ type Authority struct{ data AuthorityInput }
 
 func NewAuthority(input AuthorityInput) (Authority, error) {
 	if !input.Repository.valid() || !input.BaseBranch.valid() || !input.HeadBranch.valid() ||
-		!input.HeadSHA.valid() || !input.ExpectedBaseTipSHA.valid() || !input.AllowedMergeMethod.Valid() || !input.Actor.valid() {
+		!input.HeadSHA.valid() || !input.ExpectedBaseTipSHA.valid() || !input.AllowedMergeMethod.Valid() || !input.Actor.valid() || !input.ExpectedContent.valid() {
 		return Authority{}, errors.New("GitHub lifecycle authority contains an invalid identity")
+	}
+	if input.ExpectedContent.SourceIntegratedHeadSHA() != input.HeadSHA || input.ExpectedContent.SourceBaselineSHA() != input.ExpectedBaseTipSHA {
+		return Authority{}, errors.New("expected merge content is not derived from the accepted head and base")
 	}
 	if input.BaseBranch == input.HeadBranch {
 		return Authority{}, errors.New("base and head branches must be distinct")
@@ -210,6 +214,9 @@ func (a Authority) HeadSHA() GitSHA                 { return a.data.HeadSHA }
 func (a Authority) ExpectedBaseTipSHA() GitSHA      { return a.data.ExpectedBaseTipSHA }
 func (a Authority) AllowedMergeMethod() MergeMethod { return a.data.AllowedMergeMethod }
 func (a Authority) Actor() ActingIdentity           { return a.data.Actor }
+func (a Authority) ExpectedContent() ExpectedMergeContent {
+	return cloneExpectedContent(a.data.ExpectedContent)
+}
 func (a Authority) PullRequest() (PullRequestIdentity, bool) {
 	if a.data.PullRequest == nil {
 		return PullRequestIdentity{}, false
@@ -241,9 +248,10 @@ func (a Authority) CanonicalJSON() ([]byte, error) {
 		PullRequest        *prIdentityWire `json:"pull_request,omitempty"`
 		AllowedMergeMethod MergeMethod     `json:"allowed_merge_method"`
 		Actor              actorWire       `json:"actor"`
+		ExpectedContent    json.RawMessage `json:"expected_merge_content"`
 	}{
 		repositoryWire(a.data.Repository), a.data.BaseBranch.String(), a.data.HeadBranch.String(), a.data.HeadSHA.String(),
-		a.data.ExpectedBaseTipSHA.String(), pullRequest, a.data.AllowedMergeMethod, actingWire(a.data.Actor),
+		a.data.ExpectedBaseTipSHA.String(), pullRequest, a.data.AllowedMergeMethod, actingWire(a.data.Actor), a.data.ExpectedContent.CanonicalJSON(),
 	})
 }
 
@@ -263,6 +271,12 @@ func cloneAuthorityInput(input AuthorityInput) AuthorityInput {
 		copy := *input.PullRequest
 		input.PullRequest = &copy
 	}
+	input.ExpectedContent = cloneExpectedContent(input.ExpectedContent)
+	return input
+}
+
+func cloneExpectedContent(input ExpectedMergeContent) ExpectedMergeContent {
+	input.canonical = append([]byte(nil), input.canonical...)
 	return input
 }
 

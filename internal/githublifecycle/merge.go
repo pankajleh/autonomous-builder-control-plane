@@ -1,6 +1,8 @@
 package githublifecycle
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -33,6 +35,9 @@ type MergeResultInput struct {
 	Lineage          []CommitLineage
 	EvidenceRefs     []ledger.EvidenceRef
 	Metadata         map[string]string
+	Attempt          WriteAttempt
+	ExpectedContent  ExpectedMergeContent
+	LimitsSHA256     string
 }
 
 // MergeResult is immutable bounded evidence returned by a write operation.
@@ -42,8 +47,14 @@ type MergeResult struct {
 
 func NewMergeResult(input MergeResultInput, limits Limits) (MergeResult, error) {
 	input = cloneMergeInput(input)
+	limitsSHA, err := limits.SHA256()
+	if err != nil {
+		return MergeResult{}, err
+	}
+	input.LimitsSHA256 = limitsSHA
 	if err := validateMergeFields(input.Snapshot, input.Repository, input.PullRequest, input.Actor, input.AcceptedHeadSHA,
-		input.AcceptedHeadTree, input.BaseBeforeSHA, input.Method, input.ResultSHA, input.ResultTree, input.Parents, input.Lineage, limits); err != nil {
+		input.AcceptedHeadTree, input.BaseBeforeSHA, input.Method, input.ResultSHA, input.ResultTree, input.Parents, input.Lineage,
+		input.Attempt, input.ExpectedContent, limits); err != nil {
 		return MergeResult{}, err
 	}
 	if err := canonicalizeCommon(&input.EvidenceRefs, input.Metadata, limits); err != nil {
@@ -79,6 +90,9 @@ type PostMergeObservationInput struct {
 	Lineage          []CommitLineage
 	EvidenceRefs     []ledger.EvidenceRef
 	Metadata         map[string]string
+	Attempt          WriteAttempt
+	ExpectedContent  ExpectedMergeContent
+	LimitsSHA256     string
 }
 
 // PostMergeObservation is an immutable target-branch observation. ResultSHA
@@ -89,11 +103,17 @@ type PostMergeObservation struct {
 
 func NewPostMergeObservation(input PostMergeObservationInput, limits Limits) (PostMergeObservation, error) {
 	input = clonePostMergeInput(input)
+	limitsSHA, err := limits.SHA256()
+	if err != nil {
+		return PostMergeObservation{}, err
+	}
+	input.LimitsSHA256 = limitsSHA
 	if !input.BaseBranch.valid() || !input.BaseAfterSHA.valid() {
 		return PostMergeObservation{}, errors.New("post-merge base identity is invalid")
 	}
 	if err := validateMergeFields(input.Snapshot, input.Repository, input.PullRequest, input.Actor, input.AcceptedHeadSHA,
-		input.AcceptedHeadTree, input.BaseBeforeSHA, input.Method, input.ResultSHA, input.ResultTree, input.Parents, input.Lineage, limits); err != nil {
+		input.AcceptedHeadTree, input.BaseBeforeSHA, input.Method, input.ResultSHA, input.ResultTree, input.Parents, input.Lineage,
+		input.Attempt, input.ExpectedContent, limits); err != nil {
 		return PostMergeObservation{}, err
 	}
 	if err := canonicalizeCommon(&input.EvidenceRefs, input.Metadata, limits); err != nil {
@@ -120,13 +140,17 @@ func (o PostMergeObservation) valid() bool {
 
 func validateMergeFields(snapshot SnapshotIdentity, repository Repository, pr PullRequestIdentity, actor ActingIdentity,
 	acceptedHead, acceptedTree, baseBefore GitSHA, method MergeMethod, result, resultTree GitSHA,
-	parents []GitSHA, lineage []CommitLineage, limits Limits) error {
+	parents []GitSHA, lineage []CommitLineage, attempt WriteAttempt, expected ExpectedMergeContent, limits Limits) error {
 	if err := limits.Validate(); err != nil {
 		return err
 	}
 	if !snapshot.valid() || !repository.valid() || !pr.valid() || !actor.valid() || !acceptedHead.valid() || !acceptedTree.valid() ||
-		!baseBefore.valid() || !method.Valid() || !result.valid() || !resultTree.valid() {
+		!baseBefore.valid() || !method.Valid() || !result.valid() || !resultTree.valid() || !attempt.valid(limits) || !expected.valid() {
 		return errors.New("merge result contains an invalid identity")
+	}
+	if attempt.operation != OperationMerge || attempt.repository != repository || attempt.actor != actor ||
+		expected.SourceIntegratedHeadSHA() != acceptedHead || acceptedTree != expected.ExpectedResultTreeSHA() || resultTree != expected.ExpectedResultTreeSHA() {
+		return errors.New("merge result does not bind the merge attempt or controller-expected tree")
 	}
 	if len(parents) > limits.MaxParents || len(lineage) > limits.MaxLineageEntries {
 		return errors.New("merge lineage exceeds governed limits")
@@ -164,8 +188,40 @@ func validateSHAs(values []GitSHA, label string) error {
 	return nil
 }
 
+func validateMergeInput(input MergeInput, limits Limits) error {
+	if err := requireAuthority(input.authority); err != nil {
+		return err
+	}
+	if err := requireLimitsSHA(limits, input.limitsSHA256); err != nil {
+		return err
+	}
+	if _, ok := input.authority.PullRequest(); !ok {
+		return errors.New("merge input requires an exact pull request identity")
+	}
+	if !input.expectedContent.valid() || input.expectedContent.SHA256() != input.authority.ExpectedContent().SHA256() {
+		return errors.New("merge input expected content does not match authority")
+	}
+	if !input.attempt.valid(limits) || !input.attempt.matchesAuthority(input.authority) || input.attempt.operation != OperationMerge {
+		return errors.New("merge write attempt is invalid")
+	}
+	evidence := append([]ledger.EvidenceRef(nil), input.approvalEvidence...)
+	if len(evidence) == 0 || canonicalizeEvidence(&evidence, limits) != nil {
+		return errors.New("merge approval evidence fails bounded revalidation")
+	}
+	payload, payloadSHA, err := canonicalJSON(struct {
+		Authority       Authority            `json:"authority"`
+		ExpectedContent ExpectedMergeContent `json:"expected_merge_content"`
+		Evidence        []ledger.EvidenceRef `json:"approval_evidence"`
+		LimitsSHA256    string               `json:"limits_sha256"`
+	}{input.authority, input.expectedContent, evidence, input.limitsSHA256})
+	if err != nil || payloadSHA != input.attempt.payloadSHA256 || !bytes.Equal(payload, input.canonicalPayload) {
+		return errors.New("merge canonical payload does not match write attempt")
+	}
+	return nil
+}
+
 // ValidatePullRequest proves that one remote PR still matches exact authority.
-func ValidatePullRequest(authority Authority, snapshot PullRequestSnapshot) error {
+func ValidatePullRequest(authority Authority, snapshot PullRequestSnapshot, limits Limits) error {
 	if err := requireAuthority(authority); err != nil {
 		return err
 	}
@@ -173,6 +229,13 @@ func ValidatePullRequest(authority Authority, snapshot PullRequestSnapshot) erro
 		return errors.New("pull request snapshot is incomplete")
 	}
 	data := snapshot.immutable.data
+	if err := requireLimitsSHA(limits, data.LimitsSHA256); err != nil {
+		return err
+	}
+	rebuilt, err := NewPullRequestSnapshot(data, limits)
+	if err != nil || rebuilt.SHA256() != snapshot.SHA256() || !bytes.Equal(rebuilt.CanonicalJSON(), snapshot.CanonicalJSON()) {
+		return errors.New("pull request snapshot fails independent bounded revalidation")
+	}
 	if data.Repository != authority.data.Repository || data.BaseBranch != authority.data.BaseBranch || data.HeadBranch != authority.data.HeadBranch {
 		return errors.New("pull request repository or branch identity does not match authority")
 	}
@@ -204,11 +267,18 @@ func SelectPullRequest(authority Authority, snapshots []PullRequestSnapshot, lim
 		return PullRequestSnapshot{}, errors.New("pull request candidates exceed item limit")
 	}
 	var matched []PullRequestSnapshot
-	for _, snapshot := range snapshots {
+	for index, snapshot := range snapshots {
 		if !snapshot.valid() {
 			return PullRequestSnapshot{}, errors.New("pull request candidate is incomplete")
 		}
 		data := snapshot.immutable.data
+		if err := requireLimitsSHA(limits, data.LimitsSHA256); err != nil {
+			return PullRequestSnapshot{}, fmt.Errorf("pull request candidate %d: %w", index, err)
+		}
+		rebuilt, err := NewPullRequestSnapshot(data, limits)
+		if err != nil || rebuilt.SHA256() != snapshot.SHA256() || !bytes.Equal(rebuilt.CanonicalJSON(), snapshot.CanonicalJSON()) {
+			return PullRequestSnapshot{}, fmt.Errorf("pull request candidate %d fails independent bounded revalidation", index)
+		}
 		if data.Repository == authority.data.Repository && data.BaseBranch == authority.data.BaseBranch && data.HeadBranch == authority.data.HeadBranch {
 			matched = append(matched, snapshot)
 		}
@@ -216,7 +286,7 @@ func SelectPullRequest(authority Authority, snapshots []PullRequestSnapshot, lim
 	if len(matched) != 1 {
 		return PullRequestSnapshot{}, fmt.Errorf("expected exactly one pull request identity, observed %d", len(matched))
 	}
-	if err := ValidatePullRequest(authority, matched[0]); err != nil {
+	if err := ValidatePullRequest(authority, matched[0], limits); err != nil {
 		return PullRequestSnapshot{}, err
 	}
 	return matched[0], nil
@@ -224,7 +294,7 @@ func SelectPullRequest(authority Authority, snapshots []PullRequestSnapshot, lim
 
 // ValidateCI proves that every check and the snapshot itself are tied to the
 // authority's exact accepted head SHA.
-func ValidateCI(authority Authority, snapshot CISnapshot) error {
+func ValidateCI(authority Authority, snapshot CISnapshot, limits Limits) error {
 	if err := requireAuthority(authority); err != nil {
 		return err
 	}
@@ -232,6 +302,13 @@ func ValidateCI(authority Authority, snapshot CISnapshot) error {
 		return errors.New("CI snapshot is incomplete")
 	}
 	data := snapshot.immutable.data
+	if err := requireLimitsSHA(limits, data.LimitsSHA256); err != nil {
+		return err
+	}
+	rebuilt, err := NewCISnapshot(data, limits)
+	if err != nil || rebuilt.SHA256() != snapshot.SHA256() || !bytes.Equal(rebuilt.CanonicalJSON(), snapshot.CanonicalJSON()) {
+		return errors.New("CI snapshot fails independent bounded revalidation")
+	}
 	if data.Repository != authority.data.Repository {
 		return errors.New("CI repository does not match authority")
 	}
@@ -248,14 +325,22 @@ func ValidateCI(authority Authority, snapshot CISnapshot) error {
 
 // ValidateMergeResult binds the provider write result back to every merge
 // authority field, including the authenticated actor and pre-merge base tip.
-func ValidateMergeResult(authority Authority, result MergeResult) error {
-	if err := requireAuthority(authority); err != nil {
+func ValidateMergeResult(input MergeInput, result MergeResult, limits Limits) error {
+	if err := validateMergeInput(input, limits); err != nil {
 		return err
 	}
 	if !result.valid() {
 		return errors.New("merge result is incomplete")
 	}
 	data := result.immutable.data
+	if err := requireLimitsSHA(limits, data.LimitsSHA256); err != nil {
+		return err
+	}
+	rebuilt, err := NewMergeResult(data, limits)
+	if err != nil || rebuilt.SHA256() != result.SHA256() || !bytes.Equal(rebuilt.CanonicalJSON(), result.CanonicalJSON()) {
+		return errors.New("merge result fails independent bounded revalidation")
+	}
+	authority := input.authority
 	pr, ok := authority.PullRequest()
 	if !ok {
 		return errors.New("merge authority requires an exact pull request identity")
@@ -264,19 +349,34 @@ func ValidateMergeResult(authority Authority, result MergeResult) error {
 		data.BaseBeforeSHA != authority.data.ExpectedBaseTipSHA || data.Method != authority.data.AllowedMergeMethod {
 		return errors.New("merge result identity, actor, head, base, or method does not match authority")
 	}
+	if data.Attempt != input.attempt || data.Attempt.operation != OperationMerge {
+		return errors.New("merge result replaced or mismatched the write attempt")
+	}
+	if data.ExpectedContent.SHA256() != input.expectedContent.SHA256() || data.ResultTree != input.expectedContent.ExpectedResultTreeSHA() ||
+		data.AcceptedHeadTree != input.expectedContent.ExpectedResultTreeSHA() {
+		return errors.New("merge result does not match controller-owned expected merge content")
+	}
 	return verifyStrategy(data.Method, data.AcceptedHeadSHA, data.AcceptedHeadTree, data.BaseBeforeSHA, data.ResultSHA, data.ResultTree, data.Parents, data.Lineage)
 }
 
 // VerifyPostMerge proves agreement among authority, write result, observed base
 // tip, content tree, ordered parents, and method-specific lineage.
-func VerifyPostMerge(authority Authority, result MergeResult, observation PostMergeObservation) error {
-	if err := ValidateMergeResult(authority, result); err != nil {
+func VerifyPostMerge(input MergeInput, result MergeResult, observation PostMergeObservation, limits Limits) error {
+	if err := ValidateMergeResult(input, result, limits); err != nil {
 		return err
 	}
 	if !observation.valid() {
 		return errors.New("post-merge observation is incomplete")
 	}
 	m, o := result.immutable.data, observation.immutable.data
+	if err := requireLimitsSHA(limits, o.LimitsSHA256); err != nil {
+		return err
+	}
+	rebuilt, err := NewPostMergeObservation(o, limits)
+	if err != nil || rebuilt.SHA256() != observation.SHA256() || !bytes.Equal(rebuilt.CanonicalJSON(), observation.CanonicalJSON()) {
+		return errors.New("post-merge observation fails independent bounded revalidation")
+	}
+	authority := input.authority
 	if o.Repository != authority.data.Repository || o.BaseBranch != authority.data.BaseBranch || o.PullRequest != m.PullRequest || o.Actor != authority.data.Actor {
 		return errors.New("post-merge repository, branch, PR, or acting identity does not match authority")
 	}
@@ -285,6 +385,10 @@ func VerifyPostMerge(authority Authority, result MergeResult, observation PostMe
 	}
 	if o.ResultSHA != m.ResultSHA || o.BaseAfterSHA != m.ResultSHA || o.ResultTree != m.ResultTree {
 		return errors.New("post-merge result SHA, base-after SHA, or result tree does not match merge result")
+	}
+	if o.Attempt != input.attempt || o.ExpectedContent.SHA256() != input.expectedContent.SHA256() ||
+		o.ResultTree != input.expectedContent.ExpectedResultTreeSHA() {
+		return errors.New("post-merge observation does not bind the write attempt and controller-expected tree")
 	}
 	if !equalSHAs(o.Parents, m.Parents) || !equalLineage(o.Lineage, m.Lineage) {
 		return errors.New("post-merge parent or lineage proof does not match merge result")
@@ -341,6 +445,7 @@ func cloneMergeInput(input MergeResultInput) MergeResultInput {
 	input.Lineage = cloneLineage(input.Lineage)
 	input.EvidenceRefs = append([]ledger.EvidenceRef(nil), input.EvidenceRefs...)
 	input.Metadata = cloneMap(input.Metadata)
+	input.ExpectedContent = cloneExpectedContent(input.ExpectedContent)
 	return input
 }
 func clonePostMergeInput(input PostMergeObservationInput) PostMergeObservationInput {
@@ -348,6 +453,7 @@ func clonePostMergeInput(input PostMergeObservationInput) PostMergeObservationIn
 	input.Lineage = cloneLineage(input.Lineage)
 	input.EvidenceRefs = append([]ledger.EvidenceRef(nil), input.EvidenceRefs...)
 	input.Metadata = cloneMap(input.Metadata)
+	input.ExpectedContent = cloneExpectedContent(input.ExpectedContent)
 	return input
 }
 func equalSHAs(a, b []GitSHA) bool {
@@ -419,7 +525,10 @@ func mergeWire(input MergeResultInput) any {
 		Lineage          []lineageWire        `json:"lineage"`
 		EvidenceRefs     []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
 		Metadata         map[string]string    `json:"metadata,omitempty"`
-	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), pullRequestWire(input.PullRequest), actingWire(input.Actor), input.AcceptedHeadSHA.String(), input.AcceptedHeadTree.String(), input.BaseBeforeSHA.String(), input.Method, input.ResultSHA.String(), input.ResultTree.String(), shaStrings(input.Parents), lineageWires(input.Lineage), input.EvidenceRefs, input.Metadata}
+		Attempt          writeAttemptWire     `json:"write_attempt"`
+		ExpectedContent  json.RawMessage      `json:"expected_merge_content"`
+		LimitsSHA256     string               `json:"limits_sha256"`
+	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), pullRequestWire(input.PullRequest), actingWire(input.Actor), input.AcceptedHeadSHA.String(), input.AcceptedHeadTree.String(), input.BaseBeforeSHA.String(), input.Method, input.ResultSHA.String(), input.ResultTree.String(), shaStrings(input.Parents), lineageWires(input.Lineage), input.EvidenceRefs, input.Metadata, attemptWire(input.Attempt), input.ExpectedContent.CanonicalJSON(), input.LimitsSHA256}
 }
 func postMergeWire(input PostMergeObservationInput) any {
 	return struct {
@@ -439,5 +548,8 @@ func postMergeWire(input PostMergeObservationInput) any {
 		Lineage          []lineageWire        `json:"lineage"`
 		EvidenceRefs     []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
 		Metadata         map[string]string    `json:"metadata,omitempty"`
-	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), input.BaseBranch.String(), pullRequestWire(input.PullRequest), actingWire(input.Actor), input.AcceptedHeadSHA.String(), input.AcceptedHeadTree.String(), input.BaseBeforeSHA.String(), input.Method, input.ResultSHA.String(), input.BaseAfterSHA.String(), input.ResultTree.String(), shaStrings(input.Parents), lineageWires(input.Lineage), input.EvidenceRefs, input.Metadata}
+		Attempt          writeAttemptWire     `json:"write_attempt"`
+		ExpectedContent  json.RawMessage      `json:"expected_merge_content"`
+		LimitsSHA256     string               `json:"limits_sha256"`
+	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), input.BaseBranch.String(), pullRequestWire(input.PullRequest), actingWire(input.Actor), input.AcceptedHeadSHA.String(), input.AcceptedHeadTree.String(), input.BaseBeforeSHA.String(), input.Method, input.ResultSHA.String(), input.BaseAfterSHA.String(), input.ResultTree.String(), shaStrings(input.Parents), lineageWires(input.Lineage), input.EvidenceRefs, input.Metadata, attemptWire(input.Attempt), input.ExpectedContent.CanonicalJSON(), input.LimitsSHA256}
 }
