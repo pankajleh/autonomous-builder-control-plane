@@ -20,16 +20,16 @@ Controller design review was followed by independent Claude design review. The f
 
 ### Task 1: Freeze GitHub lifecycle contracts
 
-- [ ] Define immutable/copy-safe identities for governed repository, base branch, head branch, exact head SHA, expected pre-merge base-tip SHA, optional PR identity, remote snapshot identity, allowed merge method, and non-secret authenticated acting principal/app-installation identity.
-- [ ] Define bounded provider result types for PR snapshot, CI/check snapshot, merge result, and post-merge observation without embedding unbounded remote bodies/logs. Merge/post-merge types must carry enough structured identity for strategy-aware proof: accepted head SHA/tree, base-before SHA, merge method, result/base-after SHA, result tree, and parent/lineage data where applicable; never assume post-merge SHA equals accepted head SHA.
-- [ ] Define a provider interface whose read/write methods use structured typed inputs and context/deadline control; no method may accept free-form shell/URL fragments as authority. Every write input/result must bind the authenticated acting identity without exposing credentials.
-- [ ] Define explicit outcome/error classes that distinguish unavailable/ambiguous provider execution from substantive policy/CI/review failure. Cancellation or deadline after a write may have been submitted is always an ambiguous write, not a clean retryable failure.
-- [ ] Define foundation resource limits for remote page/item counts, text fields, evidence-reference counts, per-call timeout/deadline, and retries; retry authority defaults to zero for ambiguous writes until an explicit reconciliation result proves the prior outcome.
-- [ ] Canonicalize ordering and JSON/digest identity for snapshots that will later become immutable evidence.
-- [ ] Validate exact Git SHA syntax and safe branch/repository identifiers without silently normalizing different identities into equality.
-- [ ] Add adversarial tests for moved/mismatched head, moved pre-merge base tip, stale CI SHA, duplicate/ambiguous PR identity, unsupported/changed merge method, post-merge SHA divergence with correct/incorrect tree-lineage proof, wrong acting identity, cancellation/deadline during a write, forbidden retry after ambiguous write, oversized collections/text, unsafe identifiers, mutation of caller-owned slices/maps, and nondeterministic input ordering.
-- [ ] Document the frozen foundation contract for later PR/CI/merge tracks.
-- [ ] Run `gofmt`, focused tests, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`; commit only this bounded foundation.
+- [x] Define immutable/copy-safe identities for governed repository, base branch, head branch, exact head SHA, expected pre-merge base-tip SHA, optional PR identity, remote snapshot identity, allowed merge method, and non-secret authenticated acting principal/app-installation identity.
+- [x] Define bounded provider result types for PR snapshot, CI/check snapshot, merge result, and post-merge observation without embedding unbounded remote bodies/logs. Merge/post-merge types must carry enough structured identity for strategy-aware proof: accepted head SHA/tree, base-before SHA, merge method, result/base-after SHA, result tree, and parent/lineage data where applicable; never assume post-merge SHA equals accepted head SHA.
+- [x] Define a provider interface whose read/write methods use structured typed inputs and context/deadline control; no method may accept free-form shell/URL fragments as authority. Every write input/result must bind the authenticated acting identity without exposing credentials.
+- [x] Define explicit outcome/error classes that distinguish unavailable/ambiguous provider execution from substantive policy/CI/review failure. Cancellation or deadline after a write may have been submitted is always an ambiguous write, not a clean retryable failure.
+- [x] Define foundation resource limits for remote page/item counts, text fields, evidence-reference counts, per-call timeout/deadline, and retries; retry authority defaults to zero for ambiguous writes until an explicit reconciliation result proves the prior outcome.
+- [x] Canonicalize ordering and JSON/digest identity for snapshots that will later become immutable evidence.
+- [x] Validate exact Git SHA syntax and safe branch/repository identifiers without silently normalizing different identities into equality.
+- [x] Add adversarial tests for moved/mismatched head, moved pre-merge base tip, stale CI SHA, duplicate/ambiguous PR identity, unsupported/changed merge method, post-merge SHA divergence with correct/incorrect tree-lineage proof, wrong acting identity, cancellation/deadline during a write, forbidden retry after ambiguous write, oversized collections/text, unsafe identifiers, mutation of caller-owned slices/maps, and nondeterministic input ordering.
+- [x] Document the frozen foundation contract for later PR/CI/merge tracks.
+- [x] Run `gofmt`, focused tests, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`; commit only this bounded foundation.
 
 ## Success criteria
 
