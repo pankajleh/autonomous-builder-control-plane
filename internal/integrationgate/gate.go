@@ -247,7 +247,7 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 			}
 			return g.finish(prepared, accepted, domain.StateFailed, headErr.Error(), inputRef)
 		}
-		refs := collectRefs(inputRef, accepted.DecisionEvidence, accepted.Materialization.CleanupRef, readyHeadRef)
+		refs := terminalRefs(accepted, inputRef)
 		if err := g.transition(prepared.Authority.RunID(), accepted.State, domain.StateReadyForMerge, refs, map[string]any{"combined_acceptance_sha256": combinedResult.SHA256()}); err != nil {
 			return g.handleTransitionFailure(prepared, accepted, domain.StateReadyForMerge, "emit ready for merge", refs, err)
 		}

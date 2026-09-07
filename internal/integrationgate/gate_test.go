@@ -263,10 +263,12 @@ func TestReadyForMergeCarriesDurableSourceHeadVerification(t *testing.T) {
 	found := false
 	for _, ref := range ready.EvidenceRefs {
 		if ref.Kind == sourceHeadsEvidenceKind {
-			found = true
 			data, readErr := evidence.ReadVerifiedLocal(fixture.gate.evidenceRoot, ref, maxEvidenceArtifactBytes)
-			if readErr != nil || !strings.Contains(string(data), `"boundary":"ready-for-merge"`) || !strings.Contains(string(data), `"verified":true`) {
+			if readErr != nil {
 				t.Fatalf("ready source evidence = %s, %v", data, readErr)
+			}
+			if strings.Contains(string(data), `"boundary":"ready-for-merge"`) && strings.Contains(string(data), `"verified":true`) {
+				found = true
 			}
 		}
 	}
@@ -350,6 +352,53 @@ func TestEvidenceVerificationFailuresTerminalizeFromEveryDurableGateState(t *tes
 		}
 		assertFallbackTerminal(t, fixture)
 	})
+}
+
+func TestReadyForMergeRejectsMutatedTransitiveAcceptanceEvidence(t *testing.T) {
+	fixture := newGateFixture(t, false, "pass")
+	var mutatedRef, acceptedDecisionRef ledger.EvidenceRef
+	fixture.gate.events = &mutatingEvents{delegate: fixture.events, after: domain.StateIntegrationAccepted, mutate: func(event ledger.Event) error {
+		for _, ref := range event.EvidenceRefs {
+			switch ref.Kind {
+			case "acceptance-command-metadata":
+				mutatedRef = ref
+			case gateEvidenceKind:
+				acceptedDecisionRef = ref
+			}
+		}
+		if mutatedRef.URI == "" {
+			return fmt.Errorf("event %s had no transitive acceptance evidence", event.StateTo)
+		}
+		if acceptedDecisionRef.URI == "" {
+			return fmt.Errorf("event %s had no integration-accepted decision evidence", event.StateTo)
+		}
+		return os.WriteFile(mutatedRef.URI, []byte("mutated after durable integration acceptance"), 0o600)
+	}}
+
+	result, err := fixture.gate.Run(context.Background(), fixture.request)
+	if err != nil || result.State != domain.StateFailed {
+		t.Fatalf("transitive evidence fallback = state %s, err %v, reason %q", result.State, err, result.FailureReason)
+	}
+	for _, state := range fixture.events.states() {
+		if state == domain.StateReadyForMerge {
+			t.Fatal("mutated transitive acceptance evidence emitted READY_FOR_MERGE")
+		}
+	}
+	assertLedgerContinuity(t, fixture.events.events)
+	terminal := fixture.events.events[len(fixture.events.events)-1]
+	if terminal.StateFrom != domain.StateIntegrationAccepted || terminal.StateTo != domain.StateFailed {
+		t.Fatalf("terminal transition = %s -> %s, want INTEGRATION_ACCEPTED -> FAILED", terminal.StateFrom, terminal.StateTo)
+	}
+	for _, ref := range terminal.EvidenceRefs {
+		if ref.URI == mutatedRef.URI && ref.SHA256 == mutatedRef.SHA256 && ref.Kind == mutatedRef.Kind {
+			t.Fatalf("terminal transition retained rejected evidence: %#v", ref)
+		}
+	}
+	assertVerifiedRefs(t, fixture.gate.evidenceRoot, terminal.EvidenceRefs)
+	if _, err := evidence.ReadVerifiedLocal(fixture.gate.evidenceRoot, acceptedDecisionRef, maxEvidenceArtifactBytes); err != nil {
+		t.Fatalf("integration-accepted decision artifact was not left untouched: %v", err)
+	}
+	assertFallbackTerminal(t, fixture)
 }
 
 func TestNormalDecisionEvidenceFailureUsesHealthyFallbackWriter(t *testing.T) {

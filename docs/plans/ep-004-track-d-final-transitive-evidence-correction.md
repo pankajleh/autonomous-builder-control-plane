@@ -27,10 +27,10 @@ This violates the normative post-acceptance invariant: any evidence that becomes
 - Ledger append ambiguity and fallback-artifact write/verification failure remain the only permitted non-terminal infrastructure stranding cases.
 
 ### Task 1: Re-verify full evidence closure at READY_FOR_MERGE
-- [ ] Replace the reduced final READY evidence set with the complete `terminalRefs(accepted, inputRef)` closure after the ready-for-merge source proof has been appended to `accepted.SourceVerificationEvidence`.
-- [ ] Keep `g.transition` as the immediate pre-append verifier so every final transition ref is independently verified at the readiness boundary.
-- [ ] Add an adversarial regression that mutates a transitive combined/acceptance evidence artifact immediately after durable `INTEGRATION_ACCEPTED` while leaving the integration-accepted decision artifact itself untouched.
-- [ ] Assert the run then ends durably at `FAILED`, never emits `READY_FOR_MERGE`, ledger continuity is preserved, rejected evidence is absent from terminal transition refs, and all emitted fallback refs independently verify.
-- [ ] Keep the existing direct mutation test for the integration-accepted decision artifact.
-- [ ] Do not alter Track B/C semantics, review-policy authority, source-head/replacement-ref checks, state mappings, scheduler contracts, or any Phase 4+ surface.
-- [ ] Run `gofmt`, focused Track D tests, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`; commit only this bounded correction.
+- [x] Replace the reduced final READY evidence set with the complete `terminalRefs(accepted, inputRef)` closure after the ready-for-merge source proof has been appended to `accepted.SourceVerificationEvidence`.
+- [x] Keep `g.transition` as the immediate pre-append verifier so every final transition ref is independently verified at the readiness boundary.
+- [x] Add an adversarial regression that mutates a transitive combined/acceptance evidence artifact immediately after durable `INTEGRATION_ACCEPTED` while leaving the integration-accepted decision artifact itself untouched.
+- [x] Assert the run then ends durably at `FAILED`, never emits `READY_FOR_MERGE`, ledger continuity is preserved, rejected evidence is absent from terminal transition refs, and all emitted fallback refs independently verify.
+- [x] Keep the existing direct mutation test for the integration-accepted decision artifact.
+- [x] Do not alter Track B/C semantics, review-policy authority, source-head/replacement-ref checks, state mappings, scheduler contracts, or any Phase 4+ surface.
+- [x] Run `gofmt`, focused Track D tests, `go test ./...`, `go test -race ./...`, `go vet ./...`, `make smoke`, and `git diff --check`; commit only this bounded correction.
