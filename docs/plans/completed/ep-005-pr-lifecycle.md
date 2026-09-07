@@ -6,10 +6,10 @@ Phase 4 authorizes `PR creation/update with exact head SHA`. This plan implement
 
 ### Task 1: Governed exact-head pull-request lifecycle
 
-- [ ] Implement controller-owned PR create/update orchestration plus the bounded GitHub REST PR adapter.
-- [ ] Create or update exactly one open PR only for the governed repository/base/head identity and exact accepted head SHA.
-- [ ] Keep CI ingestion, merge authorization/execution, post-merge acceptance, lifecycle state transitions, service/API/dashboard, and Phase 5+ work out of scope.
-- [ ] Preserve frozen `internal/githublifecycle` invariants; additive track-owned proof types may wrap them but may not weaken them.
+- [x] Implement controller-owned PR create/update orchestration plus the bounded GitHub REST PR adapter.
+- [x] Create or update exactly one open PR only for the governed repository/base/head identity and exact accepted head SHA.
+- [x] Keep CI ingestion, merge authorization/execution, post-merge acceptance, lifecycle state transitions, service/API/dashboard, and Phase 5+ work out of scope.
+- [x] Preserve frozen `internal/githublifecycle` invariants; additive track-owned proof types may wrap them but may not weaken them.
 
 ## Durable PR-resource admission and revision authority
 
@@ -189,31 +189,31 @@ This task consumes `READY_FOR_MERGE` authority but owns no domain lifecycle tran
 
 ## Adversarial tests
 
-- [ ] physical-resource serialization: actor/title/body/head-SHA/run/policy changes cannot create a second lock; CREATE and UPDATE share the resource; unresolved and `applied_reconciled` revisions block drift; clean `applied_confirmed` permits only a freshly proved later revision.
-- [ ] revision ownership: exactly one active revision; different request with no generation can advance only through durable `superseded_zero_write`; once any generation exists, different request fails `REVISION_CONFLICT` and cannot supersede/resubmit.
-- [ ] concurrent capacity: distinct resources race at resource/file/byte limits; root-wide capacity lock and outstanding terminal reservations prevent oversubscription; every mutation including reconciliation/terminal/lock-file creation rechecks projected capacity.
-- [ ] production limits: exact `DefaultLimits()` only in production; looser/different caller profile rejected; tests may use only stricter profiles.
-- [ ] locking/durability: dedicated `flock`, in-process serialization, fixed lock order, crash release, lock-file/root fsync, generation/marker/terminal root fsync, submitted marker binds fresh initial/resume proof, uncertain semantics fail closed.
-- [ ] submitted-marker crash windows: marker file fsync succeeds/root fsync fails, marker create returns uncertain error, crash before `Do`, and partial/corrupt marker; any valid marker observed after restart is submitted+unresolved, while only securely proven absence permits same-generation resume.
-- [ ] resume: separate monotonic 1..4 resume rounds, crash/storage repair, divergence rejection, exhaustion leaves zero-write generation and consumes no submitted budget.
-- [ ] GitHub request matrix: exact version/Accept/content-type/method/path/query/body/status, escaped malicious identities, redirect/304/unexpected 2xx rejection, 16 KiB request and 4 MiB response body caps, 32 KiB header/8 KiB Link/256-byte request-ID caps.
-- [ ] principal identity: Authority user subject must be stable `github-user-id:<id>`; login rename cannot change security identity; `/user` id mismatch and PR-author id/node mismatch on CREATE/adoption produce zero success; app installation unsupported.
-- [ ] discovery: filtered raw count exactly zero is the only CREATE resolution; one candidate is full-GET before eligibility; stale list/head SHA cannot cause CREATE; multiple candidates/truncation/Link-next fail closed; 422 race remains ambiguous.
-- [ ] exact postflight: moved head/base, closed/merged PR, fork/head-repo/head-label/node mismatch, title/body mismatch all prevent success and persist `remote_diverged_after_write` after a known remote mutation.
-- [ ] ambiguity: timeout/cancel/lost response/422/5xx after `Do`; absence never proves not-applied; generic `ReconciliationNotApplied` never grants this track a second submission; applied adoption requires full postflight + fresh stable principal; `applied_reconciled` permanently barriers later revisions.
-- [ ] reconciliation bounds: monotonic names, 8 rounds, byte/rate/capacity limits, no evidence-name collision, no terminal-reservation starvation.
-- [ ] crash recovery: frozen `Authority`/`ExpectedMergeContent` are deliberately non-rehydratable; restart strictly decodes/re-canonicalizes the stored Authority mirror (nested expected content stays raw+hashed) and succeeds from primitive recovery wire without calling `NewAuthority`, `DeriveExpectedMergeContent`, `NewUpsertPullRequestInput`, or `NewPullRequestWriteResult`; snapshot is rebuilt only through public primitive constructors; mirrored-authority/attempt/snapshot/result mismatch blocks.
-- [ ] terminal profile/hash: PR-lifecycle snapshot has empty reviews/evidence/metadata; every future normalized wire obeys its fixed TerminalBudgetV1 cap; pre-submit worst-case or final terminal >256 KiB blocks/fails closed; `PRLifecycleResultCoreV1` contains no terminal-dependent identity; `TerminalCoreV1 -> terminal_core_digest -> deterministic event -> final terminal digest -> PRLifecycleResultV1 wrapper` is non-circular and tamper-evident; crash after terminal fsync before evidence, material-ledger append, or caller return reconstructs identical confirmed/reconciled/diverged `PRLifecycleResultV1` from the stored result core + final terminal digest.
-- [ ] material ledger recovery: controller-bound path and supplied `JSONLLedger.Path()` mismatch is rejected; safe owner-only parent + missing ledger is clean absence; scan and append use one no-follow verified `O_APPEND` descriptor; path swap after open cannot redirect the write; exact deterministic EventID+bytes already present is success; same ID/different bytes fails integrity; append/fsync-error-after-possible-write is rescanned before any retry; inaccessible/malformed/>64MiB ledger, >256KiB line, >262144 lines, non-newline snapshotted prefix and non-regular/symlink/unsafe-parent path fail local recovery and never authorize remote replay; unrelated concurrent one-write appends are tolerated.
-- [ ] cleanup: atomic temp leftovers, cancellation/timeout/publication failure never delete authoritative records or grant replay; cleanup failure is recorded and fail-closed.
-- [ ] malformed/oversized JSON, duplicate identities, defensive-copy/provenance forgery, bounded read retries, evidence publish-or-verify mismatch, and post-submit admission failure all fail closed.
+- [x] physical-resource serialization: actor/title/body/head-SHA/run/policy changes cannot create a second lock; CREATE and UPDATE share the resource; unresolved and `applied_reconciled` revisions block drift; clean `applied_confirmed` permits only a freshly proved later revision.
+- [x] revision ownership: exactly one active revision; different request with no generation can advance only through durable `superseded_zero_write`; once any generation exists, different request fails `REVISION_CONFLICT` and cannot supersede/resubmit.
+- [x] concurrent capacity: distinct resources race at resource/file/byte limits; root-wide capacity lock and outstanding terminal reservations prevent oversubscription; every mutation including reconciliation/terminal/lock-file creation rechecks projected capacity.
+- [x] production limits: exact `DefaultLimits()` only in production; looser/different caller profile rejected; tests may use only stricter profiles.
+- [x] locking/durability: dedicated `flock`, in-process serialization, fixed lock order, crash release, lock-file/root fsync, generation/marker/terminal root fsync, submitted marker binds fresh initial/resume proof, uncertain semantics fail closed.
+- [x] submitted-marker crash windows: marker file fsync succeeds/root fsync fails, marker create returns uncertain error, crash before `Do`, and partial/corrupt marker; any valid marker observed after restart is submitted+unresolved, while only securely proven absence permits same-generation resume.
+- [x] resume: separate monotonic 1..4 resume rounds, crash/storage repair, divergence rejection, exhaustion leaves zero-write generation and consumes no submitted budget.
+- [x] GitHub request matrix: exact version/Accept/content-type/method/path/query/body/status, escaped malicious identities, redirect/304/unexpected 2xx rejection, 16 KiB request and 4 MiB response body caps, 32 KiB header/8 KiB Link/256-byte request-ID caps.
+- [x] principal identity: Authority user subject must be stable `github-user-id:<id>`; login rename cannot change security identity; `/user` id mismatch and PR-author id/node mismatch on CREATE/adoption produce zero success; app installation unsupported.
+- [x] discovery: filtered raw count exactly zero is the only CREATE resolution; one candidate is full-GET before eligibility; stale list/head SHA cannot cause CREATE; multiple candidates/truncation/Link-next fail closed; 422 race remains ambiguous.
+- [x] exact postflight: moved head/base, closed/merged PR, fork/head-repo/head-label/node mismatch, title/body mismatch all prevent success and persist `remote_diverged_after_write` after a known remote mutation.
+- [x] ambiguity: timeout/cancel/lost response/422/5xx after `Do`; absence never proves not-applied; generic `ReconciliationNotApplied` never grants this track a second submission; applied adoption requires full postflight + fresh stable principal; `applied_reconciled` permanently barriers later revisions.
+- [x] reconciliation bounds: monotonic names, 8 rounds, byte/rate/capacity limits, no evidence-name collision, no terminal-reservation starvation.
+- [x] crash recovery: frozen `Authority`/`ExpectedMergeContent` are deliberately non-rehydratable; restart strictly decodes/re-canonicalizes the stored Authority mirror (nested expected content stays raw+hashed) and succeeds from primitive recovery wire without calling `NewAuthority`, `DeriveExpectedMergeContent`, `NewUpsertPullRequestInput`, or `NewPullRequestWriteResult`; snapshot is rebuilt only through public primitive constructors; mirrored-authority/attempt/snapshot/result mismatch blocks.
+- [x] terminal profile/hash: PR-lifecycle snapshot has empty reviews/evidence/metadata; every future normalized wire obeys its fixed TerminalBudgetV1 cap; pre-submit worst-case or final terminal >256 KiB blocks/fails closed; `PRLifecycleResultCoreV1` contains no terminal-dependent identity; `TerminalCoreV1 -> terminal_core_digest -> deterministic event -> final terminal digest -> PRLifecycleResultV1 wrapper` is non-circular and tamper-evident; crash after terminal fsync before evidence, material-ledger append, or caller return reconstructs identical confirmed/reconciled/diverged `PRLifecycleResultV1` from the stored result core + final terminal digest.
+- [x] material ledger recovery: controller-bound path and supplied `JSONLLedger.Path()` mismatch is rejected; safe owner-only parent + missing ledger is clean absence; scan and append use one no-follow verified `O_APPEND` descriptor; path swap after open cannot redirect the write; exact deterministic EventID+bytes already present is success; same ID/different bytes fails integrity; append/fsync-error-after-possible-write is rescanned before any retry; inaccessible/malformed/>64MiB ledger, >256KiB line, >262144 lines, non-newline snapshotted prefix and non-regular/symlink/unsafe-parent path fail local recovery and never authorize remote replay; unrelated concurrent one-write appends are tolerated.
+- [x] cleanup: atomic temp leftovers, cancellation/timeout/publication failure never delete authoritative records or grant replay; cleanup failure is recorded and fail-closed.
+- [x] malformed/oversized JSON, duplicate identities, defensive-copy/provenance forgery, bounded read retries, evidence publish-or-verify mismatch, and post-submit admission failure all fail closed.
 
 ## Required validation
 
-- [ ] `gofmt -w` changed Go files.
-- [ ] `go test ./...`
-- [ ] `go test -race ./...`
-- [ ] `go vet ./...`
-- [ ] `make smoke`
-- [ ] `git diff --check bf5f923f1743b541fac8ad75fa173557fe68ba0f HEAD`
-- [ ] Move this plan to `docs/plans/completed/` only after every item passes and commit the completed plan.
+- [x] `gofmt -w` changed Go files.
+- [x] `go test ./...`
+- [x] `go test -race ./...`
+- [x] `go vet ./...`
+- [x] `make smoke`
+- [x] `git diff --check bf5f923f1743b541fac8ad75fa173557fe68ba0f HEAD`
+- [x] Move this plan to `docs/plans/completed/` only after every item passes and commit the completed plan.
