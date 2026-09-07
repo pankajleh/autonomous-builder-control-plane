@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -42,6 +43,8 @@ const (
 	resultSchemaVersion    = 1
 	gitOutputLimitBytes    = 1024 * 1024
 	gitNoReplaceObjectsArg = "--no-replace-objects"
+	maxArtifactSizeBytes   = 16 * 1024 * 1024
+	maxIntegrationEvidence = 64
 
 	combinedTargetEvidenceKindPrefix = "combined-target-"
 	acceptanceEvidenceKindPrefix     = "acceptance-"
@@ -448,6 +451,9 @@ func canonicalTarget(target Target) (Target, error) {
 	if len(integration.CandidateOrder) == 0 || len(integration.Evidence) == 0 {
 		return Target{}, errors.New("candidate order and integration evidence are required")
 	}
+	if len(integration.Evidence) > maxIntegrationEvidence {
+		return Target{}, fmt.Errorf("integration evidence count %d exceeds maximum %d", len(integration.Evidence), maxIntegrationEvidence)
+	}
 	for index, identity := range integration.CandidateOrder {
 		if !validText(identity.ProjectID) || !validText(identity.PlanID) || !validText(identity.RunID) || !validText(identity.AttemptID) || !validSHA(identity.HeadSHA) {
 			return Target{}, fmt.Errorf("candidate order %d has incomplete provenance", index)
@@ -728,9 +734,51 @@ func readVerifiedArtifact(ref ledger.EvidenceRef) ([]byte, error) {
 	if err := validateEvidenceRef(ref); err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(ref.URI)
+	if !filepath.IsAbs(ref.URI) || filepath.Clean(ref.URI) != ref.URI {
+		return nil, errors.New("evidence artifact path must be absolute and clean")
+	}
+	file, err := openArtifactNoSymlinks(ref.URI)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open evidence artifact: %w", err)
+	}
+	defer file.Close()
+
+	before, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect evidence artifact: %w", err)
+	}
+	if !before.Mode().IsRegular() {
+		return nil, errors.New("evidence artifact must be a regular file, not a symlink or special file")
+	}
+	if before.Size() > maxArtifactSizeBytes {
+		return nil, fmt.Errorf("evidence artifact is %d bytes; maximum is %d", before.Size(), maxArtifactSizeBytes)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, maxArtifactSizeBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read evidence artifact: %w", err)
+	}
+	if int64(len(data)) > maxArtifactSizeBytes {
+		return nil, fmt.Errorf("evidence artifact exceeds maximum %d bytes", maxArtifactSizeBytes)
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("reinspect evidence artifact: %w", err)
+	}
+	if !after.Mode().IsRegular() || int64(len(data)) != before.Size() || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return nil, errors.New("evidence artifact changed while being read")
+	}
+	current, err := openArtifactNoSymlinks(ref.URI)
+	if err != nil {
+		return nil, fmt.Errorf("reopen evidence artifact: %w", err)
+	}
+	currentInfo, statErr := current.Stat()
+	closeErr := current.Close()
+	if statErr != nil || closeErr != nil {
+		return nil, fmt.Errorf("reinspect evidence artifact path: %w", errors.Join(statErr, closeErr))
+	}
+	if !currentInfo.Mode().IsRegular() || !os.SameFile(before, currentInfo) || currentInfo.Size() != before.Size() || !currentInfo.ModTime().Equal(before.ModTime()) {
+		return nil, errors.New("evidence artifact path changed while being read")
 	}
 	if sha256Hex(data) != ref.SHA256 {
 		return nil, errors.New("evidence SHA256 mismatch")

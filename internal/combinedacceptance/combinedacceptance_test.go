@@ -223,9 +223,49 @@ func TestEvaluatorRejectsUnverifiedIntegrationEvidenceBeforeExecution(t *testing
 			},
 		},
 		{
-			name: "unreadable artifact",
+			name: "directory",
 			mutate: func(t *testing.T, ref *ledger.EvidenceRef) {
 				ref.URI = t.TempDir()
+			},
+		},
+		{
+			name: "relative path",
+			mutate: func(_ *testing.T, ref *ledger.EvidenceRef) {
+				ref.URI = filepath.Base(ref.URI)
+			},
+		},
+		{
+			name: "non-canonical path",
+			mutate: func(_ *testing.T, ref *ledger.EvidenceRef) {
+				ref.URI = filepath.Dir(ref.URI) + string(filepath.Separator) + "." + string(filepath.Separator) + filepath.Base(ref.URI)
+			},
+		},
+		{
+			name: "symlink",
+			mutate: func(t *testing.T, ref *ledger.EvidenceRef) {
+				link := filepath.Join(t.TempDir(), "integration-evidence-link")
+				if err := os.Symlink(ref.URI, link); err != nil {
+					t.Fatal(err)
+				}
+				ref.URI = link
+			},
+		},
+		{
+			name: "symlinked parent",
+			mutate: func(t *testing.T, ref *ledger.EvidenceRef) {
+				link := filepath.Join(t.TempDir(), "evidence-parent")
+				if err := os.Symlink(filepath.Dir(ref.URI), link); err != nil {
+					t.Fatal(err)
+				}
+				ref.URI = filepath.Join(link, filepath.Base(ref.URI))
+			},
+		},
+		{
+			name: "oversized artifact",
+			mutate: func(t *testing.T, ref *ledger.EvidenceRef) {
+				if err := os.Truncate(ref.URI, maxArtifactSizeBytes+1); err != nil {
+					t.Fatal(err)
+				}
 			},
 		},
 	}
@@ -237,18 +277,54 @@ func TestEvaluatorRejectsUnverifiedIntegrationEvidenceBeforeExecution(t *testing
 			}})
 			target := cloneTarget(fixture.target)
 			test.mutate(t, &target.Integration.Evidence[0])
-			store, err := evidence.NewStore(t.TempDir(), "unverified-integration")
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, err = New(supervisor.New(), store).Evaluate(context.Background(), fixture.authority, fixture.policy([]string{"unit"}, nil), target, fixture.candidates, fixture.risk)
-			if err == nil || !strings.Contains(err.Error(), "verify exact artifact bytes") {
-				t.Fatalf("unverified integration evidence error = %v", err)
-			}
-			if entries, readErr := os.ReadDir(store.RunDir()); readErr != nil || len(entries) != 0 {
-				t.Fatalf("unverified input executed controller commands: entries=%d err=%v", len(entries), readErr)
-			}
+			assertIntegrationEvidenceRejectedBeforeExecution(t, fixture, target, "verify exact artifact bytes")
 		})
+	}
+}
+
+func TestEvaluatorRejectsExcessiveIntegrationEvidenceBeforeReads(t *testing.T) {
+	fixture := newFixture(t, []authority.AcceptanceCommand{{
+		Name: "combined unit", Class: "unit", Required: true, Timeout: "5s", Argv: helperArgv("pass"),
+	}})
+	target := cloneTarget(fixture.target)
+	target.Integration.Evidence = make([]ledger.EvidenceRef, maxIntegrationEvidence+1)
+	for index := range target.Integration.Evidence {
+		target.Integration.Evidence[index] = fixture.target.Integration.Evidence[0]
+	}
+	if err := os.Remove(fixture.target.Integration.Evidence[0].URI); err != nil {
+		t.Fatal(err)
+	}
+	assertIntegrationEvidenceRejectedBeforeExecution(t, fixture, target, "evidence count")
+}
+
+func TestReadVerifiedArtifactAcceptsValidBoundedRegularFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bounded-evidence.json")
+	want := []byte(`{"status":"clean"}`)
+	if err := os.WriteFile(path, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref := ledger.EvidenceRef{URI: path, SHA256: sha256Hex(want), Kind: "textual-integration-metadata"}
+	got, err := readVerifiedArtifact(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("verified artifact = %q, want %q", got, want)
+	}
+}
+
+func assertIntegrationEvidenceRejectedBeforeExecution(t *testing.T, fixture testFixture, target Target, wantError string) {
+	t.Helper()
+	store, err := evidence.NewStore(t.TempDir(), "unverified-integration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(supervisor.New(), store).Evaluate(context.Background(), fixture.authority, fixture.policy([]string{"unit"}, nil), target, fixture.candidates, fixture.risk)
+	if err == nil || !strings.Contains(err.Error(), wantError) {
+		t.Fatalf("unverified integration evidence error = %v, want substring %q", err, wantError)
+	}
+	if entries, readErr := os.ReadDir(store.RunDir()); readErr != nil || len(entries) != 0 {
+		t.Fatalf("unverified input executed controller commands: entries=%d err=%v", len(entries), readErr)
 	}
 }
 
