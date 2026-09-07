@@ -29,18 +29,74 @@ type GitHubAdapter struct {
 	now    func() time.Time
 }
 
+// GitHubRequestAuthenticator applies credentials to a cloned outbound request.
+// Network I/O remains sealed behind the controller-owned capped transport.
+type GitHubRequestAuthenticator interface {
+	AuthenticateGitHubRequest(*http.Request) error
+}
+
+type authenticatedGitHubTransport struct {
+	base          *http.Transport
+	authenticator GitHubRequestAuthenticator
+}
+
+func (t *authenticatedGitHubTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header = request.Header.Clone()
+	method, endpoint, host := clone.Method, clone.URL.String(), clone.Host
+	contentLength := clone.ContentLength
+	originalHeaders := clone.Header.Clone()
+	if err := t.authenticator.AuthenticateGitHubRequest(clone); err != nil {
+		return nil, errors.New("GitHub request authentication failed")
+	}
+	if clone.Method != method || clone.URL.String() != endpoint || clone.Host != host || clone.ContentLength != contentLength || !headersDifferOnlyByAuthorization(originalHeaders, clone.Header) {
+		return nil, errors.New("GitHub authenticator modified sealed request identity")
+	}
+	return t.base.RoundTrip(clone)
+}
+
+func headersDifferOnlyByAuthorization(before, after http.Header) bool {
+	for key, values := range before {
+		if strings.EqualFold(key, "Authorization") {
+			continue
+		}
+		if !equalStrings(values, after.Values(key)) {
+			return false
+		}
+	}
+	for key, values := range after {
+		if strings.EqualFold(key, "Authorization") {
+			continue
+		}
+		if !equalStrings(values, before.Values(key)) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // NewGitHubAdapter seals the authenticated transport behind the exact
 // production GitHub origin and production limits. Authorization remains the
 // transport's concern and is never accepted by an adapter method.
-func NewGitHubAdapter(transport http.RoundTripper) (*GitHubAdapter, error) {
-	if transport == nil {
-		return nil, errors.New("authenticated GitHub transport is required")
+func NewGitHubAdapter(authenticator GitHubRequestAuthenticator) (*GitHubAdapter, error) {
+	if authenticator == nil {
+		return nil, errors.New("GitHub request authenticator is required")
 	}
-	if base, ok := transport.(*http.Transport); ok {
-		base = base.Clone()
-		base.MaxResponseHeaderBytes = MaxResponseHeaderBytes
-		transport = base
-	}
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.MaxResponseHeaderBytes = MaxResponseHeaderBytes
+	transport := &authenticatedGitHubTransport{base: base, authenticator: authenticator}
 	return newGitHubAdapter(transport, githubAPIOrigin, githublifecycle.DefaultLimits(), time.Now)
 }
 
@@ -84,7 +140,7 @@ func (a *GitHubAdapter) principal(ctx context.Context) (RemotePrincipalObservati
 		NodeID string `json:"node_id"`
 		Login  string `json:"login"`
 	}
-	if err := providerJSON(body, &wire); err != nil || wire.ID <= 0 || !validRemoteText(wire.NodeID, a.limits.MaxTextBytes, false) || !validRemoteText(wire.Login, a.limits.MaxTextBytes, false) {
+	if err := providerJSON(body, &wire); err != nil || wire.ID <= 0 || !validRemoteText(wire.NodeID, lifecycleRemoteTextLimit(a.limits), false) || !validRemoteText(wire.Login, lifecycleRemoteTextLimit(a.limits), false) {
 		return RemotePrincipalObservation{}, errors.New("invalid authenticated-principal response")
 	}
 	limitsSHA, _ := a.limits.SHA256()
@@ -145,7 +201,7 @@ func (a *GitHubAdapter) discover(ctx context.Context, repository githublifecycle
 		return nil, nil, &Error{Code: CodeDiscoveryTruncated, Cause: errors.New("filtered discovery exceeds page limit")}
 	}
 	for i, item := range candidates {
-		if item.Number <= 0 || !validRemoteText(item.NodeID, a.limits.MaxTextBytes, false) {
+		if item.Number <= 0 || !validRemoteText(item.NodeID, lifecycleRemoteTextLimit(a.limits), false) {
 			return nil, nil, fmt.Errorf("invalid discovery candidate %d", i)
 		}
 	}
@@ -216,7 +272,7 @@ func (a *GitHubAdapter) decodePR(id HTTPRequestIdentity, body []byte, requestID 
 	}
 	fields := []string{wire.NodeID, wire.State, wire.Title, bodyText, wire.User.NodeID, wire.User.Login, wire.Base.Ref, wire.Base.SHA, wire.Base.Repo.Name, wire.Base.Repo.Owner.Login, wire.Head.Ref, wire.Head.SHA, wire.Head.Label, wire.Head.Repo.Name, wire.Head.Repo.Owner.Login}
 	for _, field := range fields {
-		if !validRemoteText(field, a.limits.MaxTextBytes, true) {
+		if !validRemoteText(field, lifecycleRemoteTextLimit(a.limits), true) {
 			return RemotePRObservation{}, errors.New("pull-request response contains oversized or invalid text")
 		}
 	}
@@ -231,6 +287,13 @@ func (a *GitHubAdapter) decodePR(id HTTPRequestIdentity, body []byte, requestID 
 		AuthorID: wire.User.ID, AuthorNodeID: wire.User.NodeID, AuthorLogin: wire.User.Login, State: wire.State, Merged: wire.Merged,
 		Title: wire.Title, Body: bodyText, RequestID: requestID, ObservedUnixNano: a.now().UTC().UnixNano(), LimitsSHA256: limitsSHA,
 	}, nil
+}
+
+func lifecycleRemoteTextLimit(limits githublifecycle.Limits) int {
+	if limits.MaxTextBytes < maxLifecycleRemoteText {
+		return limits.MaxTextBytes
+	}
+	return maxLifecycleRemoteText
 }
 
 func (a *GitHubAdapter) write(ctx context.Context, repository githublifecycle.Repository, prNumber int64, title, body string, base, head githublifecycle.Branch) (RemotePRObservation, error) {
@@ -302,9 +365,9 @@ func (a *GitHubAdapter) requestHeaders(ctx context.Context, method, template, es
 	response, err := a.client.Do(req)
 	if err != nil {
 		if write {
-			return id, nil, "", nil, &Error{Submitted: true, Cause: err}
+			return id, nil, "", nil, &Error{Code: CodeRemoteWriteFailed, Submitted: true, Cause: errors.New("authenticated GitHub write transport failed")}
 		}
-		return id, nil, "", nil, err
+		return id, nil, "", nil, &Error{Code: CodeRemoteReadFailed, Cause: errors.New("authenticated GitHub read transport failed")}
 	}
 	defer response.Body.Close()
 	if err := boundHeaders(response.Header); err != nil {
@@ -323,9 +386,9 @@ func (a *GitHubAdapter) requestHeaders(ctx context.Context, method, template, es
 			err = errors.New("GitHub response exceeds body cap")
 		}
 		if write {
-			return id, nil, requestID, response.Header.Clone(), &Error{Submitted: true, Cause: err}
+			return id, nil, requestID, response.Header.Clone(), &Error{Code: CodeRemoteWriteFailed, Submitted: true, Cause: errors.New("bounded GitHub write response could not be read")}
 		}
-		return id, nil, requestID, response.Header.Clone(), err
+		return id, nil, requestID, response.Header.Clone(), &Error{Code: CodeRemoteReadFailed, Cause: errors.New("bounded GitHub read response could not be read")}
 	}
 	if response.StatusCode != expected {
 		err = fmt.Errorf("unexpected GitHub status %d", response.StatusCode)

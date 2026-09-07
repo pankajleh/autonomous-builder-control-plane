@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,9 +20,16 @@ import (
 
 func (c *Controller) terminalize(tx *resourceTxn, request Request, revision revisionRecord, authority githublifecycle.Authority, input githublifecycle.UpsertPullRequestInput, generation generationRecord, genSHA, markerSHA string, principal RemotePrincipalObservation, pr RemotePRObservation, head, base RemoteRefObservation, snapshot githublifecycle.PullRequestSnapshot, disposition Disposition, reconciliation json.RawMessage, refs []ledger.EvidenceRef, dispositionErr error) (PRLifecycleResultV1, error) {
 	var zero PRLifecycleResultV1
-	snapshotBytes := snapshot.CanonicalJSON()
-	if len(snapshotBytes) == 0 || len(snapshotBytes) > 32<<10 {
-		return zero, &Error{Code: CodeIntegrityFailure, Submitted: true, Attempt: generation.WriteID, Cause: errors.New("snapshot cannot fit terminal profile")}
+	var snapshotBytes []byte
+	snapshotSHA := ""
+	if disposition == AppliedConfirmed || disposition == AppliedReconciled {
+		snapshotBytes = snapshot.CanonicalJSON()
+		snapshotSHA = snapshot.SHA256()
+		if len(snapshotBytes) == 0 || len(snapshotBytes) > MaxTerminalSnapshotBytes || !validDigest(snapshotSHA) {
+			return zero, &Error{Code: CodeIntegrityFailure, Submitted: true, Attempt: generation.WriteID, Cause: errors.New("successful snapshot cannot fit terminal profile")}
+		}
+	} else if disposition != RemoteDivergedAfterWrite {
+		return zero, &Error{Code: CodeIntegrityFailure, Submitted: true, Attempt: generation.WriteID, Cause: errors.New("unknown terminal disposition")}
 	}
 	prSHA, err := observationDigest(pr, 32<<10)
 	if err != nil {
@@ -49,7 +55,7 @@ func (c *Controller) terminalize(tx *resourceTxn, request Request, revision revi
 		WriteID: generation.WriteID, Repository: authority.Repository().String(), BaseBranch: authority.BaseBranch().String(), HeadBranch: authority.HeadBranch().String(),
 		HeadSHA: authority.HeadSHA().String(), ExpectedBaseTipSHA: authority.ExpectedBaseTipSHA().String(), PRNumber: pr.Number, PRNodeID: pr.NodeID,
 		DocumentSHA256: revision.DocumentSHA256, PrincipalID: principal.ID, PrincipalNodeID: principal.NodeID, PrincipalLogin: principal.Login,
-		SnapshotSHA256: snapshot.SHA256(), PRObservationSHA: prSHA, HeadObservationSHA: headSHA, BaseObservationSHA: baseSHA, ReconciliationSHA: reconciliationSHA,
+		SnapshotSHA256: snapshotSHA, PRObservationSHA: prSHA, HeadObservationSHA: headSHA, BaseObservationSHA: baseSHA, ReconciliationSHA: reconciliationSHA,
 	}
 	coreBytes, err := core.CanonicalJSON()
 	if err != nil || len(coreBytes) > 16<<10 {
@@ -59,16 +65,26 @@ func (c *Controller) terminalize(tx *resourceTxn, request Request, revision revi
 	writeAuthority := input.Authority()
 	authorityBytes, _ := writeAuthority.CanonicalJSON()
 	attemptBytes, _ := input.Attempt().CanonicalJSON()
-	artifacts, err := captureArtifacts(c.artifacts, refs)
+	// The normalized reconciliation observation is sufficient to reconstruct
+	// current-run evidence. Do not duplicate earlier preflight evidence inside
+	// the terminal.
+	terminalRefs := refs
+	if len(terminalRefs) > 1 {
+		terminalRefs = terminalRefs[len(terminalRefs)-1:]
+	}
+	artifacts, err := captureArtifacts(c.artifacts, terminalRefs)
 	if err != nil {
 		return zero, err
 	}
 	policySHA, _ := c.store.policy.SHA256()
 	limitsSHA, _ := c.github.limits.SHA256()
-	recovery := snapshotRecoveryWire{
-		Provider: "github", RequestID: snapshot.Input().Snapshot.RequestID(), ObservedAt: snapshot.Input().Snapshot.ObservedUnixNano(),
-		RepositoryOwn: authority.Repository().Owner(), Repository: authority.Repository().Name(), PRNumber: pr.Number, PRNodeID: pr.NodeID,
-		BaseBranch: authority.BaseBranch().String(), BaseTipSHA: base.SHA, HeadBranch: authority.HeadBranch().String(), HeadSHA: head.SHA, State: string(snapshot.Input().State),
+	var recovery snapshotRecoveryWire
+	if len(snapshotBytes) > 0 {
+		recovery = snapshotRecoveryWire{
+			Provider: "github", RequestID: snapshot.Input().Snapshot.RequestID(), ObservedAt: snapshot.Input().Snapshot.ObservedUnixNano(),
+			RepositoryOwn: authority.Repository().Owner(), Repository: authority.Repository().Name(), PRNumber: pr.Number, PRNodeID: pr.NodeID,
+			BaseBranch: authority.BaseBranch().String(), BaseTipSHA: base.SHA, HeadBranch: authority.HeadBranch().String(), HeadSHA: head.SHA, State: string(snapshot.Input().State),
+		}
 	}
 	reason, failureCode := string(disposition), ""
 	if dispositionErr != nil {
@@ -79,9 +95,9 @@ func (c *Controller) terminalize(tx *resourceTxn, request Request, revision revi
 		GenerationSHA256: genSHA, SubmittedSHA256: markerSHA, Attempt: attemptBytes, AttemptSHA256: digestBytes(attemptBytes),
 		SourceAuthority: revision.SourceAuthority, SourceAuthoritySHA: revision.SourceSHA256, DerivedAuthority: authorityBytes, DerivedAuthoritySHA: revision.AuthoritySHA256,
 		ExpectedContentSHA: writeAuthority.ExpectedContent().SHA256(), Title: revision.Title, Body: revision.Body, DocumentSHA256: revision.DocumentSHA256,
-		Snapshot: snapshotBytes, SnapshotSHA256: snapshot.SHA256(), SnapshotRecovery: recovery, Principal: principal, PullRequest: pr, Head: head, Base: base,
+		Snapshot: snapshotBytes, SnapshotSHA256: snapshotSHA, SnapshotRecovery: recovery, Principal: principal, PullRequest: pr, Head: head, Base: base,
 		Reconciliation: reconciliation, ResultCore: core, ResultCoreSHA256: coreSHA, Reason: reason, FailureCode: failureCode, RunID: request.RunID,
-		TerminalUnixNano: c.now().UTC().UnixNano(), EvidenceRefs: append([]ledger.EvidenceRef(nil), refs...), EvidenceArtifacts: artifacts,
+		TerminalUnixNano: c.now().UTC().UnixNano(), EvidenceRefs: append([]ledger.EvidenceRef(nil), terminalRefs...), EvidenceArtifacts: artifacts,
 	}
 	terminalCoreBytes, err := json.Marshal(terminalCore)
 	if err != nil {
@@ -108,7 +124,7 @@ func (c *Controller) terminalize(tx *resourceTxn, request Request, revision revi
 	if err := c.ledger.Record(event, eventBytes); err != nil {
 		return zero, err
 	}
-	return PRLifecycleResultV1{core: core, terminalSHA: terminalSHA, evidenceRefs: append([]ledger.EvidenceRef(nil), refs...)}, nil
+	return PRLifecycleResultV1{core: core, terminalSHA: terminalSHA, evidenceRefs: append([]ledger.EvidenceRef(nil), terminalRefs...)}, nil
 }
 
 func deterministicTerminalEvent(core terminalCoreV1) (ledger.Event, []byte, error) {
@@ -145,7 +161,7 @@ func (c *Controller) recoverTerminal(tx *resourceTxn, name, runID string) (PRLif
 		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("terminal is not canonical JSON")}
 	}
 	coreBytes, _ := json.Marshal(terminal.Core)
-	if digestBytes(coreBytes) != terminal.TerminalCoreSHA256 || terminal.Core.RunID != runID || terminal.Core.ResourceKey != tx.key.String() {
+	if digestBytes(coreBytes) != terminal.TerminalCoreSHA256 || terminal.Core.RunID == "" || terminal.Core.ResourceKey != tx.key.String() {
 		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("terminal core identity mismatch")}
 	}
 	policySHA, _ := c.store.policy.SHA256()
@@ -196,8 +212,16 @@ func (c *Controller) recoverTerminal(tx *resourceTxn, name, runID string) (PRLif
 		attempt.Repository.Owner+"/"+attempt.Repository.Name != terminal.Core.ResultCore.Repository || attempt.Actor.Subject != authority.Actor.Subject {
 		return zero, &Error{Code: CodeIntegrityFailure, Cause: firstError(err, errors.New("write-attempt primitive fields mismatch"))}
 	}
-	if digestBytes(terminal.Core.Attempt) != terminal.Core.AttemptSHA256 || digestBytes(terminal.Core.Snapshot) != terminal.Core.SnapshotSHA256 || documentDigest(terminal.Core.Title, terminal.Core.Body) != terminal.Core.DocumentSHA256 {
+	if digestBytes(terminal.Core.Attempt) != terminal.Core.AttemptSHA256 || documentDigest(terminal.Core.Title, terminal.Core.Body) != terminal.Core.DocumentSHA256 {
 		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("terminal attempt, document, or snapshot digest mismatch")}
+	}
+	if terminal.Core.ResultCore.Disposition == RemoteDivergedAfterWrite {
+		snapshotAbsent := len(terminal.Core.Snapshot) == 0 || bytes.Equal(terminal.Core.Snapshot, []byte("null"))
+		if snapshotAbsent && terminal.Core.SnapshotSHA256 != "" || !snapshotAbsent && digestBytes(terminal.Core.Snapshot) != terminal.Core.SnapshotSHA256 {
+			return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("optional divergence snapshot digest mismatch")}
+		}
+	} else if len(terminal.Core.Snapshot) == 0 || digestBytes(terminal.Core.Snapshot) != terminal.Core.SnapshotSHA256 {
+		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("successful terminal snapshot digest mismatch")}
 	}
 	if terminal.Core.ResultCore.ResourceKey != terminal.Core.ResourceKey || terminal.Core.ResultCore.Revision != terminal.Core.Revision || terminal.Core.ResultCore.Generation != terminal.Core.Generation ||
 		terminal.Core.ResultCore.DocumentSHA256 != terminal.Core.DocumentSHA256 || terminal.Core.ResultCore.PRNumber != terminal.Core.PullRequest.Number || terminal.Core.ResultCore.PRNodeID != terminal.Core.PullRequest.NodeID ||
@@ -207,9 +231,11 @@ func (c *Controller) recoverTerminal(tx *resourceTxn, name, runID string) (PRLif
 	if len(terminal.Core.Reconciliation) == 0 && terminal.Core.ResultCore.ReconciliationSHA != "" || len(terminal.Core.Reconciliation) > 0 && digestBytes(terminal.Core.Reconciliation) != terminal.Core.ResultCore.ReconciliationSHA {
 		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("terminal reconciliation binding mismatch")}
 	}
-	snapshot, err := rebuildSnapshot(terminal.Core.SnapshotRecovery, c.github.limits)
-	if err != nil || !bytes.Equal(snapshot.CanonicalJSON(), terminal.Core.Snapshot) || snapshot.SHA256() != terminal.Core.SnapshotSHA256 {
-		return zero, &Error{Code: CodeIntegrityFailure, Cause: firstError(err, errors.New("primitive snapshot recovery mismatch"))}
+	if len(terminal.Core.Snapshot) > 0 && !bytes.Equal(terminal.Core.Snapshot, []byte("null")) {
+		snapshot, rebuildErr := rebuildSnapshot(terminal.Core.SnapshotRecovery, c.github.limits)
+		if rebuildErr != nil || !bytes.Equal(snapshot.CanonicalJSON(), terminal.Core.Snapshot) || snapshot.SHA256() != terminal.Core.SnapshotSHA256 {
+			return zero, &Error{Code: CodeIntegrityFailure, Cause: firstError(rebuildErr, errors.New("primitive snapshot recovery mismatch"))}
+		}
 	}
 	resultBytes, err := terminal.Core.ResultCore.CanonicalJSON()
 	if err != nil || digestBytes(resultBytes) != terminal.Core.ResultCoreSHA256 {
@@ -229,23 +255,31 @@ func (c *Controller) recoverTerminal(tx *resourceTxn, name, runID string) (PRLif
 		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("deterministic material event mismatch")}
 	}
 	refs := make([]ledger.EvidenceRef, 0, len(terminal.Core.EvidenceArtifacts))
-	for _, artifact := range terminal.Core.EvidenceArtifacts {
+	for i, artifact := range terminal.Core.EvidenceArtifacts {
 		if digestBytes(artifact.Bytes) != artifact.SHA256 {
 			return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("terminal evidence artifact mismatch")}
 		}
-		ref, err := publishOrVerify(c.artifacts, artifact.Name, artifact.Kind, artifact.Bytes)
+		if i >= len(terminal.Core.EvidenceRefs) || filepath.Base(terminal.Core.EvidenceRefs[i].URI) != artifact.Name || terminal.Core.EvidenceRefs[i].Kind != artifact.Kind || terminal.Core.EvidenceRefs[i].SHA256 != artifact.SHA256 || !strings.HasPrefix(artifact.Name, terminal.Core.RunID+"-") {
+			return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("terminal evidence provenance differs")}
+		}
+		currentName := runID + strings.TrimPrefix(artifact.Name, terminal.Core.RunID)
+		ref, err := publishOrVerify(c.artifacts, currentName, artifact.Kind, artifact.Bytes)
 		if err != nil {
 			return zero, err
 		}
 		refs = append(refs, ref)
 	}
-	if !equalEvidence(refs, terminal.Core.EvidenceRefs) {
-		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("recovered evidence references differ")}
+	if len(refs) != len(terminal.Core.EvidenceRefs) {
+		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("recovered evidence count differs")}
 	}
 	if err := c.ledger.Record(event, eventBytes); err != nil {
 		return zero, err
 	}
-	return PRLifecycleResultV1{core: terminal.Core.ResultCore, terminalSHA: digestBytes(b), evidenceRefs: refs}, nil
+	result := PRLifecycleResultV1{core: terminal.Core.ResultCore, terminalSHA: digestBytes(b), evidenceRefs: refs}
+	if terminal.Core.ResultCore.Disposition == RemoteDivergedAfterWrite {
+		return result, &Error{Code: CodeRemoteDivergedAfterWrite, Submitted: true, Attempt: terminal.Core.ResultCore.WriteID, Cause: errors.New("durable unresolved divergence")}
+	}
+	return result, nil
 }
 
 type authorityMirror struct {
@@ -341,8 +375,8 @@ func captureArtifacts(writer ArtifactWriter, refs []ledger.EvidenceRef) ([]termi
 		if filepath.Dir(ref.URI) != writer.RunDir() || filepath.Base(ref.URI) == "." || ref.SHA256 == "" || ref.Kind == "" {
 			return nil, errors.New("evidence reference escapes controller run directory")
 		}
-		b, err := os.ReadFile(ref.URI)
-		if err != nil || len(b) > 128<<10 || !json.Valid(b) || digestBytes(b) != ref.SHA256 {
+		b, err := evidence.ReadVerifiedLocal(writer.RunDir(), ref, MaxTerminalArtifactBytes)
+		if err != nil || !json.Valid(b) {
 			return nil, errors.New("evidence artifact is unavailable, oversized, or mismatched")
 		}
 		artifacts = append(artifacts, terminalArtifact{filepath.Base(ref.URI), ref.Kind, b, ref.SHA256})
@@ -427,8 +461,8 @@ func readGeneration(tx *resourceTxn, revision uint64) (generationRecord, string,
 	return generation, digestBytes(gb), nil
 }
 
-func latestRevision(root string, key PRResourceKeyV1) (uint64, error) {
-	entries, err := os.ReadDir(root)
+func latestRevision(store *PRWriteAdmissionStore, key PRResourceKeyV1) (uint64, error) {
+	entries, err := store.readDir()
 	if err != nil {
 		return 0, err
 	}
@@ -449,8 +483,8 @@ func latestRevision(root string, key PRResourceKeyV1) (uint64, error) {
 	return latest, nil
 }
 
-func nextRound(root string, key PRResourceKeyV1, revision uint64, kind string, maximum int) int {
-	entries, err := os.ReadDir(root)
+func nextLegacyRound(store *PRWriteAdmissionStore, key PRResourceKeyV1, revision uint64, kind string, maximum int) int {
+	entries, err := store.readDir()
 	if err != nil {
 		return 0
 	}
@@ -483,7 +517,8 @@ func publishOrVerify(writer ArtifactWriter, name, kind string, data []byte) (led
 	if filepath.Dir(path) != writer.RunDir() {
 		return ledger.EvidenceRef{}, errors.New("evidence path escapes run directory")
 	}
-	existing, readErr := os.ReadFile(path)
+	expected := ledger.EvidenceRef{URI: path, SHA256: digestBytes(data), Kind: kind}
+	existing, readErr := evidence.ReadVerifiedLocal(writer.RunDir(), expected, int64(MaxTerminalArtifactBytes))
 	if readErr != nil || !bytes.Equal(existing, data) {
 		return ledger.EvidenceRef{}, &Error{Code: CodeIntegrityFailure, Cause: errors.New("immutable evidence name conflicts")}
 	}

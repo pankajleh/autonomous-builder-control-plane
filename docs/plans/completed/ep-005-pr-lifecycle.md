@@ -1,5 +1,17 @@
 # EP-005 — Exact-Head PR Lifecycle
 
+## Post-implementation correction note
+
+The post-implementation review corrections in `docs/plans/ep-005-pr-lifecycle-review-corrections.md` refine this completed contract without erasing its design history. Where the earlier text below differs, the corrected implementation has these controlling semantics:
+
+- Production construction reads one admission root captured from controller host configuration at process startup; root injection is package-private for tests. The store pins the root descriptor/device/inode for its lifetime and performs lock, record, inventory, and fsync operations descriptor-relative. The exact resource-lock descriptor is checked against its remembered identity again after `flock`.
+- Production material recording accepts the controller's non-nil canonical `*ledger.JSONLLedger` and derives its path from that object. There is no exported path-only or nil-ledger production mode.
+- Every submitted/no-terminal remote-read attempt first creates immutable `reconcile-<n>-start.json` under resource+capacity authority. The 30-second gate is checked from the prior start before any network call. A bounded optional `reconcile-<n>-observation.json` follows; a start without an observation still consumes one of eight rounds, and both records count toward byte/capacity limits.
+- `remote_diverged_after_write` is an unresolved, no-retry terminal with bounded normalized observations and a stable controller-owned divergence class. It does not require a valid snapshot. Confirmed and reconciled success continue to require a rebuilt and validated frozen snapshot.
+- The pre-submit terminal proof covers both Authority forms, WriteAttempt, document, normalized observations, reconciliation, optional snapshot, result/reason/event material, and the one self-contained normalized evidence artifact retained for recovery. Authority is capped at 16 KiB, lifecycle-owned remote text at 1 KiB per field, snapshot at 16 KiB, and retained artifact/reconciliation/observation envelopes at 32 KiB; the computed maximum remains below the 256-KiB reservation and final canonical bytes are checked again.
+- Originating run identity remains immutable terminal/event provenance, not an idempotency key. A later governed run with the same logical request validates the terminal, republishes equivalent evidence under current-run artifact names/URIs, returns current-run evidence references, and makes no GitHub call. All evidence reads and publish-or-verify rereads use `evidence.ReadVerifiedLocal`.
+- Authentication is a sealed request-signing layer around the controller-owned `http.Transport`; the underlying transport always has `MaxResponseHeaderBytes=32 KiB`. CREATE postflight binds both discovery number and node ID to the full PR response. Persisted error material contains stable controller classes only, never provider/transport `Error()` strings.
+
 ## Roadmap authority
 
 Phase 4 authorizes `PR creation/update with exact head SHA`. This plan implements only that bullet over merged EP-005 foundation main `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.

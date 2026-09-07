@@ -15,14 +15,14 @@ var errUnsupportedLockSemantics = errors.New("PR lifecycle requires verified Lin
 
 type PRWriteAdmissionStore struct{}
 
-func NewPRWriteAdmissionStore(string) (*PRWriteAdmissionStore, error) {
+func newPRWriteAdmissionStore(string) (*PRWriteAdmissionStore, error) {
 	return nil, errUnsupportedLockSemantics
 }
 func (*PRWriteAdmissionStore) Root() string { return "" }
 
 type MaterialLedgerRecorder struct{}
 
-func NewMaterialLedgerRecorder(string, *ledger.JSONLLedger) (*MaterialLedgerRecorder, error) {
+func NewMaterialLedgerRecorder(*ledger.JSONLLedger) (*MaterialLedgerRecorder, error) {
 	return nil, errUnsupportedLockSemantics
 }
 func (*MaterialLedgerRecorder) Record(ledger.Event, []byte) error { return errUnsupportedLockSemantics }
@@ -42,7 +42,18 @@ type ControllerConfig struct {
 }
 type Controller struct{}
 
-func NewController(ControllerConfig) (*Controller, error) { return nil, errUnsupportedLockSemantics }
+func newController(ControllerConfig) (*Controller, error) { return nil, errUnsupportedLockSemantics }
+
+type ProductionControllerConfig struct {
+	GitHub              *GitHubAdapter
+	Artifacts           ArtifactWriter
+	AuthoritativeLedger *ledger.JSONLLedger
+	Now                 func() time.Time
+}
+
+func NewProductionController(ProductionControllerConfig) (*Controller, error) {
+	return nil, errUnsupportedLockSemantics
+}
 
 type Request struct {
 	RunID     string

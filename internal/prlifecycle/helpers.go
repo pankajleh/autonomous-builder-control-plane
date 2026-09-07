@@ -158,19 +158,27 @@ func boundedError(err error) string {
 	if err == nil {
 		return ""
 	}
-	value := err.Error()
-	if len(value) > 4096 {
-		value = value[:4096]
+	var lifecycle *Error
+	if errors.As(err, &lifecycle) && lifecycle.Code != "" {
+		return lifecycle.Code
 	}
-	return value
+	// Persisted diagnostics are controller-owned classes, never provider or
+	// transport Error() strings.
+	return "CONTROLLER_OPERATION_FAILED"
 }
 
 func NewTerminalBudget(authority, attempt []byte, title, body string) (TerminalBudgetV1, error) {
-	if len(authority) == 0 || len(authority) > 32<<10 || len(attempt) == 0 || len(attempt) > 8<<10 || validateDocument(title, body, githublifecycle.DefaultLimits().MaxTextBytes) != nil {
+	if len(authority) == 0 || len(authority) > 16<<10 || len(attempt) == 0 || len(attempt) > 8<<10 || validateDocument(title, body, githublifecycle.DefaultLimits().MaxTextBytes) != nil {
 		return TerminalBudgetV1{}, errors.New("terminal input exceeds an individual wire cap")
 	}
-	// The fixed normalized maxima from the plan sum to 208 KiB.
-	worst := (32 + 8 + 32 + 8 + 32 + 16 + 32 + 16 + 32) << 10
+	// Complete pre-submit bound: source+derived authority, attempt, desired
+	// document, primitive PR/principal/ref observations, optional snapshot,
+	// reconciliation wire, one self-contained normalized evidence artifact,
+	// result/reason/event material, digests and JSON framing. Lifecycle remote
+	// text is independently capped at 1 KiB, making the observation envelope
+	// at most 32 KiB.
+	worst := 2*len(authority) + len(attempt) + len(title) + len(body) +
+		3*MaxTerminalArtifactBytes + MaxTerminalSnapshotBytes + (48 << 10)
 	if worst > MaxTerminalBytes {
 		return TerminalBudgetV1{}, errors.New("terminal worst-case profile exceeds terminal cap")
 	}

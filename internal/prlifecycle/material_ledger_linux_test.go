@@ -29,7 +29,11 @@ func TestMaterialLedgerIdempotenceAndConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(parent, "material.jsonl")
-	recorder, err := NewMaterialLedgerRecorder(path, nil)
+	controllerLedger, err := ledger.NewJSONLLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder, err := NewMaterialLedgerRecorder(controllerLedger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +64,7 @@ func TestMaterialLedgerRejectsUnsafeParentAndMalformedSnapshot(t *testing.T) {
 	if err := os.Chmod(unsafe, 0o777); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewMaterialLedgerRecorder(filepath.Join(unsafe, "ledger"), nil); err == nil {
+	if _, err := newMaterialLedgerRecorder(filepath.Join(unsafe, "ledger")); err == nil {
 		t.Fatal("group/world-writable ledger parent accepted")
 	}
 	parent := t.TempDir()
@@ -71,7 +75,7 @@ func TestMaterialLedgerRejectsUnsafeParentAndMalformedSnapshot(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"broken":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	recorder, err := NewMaterialLedgerRecorder(path, nil)
+	recorder, err := newMaterialLedgerRecorder(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +92,7 @@ func TestMaterialLedgerParentReplacementCannotRedirectAppend(t *testing.T) {
 	if err := os.Mkdir(parent, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	recorder, err := NewMaterialLedgerRecorder(filepath.Join(parent, "ledger"), nil)
+	recorder, err := newMaterialLedgerRecorder(filepath.Join(parent, "ledger"))
 	if err != nil {
 		t.Fatal(err)
 	}

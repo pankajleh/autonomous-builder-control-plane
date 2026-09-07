@@ -16,22 +16,29 @@ import (
 	"syscall"
 )
 
-var admissionName = regexp.MustCompile(`^r-([0-9a-f]{64})(?:\.lock|-resource\.json|-rev-([1-9][0-9]*)-(?:revision|generation|submitted|terminal|superseded|prepare-[1-3]|resume-[1-4]|reconcile-[1-8])\.json)$`)
+var admissionName = regexp.MustCompile(`^r-([0-9a-f]{64})(?:\.lock|-resource\.json|-rev-([1-9][0-9]*)-(?:revision|generation|submitted|terminal|superseded|prepare-[1-3]|resume-[1-4]|reconcile-[1-8]-(?:start|observation))\.json)$`)
 
 type fileIdentity struct{ dev, ino uint64 }
 
 type PRWriteAdmissionStore struct {
 	root       string
+	rootDir    *os.File
 	rootID     fileIdentity
 	capacityID fileIdentity
 	policy     PRAdmissionPolicyV1
 	identityMu sync.Mutex
 	lockIDs    map[string]fileIdentity
+	// afterResourceLockOpen is an unexported deterministic race hook used only
+	// by same-package adversarial tests.
+	afterResourceLockOpen func()
 }
 
 var processResourceLocks sync.Map // canonical-root + NUL + resource-key -> *sync.Mutex
 
-func NewPRWriteAdmissionStore(root string) (*PRWriteAdmissionStore, error) {
+// newPRWriteAdmissionStore is the package-private test boundary. Production
+// construction is performed only by NewProductionController from the
+// process-startup host binding in production_linux.go.
+func newPRWriteAdmissionStore(root string) (*PRWriteAdmissionStore, error) {
 	if !filepath.IsAbs(root) {
 		return nil, errors.New("admission root must be an absolute controller-configured path")
 	}
@@ -47,14 +54,13 @@ func NewPRWriteAdmissionStore(root string) (*PRWriteAdmissionStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open admission root: %w", err)
 	}
-	_ = rootFile.Close()
-	capacityPath := filepath.Join(root, "capacity.lock")
-	capacity, capacityID, err := openVerified(capacityPath, syscall.O_RDWR, 0, false, 0o600)
+	capacity, capacityID, err := openatVerified(rootFile, "capacity.lock", syscall.O_RDWR, 0, false, 0o600)
 	if err != nil {
+		_ = rootFile.Close()
 		return nil, fmt.Errorf("open administrator-provisioned capacity lock: %w", err)
 	}
 	_ = capacity.Close()
-	store := &PRWriteAdmissionStore{root: root, rootID: rootID, capacityID: capacityID, policy: DefaultAdmissionPolicy(), lockIDs: make(map[string]fileIdentity)}
+	store := &PRWriteAdmissionStore{root: root, rootDir: rootFile, rootID: rootID, capacityID: capacityID, policy: DefaultAdmissionPolicy(), lockIDs: make(map[string]fileIdentity)}
 	if err := store.checkRoot(); err != nil {
 		return nil, err
 	}
@@ -64,6 +70,13 @@ func NewPRWriteAdmissionStore(root string) (*PRWriteAdmissionStore, error) {
 func (s *PRWriteAdmissionStore) Root() string { return s.root }
 
 func (s *PRWriteAdmissionStore) checkRoot() error {
+	if s == nil || s.rootDir == nil {
+		return errors.New(CodeIntegrityFailure + ": admission root is not pinned")
+	}
+	var pinned syscall.Stat_t
+	if err := syscall.Fstat(int(s.rootDir.Fd()), &pinned); err != nil || (fileIdentity{uint64(pinned.Dev), pinned.Ino}) != s.rootID {
+		return errors.New(CodeIntegrityFailure + ": pinned admission root identity changed")
+	}
 	f, id, err := openVerified(s.root, syscall.O_RDONLY|syscall.O_DIRECTORY, 0, true, 0o700)
 	if err != nil {
 		return err
@@ -83,28 +96,24 @@ func (s *PRWriteAdmissionStore) ensureResourceLock(key PRResourceKeyV1) error {
 		return err
 	}
 	name := "r-" + key.String() + ".lock"
-	path := filepath.Join(s.root, name)
-	if _, err := os.Lstat(path); err == nil {
-		f, id, openErr := openVerified(path, syscall.O_RDWR, 0, false, 0o600)
+	if f, id, openErr := openatVerified(s.rootDir, name, syscall.O_RDWR, 0, false, 0o600); openErr == nil {
 		if f != nil {
 			_ = f.Close()
 		}
-		if openErr == nil {
-			openErr = s.rememberResourceLock(key, id)
-		}
+		return s.rememberResourceLock(key, id)
+	} else if !errors.Is(openErr, syscall.ENOENT) {
 		return openErr
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
 	}
 	capacity, err := s.lockCapacity()
 	if err != nil {
 		return err
 	}
 	defer unlockClose(capacity)
-	if _, err := os.Lstat(path); err == nil {
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+	if f, id, openErr := openatVerified(s.rootDir, name, syscall.O_RDWR, 0, false, 0o600); openErr == nil {
+		_ = f.Close()
+		return s.rememberResourceLock(key, id)
+	} else if !errors.Is(openErr, syscall.ENOENT) {
+		return openErr
 	}
 	inv, err := s.inventory()
 	if err != nil {
@@ -116,11 +125,11 @@ func (s *PRWriteAdmissionStore) ensureResourceLock(key PRResourceKeyV1) error {
 	if err := s.checkProjection(int64(1), 0, false, false); err != nil {
 		return err
 	}
-	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	fd, err := syscall.Openat(int(s.rootDir.Fd()), name, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 	if err != nil {
 		return err
 	}
-	f := os.NewFile(uintptr(fd), path)
+	f := os.NewFile(uintptr(fd), filepath.Join(s.root, name))
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		return err
@@ -128,10 +137,10 @@ func (s *PRWriteAdmissionStore) ensureResourceLock(key PRResourceKeyV1) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := syncDir(s.root); err != nil {
+	if err := s.rootDir.Sync(); err != nil {
 		return err
 	}
-	verified, id, err := openVerified(path, syscall.O_RDWR, 0, false, 0o600)
+	verified, id, err := openatVerified(s.rootDir, name, syscall.O_RDWR, 0, false, 0o600)
 	if err != nil {
 		return err
 	}
@@ -161,16 +170,19 @@ func (s *PRWriteAdmissionStore) withResource(key PRResourceKeyV1, operation func
 	if err := s.ensureResourceLock(key); err != nil {
 		return err
 	}
-	value, _ := processResourceLocks.LoadOrStore(s.root+"\x00"+key.String(), &sync.Mutex{})
+	value, _ := processResourceLocks.LoadOrStore(fmt.Sprintf("%d:%d\x00%s", s.rootID.dev, s.rootID.ino, key.String()), &sync.Mutex{})
 	local := value.(*sync.Mutex)
 	local.Lock()
 	defer local.Unlock()
-	lockPath := filepath.Join(s.root, "r-"+key.String()+".lock")
-	lock, _, err := openVerified(lockPath, syscall.O_RDWR, 0, false, 0o600)
+	lockName := "r-" + key.String() + ".lock"
+	lock, lockedID, err := openatVerified(s.rootDir, lockName, syscall.O_RDWR, 0, false, 0o600)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
+	if s.afterResourceLockOpen != nil {
+		s.afterResourceLockOpen()
+	}
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return errors.New("PR resource is locked by another process")
@@ -178,6 +190,22 @@ func (s *PRWriteAdmissionStore) withResource(key PRResourceKeyV1, operation func
 		return fmt.Errorf("acquire resource flock: %w", err)
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	s.identityMu.Lock()
+	expectedID, remembered := s.lockIDs[key.String()]
+	s.identityMu.Unlock()
+	if !remembered || lockedID != expectedID {
+		return errors.New(CodeIntegrityFailure + ": acquired resource lock differs from remembered inode")
+	}
+	// Re-resolve the name after flock. A replacement between discovery/open
+	// and lock acquisition must never split serialization across two inodes.
+	resolved, resolvedID, err := openatVerified(s.rootDir, lockName, syscall.O_RDWR, 0, false, 0o600)
+	if err != nil {
+		return err
+	}
+	_ = resolved.Close()
+	if resolvedID != lockedID {
+		return errors.New(CodeIntegrityFailure + ": resource lock was replaced during acquisition")
+	}
 	if err := s.checkRoot(); err != nil {
 		return err
 	}
@@ -185,8 +213,7 @@ func (s *PRWriteAdmissionStore) withResource(key PRResourceKeyV1, operation func
 }
 
 func (s *PRWriteAdmissionStore) lockCapacity() (*os.File, error) {
-	path := filepath.Join(s.root, "capacity.lock")
-	f, id, err := openVerified(path, syscall.O_RDWR, 0, false, 0o600)
+	f, id, err := openatVerified(s.rootDir, "capacity.lock", syscall.O_RDWR, 0, false, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -226,8 +253,7 @@ func (t *resourceTxn) create(name string, data []byte, terminalReservation, cons
 	if err := t.store.checkProjection(1, int64(len(data)), terminalReservation, consumesReservation); err != nil {
 		return nil, "", err
 	}
-	path := filepath.Join(t.store.root, name)
-	fd, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	fd, err := syscall.Openat(int(t.store.rootDir.Fd()), name, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 	if err != nil {
 		if errors.Is(err, syscall.EEXIST) {
 			existing, readErr := t.read(name, MaxTerminalBytes)
@@ -238,7 +264,7 @@ func (t *resourceTxn) create(name string, data []byte, terminalReservation, cons
 		}
 		return nil, "", err
 	}
-	f := os.NewFile(uintptr(fd), path)
+	f := os.NewFile(uintptr(fd), filepath.Join(t.store.root, name))
 	if err := writeFull(f, data); err != nil {
 		_ = f.Close()
 		return nil, "", err
@@ -250,7 +276,7 @@ func (t *resourceTxn) create(name string, data []byte, terminalReservation, cons
 	if err := f.Close(); err != nil {
 		return nil, "", err
 	}
-	if err := syncDir(t.store.root); err != nil {
+	if err := t.store.rootDir.Sync(); err != nil {
 		return nil, "", err
 	}
 	return append([]byte(nil), data...), digestBytes(data), nil
@@ -260,8 +286,7 @@ func (t *resourceTxn) read(name string, maximum int) ([]byte, error) {
 	if !admissionName.MatchString(name) || !bytes.HasPrefix([]byte(name), []byte("r-"+t.key.String())) {
 		return nil, errors.New("invalid admission record name")
 	}
-	path := filepath.Join(t.store.root, name)
-	f, _, err := openVerified(path, syscall.O_RDONLY, 0, false, 0o600)
+	f, _, err := openatVerified(t.store.rootDir, name, syscall.O_RDONLY, 0, false, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -274,14 +299,17 @@ func (t *resourceTxn) read(name string, maximum int) ([]byte, error) {
 }
 
 func (t *resourceTxn) exists(name string) (bool, error) {
-	path := filepath.Join(t.store.root, name)
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
+	if !admissionName.MatchString(name) || !bytes.HasPrefix([]byte(name), []byte("r-"+t.key.String())) {
+		return false, errors.New("invalid admission record name")
+	}
+	f, _, err := openatVerified(t.store.rootDir, name, syscall.O_RDONLY, 0, false, 0o600)
+	if errors.Is(err, syscall.ENOENT) {
 		return false, nil
 	}
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 {
+	if err != nil {
 		return false, errors.New(CodeIntegrityFailure + ": unsafe admission record")
 	}
+	_ = f.Close()
 	return true, nil
 }
 
@@ -309,7 +337,7 @@ func (s *PRWriteAdmissionStore) checkProjection(addFiles, addBytes int64, addRes
 		return &Error{Code: CodeCapacityExhausted, Cause: errors.New("admission policy capacity exceeded")}
 	}
 	var stat syscall.Statfs_t
-	if err := syscall.Statfs(s.root, &stat); err != nil {
+	if err := syscall.Fstatfs(int(s.rootDir.Fd()), &stat); err != nil {
 		return &Error{Code: CodeCapacityExhausted, Cause: err}
 	}
 	free := int64(stat.Bavail) * int64(stat.Bsize)
@@ -320,7 +348,7 @@ func (s *PRWriteAdmissionStore) checkProjection(addFiles, addBytes int64, addRes
 }
 
 func (s *PRWriteAdmissionStore) inventory() (inventory, error) {
-	entries, err := os.ReadDir(s.root)
+	entries, err := s.readDir()
 	if err != nil {
 		return inventory{}, err
 	}
@@ -368,12 +396,43 @@ func (s *PRWriteAdmissionStore) inventory() (inventory, error) {
 	return result, nil
 }
 
+func (s *PRWriteAdmissionStore) readDir() ([]os.DirEntry, error) {
+	fd, err := syscall.Openat(int(s.rootDir.Fd()), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), s.root)
+	defer f.Close()
+	return f.ReadDir(-1)
+}
+
 func openVerified(path string, flags int, perm uint32, directory bool, expectedPerm os.FileMode) (*os.File, fileIdentity, error) {
 	fd, err := syscall.Open(path, flags|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, perm)
 	if err != nil {
 		return nil, fileIdentity{}, err
 	}
 	f := os.NewFile(uintptr(fd), path)
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil {
+		_ = f.Close()
+		return nil, fileIdentity{}, err
+	}
+	if directory && stat.Mode&syscall.S_IFMT != syscall.S_IFDIR || !directory && stat.Mode&syscall.S_IFMT != syscall.S_IFREG || os.FileMode(stat.Mode).Perm() != expectedPerm {
+		_ = f.Close()
+		return nil, fileIdentity{}, errors.New("path type or permissions are unsafe")
+	}
+	return f, fileIdentity{uint64(stat.Dev), stat.Ino}, nil
+}
+
+func openatVerified(parent *os.File, name string, flags int, perm uint32, directory bool, expectedPerm os.FileMode) (*os.File, fileIdentity, error) {
+	if parent == nil || filepath.Base(name) != name || name == "." || name == ".." {
+		return nil, fileIdentity{}, errors.New("unsafe descriptor-relative name")
+	}
+	fd, err := syscall.Openat(int(parent.Fd()), name, flags|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, perm)
+	if err != nil {
+		return nil, fileIdentity{}, err
+	}
+	f := os.NewFile(uintptr(fd), name)
 	var stat syscall.Stat_t
 	if err := syscall.Fstat(fd, &stat); err != nil {
 		_ = f.Close()
@@ -398,15 +457,6 @@ func writeFull(f *os.File, data []byte) error {
 		data = data[n:]
 	}
 	return nil
-}
-
-func syncDir(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
 }
 
 func recordPrefix(key PRResourceKeyV1, revision uint64) string {

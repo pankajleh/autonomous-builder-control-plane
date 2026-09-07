@@ -29,12 +29,20 @@ type MaterialLedgerRecorder struct {
 	parentID fileIdentity
 }
 
-func NewMaterialLedgerRecorder(path string, supplied *ledger.JSONLLedger) (*MaterialLedgerRecorder, error) {
+// NewMaterialLedgerRecorder binds the PR material recorder to the exact
+// authoritative controller ledger object. There is deliberately no production
+// path-only or nil-ledger construction mode.
+func NewMaterialLedgerRecorder(supplied *ledger.JSONLLedger) (*MaterialLedgerRecorder, error) {
+	if supplied == nil {
+		return nil, errors.New("authoritative controller ledger is required")
+	}
+	return newMaterialLedgerRecorder(supplied.Path())
+}
+
+// newMaterialLedgerRecorder is available only to same-package tests.
+func newMaterialLedgerRecorder(path string) (*MaterialLedgerRecorder, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, errors.New("canonical absolute material ledger path is required")
-	}
-	if supplied != nil && supplied.Path() != path {
-		return nil, errors.New("material ledger path does not match controller ledger")
 	}
 	parent := filepath.Dir(path)
 	canonical, err := filepath.EvalSymlinks(parent)

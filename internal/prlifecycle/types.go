@@ -24,6 +24,9 @@ const (
 	MaxReconciliationRounds   = 8
 	MaxResumeRounds           = 4
 	MinReconciliationInterval = 30 * time.Second
+	MaxTerminalArtifactBytes  = 32 << 10
+	MaxTerminalSnapshotBytes  = 16 << 10
+	maxLifecycleRemoteText    = 1024
 )
 
 const (
@@ -43,6 +46,8 @@ const (
 	CodeRemoteDivergedAfterWrite = "REMOTE_DIVERGED_AFTER_WRITE"
 	CodePreflightBudgetExhausted = "PREFLIGHT_BUDGET_EXHAUSTED"
 	CodeAmbiguousUnresolved      = "AMBIGUOUS_WRITE_UNRESOLVED"
+	CodeRemoteReadFailed         = "REMOTE_READ_FAILED"
+	CodeRemoteWriteFailed        = "REMOTE_WRITE_FAILED"
 )
 
 type Error struct {
@@ -220,9 +225,13 @@ type PRLifecycleResultCoreV1 struct {
 }
 
 func (c PRLifecycleResultCoreV1) CanonicalJSON() ([]byte, error) {
+	snapshotValid := validDigest(c.SnapshotSHA256)
+	if c.Disposition == RemoteDivergedAfterWrite {
+		snapshotValid = c.SnapshotSHA256 == "" || snapshotValid
+	}
 	if c.SchemaVersion != SchemaVersion || !validDigest(c.ResourceKey) || c.Revision == 0 || c.Generation != 1 || c.WriteID == "" ||
 		(c.Disposition != AppliedConfirmed && c.Disposition != AppliedReconciled && c.Disposition != RemoteDivergedAfterWrite) ||
-		!validDigest(c.DocumentSHA256) || !validDigest(c.SnapshotSHA256) || !validDigest(c.PRObservationSHA) || !validDigest(c.HeadObservationSHA) || !validDigest(c.BaseObservationSHA) {
+		!validDigest(c.DocumentSHA256) || !snapshotValid || !validDigest(c.PRObservationSHA) || !validDigest(c.HeadObservationSHA) || !validDigest(c.BaseObservationSHA) {
 		return nil, errors.New("incomplete PR lifecycle result core")
 	}
 	return json.Marshal(c)

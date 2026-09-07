@@ -78,37 +78,37 @@ Admission records, reconciliation records, terminal material, run evidence, and 
 
 ## Required adversarial regression matrix
 
-- [ ] Production factory cannot select two admission roots for one host/controller; test-only root injection cannot escape into production API.
-- [ ] Production material recorder derives exact controller ledger path; nil/arbitrary production ledger binding is impossible.
-- [ ] Root directory replacement and resource-lock replacement between discovery/open/flock fail closed; the locked fd must equal the remembered inode.
-- [ ] Two concurrent processes for one physical PR cannot acquire different lock inodes or roots and cannot submit twice.
-- [ ] Submitted/no-terminal immediate retry performs zero GitHub calls before the 30-second interval.
-- [ ] Reconciliation creates immutable `round-start` before its first GitHub call and optional `round-observation` afterward; crash/failure after start still consumes the round, repeated failures stop at eight starts, and byte/rate caps include both records.
-- [ ] Moved head, moved base, closed PR, merged PR, repository/ref/head-label mismatch, document mismatch, and CREATE author mismatch each create a durable `remote_diverged_after_write` terminal and restart returns the same unresolved result with zero GitHub writes.
-- [ ] Divergence terminal does not require a valid frozen snapshot; confirmed/reconciled success still does.
-- [ ] Terminal budget maximal-value tests cover all stored components and prove final canonical terminal cannot exceed its pre-submit reservation.
-- [ ] A terminal-budget overflow is rejected before submitted marker and before `Do`.
-- [ ] A second controller/evidence store with a different run ID recovers the same terminal with zero GitHub calls and current-run evidence refs.
-- [ ] Wrapped authenticated transport still enforces the 32-KiB network response-header cap before application parsing.
-- [ ] CREATE discovery candidate node-ID/full-GET node-ID mismatch fails closed.
-- [ ] Evidence symlink/path/inode replacement during terminal capture or publish-or-verify is rejected through the safe evidence reader.
-- [ ] A transport error containing a fake secret/token string never appears in admission files, evidence, terminal material, ledger material, or returned persisted diagnostics.
-- [ ] Existing exact CREATE/UPDATE, stable numeric actor, one-submission ambiguity, no-replay, capacity, restart, material-ledger, and unsupported-platform tests remain green.
+- [x] Production factory cannot select two admission roots for one host/controller; test-only root injection cannot escape into production API.
+- [x] Production material recorder derives exact controller ledger path; nil/arbitrary production ledger binding is impossible.
+- [x] Root directory replacement and resource-lock replacement between discovery/open/flock fail closed; the locked fd must equal the remembered inode.
+- [x] Two concurrent processes for one physical PR cannot acquire different lock inodes or roots and cannot submit twice.
+- [x] Submitted/no-terminal immediate retry performs zero GitHub calls before the 30-second interval.
+- [x] Reconciliation creates immutable `round-start` before its first GitHub call and optional `round-observation` afterward; crash/failure after start still consumes the round, repeated failures stop at eight starts, and byte/rate caps include both records.
+- [x] Moved head, moved base, closed PR, merged PR, repository/ref/head-label mismatch, document mismatch, and CREATE author mismatch each create a durable `remote_diverged_after_write` terminal and restart returns the same unresolved result with zero GitHub writes.
+- [x] Divergence terminal does not require a valid frozen snapshot; confirmed/reconciled success still does.
+- [x] Terminal budget maximal-value tests cover all stored components and prove final canonical terminal cannot exceed its pre-submit reservation.
+- [x] A terminal-budget overflow is rejected before submitted marker and before `Do`.
+- [x] A second controller/evidence store with a different run ID recovers the same terminal with zero GitHub calls and current-run evidence refs.
+- [x] Wrapped authenticated transport still enforces the 32-KiB network response-header cap before application parsing.
+- [x] CREATE discovery candidate node-ID/full-GET node-ID mismatch fails closed.
+- [x] Evidence symlink/path/inode replacement during terminal capture or publish-or-verify is rejected through the safe evidence reader.
+- [x] A transport error containing a fake secret/token string never appears in admission files, evidence, terminal material, ledger material, or returned persisted diagnostics.
+- [x] Existing exact CREATE/UPDATE, stable numeric actor, one-submission ambiguity, no-replay, capacity, restart, material-ledger, and unsupported-platform tests remain green.
 
 ### Task 1: Correct the exact-head PR lifecycle implementation
 
-- [ ] Implement the ten correction invariants above without modifying frozen `internal/githublifecycle` semantics unless a test proves an unavoidable foundation defect.
-- [ ] Keep the package fail-closed and preserve exactly one remote PR submission per revision.
-- [ ] Add all adversarial regressions above.
-- [ ] Update the completed lifecycle contract/plan only where necessary to record corrected implementation semantics; do not erase prior design/review history.
-- [ ] Run `gofmt -w` on changed Go files.
-- [ ] Run focused `go test ./internal/prlifecycle`.
-- [ ] Run `go test ./...`.
-- [ ] Run `go test -race ./...`.
-- [ ] Run `go vet ./...`.
-- [ ] Run `make smoke`.
-- [ ] Run `git diff --check f986008ba11c69c3864f0b8977af440024d12048 HEAD`.
-- [ ] Commit only after every required validation passes.
+- [x] Implement the ten correction invariants above without modifying frozen `internal/githublifecycle` semantics unless a test proves an unavoidable foundation defect.
+- [x] Keep the package fail-closed and preserve exactly one remote PR submission per revision.
+- [x] Add all adversarial regressions above.
+- [x] Update the completed lifecycle contract/plan only where necessary to record corrected implementation semantics; do not erase prior design/review history.
+- [x] Run `gofmt -w` on changed Go files.
+- [x] Run focused `go test ./internal/prlifecycle`.
+- [x] Run `go test ./...`.
+- [x] Run `go test -race ./...`.
+- [x] Run `go vet ./...`.
+- [x] Run `make smoke`.
+- [x] Run `git diff --check f986008ba11c69c3864f0b8977af440024d12048 HEAD`.
+- [x] Commit only after every required validation passes.
 
 ## Completion gate
 

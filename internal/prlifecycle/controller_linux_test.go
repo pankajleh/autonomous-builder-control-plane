@@ -165,11 +165,11 @@ func TestControllerCreatesExactHeadPRAndRecoversWithoutRemoteCall(t *testing.T) 
 	if err := os.Chmod(ledgerParent, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	recorder, err := NewMaterialLedgerRecorder(filepath.Join(ledgerParent, "material.jsonl"), nil)
+	recorder, err := newMaterialLedgerRecorder(filepath.Join(ledgerParent, "material.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	controller, err := NewController(ControllerConfig{Store: store, GitHub: adapter, Artifacts: artifacts, Ledger: recorder, Now: func() time.Time { return fixed }})
+	controller, err := newController(ControllerConfig{Store: store, GitHub: adapter, Artifacts: artifacts, Ledger: recorder, Now: func() time.Time { return fixed }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestControllerCreatesExactHeadPRAndRecoversWithoutRemoteCall(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Core().Disposition != AppliedConfirmed || result.Core().PRNumber != 7 || result.TerminalSHA256() == "" || len(result.EvidenceRefs()) != 2 {
+	if result.Core().Disposition != AppliedConfirmed || result.Core().PRNumber != 7 || result.TerminalSHA256() == "" || len(result.EvidenceRefs()) != 1 {
 		t.Fatalf("unexpected result: %#v", result.Core())
 	}
 	fixture.mu.Lock()
@@ -275,8 +275,8 @@ func TestSubmittedAmbiguityNeverCreatesSecondGenerationOrSubmission(t *testing.T
 	artifacts, _ := evidence.NewStore(filepath.Join(t.TempDir(), "evidence"), "run-ambiguous")
 	ledgerParent := t.TempDir()
 	_ = os.Chmod(ledgerParent, 0o700)
-	recorder, _ := NewMaterialLedgerRecorder(filepath.Join(ledgerParent, "ledger"), nil)
-	controller, _ := NewController(ControllerConfig{Store: store, GitHub: adapter, Artifacts: artifacts, Ledger: recorder, Now: func() time.Time { return fixed }})
+	recorder, _ := newMaterialLedgerRecorder(filepath.Join(ledgerParent, "ledger"))
+	controller, _ := newController(ControllerConfig{Store: store, GitHub: adapter, Artifacts: artifacts, Ledger: recorder, Now: func() time.Time { return fixed }})
 	request := Request{RunID: "run-ambiguous", Authority: authority, Title: "title", Body: ""}
 	if _, err := controller.Upsert(context.Background(), request); err == nil {
 		t.Fatal("ambiguous submitted response reported success")
@@ -310,8 +310,8 @@ func TestExternalHeadPreconditionCreatesNoGeneration(t *testing.T) {
 	artifacts, _ := evidence.NewStore(filepath.Join(t.TempDir(), "evidence"), "run-head")
 	ledgerParent := t.TempDir()
 	_ = os.Chmod(ledgerParent, 0o700)
-	recorder, _ := NewMaterialLedgerRecorder(filepath.Join(ledgerParent, "ledger"), nil)
-	controller, _ := NewController(ControllerConfig{Store: store, GitHub: adapter, Artifacts: artifacts, Ledger: recorder, Now: func() time.Time { return fixed }})
+	recorder, _ := newMaterialLedgerRecorder(filepath.Join(ledgerParent, "ledger"))
+	controller, _ := newController(ControllerConfig{Store: store, GitHub: adapter, Artifacts: artifacts, Ledger: recorder, Now: func() time.Time { return fixed }})
 	_, err := controller.Upsert(context.Background(), Request{RunID: "run-head", Authority: authority, Title: "title"})
 	if err == nil || !strings.Contains(err.Error(), CodeRemoteHeadDiverged) {
 		t.Fatalf("wrong remote head was not rejected: %v", err)

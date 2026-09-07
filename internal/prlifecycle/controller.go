@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
@@ -36,7 +37,7 @@ type Controller struct {
 	now       func() time.Time
 }
 
-func NewController(config ControllerConfig) (*Controller, error) {
+func newController(config ControllerConfig) (*Controller, error) {
 	if config.Store == nil || config.GitHub == nil || config.Artifacts == nil || config.Ledger == nil {
 		return nil, errors.New("PR lifecycle store, GitHub adapter, artifacts, and material ledger are required")
 	}
@@ -244,7 +245,7 @@ func (c *Controller) upsertLocked(ctx context.Context, tx *resourceTxn, request 
 	if err := c.ensureResourceRecord(tx, request.Authority); err != nil {
 		return zero, err
 	}
-	latest, err := latestRevision(c.store.root, tx.key)
+	latest, err := latestRevision(c.store, tx.key)
 	if err != nil {
 		return zero, err
 	}
@@ -302,7 +303,7 @@ func (c *Controller) upsertLocked(ctx context.Context, tx *resourceTxn, request 
 		}
 	}
 
-	prepareRound := nextRound(c.store.root, tx.key, ordinal, "prepare", c.github.limits.MaxReadRetries+1)
+	prepareRound := nextLegacyRound(c.store, tx.key, ordinal, "prepare", c.github.limits.MaxReadRetries+1)
 	if prepareRound == 0 {
 		return zero, &Error{Code: CodePreflightBudgetExhausted, Cause: errors.New("bounded prepare rounds exhausted")}
 	}
@@ -494,10 +495,7 @@ func (c *Controller) submit(ctx context.Context, tx *resourceTxn, request Reques
 		prNumber = revision.PRNumber
 	}
 	_, writeErr := c.github.write(ctx, prep.authority.Repository(), prNumber, revision.Title, revision.Body, prep.authority.BaseBranch(), prep.authority.HeadBranch())
-	if writeErr != nil {
-		return c.reconcile(ctx, tx, request, revision, prep.authority, input, generation, genSHA, markerSHA, refs, writeErr)
-	}
-	return c.postflight(ctx, tx, request, revision, prep.authority, input, generation, genSHA, markerSHA, prep.bundle.Principal, refs, AppliedConfirmed, nil)
+	return c.reconcile(ctx, tx, request, revision, prep.authority, input, generation, genSHA, markerSHA, refs, writeErr)
 }
 
 func (c *Controller) resumeGeneration(ctx context.Context, tx *resourceTxn, request Request, revision revisionRecord) (PRLifecycleResultV1, error) {
@@ -511,15 +509,11 @@ func (c *Controller) resumeGeneration(ctx context.Context, tx *resourceTxn, requ
 		return PRLifecycleResultV1{}, err
 	}
 	if marker {
-		reconcileRound := nextRound(c.store.root, tx.key, revision.Ordinal, "reconcile", MaxReconciliationRounds)
-		if reconcileRound == 0 {
-			return PRLifecycleResultV1{}, &Error{Code: CodeReconcileBudgetExhausted, Submitted: true, Cause: errors.New("reconciliation rounds exhausted")}
-		}
-		prep, _, ref, err := c.prepare(ctx, tx.key, revision.Ordinal, reconcileRound, "reconcile-preflight", request, nil)
+		authority, err := authorityForGeneration(request.Authority, revision)
 		if err != nil {
 			return PRLifecycleResultV1{}, err
 		}
-		input, err := githublifecycle.NewUpsertPullRequestInput(prep.authority, revision.Title, revision.Body, deterministicWriteID(tx.key, revision.Ordinal), c.github.limits)
+		input, err := githublifecycle.NewUpsertPullRequestInput(authority, revision.Title, revision.Body, deterministicWriteID(tx.key, revision.Ordinal), c.github.limits)
 		if err != nil {
 			return PRLifecycleResultV1{}, err
 		}
@@ -527,9 +521,9 @@ func (c *Controller) resumeGeneration(ctx context.Context, tx *resourceTxn, requ
 		if err != nil {
 			return PRLifecycleResultV1{}, err
 		}
-		return c.reconcile(ctx, tx, request, revision, prep.authority, input, generation, genSHA, markerSHA, []ledger.EvidenceRef{ref}, errors.New("submitted generation recovered without terminal"))
+		return c.reconcile(ctx, tx, request, revision, authority, input, generation, genSHA, markerSHA, nil, &Error{Code: CodeAmbiguousUnresolved, Submitted: true})
 	}
-	resumeRound := nextRound(c.store.root, tx.key, revision.Ordinal, "resume", MaxResumeRounds)
+	resumeRound := nextLegacyRound(c.store, tx.key, revision.Ordinal, "resume", MaxResumeRounds)
 	if resumeRound == 0 {
 		return PRLifecycleResultV1{}, &Error{Code: CodeResumeBudgetExhausted, Cause: errors.New("four resume rounds exhausted")}
 	}
@@ -544,40 +538,201 @@ func (c *Controller) resumeGeneration(ctx context.Context, tx *resourceTxn, requ
 	return c.submit(ctx, tx, request, revision, prep, proof, []ledger.EvidenceRef{ref}, true)
 }
 
-func (c *Controller) postflight(ctx context.Context, tx *resourceTxn, request Request, revision revisionRecord, authority githublifecycle.Authority, input githublifecycle.UpsertPullRequestInput, generation generationRecord, genSHA, markerSHA string, principal RemotePrincipalObservation, refs []ledger.EvidenceRef, disposition Disposition, reconcileWire json.RawMessage) (PRLifecycleResultV1, error) {
+func authorityForGeneration(source githublifecycle.Authority, revision revisionRecord) (githublifecycle.Authority, error) {
+	input := source.Input()
+	if revision.PRNumber > 0 {
+		identity, err := githublifecycle.NewPullRequestIdentity(revision.PRNumber, revision.PRNodeID)
+		if err != nil {
+			return githublifecycle.Authority{}, err
+		}
+		input.PullRequest = &identity
+	}
+	authority, err := githublifecycle.NewAuthority(input)
+	if err != nil {
+		return authority, err
+	}
+	sha, _ := authority.SHA256()
+	if sha != revision.AuthoritySHA256 {
+		return githublifecycle.Authority{}, &Error{Code: CodeIntegrityFailure, Cause: errors.New("request cannot reconstruct generation authority")}
+	}
+	return authority, nil
+}
+
+type reconciliationStartV1 struct {
+	SchemaVersion       int    `json:"schema_version"`
+	Round               int    `json:"round"`
+	ResourceKey         string `json:"resource_key"`
+	Revision            uint64 `json:"revision"`
+	Generation          uint64 `json:"generation"`
+	WriteID             string `json:"write_id"`
+	AttemptSHA256       string `json:"write_attempt_sha256"`
+	PreviousRoundSHA256 string `json:"previous_round_sha256,omitempty"`
+	AdmittedUnixNano    int64  `json:"admitted_unix_nano"`
+	PolicySHA256        string `json:"admission_policy_sha256"`
+	LimitsSHA256        string `json:"production_limits_sha256"`
+}
+
+type reconciliationObservationV1 struct {
+	SchemaVersion    int                        `json:"schema_version"`
+	Round            int                        `json:"round"`
+	StartSHA256      string                     `json:"start_sha256"`
+	Outcome          string                     `json:"outcome"`
+	Principal        RemotePrincipalObservation `json:"principal"`
+	Candidate        *discoveryCandidate        `json:"candidate,omitempty"`
+	PullRequest      RemotePRObservation        `json:"pull_request"`
+	Head             RemoteRefObservation       `json:"head_ref"`
+	Base             RemoteRefObservation       `json:"base_ref"`
+	ObservedUnixNano int64                      `json:"observed_unix_nano"`
+}
+
+func (c *Controller) beginReconciliation(tx *resourceTxn, revision revisionRecord, generation generationRecord) (int, string, error) {
+	entries, err := c.store.readDir()
+	if err != nil {
+		return 0, "", err
+	}
+	prefix := recordPrefix(tx.key, revision.Ordinal) + "reconcile-"
+	policySHA, _ := c.store.policy.SHA256()
+	limitsSHA, _ := c.github.limits.SHA256()
+	latest := 0
+	starts := make(map[int]bool)
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, "-start.json") {
+			raw := strings.TrimSuffix(strings.TrimPrefix(name, prefix), "-start.json")
+			n, parseErr := strconv.Atoi(raw)
+			if parseErr != nil || n < 1 || n > MaxReconciliationRounds {
+				return 0, "", &Error{Code: CodeIntegrityFailure, Cause: errors.New("malformed reconciliation start name")}
+			}
+			if n > latest {
+				latest = n
+			}
+			starts[n] = true
+		}
+	}
+	if latest >= MaxReconciliationRounds {
+		return 0, "", &Error{Code: CodeReconcileBudgetExhausted, Submitted: true, Attempt: generation.WriteID, Cause: errors.New("reconciliation rounds exhausted")}
+	}
+	previousSHA := ""
+	if latest > 0 {
+		var previous reconciliationStartV1
+		for ordinal := 1; ordinal <= latest; ordinal++ {
+			if !starts[ordinal] {
+				return 0, "", &Error{Code: CodeIntegrityFailure, Cause: errors.New("reconciliation start sequence has a gap")}
+			}
+			previousBytes, readErr := tx.read(prefix+strconv.Itoa(ordinal)+"-start.json", DefaultReconciliationPolicy().MaxBytesPerRound)
+			var observed reconciliationStartV1
+			if readErr != nil || strictJSON(previousBytes, &observed) != nil || observed.Round != ordinal || observed.ResourceKey != tx.key.String() || observed.Revision != revision.Ordinal || observed.Generation != 1 || observed.WriteID != generation.WriteID || observed.AttemptSHA256 != generation.AttemptSHA256 || observed.PreviousRoundSHA256 != previousSHA || observed.AdmittedUnixNano <= 0 || observed.PolicySHA256 != policySHA || observed.LimitsSHA256 != limitsSHA {
+				return 0, "", &Error{Code: CodeIntegrityFailure, Cause: errors.New("prior reconciliation start is malformed")}
+			}
+			previous = observed
+			previousSHA = digestBytes(previousBytes)
+		}
+		if c.now().UTC().UnixNano()-previous.AdmittedUnixNano < int64(MinReconciliationInterval) {
+			return 0, "", &Error{Code: CodeReconcileBudgetExhausted, Submitted: true, Attempt: generation.WriteID, Cause: errors.New("reconciliation minimum interval has not elapsed")}
+		}
+	}
+	round := latest + 1
+	start := reconciliationStartV1{SchemaVersion, round, tx.key.String(), revision.Ordinal, 1, generation.WriteID, generation.AttemptSHA256, previousSHA, c.now().UTC().UnixNano(), policySHA, limitsSHA}
+	startBytes, _ := json.Marshal(start)
+	if err := c.checkReconciliationAggregate(tx, revision.Ordinal, int64(len(startBytes))); err != nil {
+		return 0, "", err
+	}
+	_, startSHA, err := tx.create(prefix+strconv.Itoa(round)+"-start.json", startBytes, false, false)
+	return round, startSHA, err
+}
+
+func (c *Controller) checkReconciliationAggregate(tx *resourceTxn, revision uint64, add int64) error {
+	entries, err := c.store.readDir()
+	if err != nil {
+		return err
+	}
+	var total int64
+	needle := recordPrefix(tx.key, revision) + "reconcile-"
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), needle) && strings.Contains(entry.Name(), "-reconcile-") {
+			info, infoErr := entry.Info()
+			if infoErr != nil {
+				return infoErr
+			}
+			total += info.Size()
+		}
+	}
+	if add > int64(DefaultReconciliationPolicy().MaxBytesPerRound) || total+add > int64(DefaultReconciliationPolicy().MaxAggregateBytes) {
+		return &Error{Code: CodeReconcileBudgetExhausted, Submitted: true, Cause: errors.New("reconciliation byte budget exhausted")}
+	}
+	return nil
+}
+
+func (c *Controller) reconcile(ctx context.Context, tx *resourceTxn, request Request, revision revisionRecord, authority githublifecycle.Authority, input githublifecycle.UpsertPullRequestInput, generation generationRecord, genSHA, markerSHA string, refs []ledger.EvidenceRef, writeErr error) (PRLifecycleResultV1, error) {
+	if _, err := githublifecycle.NewReconcileWriteInput(input.Attempt(), c.github.limits); err != nil {
+		return PRLifecycleResultV1{}, &Error{Code: CodeIntegrityFailure, Submitted: true, Attempt: generation.WriteID, Cause: err}
+	}
+	round, startSHA, err := c.beginReconciliation(tx, revision, generation)
+	if err != nil {
+		return PRLifecycleResultV1{}, err
+	}
+	principal, principalErr := c.github.principal(ctx)
+	expectedID, _ := trackActorID(authority.Actor())
+	exactClass := ""
+	if principalErr == nil && principal.ID != expectedID {
+		principalErr = errors.New("reconciliation principal differs from authority")
+		exactClass = "DIVERGED_AUTHENTICATED_PRINCIPAL"
+	}
+	var candidate *discoveryCandidate
+	var discoveryErr error
 	prNumber := revision.PRNumber
 	if prNumber == 0 {
-		items, _, err := c.github.discover(ctx, authority.Repository(), authority.BaseBranch(), authority.HeadBranch())
-		if err != nil || len(items) != 1 {
-			return PRLifecycleResultV1{}, &Error{Code: CodeRemoteDivergedAfterWrite, Submitted: true, Attempt: generation.WriteID, Cause: firstError(err, errors.New("post-write PR identity is not unique"))}
+		items, _, readErr := c.github.discover(ctx, authority.Repository(), authority.BaseBranch(), authority.HeadBranch())
+		if readErr != nil || len(items) != 1 {
+			discoveryErr = firstError(readErr, errors.New("post-write PR identity is not unique"))
+		} else {
+			candidate = &items[0]
+			prNumber = items[0].Number
 		}
-		prNumber = items[0].Number
 	}
-	pr, prErr := c.github.pullRequest(ctx, authority.Repository(), prNumber)
+	var pr RemotePRObservation
+	var prErr error
+	if prNumber > 0 {
+		pr, prErr = c.github.pullRequest(ctx, authority.Repository(), prNumber)
+	}
 	head, headErr := c.github.ref(ctx, authority.Repository(), authority.HeadBranch())
 	base, baseErr := c.github.ref(ctx, authority.Repository(), authority.BaseBranch())
-	if prErr != nil || headErr != nil || baseErr != nil {
-		return PRLifecycleResultV1{}, &Error{Code: CodeRemoteDivergedAfterWrite, Submitted: true, Attempt: generation.WriteID, Cause: firstError(prErr, headErr, baseErr)}
-	}
 	postAuthority := authority
-	if _, bound := authority.PullRequest(); !bound {
+	identityErr := error(nil)
+	if candidate != nil && prErr == nil && (pr.Number != candidate.Number || pr.NodeID != candidate.NodeID) {
+		identityErr = errors.New("CREATE discovery and full PR identities differ")
+		exactClass = "DIVERGED_CREATE_LIST_FULL_IDENTITY"
+	}
+	if _, bound := authority.PullRequest(); !bound && pr.Number > 0 {
 		identity, err := githublifecycle.NewPullRequestIdentity(pr.Number, pr.NodeID)
 		if err != nil {
-			return PRLifecycleResultV1{}, err
-		}
-		data := authority.Input()
-		data.PullRequest = &identity
-		postAuthority, err = githublifecycle.NewAuthority(data)
-		if err != nil {
-			return PRLifecycleResultV1{}, err
+			identityErr = err
+		} else {
+			data := authority.Input()
+			data.PullRequest = &identity
+			derived, derivedErr := githublifecycle.NewAuthority(data)
+			if derivedErr != nil {
+				identityErr = firstError(identityErr, derivedErr)
+			} else {
+				postAuthority = derived
+			}
 		}
 	}
-	snapshot, exactErr := validateExactPR(postAuthority, pr, head, base, c.github.limits)
+	exactErr := firstError(principalErr, discoveryErr, prErr, headErr, baseErr, identityErr)
+	var snapshot githublifecycle.PullRequestSnapshot
+	if exactErr == nil {
+		snapshot, exactErr = validateExactPR(postAuthority, pr, head, base, c.github.limits)
+		if exactErr != nil {
+			exactClass = classifyExactDivergence(postAuthority, pr, head, base)
+		}
+	}
 	if exactErr == nil && (pr.Title != revision.Title || pr.Body != revision.Body) {
 		exactErr = errors.New("postflight title/body differs from immutable desired document")
+		exactClass = "DIVERGED_DESIRED_DOCUMENT"
 	}
 	if exactErr == nil && revision.Mode == "CREATE" && (pr.AuthorID != principal.ID || pr.AuthorNodeID != principal.NodeID) {
 		exactErr = errors.New("created PR author differs from authenticated principal")
+		exactClass = "DIVERGED_CREATE_AUTHOR"
 	}
 	if exactErr == nil {
 		writeResult, err := githublifecycle.NewPullRequestWriteResult(input, snapshot, c.github.limits)
@@ -586,88 +741,72 @@ func (c *Controller) postflight(ctx context.Context, tx *resourceTxn, request Re
 		}
 		if err != nil {
 			exactErr = err
+			exactClass = "DIVERGED_WRITE_RESULT_VALIDATION"
 		}
 	}
-	if exactErr != nil {
-		disposition = RemoteDivergedAfterWrite
+	if exactErr != nil && discoveryErr == nil && prErr == nil && headErr == nil && baseErr == nil {
+		if exactClass == "" {
+			exactClass = "DIVERGED_EXACT_POSTFLIGHT"
+		}
+		exactErr = &Error{Code: exactClass, Cause: errors.New("bounded exact-postflight validation failed")}
 	}
-	postBundle, _ := json.Marshal(struct {
-		Principal RemotePrincipalObservation `json:"principal"`
-		PR        RemotePRObservation        `json:"pull_request"`
-		Head      RemoteRefObservation       `json:"head"`
-		Base      RemoteRefObservation       `json:"base"`
-		Error     string                     `json:"exact_error,omitempty"`
-	}{principal, pr, head, base, errorString(exactErr)})
-	postRef, err := publishOrVerify(c.artifacts, evidenceName(request.RunID, tx.key, revision.Ordinal, 1, "postflight"), "pr-lifecycle-postflight", postBundle)
+	outcome := "exact_applied"
+	if exactErr != nil {
+		outcome = boundedError(exactErr)
+	}
+	observation := reconciliationObservationV1{SchemaVersion, round, startSHA, outcome, principal, candidate, pr, head, base, c.now().UTC().UnixNano()}
+	observationBytes, _ := json.Marshal(observation)
+	if err := c.checkReconciliationAggregate(tx, revision.Ordinal, int64(len(observationBytes))); err != nil {
+		return PRLifecycleResultV1{}, err
+	}
+	observationName := recordPrefix(tx.key, revision.Ordinal) + "reconcile-" + strconv.Itoa(round) + "-observation.json"
+	if _, _, err := tx.create(observationName, observationBytes, false, false); err != nil {
+		return PRLifecycleResultV1{}, err
+	}
+	postRef, err := publishOrVerify(c.artifacts, evidenceName(request.RunID, tx.key, revision.Ordinal, round, "reconcile"), "pr-lifecycle-reconciliation", observationBytes)
 	if err != nil {
 		return PRLifecycleResultV1{}, &Error{Submitted: true, Attempt: generation.WriteID, Cause: err}
 	}
 	refs = append(refs, postRef)
-	result, err := c.terminalize(tx, request, revision, postAuthority, input, generation, genSHA, markerSHA, principal, pr, head, base, snapshot, disposition, reconcileWire, refs, exactErr)
-	if err != nil {
-		return PRLifecycleResultV1{}, err
+	if discoveryErr != nil || prErr != nil || headErr != nil || baseErr != nil {
+		return PRLifecycleResultV1{}, &Error{Code: CodeAmbiguousUnresolved, Submitted: true, Attempt: generation.WriteID, Cause: errors.New(boundedError(firstError(discoveryErr, prErr, headErr, baseErr)))}
+	}
+	disposition := AppliedConfirmed
+	if writeErr != nil {
+		disposition = AppliedReconciled
 	}
 	if exactErr != nil {
-		return result, &Error{Code: CodeRemoteDivergedAfterWrite, Submitted: true, Attempt: generation.WriteID, Cause: exactErr}
+		disposition = RemoteDivergedAfterWrite
+	}
+	result, terminalErr := c.terminalize(tx, request, revision, authority, input, generation, genSHA, markerSHA, principal, pr, head, base, snapshot, disposition, observationBytes, refs, exactErr)
+	if terminalErr != nil {
+		return PRLifecycleResultV1{}, terminalErr
+	}
+	if exactErr != nil {
+		return result, &Error{Code: CodeRemoteDivergedAfterWrite, Submitted: true, Attempt: generation.WriteID, Cause: errors.New(boundedError(exactErr))}
 	}
 	return result, nil
 }
 
-func (c *Controller) reconcile(ctx context.Context, tx *resourceTxn, request Request, revision revisionRecord, authority githublifecycle.Authority, input githublifecycle.UpsertPullRequestInput, generation generationRecord, genSHA, markerSHA string, refs []ledger.EvidenceRef, writeErr error) (PRLifecycleResultV1, error) {
-	if _, err := githublifecycle.NewReconcileWriteInput(input.Attempt(), c.github.limits); err != nil {
-		return PRLifecycleResultV1{}, &Error{Code: CodeIntegrityFailure, Submitted: true, Attempt: generation.WriteID, Cause: err}
+func classifyExactDivergence(authority githublifecycle.Authority, pr RemotePRObservation, head, base RemoteRefObservation) string {
+	repository := authority.Repository()
+	if pr.State != "open" || pr.Merged {
+		return "DIVERGED_PR_STATE"
 	}
-	round := nextRound(c.store.root, tx.key, revision.Ordinal, "reconcile", MaxReconciliationRounds)
-	if round == 0 {
-		return PRLifecycleResultV1{}, &Error{Code: CodeReconcileBudgetExhausted, Submitted: true, Attempt: generation.WriteID, Cause: writeErr}
+	if pr.RepositoryOwner != repository.Owner() || pr.RepositoryName != repository.Name() || pr.BaseRepository != repository.String() || pr.HeadRepository != repository.String() {
+		return "DIVERGED_REPOSITORY_IDENTITY"
 	}
-	if round > 1 {
-		previousBytes, err := tx.read(recordPrefix(tx.key, revision.Ordinal)+"reconcile-"+strconv.Itoa(round-1)+".json", DefaultReconciliationPolicy().MaxBytesPerRound)
-		if err != nil {
-			return PRLifecycleResultV1{}, err
-		}
-		var previous struct {
-			ObservedUnixNano int64 `json:"observed_unix_nano"`
-		}
-		if err := json.Unmarshal(previousBytes, &previous); err != nil || previous.ObservedUnixNano <= 0 {
-			return PRLifecycleResultV1{}, &Error{Code: CodeIntegrityFailure, Cause: errors.New("prior reconciliation round is malformed")}
-		}
-		if c.now().UTC().UnixNano()-previous.ObservedUnixNano < int64(MinReconciliationInterval) {
-			return PRLifecycleResultV1{}, &Error{Code: CodeReconcileBudgetExhausted, Submitted: true, Attempt: generation.WriteID, Cause: errors.New("reconciliation minimum interval has not elapsed")}
-		}
+	if pr.BaseRef != authority.BaseBranch().String() || pr.HeadRef != authority.HeadBranch().String() || pr.HeadLabel != repository.Owner()+":"+authority.HeadBranch().String() {
+		return "DIVERGED_REF_IDENTITY"
 	}
-	principal, principalErr := c.github.principal(ctx)
-	expectedID, _ := trackActorID(authority.Actor())
-	if principalErr == nil && principal.ID != expectedID {
-		principalErr = errors.New("reconciliation principal differs")
+	if pr.HeadSHA != head.SHA || head.SHA != authority.HeadSHA().String() {
+		return "DIVERGED_HEAD_SHA"
 	}
-	reconcile := struct {
-		SchemaVersion    int                        `json:"schema_version"`
-		Round            int                        `json:"round"`
-		Disposition      string                     `json:"disposition"`
-		WriteError       string                     `json:"write_error"`
-		Principal        RemotePrincipalObservation `json:"principal"`
-		PrincipalErr     string                     `json:"principal_error,omitempty"`
-		ObservedUnixNano int64                      `json:"observed_unix_nano"`
-	}{SchemaVersion, round, "pending_exact_read", boundedError(writeErr), principal, errorString(principalErr), c.now().UTC().UnixNano()}
-	reconcileBytes, _ := json.Marshal(reconcile)
-	if len(reconcileBytes) > DefaultReconciliationPolicy().MaxBytesPerRound {
-		return PRLifecycleResultV1{}, &Error{Code: CodeReconcileBudgetExhausted, Submitted: true, Attempt: generation.WriteID}
+	if base.SHA != authority.ExpectedBaseTipSHA().String() {
+		return "DIVERGED_BASE_SHA"
 	}
-	name := recordPrefix(tx.key, revision.Ordinal) + "reconcile-" + strconv.Itoa(round) + ".json"
-	if _, _, err := tx.create(name, reconcileBytes, false, false); err != nil {
-		return PRLifecycleResultV1{}, err
+	if expected, ok := authority.PullRequest(); ok && (pr.Number != expected.Number() || pr.NodeID != expected.NodeID()) {
+		return "DIVERGED_PR_IDENTITY"
 	}
-	ref, err := publishOrVerify(c.artifacts, evidenceName(request.RunID, tx.key, revision.Ordinal, round, "reconcile"), "pr-lifecycle-reconciliation", reconcileBytes)
-	if err != nil {
-		return PRLifecycleResultV1{}, err
-	}
-	refs = append(refs, ref)
-	if principalErr == nil {
-		result, postErr := c.postflight(ctx, tx, request, revision, authority, input, generation, genSHA, markerSHA, principal, refs, AppliedReconciled, reconcileBytes)
-		if postErr == nil || result.Core().WriteID != "" {
-			return result, postErr
-		}
-	}
-	return PRLifecycleResultV1{}, &Error{Code: CodeAmbiguousUnresolved, Submitted: true, Attempt: generation.WriteID, Cause: writeErr}
+	return "DIVERGED_EXACT_POSTFLIGHT"
 }

@@ -21,7 +21,7 @@ func provisionStore(t *testing.T) *PRWriteAdmissionStore {
 	if err := os.WriteFile(filepath.Join(root, "capacity.lock"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewPRWriteAdmissionStore(root)
+	store, err := newPRWriteAdmissionStore(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,13 +45,13 @@ func TestAdmissionStoreRequiresProvisionedStableSafeRoot(t *testing.T) {
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewPRWriteAdmissionStore(root); err == nil {
+	if _, err := newPRWriteAdmissionStore(root); err == nil {
 		t.Fatal("missing administrator capacity lock accepted")
 	}
 	if err := os.WriteFile(filepath.Join(root, "capacity.lock"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewPRWriteAdmissionStore(root); err == nil {
+	if _, err := newPRWriteAdmissionStore(root); err == nil {
 		t.Fatal("unsafe capacity-lock permissions accepted")
 	}
 }
