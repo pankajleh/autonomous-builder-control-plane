@@ -16,11 +16,11 @@
 
 ## Current work
 
-EP-005 Phase 4 is in progress. The network-free foundation is merged. Current work is the next roadmap-authorized track: exact-head PR lifecycle. The corrected implementation design at plan SHA-256 `79470824b6d43294eee64e9c079041173ac1ecfe4b8f8dadb717eb871f7e2da7` passed the repository's controller-fallback design gate with `DESIGN_CLEAN_CRITICAL_MAJOR` after the configured independent provider hit a session/quota limit. Deterministic pre-implementation unit, race, vet, smoke, and diff checks are green. Ralphex/Codex implementation is now authorized but has not yet started.
+EP-005 exact-head PR lifecycle implementation reached ABCP `BRANCH_ACCEPTED` at exact head `f986008ba11c69c3864f0b8977af440024d12048`. The risk-triggered post-implementation Claude review could not run because of provider session/quota limits; the documented controller fallback then found 1 Critical and 9 Major defects at that exact accepted SHA. Push and PR #8 are blocked. Current work is the bounded correction plan `docs/plans/ep-005-pr-lifecycle-review-corrections.md`, grounded in controller review artifact SHA-256 `5919918bb38fee0ced9c858cd8109a63f48f600c0dfcad39ff1f2408eb8e3e4d`.
 
 ## Current authority
 
 Canonical roadmap: `docs/roadmap/IMPLEMENTATION_ROADMAP.md`
 Execution pack: `docs/execution-packs/EP-005-github-lifecycle.md`
-Active plan: `docs/plans/ep-005-pr-lifecycle.md`
+Active plan: `docs/plans/ep-005-pr-lifecycle-review-corrections.md`
 Design gate: `docs/architecture/IMPLEMENTATION_DESIGN_GATE.md`

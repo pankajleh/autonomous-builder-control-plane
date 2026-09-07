@@ -14,7 +14,7 @@ Updated: 2026-09-07
 
 ## Current
 
-EP-005 exact-head PR lifecycle: design gate accepted at plan SHA-256 `79470824b6d43294eee64e9c079041173ac1ecfe4b8f8dadb717eb871f7e2da7` under the documented controller-fallback policy after independent-provider session/quota failure. Pre-implementation unit, race, vet, smoke, and diff validation are green. Governed Ralphex/Codex implementation is the current authorized action.
+EP-005 exact-head PR lifecycle: ABCP accepted implementation SHA `f986008ba11c69c3864f0b8977af440024d12048`, but the required post-implementation controller-fallback review found 1 Critical and 9 Major defects after Claude hit a session/quota limit. Push/PR #8 are blocked. Current authorized action is the review-correction plan `docs/plans/ep-005-pr-lifecycle-review-corrections.md`.
 
 ## Next
 
