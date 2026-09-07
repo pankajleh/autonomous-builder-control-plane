@@ -8,17 +8,17 @@ Updated: 2026-09-07
 | Phase 1 — Governed single-plan execution | COMPLETE | PR #4 merged |
 | Phase 2 — Recovery and blocker control | COMPLETE | PR #5 merged |
 | Phase 3 — Cross-plan scheduler and integration | COMPLETE | PR #6 merged at `94e14ca749d31ac214e979aab03fbde37502dd7f` |
-| Phase 4 — GitHub lifecycle | IN PROGRESS | EP-005 foundation design accepted |
+| Phase 4 — GitHub lifecycle | IN PROGRESS | Foundation merged in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f` |
 | Phase 5 — Service/API/dashboard | NOT STARTED | roadmap only |
 | Phase 6 — Production hardening | NOT STARTED | roadmap only |
 
 ## Current
 
-EP-005 foundation: freeze network-free GitHub lifecycle identities, provider boundary, bounded remote snapshot/result contracts, merge-strategy/content-lineage identity, acting-principal provenance, timeout/cancellation semantics, and fail-closed resource limits.
+EP-005 exact-head PR lifecycle: design gate accepted at plan SHA-256 `79470824b6d43294eee64e9c079041173ac1ecfe4b8f8dadb717eb871f7e2da7` under the documented controller-fallback policy after independent-provider session/quota failure. Pre-implementation unit, race, vet, smoke, and diff validation are green. Governed Ralphex/Codex implementation is the current authorized action.
 
 ## Next
 
-After independent acceptance/review of the foundation, implement the remaining Phase 4 tracks in roadmap order: exact-head PR lifecycle, CI evidence ingestion, merge approval/expected-head protection, then serial post-merge acceptance.
+After exact-head PR lifecycle acceptance/review/merge, continue Phase 4 in roadmap order: CI evidence ingestion, merge approval/expected-head protection, then serial post-merge acceptance.
 
 ## Remaining after Phase 4
 
