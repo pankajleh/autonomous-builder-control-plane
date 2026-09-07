@@ -9,7 +9,7 @@ Correct the remaining substantive Major found by final independent review of exa
 - Track D correction head `f7c3c1f...` is ABCP `BRANCH_ACCEPTED` and exact-head deterministic validation passed.
 - Final Claude re-review confirmed the prior four Major classes are fixed except one terminal-evidence failure path.
 - The defect: an unverified materialization evidence ref can escape from `UseMaterialized`; then `Gate.finish` re-verification can return while the durable state remains `INTEGRATING`.
-- Governed context capsule: `/home/devagent/abcp-runtime/ep004-track-d-terminal-correction/context.json`; before any task work, run `abcp context-verify` against this repository and stop on any mismatch. The exact capsule SHA256 is bound by the ABCP run authority.
+- Governed context capsule: `/home/devagent/abcp-runtime/ep004-track-d-terminal-correction-02/context.json`; before any task work, run `abcp context-verify` against this repository and stop on any mismatch. The exact capsule SHA256 is bound by the ABCP run authority.
 
 ## Pre-implementation design gate
 - Trust boundary: no evidence ref becomes part of a returned Track B materialization result until its bytes, root containment, type, bound, identity and digest have verified.
@@ -17,7 +17,7 @@ Correct the remaining substantive Major found by final independent review of exa
 - Evidence invariant: terminal fallback transitions contain only freshly verified evidence refs; rejected refs may be described/hashes recorded as failure metadata but are never attached as transition evidence.
 - Post-acceptance invariant: if evidence becomes unverifiable after `INTEGRATION_ACCEPTED` but before `READY_FOR_MERGE`, fail closed to an allowed state rather than leaving an unrecoverable accepted-but-not-ready run.
 - Unavoidable ledger/evidence-store write failure remains a controller infrastructure failure; do not fabricate a transition when durable append itself is unavailable.
-## Task 1: Eliminate terminal evidence stranding
+### Task 1: Eliminate terminal evidence stranding
 - [ ] In `internal/integrationworkspace.UseMaterialized`, hold newly published capture refs in a local variable; assign `outcome.CaptureRef` and expose it to target/cleanup evidence only after secure verification succeeds. Mirror the already-safe `Integrate` publication pattern.
 - [ ] In `internal/integrationgate`, make terminalization resilient to evidence-verification failure after `INTEGRATING`: individually verify candidate refs, exclude failed refs, create a fresh bounded fallback decision artifact that records authority/risk/result digests, failure class, and rejected-ref identities/digest metadata, and emit `VALIDATION_UNAVAILABLE` with only verified refs.
 - [ ] Do not reuse an unverified or missing `inputRef`, decision ref, Track B/C ref, review ref, or source-head ref in fallback transition evidence. The freshly written/verified fallback decision is the minimum durable evidence anchor.
