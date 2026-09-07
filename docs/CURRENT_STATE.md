@@ -1,59 +1,30 @@
 # Current Project State
 
-**Date:** 2026-09-06  
-**Repository:** `autonomous-builder-control-plane`  
-**Phase:** EP-002 code review and live acceptance
+**Date:** 2026-09-06
+**Repository:** `autonomous-builder-control-plane`
+**Current roadmap phase:** Phase 3 — Cross-plan scheduler and integration
+**Current execution pack:** EP-004 — Cross-plan Scheduler and Integration
 
 ## Completed
 
-- Ralphex behavior audit EXP-00 through EXP-09 documented.
-- Architecture decision: Ralphex is the inner orchestrator, not global authority.
-- Canonical audit, architecture, ADRs and roadmap merged to `main` in PR #1.
-- State machine documented and implemented.
-- Append-only JSONL event ledger implemented.
-- Ralphex command-construction contract implemented.
-- EP-001 foundation tests and smoke checks pass with Go standard library only.
-- EP-002 authority, evidence, process supervision, candidate-branch discovery,
-  independent acceptance, and governed CLI implementation are code-complete.
+- Phase 0 / EP-001 foundation merged.
+- Phase 1 / EP-002 governed single-plan execution merged in PR #4.
+- Phase 2 / EP-003 recovery and blocker control merged in PR #5.
+- EP-003 also added deterministic context capsules, context-authority policy, run-evidence-retention policy, and independent-review fallback governance.
+- Exact-head deterministic validation passed for EP-003 before merge.
 
-## Foundation evidence
+## Current work
 
-```bash
-go test ./...
-make smoke
-```
+EP-004 begins Phase 3. The first bounded plan implements only:
 
-Expected smoke behavior:
+- accepted-candidate queue;
+- final-diff risk analysis;
+- frozen shared contracts needed for controlled parallel fan-out.
 
-```text
-abcp version
-→ 0.1.0-dev
+After that foundation is independently accepted, the integration-workspace/textual-conflict track and the combined-acceptance/semantic-conflict track may run in parallel from the same exact accepted SHA with disjoint ownership. Final `READY_FOR_MERGE` gate assembly remains serial.
 
-abcp validate-transition IMPLEMENTATION_COMPLETED BRANCH_ACCEPTANCE_PENDING
-→ VALID
+## Current authority
 
-abcp validate-transition IMPLEMENTATION_COMPLETED READY_FOR_MERGE
-→ rejected
-```
-
-## Active verification
-
-`EP-002 — Governed Single-Plan Execution`
-
-Ralphex execution plan:
-
-`docs/plans/ep-002-governed-single-plan.md`
-
-EP-002 now provides:
-
-- validated immutable run authority manifest;
-- immutable evidence artifact store;
-- supervised Ralphex subprocess execution;
-- deterministic controller-owned branch acceptance;
-- governed single-plan runner and CLI.
-
-Code-review fixes and the deterministic fake-Ralphex suite pass locally. One
-real pinned Ralphex plan must still run on the Ubuntu behavior-lab host before
-live acceptance is complete.
-
-EP-002 explicitly does **not** add recovery, multi-plan scheduling, integration/merge authority, GitHub lifecycle automation, or production completion.
+Canonical roadmap: `docs/roadmap/IMPLEMENTATION_ROADMAP.md`
+Execution pack: `docs/execution-packs/EP-004-cross-plan-scheduler-integration.md`
+Active plan: `docs/plans/ep-004-candidate-queue-risk-foundation.md`

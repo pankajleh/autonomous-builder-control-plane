@@ -17,15 +17,38 @@ import (
 )
 
 func TestRunCapturesExternalSignal(t *testing.T) {
+	readyPath := filepath.Join(t.TempDir(), "signal-helper.pid")
 	command, _ := helperCommand(t, "success")
-	command.Argv = []string{os.Args[0], "-test.run=TestSupervisorSignalHelperProcess"}
-	command.Env = append(os.Environ(), "GO_WANT_SUPERVISOR_SIGNAL_HELPER=1")
-	result, err := New().Run(context.Background(), command)
-	if err != nil {
-		t.Fatal(err)
+	command.Argv = []string{os.Args[0], "-test.run=^TestSupervisorSignalHelperProcess$"}
+	command.Env = append(os.Environ(),
+		"GO_WANT_SUPERVISOR_SIGNAL_HELPER=1",
+		"GO_WANT_SUPERVISOR_SIGNAL_READY_PATH="+readyPath,
+	)
+	type runOutcome struct {
+		result Result
+		err    error
 	}
-	if result.Outcome != OutcomeSignaled || result.ExitCode != -1 || result.TerminatingSignal != syscall.SIGTERM.String() {
-		t.Fatalf("terminal result = (%q, %d, %q), want SIGTERM", result.Outcome, result.ExitCode, result.TerminatingSignal)
+	done := make(chan runOutcome, 1)
+	go func() {
+		result, err := New().Run(context.Background(), command)
+		done <- runOutcome{result: result, err: err}
+	}()
+
+	waitForFile(t, readyPath)
+	if err := syscall.Kill(readProcessID(t, readyPath), syscall.SIGTERM); err != nil {
+		t.Fatalf("deliver external SIGTERM: %v", err)
+	}
+	var outcome runOutcome
+	select {
+	case outcome = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("supervisor did not return after external SIGTERM")
+	}
+	if outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+	if outcome.result.Outcome != OutcomeSignaled || outcome.result.ExitCode != -1 || outcome.result.TerminatingSignal != syscall.SIGTERM.String() {
+		t.Fatalf("terminal result = (%q, %d, %q), want SIGTERM", outcome.result.Outcome, outcome.result.ExitCode, outcome.result.TerminatingSignal)
 	}
 }
 
@@ -240,8 +263,18 @@ func TestSupervisorSignalHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_SUPERVISOR_SIGNAL_HELPER") != "1" {
 		return
 	}
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+	readyPath := os.Getenv("GO_WANT_SUPERVISOR_SIGNAL_READY_PATH")
+	if readyPath == "" {
 		os.Exit(94)
 	}
-	os.Exit(95)
+	temporaryPath := readyPath + ".tmp"
+	if err := os.WriteFile(temporaryPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		os.Exit(95)
+	}
+	if err := os.Rename(temporaryPath, readyPath); err != nil {
+		os.Exit(96)
+	}
+	for {
+		time.Sleep(time.Hour)
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,11 +25,28 @@ type Manifest struct {
 	Repository     RepositoryManifest      `json:"repository"`
 	Plan           PlanManifest            `json:"plan"`
 	ContextCapsule *ContextCapsuleManifest `json:"context_capsule,omitempty"`
+	MergeReview    *ReviewPolicy           `json:"merge_review,omitempty"`
 	Ralphex        RalphexManifest         `json:"ralphex"`
 	Executor       ExecutorPolicy          `json:"executor"`
 	Worktree       WorktreePolicy          `json:"worktree"`
 	Acceptance     []AcceptanceCommand     `json:"acceptance"`
 	PolicyVersion  string                  `json:"policy_version"`
+}
+
+// ReviewRequirement binds one controller-selected component to the exact
+// commit and verdict required by the serial merge gate.
+type ReviewRequirement struct {
+	Component   string `json:"component"`
+	ReviewedSHA string `json:"reviewed_sha"`
+	Verdict     string `json:"verdict"`
+}
+
+// ReviewPolicy is optional for authorities created before the serial merge
+// gate. The merge gate itself requires it and never accepts caller-selected
+// requirements as a substitute.
+type ReviewPolicy struct {
+	PolicyIdentity string              `json:"policy_identity"`
+	Required       []ReviewRequirement `json:"required"`
 }
 
 // RepositoryManifest pins the governed repository and its starting identity.
@@ -99,6 +117,11 @@ type Authority struct {
 // New validates, canonicalizes, and freezes a run manifest.
 func New(input Manifest) (Authority, error) {
 	manifest := cloneManifest(input)
+	if manifest.MergeReview != nil {
+		sort.Slice(manifest.MergeReview.Required, func(i, j int) bool {
+			return manifest.MergeReview.Required[i].Component < manifest.MergeReview.Required[j].Component
+		})
+	}
 	if err := canonicalizeExecutorPolicy(&manifest.Executor); err != nil {
 		return Authority{}, err
 	}
@@ -214,6 +237,14 @@ func (a Authority) ContextCapsule() (ContextCapsuleManifest, bool) {
 	return *a.manifest.ContextCapsule, true
 }
 
+// MergeReviewPolicy returns the optional immutable controller review policy.
+func (a Authority) MergeReviewPolicy() (ReviewPolicy, bool) {
+	if a.manifest.MergeReview == nil {
+		return ReviewPolicy{}, false
+	}
+	return cloneReviewPolicy(*a.manifest.MergeReview), true
+}
+
 // Ralphex returns the canonical Ralphex identity and mode.
 func (a Authority) Ralphex() RalphexManifest {
 	return a.manifest.Ralphex
@@ -271,6 +302,11 @@ func validateRequired(manifest Manifest) error {
 		}
 		if manifest.ContextCapsule.SHA256 == "" {
 			missing = append(missing, "context_capsule.sha256")
+		}
+	}
+	if manifest.MergeReview != nil {
+		if err := validateReviewPolicy(*manifest.MergeReview); err != nil {
+			return err
 		}
 	}
 	if manifest.Ralphex.BinaryPath == "" {
@@ -359,6 +395,44 @@ func validateRequired(manifest Manifest) error {
 		return fmt.Errorf("repository.identity %q does not match any governed remote URL", manifest.Repository.Identity)
 	}
 	return nil
+}
+
+func validateReviewPolicy(policy ReviewPolicy) error {
+	if policy.PolicyIdentity == "" || policy.PolicyIdentity != strings.TrimSpace(policy.PolicyIdentity) || strings.ContainsAny(policy.PolicyIdentity, "\r\n") {
+		return errors.New("merge_review.policy_identity must be non-empty and contain no surrounding whitespace or newlines")
+	}
+	if len(policy.Required) == 0 {
+		return errors.New("merge_review.required must contain at least one component")
+	}
+	seen := make(map[string]struct{}, len(policy.Required))
+	for index, requirement := range policy.Required {
+		if requirement.Component == "" || requirement.Component != strings.TrimSpace(requirement.Component) || strings.ContainsAny(requirement.Component, "\r\n") {
+			return fmt.Errorf("merge_review.required[%d].component is invalid", index)
+		}
+		if _, exists := seen[requirement.Component]; exists {
+			return fmt.Errorf("merge_review.required repeats component %q", requirement.Component)
+		}
+		seen[requirement.Component] = struct{}{}
+		if !validObjectID(requirement.ReviewedSHA) {
+			return fmt.Errorf("merge_review.required[%d].reviewed_sha must be an exact lowercase Git object ID", index)
+		}
+		if requirement.Verdict == "" || requirement.Verdict != strings.TrimSpace(requirement.Verdict) || strings.ContainsAny(requirement.Verdict, "\r\n") {
+			return fmt.Errorf("merge_review.required[%d].verdict is invalid", index)
+		}
+	}
+	return nil
+}
+
+func validObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func rejectRemoteCredentials(remoteURL string) error {
@@ -531,8 +605,17 @@ func cloneManifest(input Manifest) Manifest {
 		binding := *input.ContextCapsule
 		clone.ContextCapsule = &binding
 	}
+	if input.MergeReview != nil {
+		policy := cloneReviewPolicy(*input.MergeReview)
+		clone.MergeReview = &policy
+	}
 	clone.Acceptance = cloneAcceptance(input.Acceptance)
 	return clone
+}
+
+func cloneReviewPolicy(input ReviewPolicy) ReviewPolicy {
+	input.Required = append([]ReviewRequirement(nil), input.Required...)
+	return input
 }
 
 func cloneRepository(input RepositoryManifest) RepositoryManifest {

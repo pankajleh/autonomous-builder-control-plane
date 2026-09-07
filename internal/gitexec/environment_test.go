@@ -24,7 +24,9 @@ func TestEnvironmentExcludesAmbientGitOverridesAndSecrets(t *testing.T) {
 			t.Fatalf("controller Git environment inherited %s", forbidden)
 		}
 	}
-	if values["GIT_CONFIG_COUNT"] != "3" || values["GIT_CONFIG_VALUE_1"] != "false" {
+	graftFile, hasGraftFile := values["GIT_GRAFT_FILE"]
+	if values["GIT_CONFIG_COUNT"] != "3" || values["GIT_CONFIG_VALUE_1"] != "false" ||
+		values["GIT_NO_REPLACE_OBJECTS"] != "1" || !hasGraftFile || graftFile != "" {
 		t.Fatalf("controller Git safety configuration is incomplete: %#v", values)
 	}
 }

@@ -353,6 +353,42 @@ func TestNewPreservesPrePolicyManifestShape(t *testing.T) {
 	if strings.Contains(string(governed.CanonicalJSON()), "context_capsule") {
 		t.Fatal("optional capsule field changed canonical pre-policy manifest JSON")
 	}
+	if _, present := governed.MergeReviewPolicy(); present || strings.Contains(string(governed.CanonicalJSON()), "merge_review") {
+		t.Fatal("optional merge review field changed canonical pre-policy manifest JSON")
+	}
+}
+
+func TestNewFreezesAndCanonicalizesMergeReviewPolicy(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.MergeReview = &ReviewPolicy{PolicyIdentity: "review-v1", Required: []ReviewRequirement{
+		{Component: "track-c", ReviewedSHA: strings.Repeat("c", 40), Verdict: "CLEAN_CRITICAL_MAJOR"},
+		{Component: "track-b", ReviewedSHA: strings.Repeat("b", 40), Verdict: "CLEAN_CRITICAL_MAJOR"},
+	}}
+	governed, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, present := governed.MergeReviewPolicy()
+	if !present || len(policy.Required) != 2 || policy.Required[0].Component != "track-b" {
+		t.Fatalf("canonical merge review policy = %#v, %t", policy, present)
+	}
+	manifest.MergeReview.Required[0].Component = "mutated-input"
+	policy.Required[0].Component = "mutated-copy"
+	unchanged, _ := governed.MergeReviewPolicy()
+	if unchanged.Required[0].Component != "track-b" {
+		t.Fatal("authority exposed mutable merge review state")
+	}
+}
+
+func TestNewRejectsInvalidMergeReviewPolicy(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.MergeReview = &ReviewPolicy{PolicyIdentity: "review-v1", Required: []ReviewRequirement{
+		{Component: "track-b", ReviewedSHA: strings.Repeat("b", 40), Verdict: "CLEAN_CRITICAL_MAJOR"},
+		{Component: "track-b", ReviewedSHA: strings.Repeat("c", 40), Verdict: "CLEAN_CRITICAL_MAJOR"},
+	}}
+	if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "repeats component") {
+		t.Fatalf("duplicate review requirement error = %v", err)
+	}
 }
 
 func boundCapsuleManifest(t *testing.T) Manifest {
