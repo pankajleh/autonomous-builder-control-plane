@@ -95,7 +95,7 @@ Admission records, reconciliation records, terminal material, run evidence, and 
 - [ ] A transport error containing a fake secret/token string never appears in admission files, evidence, terminal material, ledger material, or returned persisted diagnostics.
 - [ ] Existing exact CREATE/UPDATE, stable numeric actor, one-submission ambiguity, no-replay, capacity, restart, material-ledger, and unsupported-platform tests remain green.
 
-## Task 1 — Correct the exact-head PR lifecycle implementation
+### Task 1: Correct the exact-head PR lifecycle implementation
 
 - [ ] Implement the ten correction invariants above without modifying frozen `internal/githublifecycle` semantics unless a test proves an unavoidable foundation defect.
 - [ ] Keep the package fail-closed and preserve exactly one remote PR submission per revision.
