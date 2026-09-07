@@ -26,7 +26,8 @@ func TestEnvironmentExcludesAmbientGitOverridesAndSecrets(t *testing.T) {
 	}
 	graftFile, hasGraftFile := values["GIT_GRAFT_FILE"]
 	if values["GIT_CONFIG_COUNT"] != "3" || values["GIT_CONFIG_VALUE_1"] != "false" ||
-		values["GIT_NO_REPLACE_OBJECTS"] != "1" || !hasGraftFile || graftFile != "" {
+		values["GIT_NO_REPLACE_OBJECTS"] != "1" || values["GIT_NO_LAZY_FETCH"] != "1" ||
+		!hasGraftFile || graftFile != "" {
 		t.Fatalf("controller Git safety configuration is incomplete: %#v", values)
 	}
 }
