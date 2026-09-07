@@ -573,7 +573,7 @@ func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, erro
 func TestTerminalBudgetMaximaAndReconciliationStartConsumption(t *testing.T) {
 	authority := make([]byte, 16<<10)
 	attempt := make([]byte, 8<<10)
-	budget, err := NewTerminalBudget(authority, attempt, strings.Repeat("t", 4096), strings.Repeat("b", 4096))
+	budget, err := NewTerminalBudget(authority, attempt, strings.Repeat("<", PRLifecycleDocumentMaxBytes), strings.Repeat("&", PRLifecycleDocumentMaxBytes))
 	if err != nil || budget.WorstCaseBytes > MaxTerminalBytes {
 		t.Fatalf("maximal admitted terminal profile is not bounded: %#v %v", budget, err)
 	}
@@ -593,7 +593,7 @@ func TestTerminalBudgetMaximaAndReconciliationStartConsumption(t *testing.T) {
 		SchemaVersion: SchemaVersion, PolicySHA256: digest, LimitsSHA256: digest, ResourceKey: digest, Revision: 1, Generation: 1,
 		GenerationSHA256: digest, SubmittedSHA256: digest, Attempt: maxJSON(8 << 10), AttemptSHA256: digest,
 		SourceAuthority: maxJSON(16 << 10), SourceAuthoritySHA: digest, DerivedAuthority: maxJSON(16 << 10), DerivedAuthoritySHA: digest,
-		ExpectedContentSHA: digest, Title: strings.Repeat("t", 4096), Body: strings.Repeat("b", 4096), DocumentSHA256: digest,
+		ExpectedContentSHA: digest, Title: strings.Repeat("<", PRLifecycleDocumentMaxBytes), Body: strings.Repeat("&", PRLifecycleDocumentMaxBytes), DocumentSHA256: digest,
 		Snapshot: maxJSON(MaxTerminalSnapshotBytes), SnapshotSHA256: digest, SnapshotRecovery: snapshotRecoveryWire{Provider: remote, RequestID: remote, RepositoryOwn: remote, Repository: remote, PRNodeID: remote, BaseBranch: remote, BaseTipSHA: strings.Repeat("b", 40), HeadBranch: remote, HeadSHA: strings.Repeat("b", 40), State: "open"},
 		Principal: principal, PullRequest: pr, Head: refObservation, Base: refObservation, Reconciliation: maxJSON(MaxTerminalArtifactBytes),
 		ResultCore: PRLifecycleResultCoreV1{Disposition: AppliedConfirmed}, ResultCoreSHA256: digest, Reason: strings.Repeat("q", 1024), RunID: "max-run", TerminalUnixNano: 1,

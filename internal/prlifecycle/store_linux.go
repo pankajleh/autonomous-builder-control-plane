@@ -16,7 +16,7 @@ import (
 	"syscall"
 )
 
-var admissionName = regexp.MustCompile(`^r-([0-9a-f]{64})(?:\.lock|-resource\.json|-rev-([1-9][0-9]*)-(?:revision|generation|submitted|terminal|superseded|prepare-[1-3]|resume-[1-4]|reconcile-[1-8]-(?:start|observation))\.json)$`)
+var admissionName = regexp.MustCompile(`^r-([0-9a-f]{64})(?:\.lock|-resource\.json|-rev-([1-9][0-9]*)-(?:revision|generation|submitted|terminal|superseded|prepare-run-[0-9a-f]{64}-[1-3]|resume-[1-4]|reconcile-[1-8]-(?:start|observation))\.json)$`)
 
 type fileIdentity struct{ dev, ino uint64 }
 

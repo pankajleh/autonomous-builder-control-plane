@@ -115,3 +115,14 @@ Admission records, reconciliation records, terminal material, run evidence, and 
 The correction is not push-ready merely because Ralphex completes. The exact correction head must pass ABCP deterministic acceptance and then a fresh Critical/Major post-implementation review. Claude/cross-model review is preferred when available; documented controller fallback is permitted only for genuine provider failure. Any substantive finding requires another correction cycle.
 
 No branch push, PR #8 creation, merge, CI lifecycle work, or later Phase-4 task is authorized until that exact-head review is clean.
+
+## Round-2 exact-head correction addendum (2026-09-07)
+
+The later exact-head review correction narrows only `internal/prlifecycle`; frozen `internal/githublifecycle` limits and semantics remain unchanged.
+
+- PR-lifecycle title and body admission is now explicitly capped at 1024 bytes per field, no greater than the controller's observable remote-text limit. The exact canonical CREATE/PATCH JSON and HTTP request are built and checked against the 16-KiB request cap before generation or submitted-marker publication.
+- A reconciliation principal read failure remains ambiguous and consumes only its already-started reconciliation round. An observed numeric principal mismatch is durable divergence evidence, while `PRLifecycleResultCoreV1` remains bound to the authority actor ID and cannot combine that ID with the mismatching node ID/login.
+- Every failure propagated after `http.Client.Do` may have run is normalized to a controller-owned submitted error containing a stable code and write-attempt identity. A locally proven never-submitted post-marker failure remains non-replayable.
+- A new revision after `applied_confirmed` directly reads and re-proves the prior terminal-bound PR number/node ID, repository, open state, refs, head/base authority, and prior document before UPDATE authority can be admitted. Filtered discovery absence can never switch that resource back to CREATE.
+- Prepare provenance is run-scoped and named `r-<resource>-rev-<ordinal>-prepare-run-<sha256(raw-run-id)>-<round>.json`. Its strict canonical body binds the raw run ID and digest, resource, pending revision, and round. Each run retains three rounds, while each physical resource plus pending revision is capped at 24 immutable prepare records; the next revision gets an independent allowance.
+- `TerminalBudgetV1` now itemizes the exact component caps and uses canonical JSON length for the direct title/body copy, including HTML escaping. Principal, PR, ref, reconciliation, snapshot, retained artifact, authority, attempt, and result-core material are checked against the same caps used by the reservation, and the final canonical terminal is checked against both the computed upper bound and 256 KiB before publication.

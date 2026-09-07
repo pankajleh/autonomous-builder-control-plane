@@ -14,40 +14,45 @@ import (
 )
 
 const (
-	SchemaVersion             = 1
-	MaxRequestBytes           = 16 << 10
-	MaxResponseBytes          = 4 << 20
-	MaxResponseHeaderBytes    = 32 << 10
-	MaxLinkHeaderBytes        = 8 << 10
-	MaxRequestIDBytes         = 256
-	MaxTerminalBytes          = 256 << 10
-	MaxReconciliationRounds   = 8
-	MaxResumeRounds           = 4
-	MinReconciliationInterval = 30 * time.Second
-	MaxTerminalArtifactBytes  = 32 << 10
-	MaxTerminalSnapshotBytes  = 16 << 10
-	maxLifecycleRemoteText    = 1024
+	SchemaVersion                              = 1
+	MaxRequestBytes                            = 16 << 10
+	MaxResponseBytes                           = 4 << 20
+	MaxResponseHeaderBytes                     = 32 << 10
+	MaxLinkHeaderBytes                         = 8 << 10
+	MaxRequestIDBytes                          = 256
+	MaxTerminalBytes                           = 256 << 10
+	MaxReconciliationRounds                    = 8
+	MaxResumeRounds                            = 4
+	MinReconciliationInterval                  = 30 * time.Second
+	MaxTerminalArtifactBytes                   = 32 << 10
+	MaxTerminalSnapshotBytes                   = 16 << 10
+	MaxPrepareRecordBytes                      = 256 << 10
+	MaxRunIDBytes                              = 1024
+	PRLifecycleDocumentMaxBytes                = 1024
+	MaxPrepareHistoryRecordsPerPendingRevision = 24
+	maxLifecycleRemoteText                     = PRLifecycleDocumentMaxBytes
 )
 
 const (
-	CodePolicyMismatch           = "ADMISSION_POLICY_MISMATCH"
-	CodeCapacityExhausted        = "ADMISSION_CAPACITY_EXHAUSTED"
-	CodeIntegrityFailure         = "ADMISSION_INTEGRITY_FAILURE"
-	CodeRemoteHeadDiverged       = "REMOTE_HEAD_UNPUBLISHED_OR_DIVERGED"
-	CodeStaleAuthority           = "STALE_READY_FOR_MERGE_AUTHORITY"
-	CodeExistingIneligible       = "EXISTING_INELIGIBLE_OPEN_PR"
-	CodeDiscoveryTruncated       = "DISCOVERY_TRUNCATED"
-	CodeRevisionConflict         = "REVISION_CONFLICT"
-	CodeResumeBudgetExhausted    = "RESUME_BUDGET_EXHAUSTED"
-	CodeReconcileBudgetExhausted = "RECONCILIATION_BUDGET_EXHAUSTED"
-	CodeUnsupportedNotApplied    = "UNSUPPORTED_NOT_APPLIED_PROOF"
-	CodeLedgerUnavailable        = "LEDGER_RECOVERY_UNAVAILABLE"
-	CodeLedgerIntegrity          = "LEDGER_INTEGRITY_FAILURE"
-	CodeRemoteDivergedAfterWrite = "REMOTE_DIVERGED_AFTER_WRITE"
-	CodePreflightBudgetExhausted = "PREFLIGHT_BUDGET_EXHAUSTED"
-	CodeAmbiguousUnresolved      = "AMBIGUOUS_WRITE_UNRESOLVED"
-	CodeRemoteReadFailed         = "REMOTE_READ_FAILED"
-	CodeRemoteWriteFailed        = "REMOTE_WRITE_FAILED"
+	CodePolicyMismatch            = "ADMISSION_POLICY_MISMATCH"
+	CodeCapacityExhausted         = "ADMISSION_CAPACITY_EXHAUSTED"
+	CodeIntegrityFailure          = "ADMISSION_INTEGRITY_FAILURE"
+	CodeRemoteHeadDiverged        = "REMOTE_HEAD_UNPUBLISHED_OR_DIVERGED"
+	CodeStaleAuthority            = "STALE_READY_FOR_MERGE_AUTHORITY"
+	CodeExistingIneligible        = "EXISTING_INELIGIBLE_OPEN_PR"
+	CodeDiscoveryTruncated        = "DISCOVERY_TRUNCATED"
+	CodeRevisionConflict          = "REVISION_CONFLICT"
+	CodeResumeBudgetExhausted     = "RESUME_BUDGET_EXHAUSTED"
+	CodeReconcileBudgetExhausted  = "RECONCILIATION_BUDGET_EXHAUSTED"
+	CodeUnsupportedNotApplied     = "UNSUPPORTED_NOT_APPLIED_PROOF"
+	CodeLedgerUnavailable         = "LEDGER_RECOVERY_UNAVAILABLE"
+	CodeLedgerIntegrity           = "LEDGER_INTEGRITY_FAILURE"
+	CodeRemoteDivergedAfterWrite  = "REMOTE_DIVERGED_AFTER_WRITE"
+	CodePreflightBudgetExhausted  = "PREFLIGHT_BUDGET_EXHAUSTED"
+	CodePreflightHistoryExhausted = "PREFLIGHT_HISTORY_EXHAUSTED"
+	CodeAmbiguousUnresolved       = "AMBIGUOUS_WRITE_UNRESOLVED"
+	CodeRemoteReadFailed          = "REMOTE_READ_FAILED"
+	CodeRemoteWriteFailed         = "REMOTE_WRITE_FAILED"
 )
 
 type Error struct {
@@ -260,10 +265,21 @@ func (r PRLifecycleResultV1) CanonicalJSON() []byte {
 func (r PRLifecycleResultV1) MarshalJSON() ([]byte, error) { return r.CanonicalJSON(), nil }
 
 type TerminalBudgetV1 struct {
-	AuthorityBytes int `json:"authority_bytes"`
-	AttemptBytes   int `json:"attempt_bytes"`
-	DocumentBytes  int `json:"document_bytes"`
-	WorstCaseBytes int `json:"worst_case_bytes"`
+	AuthorityBytes            int `json:"authority_bytes"`
+	AttemptBytes              int `json:"attempt_bytes"`
+	DocumentBytes             int `json:"document_bytes"`
+	SourceAuthorityCap        int `json:"source_authority_cap"`
+	DerivedAuthorityCap       int `json:"derived_authority_cap"`
+	AttemptCap                int `json:"attempt_cap"`
+	SnapshotCap               int `json:"snapshot_cap"`
+	PrincipalObservationCap   int `json:"principal_observation_cap"`
+	PullRequestObservationCap int `json:"pull_request_observation_cap"`
+	RefObservationsCap        int `json:"ref_observations_cap"`
+	ReconciliationCap         int `json:"reconciliation_cap"`
+	TerminalArtifactCap       int `json:"terminal_artifact_cap"`
+	ResultCoreCap             int `json:"result_core_cap"`
+	FramingAndEventCap        int `json:"framing_and_event_cap"`
+	WorstCaseBytes            int `json:"worst_case_bytes"`
 }
 
 func observationDigest(v any, max int) (string, error) {

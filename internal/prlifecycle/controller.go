@@ -35,6 +35,9 @@ type Controller struct {
 	artifacts ArtifactWriter
 	ledger    *MaterialLedgerRecorder
 	now       func() time.Time
+	// postSubmitFailure is an unexported deterministic fault boundary used by
+	// same-package adversarial tests to prove submitted error provenance.
+	postSubmitFailure func(stage string) error
 }
 
 func newController(config ControllerConfig) (*Controller, error) {
@@ -47,7 +50,7 @@ func newController(config ControllerConfig) (*Controller, error) {
 	if !limitsAllowed(config.GitHub.limits) {
 		return nil, errors.New(CodePolicyMismatch)
 	}
-	return &Controller{config.Store, config.GitHub, config.Artifacts, config.Ledger, config.Now}, nil
+	return &Controller{store: config.Store, github: config.GitHub, artifacts: config.Artifacts, ledger: config.Ledger, now: config.Now}, nil
 }
 
 type Request struct {
@@ -128,6 +131,17 @@ type prepareBundle struct {
 	AuthoritySHA  string                     `json:"authority_sha256"`
 }
 
+type prepareRecordV1 struct {
+	SchemaVersion int             `json:"schema_version"`
+	RunID         string          `json:"run_id"`
+	RunSHA256     string          `json:"run_sha256"`
+	ResourceKey   string          `json:"resource_key"`
+	Revision      uint64          `json:"revision"`
+	Round         int             `json:"round"`
+	Outcome       string          `json:"outcome"`
+	Proof         json.RawMessage `json:"proof,omitempty"`
+}
+
 type snapshotRecoveryWire struct {
 	Provider      string `json:"provider"`
 	RequestID     string `json:"request_id"`
@@ -204,11 +218,14 @@ type prepared struct {
 
 func (c *Controller) Upsert(ctx context.Context, request Request) (PRLifecycleResultV1, error) {
 	var result PRLifecycleResultV1
-	if ctx == nil || request.RunID == "" || request.RunID != c.artifacts.RunID() {
+	if ctx == nil || !validRemoteText(request.RunID, MaxRunIDBytes, false) || request.RunID != c.artifacts.RunID() {
 		return result, errors.New("context and matching controller run identity are required")
 	}
 	limits := c.github.limits
-	if err := validateDocument(request.Title, request.Body, limits.MaxTextBytes); err != nil {
+	if PRLifecycleDocumentMaxBytes > lifecycleRemoteTextLimit(limits) {
+		return result, &Error{Code: CodePolicyMismatch, Cause: errors.New("PR lifecycle document bound exceeds observable remote-text bound")}
+	}
+	if err := validateDocument(request.Title, request.Body, PRLifecycleDocumentMaxBytes); err != nil {
 		return result, err
 	}
 	authorityBytes, err := request.Authority.CanonicalJSON()
@@ -263,7 +280,11 @@ func (c *Controller) upsertLocked(ctx context.Context, tx *resourceTxn, request 
 			return zero, err
 		}
 		if revision.RequestSHA256 == requestSHA && terminalExists {
-			return c.recoverTerminal(tx, terminalName, request.RunID)
+			recovered, recoverErr := c.recoverTerminal(tx, terminalName, request.RunID)
+			if recoverErr != nil {
+				return recovered, submittedControllerError(recoverErr, deterministicWriteID(tx.key, latest))
+			}
+			return recovered, nil
 		}
 		generationExists, err := tx.exists(recordPrefix(tx.key, latest) + "generation.json")
 		if err != nil {
@@ -303,17 +324,28 @@ func (c *Controller) upsertLocked(ctx context.Context, tx *resourceTxn, request 
 		}
 	}
 
-	prepareRound := nextLegacyRound(c.store, tx.key, ordinal, "prepare", c.github.limits.MaxReadRetries+1)
-	if prepareRound == 0 {
-		return zero, &Error{Code: CodePreflightBudgetExhausted, Cause: errors.New("bounded prepare rounds exhausted")}
+	prepareRound, err := nextPrepareRound(tx, request.RunID, ordinal, c.github.limits.MaxReadRetries+1)
+	if err != nil {
+		return zero, err
 	}
 	prep, prepBytes, prepRef, err := c.prepare(ctx, tx.key, ordinal, prepareRound, "prepare", request, previous)
+	prepareRecord := prepareRecordV1{
+		SchemaVersion: SchemaVersion, RunID: request.RunID, RunSHA256: digestBytes([]byte(request.RunID)),
+		ResourceKey: tx.key.String(), Revision: ordinal, Round: prepareRound, Outcome: "prepared", Proof: prepBytes,
+	}
 	if err != nil {
-		failure, _ := json.Marshal(struct {
-			SchemaVersion int    `json:"schema_version"`
-			Error         string `json:"error"`
-		}{SchemaVersion, boundedError(err)})
-		_, _, _ = tx.create(recordPrefix(tx.key, ordinal)+"prepare-"+strconv.Itoa(prepareRound)+".json", failure, false, false)
+		prepareRecord.Outcome = boundedError(err)
+		prepareRecord.Proof = nil
+	}
+	prepareRecordBytes, marshalErr := json.Marshal(prepareRecord)
+	if marshalErr != nil || len(prepareRecordBytes) > MaxPrepareRecordBytes {
+		return zero, firstError(marshalErr, errors.New("prepare record exceeds bounded profile"))
+	}
+	prepareName := prepareRecordName(tx.key, ordinal, prepareRecord.RunSHA256, prepareRound)
+	if _, _, createErr := tx.create(prepareName, prepareRecordBytes, false, false); createErr != nil {
+		return zero, createErr
+	}
+	if err != nil {
 		return zero, err
 	}
 	revision, err := c.makeRevision(tx.key, ordinal, request, requestSHA, prep)
@@ -324,11 +356,7 @@ func (c *Controller) upsertLocked(ctx context.Context, tx *resourceTxn, request 
 	if _, _, err := tx.createJSON(revisionName, revision, false, false); err != nil {
 		return zero, err
 	}
-	prepareName := recordPrefix(tx.key, ordinal) + "prepare-" + strconv.Itoa(prepareRound) + ".json"
-	if _, _, err := tx.create(prepareName, prepBytes, false, false); err != nil {
-		return zero, err
-	}
-	return c.submit(ctx, tx, request, revision, prep, prepBytes, []ledger.EvidenceRef{prepRef}, false)
+	return c.submit(ctx, tx, request, revision, prep, prepareRecordBytes, []ledger.EvidenceRef{prepRef}, false)
 }
 
 func (c *Controller) ensureResourceRecord(tx *resourceTxn, authority githublifecycle.Authority) error {
@@ -380,6 +408,24 @@ func (c *Controller) prepare(ctx context.Context, key PRResourceKeyV1, ordinal u
 		pr, err := c.github.pullRequest(ctx, request.Authority.Repository(), bound.Number())
 		if err != nil || pr.NodeID != bound.NodeID() {
 			return out, nil, ledger.EvidenceRef{}, &Error{Code: CodeExistingIneligible, Cause: firstError(err, errors.New("authority-bound PR identity differs"))}
+		}
+		out.pr = &pr
+		out.mode = "UPDATE"
+	} else if previous != nil {
+		priorNumber := previous.Core.ResultCore.PRNumber
+		pr, err := c.github.pullRequest(ctx, request.Authority.Repository(), priorNumber)
+		if err != nil || priorNumber <= 0 || pr.Number != priorNumber || pr.NodeID != previous.Core.ResultCore.PRNodeID {
+			return out, nil, ledger.EvidenceRef{}, &Error{Code: CodeRevisionConflict, Cause: firstError(err, errors.New("prior confirmed PR identity cannot be re-proven"))}
+		}
+		identity, err := githublifecycle.NewPullRequestIdentity(pr.Number, pr.NodeID)
+		if err != nil {
+			return out, nil, ledger.EvidenceRef{}, err
+		}
+		input := request.Authority.Input()
+		input.PullRequest = &identity
+		out.authority, err = githublifecycle.NewAuthority(input)
+		if err != nil {
+			return out, nil, ledger.EvidenceRef{}, err
 		}
 		out.pr = &pr
 		out.mode = "UPDATE"
@@ -462,6 +508,15 @@ func (c *Controller) submit(ctx context.Context, tx *resourceTxn, request Reques
 	if _, err := NewTerminalBudget(authorityBytes, attemptBytes, revision.Title, revision.Body); err != nil {
 		return zero, err
 	}
+	prNumber := int64(0)
+	if revision.Mode == "UPDATE" {
+		prNumber = revision.PRNumber
+	}
+	preparedWrite, err := c.github.prepareWrite(ctx, prep.authority.Repository(), prNumber, revision.Title, revision.Body, prep.authority.BaseBranch(), prep.authority.HeadBranch())
+	if err != nil {
+		return zero, err
+	}
+	defer preparedWrite.cancel()
 	generation := generationRecord{SchemaVersion, tx.key.String(), revision.Ordinal, 1, writeID, attemptBytes, digestBytes(attemptBytes), revision.AuthoritySHA256, input.Attempt().PayloadSHA256(), revision.Mode, revision.PRNumber, revision.PRNodeID, digestBytes(proof)}
 	genName := recordPrefix(tx.key, revision.Ordinal) + "generation.json"
 	var genBytes []byte
@@ -490,12 +545,16 @@ func (c *Controller) submit(ctx context.Context, tx *resourceTxn, request Reques
 	if err != nil {
 		return zero, err // marker durability is uncertain; never call HTTP.
 	}
-	prNumber := int64(0)
-	if revision.Mode == "UPDATE" {
-		prNumber = revision.PRNumber
+	_, writeErr := c.github.executeWrite(preparedWrite)
+	var never *neverSubmittedError
+	if errors.As(writeErr, &never) {
+		return zero, submittedControllerError(writeErr, writeID)
 	}
-	_, writeErr := c.github.write(ctx, prep.authority.Repository(), prNumber, revision.Title, revision.Body, prep.authority.BaseBranch(), prep.authority.HeadBranch())
-	return c.reconcile(ctx, tx, request, revision, prep.authority, input, generation, genSHA, markerSHA, refs, writeErr)
+	result, reconcileErr := c.reconcile(ctx, tx, request, revision, prep.authority, input, generation, genSHA, markerSHA, refs, writeErr)
+	if reconcileErr != nil {
+		return result, submittedControllerError(reconcileErr, writeID)
+	}
+	return result, nil
 }
 
 func (c *Controller) resumeGeneration(ctx context.Context, tx *resourceTxn, request Request, revision revisionRecord) (PRLifecycleResultV1, error) {
@@ -511,17 +570,21 @@ func (c *Controller) resumeGeneration(ctx context.Context, tx *resourceTxn, requ
 	if marker {
 		authority, err := authorityForGeneration(request.Authority, revision)
 		if err != nil {
-			return PRLifecycleResultV1{}, err
+			return PRLifecycleResultV1{}, submittedControllerError(err, storedGeneration.WriteID)
 		}
 		input, err := githublifecycle.NewUpsertPullRequestInput(authority, revision.Title, revision.Body, deterministicWriteID(tx.key, revision.Ordinal), c.github.limits)
 		if err != nil {
-			return PRLifecycleResultV1{}, err
+			return PRLifecycleResultV1{}, submittedControllerError(err, storedGeneration.WriteID)
 		}
 		generation, genSHA, markerSHA, err := readGenerationAndMarker(tx, revision.Ordinal)
 		if err != nil {
-			return PRLifecycleResultV1{}, err
+			return PRLifecycleResultV1{}, submittedControllerError(err, storedGeneration.WriteID)
 		}
-		return c.reconcile(ctx, tx, request, revision, authority, input, generation, genSHA, markerSHA, nil, &Error{Code: CodeAmbiguousUnresolved, Submitted: true})
+		result, reconcileErr := c.reconcile(ctx, tx, request, revision, authority, input, generation, genSHA, markerSHA, nil, &Error{Code: CodeAmbiguousUnresolved, Submitted: true})
+		if reconcileErr != nil {
+			return result, submittedControllerError(reconcileErr, generation.WriteID)
+		}
+		return result, nil
 	}
 	resumeRound := nextLegacyRound(c.store, tx.key, revision.Ordinal, "resume", MaxResumeRounds)
 	if resumeRound == 0 {
@@ -674,8 +737,8 @@ func (c *Controller) reconcile(ctx context.Context, tx *resourceTxn, request Req
 	principal, principalErr := c.github.principal(ctx)
 	expectedID, _ := trackActorID(authority.Actor())
 	exactClass := ""
-	if principalErr == nil && principal.ID != expectedID {
-		principalErr = errors.New("reconciliation principal differs from authority")
+	principalMismatch := principalErr == nil && principal.ID != expectedID
+	if principalMismatch {
 		exactClass = "DIVERGED_AUTHENTICATED_PRINCIPAL"
 	}
 	var candidate *discoveryCandidate
@@ -719,6 +782,9 @@ func (c *Controller) reconcile(ctx context.Context, tx *resourceTxn, request Req
 		}
 	}
 	exactErr := firstError(principalErr, discoveryErr, prErr, headErr, baseErr, identityErr)
+	if exactErr == nil && principalMismatch {
+		exactErr = errors.New("reconciliation principal differs from authority")
+	}
 	var snapshot githublifecycle.PullRequestSnapshot
 	if exactErr == nil {
 		snapshot, exactErr = validateExactPR(postAuthority, pr, head, base, c.github.limits)
@@ -744,7 +810,7 @@ func (c *Controller) reconcile(ctx context.Context, tx *resourceTxn, request Req
 			exactClass = "DIVERGED_WRITE_RESULT_VALIDATION"
 		}
 	}
-	if exactErr != nil && discoveryErr == nil && prErr == nil && headErr == nil && baseErr == nil {
+	if exactErr != nil && principalErr == nil && discoveryErr == nil && prErr == nil && headErr == nil && baseErr == nil {
 		if exactClass == "" {
 			exactClass = "DIVERGED_EXACT_POSTFLIGHT"
 		}
@@ -755,7 +821,10 @@ func (c *Controller) reconcile(ctx context.Context, tx *resourceTxn, request Req
 		outcome = boundedError(exactErr)
 	}
 	observation := reconciliationObservationV1{SchemaVersion, round, startSHA, outcome, principal, candidate, pr, head, base, c.now().UTC().UnixNano()}
-	observationBytes, _ := json.Marshal(observation)
+	observationBytes, marshalErr := json.Marshal(observation)
+	if marshalErr != nil {
+		return PRLifecycleResultV1{}, marshalErr
+	}
 	if err := c.checkReconciliationAggregate(tx, revision.Ordinal, int64(len(observationBytes))); err != nil {
 		return PRLifecycleResultV1{}, err
 	}
@@ -768,8 +837,8 @@ func (c *Controller) reconcile(ctx context.Context, tx *resourceTxn, request Req
 		return PRLifecycleResultV1{}, &Error{Submitted: true, Attempt: generation.WriteID, Cause: err}
 	}
 	refs = append(refs, postRef)
-	if discoveryErr != nil || prErr != nil || headErr != nil || baseErr != nil {
-		return PRLifecycleResultV1{}, &Error{Code: CodeAmbiguousUnresolved, Submitted: true, Attempt: generation.WriteID, Cause: errors.New(boundedError(firstError(discoveryErr, prErr, headErr, baseErr)))}
+	if principalErr != nil || discoveryErr != nil || prErr != nil || headErr != nil || baseErr != nil {
+		return PRLifecycleResultV1{}, &Error{Code: CodeAmbiguousUnresolved, Submitted: true, Attempt: generation.WriteID, Cause: errors.New(boundedError(firstError(principalErr, discoveryErr, prErr, headErr, baseErr)))}
 	}
 	disposition := AppliedConfirmed
 	if writeErr != nil {

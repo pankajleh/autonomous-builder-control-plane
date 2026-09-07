@@ -23,11 +23,18 @@ const (
 )
 
 type GitHubAdapter struct {
-	client *http.Client
-	origin string
-	limits githublifecycle.Limits
-	now    func() time.Time
+	client                *http.Client
+	origin                string
+	limits                githublifecycle.Limits
+	now                   func() time.Time
+	writeConstructionHook func() error
+	principalObserveHook  func(*RemotePrincipalObservation)
 }
+
+type neverSubmittedError struct{ cause error }
+
+func (e *neverSubmittedError) Error() string { return "GitHub request was not submitted" }
+func (e *neverSubmittedError) Unwrap() error { return e.cause }
 
 // GitHubRequestAuthenticator applies credentials to a cloned outbound request.
 // Network I/O remains sealed behind the controller-owned capped transport.
@@ -47,10 +54,10 @@ func (t *authenticatedGitHubTransport) RoundTrip(request *http.Request) (*http.R
 	contentLength := clone.ContentLength
 	originalHeaders := clone.Header.Clone()
 	if err := t.authenticator.AuthenticateGitHubRequest(clone); err != nil {
-		return nil, errors.New("GitHub request authentication failed")
+		return nil, &neverSubmittedError{cause: errors.New("GitHub request authentication failed")}
 	}
 	if clone.Method != method || clone.URL.String() != endpoint || clone.Host != host || clone.ContentLength != contentLength || !headersDifferOnlyByAuthorization(originalHeaders, clone.Header) {
-		return nil, errors.New("GitHub authenticator modified sealed request identity")
+		return nil, &neverSubmittedError{cause: errors.New("GitHub authenticator modified sealed request identity")}
 	}
 	return t.base.RoundTrip(clone)
 }
@@ -144,7 +151,11 @@ func (a *GitHubAdapter) principal(ctx context.Context) (RemotePrincipalObservati
 		return RemotePrincipalObservation{}, errors.New("invalid authenticated-principal response")
 	}
 	limitsSHA, _ := a.limits.SHA256()
-	return RemotePrincipalObservation{id, wire.ID, wire.NodeID, wire.Login, requestID, a.now().UTC().UnixNano(), limitsSHA}, nil
+	observation := RemotePrincipalObservation{id, wire.ID, wire.NodeID, wire.Login, requestID, a.now().UTC().UnixNano(), limitsSHA}
+	if a.principalObserveHook != nil {
+		a.principalObserveHook(&observation)
+	}
+	return observation, nil
 }
 
 func (a *GitHubAdapter) ref(ctx context.Context, repository githublifecycle.Repository, branch githublifecycle.Branch) (RemoteRefObservation, error) {
@@ -296,7 +307,20 @@ func lifecycleRemoteTextLimit(limits githublifecycle.Limits) int {
 	return maxLifecycleRemoteText
 }
 
-func (a *GitHubAdapter) write(ctx context.Context, repository githublifecycle.Repository, prNumber int64, title, body string, base, head githublifecycle.Branch) (RemotePRObservation, error) {
+type preparedGitHubWrite struct {
+	request    *http.Request
+	cancel     context.CancelFunc
+	identity   HTTPRequestIdentity
+	expected   int
+	repository githublifecycle.Repository
+}
+
+func (a *GitHubAdapter) prepareWrite(ctx context.Context, repository githublifecycle.Repository, prNumber int64, title, body string, base, head githublifecycle.Branch) (*preparedGitHubWrite, error) {
+	if a.writeConstructionHook != nil {
+		if err := a.writeConstructionHook(); err != nil {
+			return nil, errors.New("canonical PR request construction failed")
+		}
+	}
 	method, template, escaped, success := http.MethodPost, "/repos/{owner}/{repo}/pulls", "/repos/"+url.PathEscape(repository.Owner())+"/"+url.PathEscape(repository.Name())+"/pulls", http.StatusCreated
 	var payload any = struct {
 		Title string `json:"title"`
@@ -313,17 +337,42 @@ func (a *GitHubAdapter) write(ctx context.Context, repository githublifecycle.Re
 	}
 	b, err := json.Marshal(payload)
 	if err != nil || len(b) > MaxRequestBytes {
-		return RemotePRObservation{}, errors.New("canonical PR request exceeds request cap")
+		return nil, errors.New("canonical PR request exceeds request cap")
 	}
-	id, response, requestID, err := a.request(ctx, method, template, escaped, nil, b, success, true)
+	id, request, cancel, err := a.buildRequest(ctx, method, template, escaped, nil, b, success)
+	if err != nil {
+		return nil, errors.New("canonical PR HTTP request construction failed")
+	}
+	return &preparedGitHubWrite{request: request, cancel: cancel, identity: id, expected: success, repository: repository}, nil
+}
+
+func (a *GitHubAdapter) executeWrite(write *preparedGitHubWrite) (RemotePRObservation, error) {
+	if write == nil || write.request == nil || write.cancel == nil {
+		return RemotePRObservation{}, &neverSubmittedError{cause: errors.New("prepared GitHub write is incomplete")}
+	}
+	defer write.cancel()
+	if err := write.request.Context().Err(); err != nil {
+		return RemotePRObservation{}, &neverSubmittedError{cause: errors.New("prepared GitHub write expired before submission")}
+	}
+	response, requestID, _, err := a.doRequest(write.request, write.identity, write.expected, true)
 	if err != nil {
 		return RemotePRObservation{}, err
 	}
-	observed, err := a.decodePR(id, response, requestID, repository)
+	observed, err := a.decodePR(write.identity, response, requestID, write.repository)
 	if err != nil {
-		return RemotePRObservation{}, &Error{Submitted: true, Cause: err}
+		return RemotePRObservation{}, &Error{Code: CodeRemoteWriteFailed, Submitted: true, Cause: errors.New("invalid bounded GitHub write response")}
 	}
 	return observed, nil
+}
+
+// write remains a package-private adapter test convenience. Controller code
+// uses prepareWrite before publishing submitted authority, then executeWrite.
+func (a *GitHubAdapter) write(ctx context.Context, repository githublifecycle.Repository, prNumber int64, title, body string, base, head githublifecycle.Branch) (RemotePRObservation, error) {
+	write, err := a.prepareWrite(ctx, repository, prNumber, title, body, base, head)
+	if err != nil {
+		return RemotePRObservation{}, err
+	}
+	return a.executeWrite(write)
 }
 
 func (a *GitHubAdapter) request(ctx context.Context, method, template, escaped string, query url.Values, body []byte, expected int, write bool) (HTTPRequestIdentity, []byte, string, error) {
@@ -332,8 +381,18 @@ func (a *GitHubAdapter) request(ctx context.Context, method, template, escaped s
 }
 
 func (a *GitHubAdapter) requestHeaders(ctx context.Context, method, template, escaped string, query url.Values, body []byte, expected int, write bool) (HTTPRequestIdentity, []byte, string, http.Header, error) {
+	id, req, cancel, err := a.buildRequest(ctx, method, template, escaped, query, body, expected)
+	if err != nil {
+		return id, nil, "", nil, err
+	}
+	defer cancel()
+	data, requestID, headers, err := a.doRequest(req, id, expected, write)
+	return id, data, requestID, headers, err
+}
+
+func (a *GitHubAdapter) buildRequest(ctx context.Context, method, template, escaped string, query url.Values, body []byte, expected int) (HTTPRequestIdentity, *http.Request, context.CancelFunc, error) {
 	if ctx == nil {
-		return HTTPRequestIdentity{}, nil, "", nil, errors.New("context is required")
+		return HTTPRequestIdentity{}, nil, nil, errors.New("context is required")
 	}
 	queryString := ""
 	if query != nil {
@@ -348,33 +407,41 @@ func (a *GitHubAdapter) requestHeaders(ctx context.Context, method, template, es
 		id.RequestBodySHA256 = digestBytes(body)
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, a.limits.CallTimeout)
-	defer cancel()
 	endpoint := a.origin + escaped
 	if queryString != "" {
 		endpoint += "?" + queryString
 	}
 	req, err := http.NewRequestWithContext(requestCtx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return id, nil, "", nil, err
+		cancel()
+		return id, nil, nil, err
 	}
 	req.Header.Set("Accept", githubAccept)
 	req.Header.Set("X-GitHub-Api-Version", githubAPIVer)
 	if body != nil {
 		req.Header.Set("Content-Type", contentType)
 	}
+	return id, req, cancel, nil
+}
+
+func (a *GitHubAdapter) doRequest(req *http.Request, id HTTPRequestIdentity, expected int, write bool) ([]byte, string, http.Header, error) {
 	response, err := a.client.Do(req)
 	if err != nil {
 		if write {
-			return id, nil, "", nil, &Error{Code: CodeRemoteWriteFailed, Submitted: true, Cause: errors.New("authenticated GitHub write transport failed")}
+			var never *neverSubmittedError
+			if errors.As(err, &never) {
+				return nil, "", nil, never
+			}
+			return nil, "", nil, &Error{Code: CodeRemoteWriteFailed, Submitted: true, Cause: errors.New("authenticated GitHub write transport failed")}
 		}
-		return id, nil, "", nil, &Error{Code: CodeRemoteReadFailed, Cause: errors.New("authenticated GitHub read transport failed")}
+		return nil, "", nil, &Error{Code: CodeRemoteReadFailed, Cause: errors.New("authenticated GitHub read transport failed")}
 	}
 	defer response.Body.Close()
 	if err := boundHeaders(response.Header); err != nil {
 		if write {
-			return id, nil, "", nil, &Error{Submitted: true, Cause: err}
+			return nil, "", nil, &Error{Code: CodeRemoteWriteFailed, Submitted: true, Cause: errors.New("bounded GitHub write headers are invalid")}
 		}
-		return id, nil, "", nil, err
+		return nil, "", nil, err
 	}
 	requestID := response.Header.Get("X-GitHub-Request-Id")
 	if len(requestID) > MaxRequestIDBytes || !validRemoteText(requestID, MaxRequestIDBytes, true) {
@@ -386,18 +453,18 @@ func (a *GitHubAdapter) requestHeaders(ctx context.Context, method, template, es
 			err = errors.New("GitHub response exceeds body cap")
 		}
 		if write {
-			return id, nil, requestID, response.Header.Clone(), &Error{Code: CodeRemoteWriteFailed, Submitted: true, Cause: errors.New("bounded GitHub write response could not be read")}
+			return nil, requestID, response.Header.Clone(), &Error{Code: CodeRemoteWriteFailed, Submitted: true, Cause: errors.New("bounded GitHub write response could not be read")}
 		}
-		return id, nil, requestID, response.Header.Clone(), &Error{Code: CodeRemoteReadFailed, Cause: errors.New("bounded GitHub read response could not be read")}
+		return nil, requestID, response.Header.Clone(), &Error{Code: CodeRemoteReadFailed, Cause: errors.New("bounded GitHub read response could not be read")}
 	}
 	if response.StatusCode != expected {
 		err = fmt.Errorf("unexpected GitHub status %d", response.StatusCode)
 		if write {
-			return id, nil, requestID, response.Header.Clone(), &Error{Submitted: true, Cause: err}
+			return nil, requestID, response.Header.Clone(), &Error{Code: CodeRemoteWriteFailed, Submitted: true, Cause: errors.New("unexpected bounded GitHub write status")}
 		}
-		return id, nil, requestID, response.Header.Clone(), err
+		return nil, requestID, response.Header.Clone(), err
 	}
-	return id, data, requestID, response.Header.Clone(), nil
+	return data, requestID, response.Header.Clone(), nil
 }
 
 func strictJSON(data []byte, target any) error {

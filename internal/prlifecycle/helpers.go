@@ -168,19 +168,43 @@ func boundedError(err error) string {
 }
 
 func NewTerminalBudget(authority, attempt []byte, title, body string) (TerminalBudgetV1, error) {
-	if len(authority) == 0 || len(authority) > 16<<10 || len(attempt) == 0 || len(attempt) > 8<<10 || validateDocument(title, body, githublifecycle.DefaultLimits().MaxTextBytes) != nil {
+	if len(authority) == 0 || len(authority) > 16<<10 || len(attempt) == 0 || len(attempt) > 8<<10 || validateDocument(title, body, PRLifecycleDocumentMaxBytes) != nil {
 		return TerminalBudgetV1{}, errors.New("terminal input exceeds an individual wire cap")
 	}
-	// Complete pre-submit bound: source+derived authority, attempt, desired
-	// document, primitive PR/principal/ref observations, optional snapshot,
-	// reconciliation wire, one self-contained normalized evidence artifact,
-	// result/reason/event material, digests and JSON framing. Lifecycle remote
-	// text is independently capped at 1 KiB, making the observation envelope
-	// at most 32 KiB.
-	worst := 2*len(authority) + len(attempt) + len(title) + len(body) +
-		3*MaxTerminalArtifactBytes + MaxTerminalSnapshotBytes + (48 << 10)
+	document, err := json.Marshal(struct {
+		Title string `json:"title"`
+		Body  string `json:"body"`
+	}{title, body})
+	if err != nil {
+		return TerminalBudgetV1{}, errors.New("terminal document cannot be canonically encoded")
+	}
+	// Each variable persisted component is independently capped before
+	// terminal construction. The PR, reconciliation, and retained artifact
+	// caps each include their own possible normalized document copy. The exact
+	// canonical document term accounts for terminalCoreV1.Title/Body, including
+	// encoding/json's worst-case HTML escaping. The final fixed allowance covers
+	// deterministic reason/digests, evidence-ref metadata, event, and JSON
+	// framing; it contains no unbounded caller/provider material.
+	const (
+		authorityCap = 16 << 10
+		attemptCap   = 8 << 10
+		principalCap = 8 << 10
+		prCap        = 32 << 10
+		refsCap      = 16 << 10
+		reconcileCap = 32 << 10
+		resultCap    = 16 << 10
+		framingCap   = 24 << 10
+	)
+	worst := 2*authorityCap + attemptCap + MaxTerminalSnapshotBytes + principalCap + prCap + refsCap + reconcileCap + MaxTerminalArtifactBytes + resultCap + len(document) + framingCap
 	if worst > MaxTerminalBytes {
 		return TerminalBudgetV1{}, errors.New("terminal worst-case profile exceeds terminal cap")
 	}
-	return TerminalBudgetV1{len(authority), len(attempt), len(title) + len(body), worst}, nil
+	return TerminalBudgetV1{
+		AuthorityBytes: len(authority), AttemptBytes: len(attempt), DocumentBytes: len(document),
+		SourceAuthorityCap: authorityCap, DerivedAuthorityCap: authorityCap, AttemptCap: attemptCap,
+		SnapshotCap: MaxTerminalSnapshotBytes, PrincipalObservationCap: principalCap,
+		PullRequestObservationCap: prCap, RefObservationsCap: refsCap, ReconciliationCap: reconcileCap,
+		TerminalArtifactCap: MaxTerminalArtifactBytes, ResultCoreCap: resultCap,
+		FramingAndEventCap: framingCap, WorstCaseBytes: worst,
+	}, nil
 }

@@ -20,6 +20,11 @@ import (
 
 func (c *Controller) terminalize(tx *resourceTxn, request Request, revision revisionRecord, authority githublifecycle.Authority, input githublifecycle.UpsertPullRequestInput, generation generationRecord, genSHA, markerSHA string, principal RemotePrincipalObservation, pr RemotePRObservation, head, base RemoteRefObservation, snapshot githublifecycle.PullRequestSnapshot, disposition Disposition, reconciliation json.RawMessage, refs []ledger.EvidenceRef, dispositionErr error) (PRLifecycleResultV1, error) {
 	var zero PRLifecycleResultV1
+	if c.postSubmitFailure != nil {
+		if err := c.postSubmitFailure("terminal"); err != nil {
+			return zero, err
+		}
+	}
 	var snapshotBytes []byte
 	snapshotSHA := ""
 	if disposition == AppliedConfirmed || disposition == AppliedReconciled {
@@ -33,33 +38,44 @@ func (c *Controller) terminalize(tx *resourceTxn, request Request, revision revi
 	}
 	prSHA, err := observationDigest(pr, 32<<10)
 	if err != nil {
-		return zero, err
+		return zero, submittedControllerError(err, generation.WriteID)
 	}
 	headSHA, err := observationDigest(head, 8<<10)
 	if err != nil {
-		return zero, err
+		return zero, submittedControllerError(err, generation.WriteID)
 	}
 	baseSHA, err := observationDigest(base, 8<<10)
 	if err != nil {
-		return zero, err
+		return zero, submittedControllerError(err, generation.WriteID)
+	}
+	if _, err := observationDigest(principal, 8<<10); err != nil {
+		return zero, submittedControllerError(err, generation.WriteID)
 	}
 	reconciliationSHA := ""
 	if len(reconciliation) > 0 {
 		if len(reconciliation) > 32<<10 || !json.Valid(reconciliation) {
-			return zero, errors.New("invalid reconciliation terminal material")
+			return zero, submittedControllerError(errors.New("invalid reconciliation terminal material"), generation.WriteID)
 		}
 		reconciliationSHA = digestBytes(reconciliation)
+	}
+	authorityPrincipalID, err := trackActorID(authority.Actor())
+	if err != nil {
+		return zero, submittedControllerError(err, generation.WriteID)
+	}
+	principalNodeID, principalLogin := "", ""
+	if principal.ID == authorityPrincipalID {
+		principalNodeID, principalLogin = principal.NodeID, principal.Login
 	}
 	core := PRLifecycleResultCoreV1{
 		SchemaVersion: SchemaVersion, Disposition: disposition, ResourceKey: tx.key.String(), Revision: revision.Ordinal, Generation: 1,
 		WriteID: generation.WriteID, Repository: authority.Repository().String(), BaseBranch: authority.BaseBranch().String(), HeadBranch: authority.HeadBranch().String(),
 		HeadSHA: authority.HeadSHA().String(), ExpectedBaseTipSHA: authority.ExpectedBaseTipSHA().String(), PRNumber: pr.Number, PRNodeID: pr.NodeID,
-		DocumentSHA256: revision.DocumentSHA256, PrincipalID: principal.ID, PrincipalNodeID: principal.NodeID, PrincipalLogin: principal.Login,
+		DocumentSHA256: revision.DocumentSHA256, PrincipalID: authorityPrincipalID, PrincipalNodeID: principalNodeID, PrincipalLogin: principalLogin,
 		SnapshotSHA256: snapshotSHA, PRObservationSHA: prSHA, HeadObservationSHA: headSHA, BaseObservationSHA: baseSHA, ReconciliationSHA: reconciliationSHA,
 	}
 	coreBytes, err := core.CanonicalJSON()
 	if err != nil || len(coreBytes) > 16<<10 {
-		return zero, firstError(err, errors.New("result core exceeds terminal profile"))
+		return zero, submittedControllerError(firstError(err, errors.New("result core exceeds terminal profile")), generation.WriteID)
 	}
 	coreSHA := digestBytes(coreBytes)
 	writeAuthority := input.Authority()
@@ -72,9 +88,14 @@ func (c *Controller) terminalize(tx *resourceTxn, request Request, revision revi
 	if len(terminalRefs) > 1 {
 		terminalRefs = terminalRefs[len(terminalRefs)-1:]
 	}
+	if c.postSubmitFailure != nil {
+		if err := c.postSubmitFailure("evidence"); err != nil {
+			return zero, err
+		}
+	}
 	artifacts, err := captureArtifacts(c.artifacts, terminalRefs)
 	if err != nil {
-		return zero, err
+		return zero, submittedControllerError(err, generation.WriteID)
 	}
 	policySHA, _ := c.store.policy.SHA256()
 	limitsSHA, _ := c.github.limits.SHA256()
@@ -101,28 +122,39 @@ func (c *Controller) terminalize(tx *resourceTxn, request Request, revision revi
 	}
 	terminalCoreBytes, err := json.Marshal(terminalCore)
 	if err != nil {
-		return zero, err
+		return zero, submittedControllerError(err, generation.WriteID)
 	}
 	terminalCoreSHA := digestBytes(terminalCoreBytes)
 	event, eventBytes, err := deterministicTerminalEvent(terminalCore)
 	if err != nil {
-		return zero, err
+		return zero, submittedControllerError(err, generation.WriteID)
 	}
 	terminal := terminalV1{terminalCore, terminalCoreSHA, eventBytes, digestBytes(eventBytes)}
 	terminalBytes, err := json.Marshal(terminal)
-	if err != nil || len(terminalBytes) > MaxTerminalBytes {
+	budget, budgetErr := NewTerminalBudget(authorityBytes, attemptBytes, revision.Title, revision.Body)
+	if err != nil || budgetErr != nil || len(terminalBytes) > budget.WorstCaseBytes || len(terminalBytes) > MaxTerminalBytes {
 		return zero, &Error{Code: CodeIntegrityFailure, Submitted: true, Attempt: generation.WriteID, Cause: errors.New("final terminal exceeds 256-KiB cap")}
 	}
 	terminalName := recordPrefix(tx.key, revision.Ordinal) + "terminal.json"
+	if c.postSubmitFailure != nil {
+		if err := c.postSubmitFailure("admission"); err != nil {
+			return zero, err
+		}
+	}
 	stored, terminalSHA, err := tx.create(terminalName, terminalBytes, false, true)
 	if err != nil {
-		return zero, err
+		return zero, submittedControllerError(err, generation.WriteID)
 	}
 	if !bytes.Equal(stored, terminalBytes) {
-		return zero, errors.New(CodeIntegrityFailure)
+		return zero, submittedControllerError(errors.New(CodeIntegrityFailure), generation.WriteID)
+	}
+	if c.postSubmitFailure != nil {
+		if err := c.postSubmitFailure("ledger"); err != nil {
+			return zero, err
+		}
 	}
 	if err := c.ledger.Record(event, eventBytes); err != nil {
-		return zero, err
+		return zero, submittedControllerError(err, generation.WriteID)
 	}
 	return PRLifecycleResultV1{core: core, terminalSHA: terminalSHA, evidenceRefs: append([]ledger.EvidenceRef(nil), terminalRefs...)}, nil
 }
@@ -223,9 +255,16 @@ func (c *Controller) recoverTerminal(tx *resourceTxn, name, runID string) (PRLif
 	} else if len(terminal.Core.Snapshot) == 0 || digestBytes(terminal.Core.Snapshot) != terminal.Core.SnapshotSHA256 {
 		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("successful terminal snapshot digest mismatch")}
 	}
+	authorityPrincipalID, principalIDErr := strconv.ParseInt(strings.TrimPrefix(authority.Actor.Subject, "github-user-id:"), 10, 64)
+	principalBindingValid := principalIDErr == nil && authorityPrincipalID == terminal.Core.ResultCore.PrincipalID
+	if terminal.Core.Principal.ID == authorityPrincipalID {
+		principalBindingValid = principalBindingValid && terminal.Core.ResultCore.PrincipalNodeID == terminal.Core.Principal.NodeID && terminal.Core.ResultCore.PrincipalLogin == terminal.Core.Principal.Login
+	} else {
+		principalBindingValid = principalBindingValid && terminal.Core.ResultCore.Disposition == RemoteDivergedAfterWrite && terminal.Core.ResultCore.PrincipalNodeID == "" && terminal.Core.ResultCore.PrincipalLogin == ""
+	}
 	if terminal.Core.ResultCore.ResourceKey != terminal.Core.ResourceKey || terminal.Core.ResultCore.Revision != terminal.Core.Revision || terminal.Core.ResultCore.Generation != terminal.Core.Generation ||
 		terminal.Core.ResultCore.DocumentSHA256 != terminal.Core.DocumentSHA256 || terminal.Core.ResultCore.PRNumber != terminal.Core.PullRequest.Number || terminal.Core.ResultCore.PRNodeID != terminal.Core.PullRequest.NodeID ||
-		terminal.Core.ResultCore.PrincipalID != terminal.Core.Principal.ID || terminal.Core.ResultCore.PrincipalNodeID != terminal.Core.Principal.NodeID || terminal.Core.ResultCore.PrincipalLogin != terminal.Core.Principal.Login {
+		!principalBindingValid {
 		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("terminal primitive result bindings mismatch")}
 	}
 	if len(terminal.Core.Reconciliation) == 0 && terminal.Core.ResultCore.ReconciliationSHA != "" || len(terminal.Core.Reconciliation) > 0 && digestBytes(terminal.Core.Reconciliation) != terminal.Core.ResultCore.ReconciliationSHA {
@@ -503,6 +542,89 @@ func nextLegacyRound(store *PRWriteAdmissionStore, key PRResourceKeyV1, revision
 		return 0
 	}
 	return latest + 1
+}
+
+func prepareRecordName(key PRResourceKeyV1, revision uint64, runSHA string, round int) string {
+	return recordPrefix(key, revision) + "prepare-run-" + runSHA + "-" + strconv.Itoa(round) + ".json"
+}
+
+func nextPrepareRound(tx *resourceTxn, runID string, revision uint64, maximum int) (int, error) {
+	if tx == nil || runID == "" || maximum <= 0 || maximum > 3 {
+		return 0, &Error{Code: CodeIntegrityFailure, Cause: errors.New("invalid prepare-round request")}
+	}
+	entries, err := tx.store.readDir()
+	if err != nil {
+		return 0, &Error{Code: CodeIntegrityFailure, Cause: errors.New("prepare history inventory failed")}
+	}
+	prefix := recordPrefix(tx.key, revision) + "prepare-run-"
+	type runRounds map[int]bool
+	runs := make(map[string]runRounds)
+	total := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		match := admissionName.FindStringSubmatch(name)
+		if match == nil || match[1] != tx.key.String() || match[2] != strconv.FormatUint(revision, 10) {
+			return 0, &Error{Code: CodeIntegrityFailure, Cause: errors.New("malformed prepare history name")}
+		}
+		rest := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".json")
+		separator := strings.LastIndexByte(rest, '-')
+		if separator != 64 || len(rest) != 66 {
+			return 0, &Error{Code: CodeIntegrityFailure, Cause: errors.New("malformed prepare history grammar")}
+		}
+		runSHA := rest[:separator]
+		round, parseErr := strconv.Atoi(rest[separator+1:])
+		if !validDigest(runSHA) || parseErr != nil || round < 1 || round > maximum {
+			return 0, &Error{Code: CodeIntegrityFailure, Cause: errors.New("malformed prepare history identity")}
+		}
+		data, readErr := tx.read(name, MaxPrepareRecordBytes)
+		var record prepareRecordV1
+		if readErr != nil || strictJSON(data, &record) != nil {
+			return 0, &Error{Code: CodeIntegrityFailure, Cause: errors.New("prepare history record is unreadable")}
+		}
+		canonical, marshalErr := json.Marshal(record)
+		if marshalErr != nil || !bytes.Equal(canonical, data) || record.SchemaVersion != SchemaVersion || record.RunID == "" || record.RunSHA256 != runSHA || digestBytes([]byte(record.RunID)) != runSHA || record.ResourceKey != tx.key.String() || record.Revision != revision || record.Round != round || record.Outcome == "" || record.Outcome == "prepared" && (len(record.Proof) == 0 || !json.Valid(record.Proof)) || record.Outcome != "prepared" && len(record.Proof) != 0 {
+			return 0, &Error{Code: CodeIntegrityFailure, Cause: errors.New("prepare history record binding differs")}
+		}
+		if runs[runSHA] == nil {
+			runs[runSHA] = make(runRounds)
+		}
+		if runs[runSHA][round] {
+			return 0, &Error{Code: CodeIntegrityFailure, Cause: errors.New("duplicate prepare history round")}
+		}
+		runs[runSHA][round] = true
+		total++
+	}
+	for _, rounds := range runs {
+		for round := 1; round <= len(rounds); round++ {
+			if !rounds[round] {
+				return 0, &Error{Code: CodeIntegrityFailure, Cause: errors.New("prepare history sequence has a gap")}
+			}
+		}
+	}
+	if total >= MaxPrepareHistoryRecordsPerPendingRevision {
+		return 0, &Error{Code: CodePreflightHistoryExhausted, Cause: errors.New("pending revision prepare history exhausted")}
+	}
+	runSHA := digestBytes([]byte(runID))
+	next := len(runs[runSHA]) + 1
+	if next > maximum {
+		return 0, &Error{Code: CodePreflightBudgetExhausted, Cause: errors.New("governed run prepare rounds exhausted")}
+	}
+	return next, nil
+}
+
+func submittedControllerError(err error, attempt string) error {
+	if err == nil {
+		return nil
+	}
+	code := CodeIntegrityFailure
+	var lifecycle *Error
+	if errors.As(err, &lifecycle) && lifecycle.Code != "" {
+		code = lifecycle.Code
+	}
+	return &Error{Code: code, Submitted: true, Attempt: attempt, Cause: errors.New("post-submit controller operation failed")}
 }
 
 func publishOrVerify(writer ArtifactWriter, name, kind string, data []byte) (ledger.EvidenceRef, error) {

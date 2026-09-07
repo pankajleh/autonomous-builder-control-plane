@@ -78,37 +78,37 @@ The pre-submit terminal reservation must conservatively upper-bound the actual c
 
 ## Required adversarial regression matrix
 
-- [ ] Title/body at exactly 1024 bytes each round-trip through CREATE and UPDATE; 1025 bytes in either field is rejected before generation/marker creation and before any HTTP call.
-- [ ] Structural regression proves PR-lifecycle admitted document bound `<= lifecycleRemoteTextLimit` and escape-maximal admitted request bytes `<= MaxRequestBytes`.
-- [ ] Pre-submit request-construction failure leaves no submitted marker and cannot select `applied_reconciled`.
-- [ ] Principal read 5xx/403/malformed response after a submitted write consumes one reconciliation round, returns ambiguous, writes no divergence terminal, and allows later bounded reconciliation.
-- [ ] Observed principal-ID mismatch creates a durable divergence terminal that recovers on a later governed run with zero GitHub writes.
-- [ ] Every injected post-`Do` terminal/evidence/admission/ledger failure returns a controller-owned `*Error` with `Submitted=true`, non-empty attempt identity, **non-empty controller-owned `Code`**, and no raw provider text.
-- [ ] Previous `applied_confirmed` PR closed before a later revision causes zero-write fail-closed behavior; no replacement CREATE is submitted.
-- [ ] Previous confirmed PR direct-read node-ID/repository/ref/document mismatch fails closed before mutation.
-- [ ] Three prepare failures exhaust run A only; run B gets a fresh three-round budget when no submitted generation exists.
-- [ ] Prepare filenames contain only the fixed run SHA-256; hostile/long RunID values cannot alter grammar, escape the root, or create unknown inventory entries, and raw RunID is bound inside the record.
-- [ ] Restart of run A does not reset its prepare-round budget; malformed prepare history fails closed rather than resetting to round 1.
-- [ ] After 24 prepare records for one resource + pending revision ordinal, the next run returns `PREFLIGHT_HISTORY_EXHAUSTED` without creating a file; an unrelated resource can still create records under the same global policy.
-- [ ] After a successful revision, the next revision ordinal receives an independent bounded prepare-history allowance while prior records remain immutable.
-- [ ] Escape-maximal title/body at the 1024-byte admitted bound plus maximal principal/PR/ref/reconciliation/artifact material prove canonical terminal bytes `<= WorstCaseBytes <= 256 KiB`; 1025-byte title/body are rejected pre-submit.
-- [ ] Principal observation above its configured bound is rejected before terminal publication with submitted provenance preserved when post-write.
-- [ ] Existing one-submission/no-replay, descriptor locking, two-phase reconciliation, divergence, cross-run recovery, evidence-reader, sealed-transport, CREATE identity, sanitization, capacity, material-ledger, and unsupported-platform regressions remain green.
+- [x] Title/body at exactly 1024 bytes each round-trip through CREATE and UPDATE; 1025 bytes in either field is rejected before generation/marker creation and before any HTTP call.
+- [x] Structural regression proves PR-lifecycle admitted document bound `<= lifecycleRemoteTextLimit` and escape-maximal admitted request bytes `<= MaxRequestBytes`.
+- [x] Pre-submit request-construction failure leaves no submitted marker and cannot select `applied_reconciled`.
+- [x] Principal read 5xx/403/malformed response after a submitted write consumes one reconciliation round, returns ambiguous, writes no divergence terminal, and allows later bounded reconciliation.
+- [x] Observed principal-ID mismatch creates a durable divergence terminal that recovers on a later governed run with zero GitHub writes.
+- [x] Every injected post-`Do` terminal/evidence/admission/ledger failure returns a controller-owned `*Error` with `Submitted=true`, non-empty attempt identity, **non-empty controller-owned `Code`**, and no raw provider text.
+- [x] Previous `applied_confirmed` PR closed before a later revision causes zero-write fail-closed behavior; no replacement CREATE is submitted.
+- [x] Previous confirmed PR direct-read node-ID/repository/ref/document mismatch fails closed before mutation.
+- [x] Three prepare failures exhaust run A only; run B gets a fresh three-round budget when no submitted generation exists.
+- [x] Prepare filenames contain only the fixed run SHA-256; hostile/long RunID values cannot alter grammar, escape the root, or create unknown inventory entries, and raw RunID is bound inside the record.
+- [x] Restart of run A does not reset its prepare-round budget; malformed prepare history fails closed rather than resetting to round 1.
+- [x] After 24 prepare records for one resource + pending revision ordinal, the next run returns `PREFLIGHT_HISTORY_EXHAUSTED` without creating a file; an unrelated resource can still create records under the same global policy.
+- [x] After a successful revision, the next revision ordinal receives an independent bounded prepare-history allowance while prior records remain immutable.
+- [x] Escape-maximal title/body at the 1024-byte admitted bound plus maximal principal/PR/ref/reconciliation/artifact material prove canonical terminal bytes `<= WorstCaseBytes <= 256 KiB`; 1025-byte title/body are rejected pre-submit.
+- [x] Principal observation above its configured bound is rejected before terminal publication with submitted provenance preserved when post-write.
+- [x] Existing one-submission/no-replay, descriptor locking, two-phase reconciliation, divergence, cross-run recovery, evidence-reader, sealed-transport, CREATE identity, sanitization, capacity, material-ledger, and unsupported-platform regressions remain green.
 
 ### Task 1: Correct the second exact-head PR lifecycle review findings
 
-- [ ] Implement only the six correction invariants above without changing frozen `internal/githublifecycle` semantics unless a regression proves an unavoidable foundation defect.
-- [ ] Add every adversarial regression above.
-- [ ] Preserve exactly one remote PR submission per revision and all existing fail-closed barriers.
-- [ ] Update completed lifecycle documentation only additively where corrected semantics require it; preserve prior review history.
-- [ ] Run `gofmt -w` on changed Go files.
-- [ ] Run focused `go test ./internal/prlifecycle`.
-- [ ] Run `go test ./...`.
-- [ ] Run `go test -race ./...`.
-- [ ] Run `go vet ./...`.
-- [ ] Run `make smoke`.
-- [ ] Run `git diff --check d4e7e1d8fc6af9545f9f67e3c99fa94c3420a7ce HEAD`.
-- [ ] Commit only after every required validation passes.
+- [x] Implement only the six correction invariants above without changing frozen `internal/githublifecycle` semantics unless a regression proves an unavoidable foundation defect.
+- [x] Add every adversarial regression above.
+- [x] Preserve exactly one remote PR submission per revision and all existing fail-closed barriers.
+- [x] Update completed lifecycle documentation only additively where corrected semantics require it; preserve prior review history.
+- [x] Run `gofmt -w` on changed Go files.
+- [x] Run focused `go test ./internal/prlifecycle`.
+- [x] Run `go test ./...`.
+- [x] Run `go test -race ./...`.
+- [x] Run `go vet ./...`.
+- [x] Run `make smoke`.
+- [x] Run `git diff --check d4e7e1d8fc6af9545f9f67e3c99fa94c3420a7ce HEAD`.
+- [x] Commit only after every required validation passes.
 
 ## Completion gate
 
