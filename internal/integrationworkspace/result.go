@@ -69,6 +69,23 @@ type CleanupEvidence struct {
 	WorkspaceRemoved bool `json:"workspace_removed"`
 }
 
+// MaterializedTarget is a controller-owned reproduction of a clean Result.
+// Its repository path is valid only for the duration of the callback passed to
+// Controller.UseMaterialized.
+type MaterializedTarget struct {
+	RepositoryPath string
+	Branch         string
+	HeadSHA        string
+	Evidence       []ledger.EvidenceRef
+}
+
+// MaterializationEvidence contains the immutable reproduction and cleanup
+// receipts. It deliberately does not expose the disposable repository path.
+type MaterializationEvidence struct {
+	CaptureRef ledger.EvidenceRef
+	CleanupRef ledger.EvidenceRef
+}
+
 // operationalCleanupEvidence is intentionally confined to the non-canonical
 // cleanup receipt that is published after the exact workspace is removed.
 type operationalCleanupEvidence struct {

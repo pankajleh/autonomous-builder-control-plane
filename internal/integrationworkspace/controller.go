@@ -21,12 +21,14 @@ import (
 )
 
 const (
-	resultSchemaVersion   = 2
-	defaultStdoutLimit    = 4 * 1024 * 1024
-	defaultStderrLimit    = 1024 * 1024
-	maximumCandidateCount = 256
-	captureEvidenceKind   = "textual-integration-capture"
-	cleanupEvidenceKind   = "textual-integration-cleanup"
+	resultSchemaVersion            = 2
+	defaultStdoutLimit             = 4 * 1024 * 1024
+	defaultStderrLimit             = 1024 * 1024
+	maximumCandidateCount          = 256
+	captureEvidenceKind            = "textual-integration-capture"
+	cleanupEvidenceKind            = "textual-integration-cleanup"
+	materializeEvidenceKind        = "textual-integration-materialization"
+	materializeCleanupEvidenceKind = "textual-integration-materialization-cleanup"
 )
 
 // ArtifactWriter publishes immutable evidence. evidence.Store implements this
@@ -36,14 +38,221 @@ type ArtifactWriter interface {
 	WriteBytes(name, kind string, data []byte) (ledger.EvidenceRef, error)
 }
 
+// UseMaterialized reproduces an exact clean integration result inside a new
+// controller-owned repository, proves the reproduced head and steps match the
+// bound result, and lends the target only for the duration of use. Cleanup is
+// attempted on every path after workspace creation.
+func (controller *Controller) UseMaterialized(
+	ctx context.Context,
+	request Request,
+	expected Result,
+	evidencePrefix string,
+	use func(MaterializedTarget) error,
+) (MaterializationEvidence, error) {
+	var outcome MaterializationEvidence
+	if ctx == nil {
+		return outcome, errors.New("context is required")
+	}
+	if controller == nil || controller.runner == nil || controller.artifacts == nil || controller.removeAll == nil {
+		return outcome, errors.New("controller is required")
+	}
+	if use == nil {
+		return outcome, errors.New("materialized target callback is required")
+	}
+	if err := validateEvidencePrefix(evidencePrefix); err != nil {
+		return outcome, err
+	}
+	if expected.Status() != StatusClean || !expected.Cleanup().WorkspaceRemoved || len(expected.CanonicalJSON()) == 0 || expected.SHA256() != sha256Hex(expected.CanonicalJSON()) {
+		return outcome, errors.New("complete immutable clean integration result is required")
+	}
+	boundCaptureBytes, err := readExistingEvidence(expected.CaptureRef(), captureEvidenceKind)
+	if err != nil {
+		return outcome, fmt.Errorf("verify bound integration capture: %w", err)
+	}
+	if err := verifyPublishedEvidence(expected.CaptureRef(), captureEvidenceKind, boundCaptureBytes, controller.evidenceRoot, ""); err != nil {
+		return outcome, fmt.Errorf("verify bound integration capture: %w", err)
+	}
+	cleanupBytes, err := readExistingEvidence(expected.CleanupRef(), cleanupEvidenceKind)
+	if err != nil {
+		return outcome, fmt.Errorf("verify bound integration cleanup receipt: %w", err)
+	}
+	if err := verifyPublishedEvidence(expected.CleanupRef(), cleanupEvidenceKind, cleanupBytes, controller.evidenceRoot, ""); err != nil {
+		return outcome, fmt.Errorf("verify bound integration cleanup receipt: %w", err)
+	}
+	candidates, err := validateRiskReport(request.RiskReport, request.BaselineSHA)
+	if err != nil {
+		return outcome, err
+	}
+	if expected.BaselineSHA() != request.BaselineSHA || expected.RiskReportSHA256() != request.RiskReport.SHA256() || !sameCandidates(expected.Candidates(), candidates) {
+		return outcome, errors.New("bound integration result does not match materialization request")
+	}
+	repository := candidates[0].Input().Repository
+	workspace, err := os.MkdirTemp(controller.temporaryRoot, "materialized-")
+	if err != nil {
+		return outcome, fmt.Errorf("create materialized workspace: %w", err)
+	}
+	if err := validateCreatedWorkspace(controller.temporaryRoot, workspace); err != nil {
+		_ = os.Remove(workspace)
+		return outcome, err
+	}
+	cleaned := false
+	defer func() {
+		if !cleaned {
+			_ = controller.cleanupWorkspace(workspace)
+		}
+	}()
+
+	record := resultRecord{SchemaVersion: resultSchemaVersion, Status: StatusUnavailable, BaselineSHA: request.BaselineSHA,
+		RiskReportSHA256: request.RiskReport.SHA256(), RiskClass: request.RiskReport.Class(), Candidates: cloneCandidates(candidates)}
+	run := func(directory string, arguments ...string) (gitResult, error) {
+		result, runErr := controller.runner.Run(ctx, directory, append([]string{noReplaceObjectsOption}, arguments...)...)
+		record.Commands = append(record.Commands, commandEvidence(result))
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
+		if result.StdoutTruncated || result.StderrTruncated {
+			return result, truncationError(result)
+		}
+		return result, runErr
+	}
+	if err := verifySourceObjects(run, repository, request.BaselineSHA, candidates); err != nil {
+		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, err, &cleaned, &outcome)
+	}
+	if err := controller.integrateWorkspace(run, workspace, repository, request.BaselineSHA, candidates, &record); err != nil {
+		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, err, &cleaned, &outcome)
+	}
+	if record.Status != StatusClean || !sameSteps(record.Steps, expected.Steps()) {
+		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, errors.New("materialized integration does not match bound Track B result"), &cleaned, &outcome)
+	}
+	head, err := exactHead(run, workspace)
+	if err != nil {
+		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, err, &cleaned, &outcome)
+	}
+	expectedSteps := expected.Steps()
+	if len(expectedSteps) == 0 {
+		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, errors.New("bound Track B result has no completed integration steps"), &cleaned, &outcome)
+	}
+	expectedHead := expectedSteps[len(expectedSteps)-1].AfterSHA
+	if head != expectedHead {
+		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, errors.New("materialized head does not match bound Track B result"), &cleaned, &outcome)
+	}
+	branch := "integration"
+	for _, arguments := range [][]string{{"branch", "--force", branch, head}, {"checkout", "--quiet", branch, "--"}} {
+		result, runErr := run(workspace, arguments...)
+		if runErr != nil || result.ExitCode != 0 {
+			return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, fmt.Errorf("prepare materialized target branch: exit %d: %w", result.ExitCode, runErr), &cleaned, &outcome)
+		}
+	}
+	if err := verifyCleanNoMergeState(run, workspace); err != nil {
+		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, err, &cleaned, &outcome)
+	}
+	captureBytes, err := json.Marshal(struct {
+		SchemaVersion           int               `json:"schema_version"`
+		IntegrationResultSHA256 string            `json:"integration_result_sha256"`
+		IntegratedHeadSHA       string            `json:"integrated_head_sha"`
+		RiskReportSHA256        string            `json:"risk_report_sha256"`
+		Commands                []CommandEvidence `json:"commands"`
+	}{resultSchemaVersion, expected.SHA256(), head, request.RiskReport.SHA256(), cloneCommands(record.Commands)})
+	if err != nil {
+		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, err, &cleaned, &outcome)
+	}
+	outcome.CaptureRef, err = controller.artifacts.WriteBytes(evidencePrefix+"-materialization.json", materializeEvidenceKind, captureBytes)
+	if err != nil {
+		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, err, &cleaned, &outcome)
+	}
+	if err := verifyPublishedEvidence(outcome.CaptureRef, materializeEvidenceKind, captureBytes, controller.evidenceRoot, workspace); err != nil {
+		return outcome, controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, err, &cleaned, &outcome)
+	}
+	useErr := use(MaterializedTarget{RepositoryPath: workspace, Branch: branch, HeadSHA: head,
+		Evidence: []ledger.EvidenceRef{expected.CaptureRef(), expected.CleanupRef(), outcome.CaptureRef}})
+	cleanupErr := controller.cleanupAfterMaterialization(workspace, evidencePrefix, expected, record, nil, &cleaned, &outcome)
+	return outcome, errors.Join(useErr, cleanupErr)
+}
+
+func (controller *Controller) cleanupAfterMaterialization(workspace, prefix string, expected Result, record resultRecord, cause error, cleaned *bool, outcome *MaterializationEvidence) error {
+	if err := controller.cleanupWorkspace(workspace); err != nil {
+		return errors.Join(cause, err)
+	}
+	*cleaned = true
+	data, err := json.Marshal(struct {
+		SchemaVersion           int                `json:"schema_version"`
+		IntegrationResultSHA256 string             `json:"integration_result_sha256"`
+		CaptureRef              ledger.EvidenceRef `json:"capture_ref"`
+		TemporaryRoot           string             `json:"temporary_root"`
+		WorkspacePath           string             `json:"workspace_path"`
+		WorkspaceID             string             `json:"workspace_id"`
+		WorkspaceRemoved        bool               `json:"workspace_removed"`
+	}{resultSchemaVersion, expected.SHA256(), outcome.CaptureRef, controller.temporaryRoot, workspace, filepath.Base(workspace), true})
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	ref, err := controller.artifacts.WriteBytes(prefix+"-materialization-cleanup.json", materializeCleanupEvidenceKind, data)
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	if err := verifyPublishedEvidence(ref, materializeCleanupEvidenceKind, data, controller.evidenceRoot, ""); err != nil {
+		return errors.Join(cause, err)
+	}
+	outcome.CleanupRef = ref
+	return cause
+}
+
+func readExistingEvidence(ref ledger.EvidenceRef, kind string) ([]byte, error) {
+	if ref.Kind != kind || ref.URI == "" || !filepath.IsAbs(ref.URI) || filepath.Clean(ref.URI) != ref.URI {
+		return nil, errors.New("invalid evidence reference")
+	}
+	data, err := os.ReadFile(ref.URI)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(data)
+	if ref.SHA256 != hex.EncodeToString(digest[:]) {
+		return nil, errors.New("evidence digest does not match bytes")
+	}
+	return data, nil
+}
+
+func sha256Hex(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
+func sameCandidates(left, right []scheduler.AcceptedCandidate) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		a, _ := json.Marshal(left[i])
+		b, _ := json.Marshal(right[i])
+		if !bytes.Equal(a, b) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameSteps(left, right []CandidateStep) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		a, b := left[i], right[i]
+		if a.Candidate.Key() != b.Candidate.Key() || a.Outcome != b.Outcome || a.BeforeSHA != b.BeforeSHA || a.AfterSHA != b.AfterSHA || !equalStrings(a.ConflictPaths, b.ConflictPaths) {
+			return false
+		}
+	}
+	return true
+}
+
 // Config defines the explicit controller-owned temporary root and immutable
 // evidence publisher. The temporary root must already exist as a canonical,
 // non-symlink directory.
 type Config struct {
-	TemporaryRoot    string
-	Artifacts        ArtifactWriter
-	StdoutLimitBytes int
-	StderrLimitBytes int
+	TemporaryRoot            string
+	Artifacts                ArtifactWriter
+	StdoutLimitBytes         int
+	StderrLimitBytes         int
+	CleanupOnEvidenceFailure bool
 }
 
 // Request binds one integration evaluation to an exact baseline, an immutable
@@ -56,11 +265,12 @@ type Request struct {
 
 // Controller owns creation and bounded cleanup of disposable repositories.
 type Controller struct {
-	temporaryRoot string
-	evidenceRoot  string
-	artifacts     ArtifactWriter
-	runner        gitRunner
-	removeAll     func(string) error
+	temporaryRoot            string
+	evidenceRoot             string
+	artifacts                ArtifactWriter
+	runner                   gitRunner
+	removeAll                func(string) error
+	cleanupOnEvidenceFailure bool
 }
 
 // NewController validates and freezes the disposable-workspace boundary.
@@ -91,11 +301,12 @@ func NewController(config Config) (*Controller, error) {
 		return nil, errors.New("Git output limits must be positive")
 	}
 	return &Controller{
-		temporaryRoot: root,
-		evidenceRoot:  evidenceRoot,
-		artifacts:     config.Artifacts,
-		runner:        execGitRunner{stdoutLimitBytes: stdoutLimit, stderrLimitBytes: stderrLimit},
-		removeAll:     os.RemoveAll,
+		temporaryRoot:            root,
+		evidenceRoot:             evidenceRoot,
+		artifacts:                config.Artifacts,
+		runner:                   execGitRunner{stdoutLimitBytes: stdoutLimit, stderrLimitBytes: stderrLimit},
+		removeAll:                os.RemoveAll,
+		cleanupOnEvidenceFailure: config.CleanupOnEvidenceFailure,
 	}, nil
 }
 
@@ -154,6 +365,7 @@ func (controller *Controller) Integrate(ctx context.Context, request Request) (R
 		return controller.finishUnavailable(request.EvidencePrefix, record, fmt.Errorf("create disposable workspace: %w", err))
 	}
 	if err := validateCreatedWorkspace(controller.temporaryRoot, workspace); err != nil {
+		_ = os.Remove(workspace)
 		return controller.finishUnavailable(request.EvidencePrefix, record, err)
 	}
 
@@ -169,11 +381,22 @@ func (controller *Controller) Integrate(ctx context.Context, request Request) (R
 	}
 	captureRef, err := controller.artifacts.WriteBytes(request.EvidencePrefix+"-capture.json", captureEvidenceKind, captureBytes)
 	if err != nil {
-		// Evidence was not preserved, so leave the exact workspace intact.
-		return unavailable(record, fmt.Errorf("publish pre-cleanup evidence; workspace preserved at %s: %w", workspace, err))
+		cause := fmt.Errorf("publish pre-cleanup evidence: %w", err)
+		if controller.cleanupOnEvidenceFailure {
+			cause = errors.Join(cause, controller.cleanupWorkspace(workspace))
+		} else {
+			cause = fmt.Errorf("%w; workspace preserved at %s", cause, workspace)
+		}
+		return unavailable(record, cause)
 	}
 	if err := verifyPublishedEvidence(captureRef, captureEvidenceKind, captureBytes, controller.evidenceRoot, workspace); err != nil {
-		return unavailable(record, fmt.Errorf("verify pre-cleanup evidence; workspace preserved at %s: %w", workspace, err))
+		cause := fmt.Errorf("verify pre-cleanup evidence: %w", err)
+		if controller.cleanupOnEvidenceFailure {
+			cause = errors.Join(cause, controller.cleanupWorkspace(workspace))
+		} else {
+			cause = fmt.Errorf("%w; workspace preserved at %s", cause, workspace)
+		}
+		return unavailable(record, cause)
 	}
 	record.CaptureSHA256 = captureRef.SHA256
 

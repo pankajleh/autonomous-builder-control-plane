@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -130,6 +131,78 @@ func TestIntegrateCommitIdentityIsIndependentOfWallClockSecond(t *testing.T) {
 	}
 	if first.Status() != second.Status() || first.RiskReportSHA256() != second.RiskReportSHA256() {
 		t.Fatalf("governed result identity changed: status (%q, %q), risk report (%q, %q)", first.Status(), second.Status(), first.RiskReportSHA256(), second.RiskReportSHA256())
+	}
+}
+
+func TestUseMaterializedReproducesBoundResultAndAlwaysCleans(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+	head := branchCommit(t, repository, baseline, "candidate", "candidate.txt", "candidate\n")
+	git(t, repository, "checkout", "--quiet", "main")
+	candidate := acceptedCandidate(t, repository, "candidate", baseline, head, "run", time.Now().UTC())
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidate})
+	temporaryRoot := t.TempDir()
+	controller := newTestController(t, temporaryRoot, evidenceStore(t))
+	request := Request{BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "bound"}
+	result, err := controller.Integrate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var materializedPath string
+	materialization, err := controller.UseMaterialized(context.Background(), request, result, "replay", func(target MaterializedTarget) error {
+		materializedPath = target.RepositoryPath
+		if target.HeadSHA != result.Steps()[0].AfterSHA || target.Branch != "integration" || len(target.Evidence) != 3 {
+			t.Fatalf("materialized target = %#v", target)
+		}
+		if got := git(t, target.RepositoryPath, "rev-parse", "HEAD"); got != target.HeadSHA {
+			t.Fatalf("materialized HEAD = %s", got)
+		}
+		return errors.New("callback failure")
+	})
+	if err == nil || !strings.Contains(err.Error(), "callback failure") {
+		t.Fatalf("UseMaterialized error = %v", err)
+	}
+	if _, err := os.Lstat(materializedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("materialized path was not removed: %v", err)
+	}
+	assertEvidence(t, materialization.CaptureRef, materializeEvidenceKind)
+	assertEvidence(t, materialization.CleanupRef, materializeCleanupEvidenceKind)
+}
+
+func TestUseMaterializedRejectsForgedResultAndFailsClosedOnCleanupFailure(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+	head := branchCommit(t, repository, baseline, "candidate", "candidate.txt", "candidate\n")
+	git(t, repository, "checkout", "--quiet", "main")
+	candidate := acceptedCandidate(t, repository, "candidate", baseline, head, "run", time.Now().UTC())
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidate})
+	temporaryRoot := t.TempDir()
+	controller := newTestController(t, temporaryRoot, evidenceStore(t))
+	request := Request{BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "bound"}
+	result, err := controller.Integrate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	forged := result
+	forged.record.Steps[0].AfterSHA = strings.Repeat("0", 40)
+	if _, err := controller.UseMaterialized(context.Background(), request, forged, "forged", func(MaterializedTarget) error { return nil }); err == nil || !strings.Contains(err.Error(), "does not match bound Track B result") {
+		t.Fatalf("forged result error = %v", err)
+	}
+
+	controller.removeAll = func(path string) error {
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
+		return errors.New("reported cleanup failure")
+	}
+	materialization, err := controller.UseMaterialized(context.Background(), request, result, "cleanup-failure", func(MaterializedTarget) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "reported cleanup failure") || materialization.CleanupRef.URI != "" {
+		t.Fatalf("cleanup failure result = %#v, err = %v", materialization, err)
+	}
+	if entries, readErr := os.ReadDir(temporaryRoot); readErr != nil || len(entries) != 0 {
+		t.Fatalf("cleanup failure left target: %v, %v", entries, readErr)
 	}
 }
 
@@ -323,6 +396,40 @@ func TestCleanupIsScopedAndFailsClosedWhenRemovalIsUncertain(t *testing.T) {
 		t.Fatalf("cleanup touched sibling sentinel: data=%q err=%v", data, readErr)
 	}
 	assertEvidence(t, result.CaptureRef(), captureEvidenceKind)
+}
+
+func TestGateLifecycleCleansWhenCapturePublicationFails(t *testing.T) {
+	repository := newRepository(t)
+	baseline := commitFile(t, repository, "base.txt", "base\n", "baseline")
+	head := branchCommit(t, repository, baseline, "candidate", "candidate.txt", "candidate\n")
+	git(t, repository, "checkout", "--quiet", "main")
+	candidate := acceptedCandidate(t, repository, "candidate", baseline, head, "run", time.Now().UTC())
+	report := riskReport(t, []scheduler.AcceptedCandidate{candidate})
+	temporaryRoot := t.TempDir()
+	writer := &selectiveFailureWriter{ArtifactWriter: evidenceStore(t), suffix: "-capture.json"}
+	controller, err := NewController(Config{TemporaryRoot: temporaryRoot, Artifacts: writer, CleanupOnEvidenceFailure: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.Integrate(context.Background(), Request{BaselineSHA: baseline, RiskReport: report, EvidencePrefix: "failed-capture"})
+	if err == nil || result.Status() != StatusUnavailable {
+		t.Fatalf("capture failure result = %s, err = %v", result.Status(), err)
+	}
+	if entries, readErr := os.ReadDir(temporaryRoot); readErr != nil || len(entries) != 0 {
+		t.Fatalf("capture failure left workspace: %v, %v", entries, readErr)
+	}
+}
+
+type selectiveFailureWriter struct {
+	ArtifactWriter
+	suffix string
+}
+
+func (w *selectiveFailureWriter) WriteBytes(name, kind string, data []byte) (ledger.EvidenceRef, error) {
+	if strings.HasSuffix(name, w.suffix) {
+		return ledger.EvidenceRef{}, errors.New("injected publication failure")
+	}
+	return w.ArtifactWriter.WriteBytes(name, kind, data)
 }
 
 func TestControllerRejectsSymlinkTemporaryRoot(t *testing.T) {
