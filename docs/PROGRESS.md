@@ -14,12 +14,12 @@ Updated: 2026-09-07
 
 ## Current
 
-EP-005 exact-head PR lifecycle: ABCP accepted implementation SHA `f986008ba11c69c3864f0b8977af440024d12048`, but the required post-implementation controller-fallback review found 1 Critical and 9 Major defects after Claude hit a session/quota limit. Push/PR #8 are blocked. Current authorized action is the review-correction plan `docs/plans/ep-005-pr-lifecycle-review-corrections.md`.
+EP-005 exact-head PR lifecycle correction round 1 reached ABCP `BRANCH_ACCEPTED` at exact clean SHA `d4e7e1d8fc6af9545f9f67e3c99fa94c3420a7ce`. The required fresh Claude Code / Opus exact-head post-implementation review then found 2 Critical and 4 Major defects. The second correction plan is now design-clean at SHA-256 `86b469cb4ced969394854aa88ad91418721b64d27a83aed5a4a2c0eeda6c8527`: the first Claude design pass found 1 Critical + 3 Major plan gaps, those were corrected, and a re-review hit provider session limits; controller fallback then returned `DESIGN_CLEAN_CRITICAL_MAJOR` with artifact SHA-256 `6851fe6a742e6bdb5cf49ed7587ec690936719d9510f6de243b1982041ebcbde`. Push and PR #8 remain blocked.
 
 ## Next
 
-After exact-head PR lifecycle acceptance/review/merge, continue Phase 4 in roadmap order: CI evidence ingestion, merge approval/expected-head protection, then serial post-merge acceptance.
+Commit the design-clean second correction authority/context checkpoint, run it through ABCP/Ralphex, then require exact-head deterministic acceptance and a fresh independent Critical/Major post-implementation review. Only a clean exact reviewed head may be published for PR #8.
 
 ## Remaining after Phase 4
 
-Service/API/dashboard and production hardening remain explicitly deferred to Phases 5–6.
+After exact-head PR lifecycle acceptance/review/merge, continue Phase 4 in roadmap order: CI evidence ingestion, merge approval/expected-head protection, then serial post-merge acceptance. Service/API/dashboard and production hardening remain deferred to Phases 5–6.
