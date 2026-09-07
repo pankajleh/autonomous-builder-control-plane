@@ -11,9 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"unicode"
@@ -23,6 +21,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/combinedacceptance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/integrationworkspace"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -34,7 +33,14 @@ const (
 	eventStateTransition      = "STATE_TRANSITION"
 	gateEvidenceKind          = "serial-integration-gate-decision"
 	gateInputEvidenceKind     = "serial-integration-gate-input"
-	maxEvidenceRefs           = 128
+	sourceHeadsEvidenceKind   = "serial-source-head-verification"
+	maxEvidenceArtifactBytes  = 16 * 1024 * 1024
+	maxAcceptanceCommands     = 256
+	maxBlockers               = 256
+	maxCandidates             = 256
+	maxCandidateEvidenceRefs  = 64
+	maxReviewRequirements     = 256
+	maxReviewEvidenceRefs     = 64
 )
 
 type EventAppender interface{ Append(ledger.Event) error }
@@ -51,16 +57,8 @@ type Config struct {
 	Processes     acceptance.CommandRunner
 }
 
-type ReviewRequirement struct {
-	Component   string `json:"component"`
-	ReviewedSHA string `json:"reviewed_sha"`
-	Verdict     string `json:"verdict"`
-}
-
-type ReviewPolicy struct {
-	PolicyIdentity string              `json:"policy_identity"`
-	Required       []ReviewRequirement `json:"required"`
-}
+type ReviewRequirement = authority.ReviewRequirement
+type ReviewPolicy = authority.ReviewPolicy
 
 type ReviewAttestation struct {
 	Component   string               `json:"component"`
@@ -92,12 +90,13 @@ type Request struct {
 }
 
 type Result struct {
-	State            domain.State
-	Textual          integrationworkspace.Result
-	Combined         combinedacceptance.Result
-	Materialization  integrationworkspace.MaterializationEvidence
-	DecisionEvidence ledger.EvidenceRef
-	FailureReason    string
+	State                      domain.State
+	Textual                    integrationworkspace.Result
+	Combined                   combinedacceptance.Result
+	Materialization            integrationworkspace.MaterializationEvidence
+	DecisionEvidence           ledger.EvidenceRef
+	SourceVerificationEvidence []ledger.EvidenceRef
+	FailureReason              string
 }
 
 type combinedEvaluator interface {
@@ -110,10 +109,11 @@ type workspaceController interface {
 }
 
 type Gate struct {
-	events    EventAppender
-	artifacts ArtifactWriter
-	workspace workspaceController
-	combined  combinedEvaluator
+	events       EventAppender
+	artifacts    ArtifactWriter
+	workspace    workspaceController
+	combined     combinedEvaluator
+	evidenceRoot string
 }
 
 func New(config Config) (*Gate, error) {
@@ -127,7 +127,7 @@ func New(config Config) (*Gate, error) {
 		return nil, err
 	}
 	return &Gate{events: config.Events, artifacts: config.Artifacts, workspace: workspace,
-		combined: combinedacceptance.New(config.Processes, config.Artifacts)}, nil
+		combined: combinedacceptance.New(config.Processes, config.Artifacts), evidenceRoot: config.Artifacts.Root()}, nil
 }
 
 // Run performs one serial integration decision. Callers supply only governed
@@ -141,7 +141,7 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 	if g == nil || g.events == nil || g.artifacts == nil || g.workspace == nil || g.combined == nil {
 		return result, errors.New("serial integration gate is required")
 	}
-	prepared, inputBytes, err := validateRequest(request)
+	prepared, inputBytes, err := g.validateRequest(ctx, request)
 	if err != nil {
 		result.FailureReason = err.Error()
 		return result, err
@@ -151,15 +151,20 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 		result.FailureReason = err.Error()
 		return result, err
 	}
-	if err := verifySourceHeads(ctx, prepared.Candidates); err != nil {
+	initialHeadRef, err := g.verifySourceHeads(ctx, prepared, "initial")
+	if initialHeadRef.URI != "" {
+		result.SourceVerificationEvidence = append(result.SourceVerificationEvidence, initialHeadRef)
+	}
+	if err != nil {
 		result.FailureReason = err.Error()
 		return result, err
 	}
-	if err := g.transition(prepared.Authority.RunID(), domain.StateBranchAccepted, domain.StateIntegrationPending, []ledger.EvidenceRef{inputRef}, map[string]any{"risk_sha256": prepared.RiskReport.SHA256()}); err != nil {
+	initialRefs := []ledger.EvidenceRef{inputRef, initialHeadRef}
+	if err := g.transition(prepared.Authority.RunID(), domain.StateBranchAccepted, domain.StateIntegrationPending, initialRefs, map[string]any{"risk_sha256": prepared.RiskReport.SHA256()}); err != nil {
 		return result, err
 	}
 	result.State = domain.StateIntegrationPending
-	if err := g.transition(prepared.Authority.RunID(), domain.StateIntegrationPending, domain.StateIntegrating, []ledger.EvidenceRef{inputRef}, nil); err != nil {
+	if err := g.transition(prepared.Authority.RunID(), domain.StateIntegrationPending, domain.StateIntegrating, initialRefs, nil); err != nil {
 		return result, err
 	}
 	result.State = domain.StateIntegrating
@@ -191,7 +196,11 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 		combinedResult, evaluateErr = g.combined.Evaluate(ctx, prepared.Authority, prepared.CombinedPolicy, combinedacceptance.Target{
 			RepositoryPath: target.RepositoryPath, Branch: target.Branch, HeadSHA: target.HeadSHA, Integration: provenance,
 		}, prepared.Candidates, prepared.RiskReport)
-		if headErr := verifySourceHeads(ctx, prepared.Candidates); headErr != nil {
+		headRef, headErr := g.verifySourceHeads(ctx, prepared, "post-acceptance")
+		if headRef.URI != "" {
+			result.SourceVerificationEvidence = append(result.SourceVerificationEvidence, headRef)
+		}
+		if headErr != nil {
 			return headErr
 		}
 		if len(combinedResult.CanonicalJSON()) == 0 {
@@ -206,16 +215,19 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 	}
 	switch combinedResult.Classification() {
 	case combinedacceptance.ClassificationClean:
+		readyHeadRef, headErr := g.verifySourceHeads(ctx, prepared, "ready-for-merge")
+		if readyHeadRef.URI != "" {
+			result.SourceVerificationEvidence = append(result.SourceVerificationEvidence, readyHeadRef)
+		}
+		if headErr != nil {
+			return g.finish(prepared, result, domain.StateValidationUnavailable, headErr.Error(), inputRef)
+		}
 		accepted, finishErr := g.finish(prepared, result, domain.StateIntegrationAccepted, "", inputRef)
 		if finishErr != nil {
 			return accepted, finishErr
 		}
-		refs := []ledger.EvidenceRef{inputRef, accepted.DecisionEvidence, accepted.Materialization.CleanupRef}
-		if err := verifyAllEvidence(refs); err != nil {
-			accepted.FailureReason = err.Error()
-			return accepted, err
-		}
-		if err := verifySourceHeads(ctx, prepared.Candidates); err != nil {
+		refs := collectRefs(inputRef, accepted.DecisionEvidence, accepted.Materialization.CleanupRef, readyHeadRef)
+		if err := g.verifyAllEvidence(refs); err != nil {
 			accepted.FailureReason = err.Error()
 			return accepted, err
 		}
@@ -233,19 +245,20 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 
 func (g *Gate) finish(request Request, result Result, state domain.State, reason string, inputRef ledger.EvidenceRef) (Result, error) {
 	record := struct {
-		SchemaVersion   int                                          `json:"schema_version"`
-		State           domain.State                                 `json:"state"`
-		AuthoritySHA256 string                                       `json:"authority_sha256"`
-		RiskSHA256      string                                       `json:"risk_sha256"`
-		TextualSHA256   string                                       `json:"textual_sha256,omitempty"`
-		Textual         json.RawMessage                              `json:"textual,omitempty"`
-		CombinedSHA256  string                                       `json:"combined_sha256,omitempty"`
-		Combined        json.RawMessage                              `json:"combined,omitempty"`
-		ReviewPolicy    ReviewPolicy                                 `json:"review_policy"`
-		Reviews         []ReviewAttestation                          `json:"reviews"`
-		Materialization integrationworkspace.MaterializationEvidence `json:"materialization"`
-		FailureReason   string                                       `json:"failure_reason,omitempty"`
-	}{1, state, request.Authority.SHA256(), request.RiskReport.SHA256(), result.Textual.SHA256(), result.Textual.CanonicalJSON(), result.Combined.SHA256(), result.Combined.CanonicalJSON(), request.ReviewPolicy, request.Reviews, result.Materialization, reason}
+		SchemaVersion      int                                          `json:"schema_version"`
+		State              domain.State                                 `json:"state"`
+		AuthoritySHA256    string                                       `json:"authority_sha256"`
+		RiskSHA256         string                                       `json:"risk_sha256"`
+		TextualSHA256      string                                       `json:"textual_sha256,omitempty"`
+		Textual            json.RawMessage                              `json:"textual,omitempty"`
+		CombinedSHA256     string                                       `json:"combined_sha256,omitempty"`
+		Combined           json.RawMessage                              `json:"combined,omitempty"`
+		ReviewPolicy       ReviewPolicy                                 `json:"review_policy"`
+		Reviews            []ReviewAttestation                          `json:"reviews"`
+		Materialization    integrationworkspace.MaterializationEvidence `json:"materialization"`
+		SourceVerification []ledger.EvidenceRef                         `json:"source_verification"`
+		FailureReason      string                                       `json:"failure_reason,omitempty"`
+	}{1, state, request.Authority.SHA256(), request.RiskReport.SHA256(), result.Textual.SHA256(), result.Textual.CanonicalJSON(), result.Combined.SHA256(), result.Combined.CanonicalJSON(), request.ReviewPolicy, request.Reviews, result.Materialization, append([]ledger.EvidenceRef(nil), result.SourceVerificationEvidence...), reason}
 	data, err := json.Marshal(record)
 	if err != nil {
 		return result, err
@@ -258,8 +271,9 @@ func (g *Gate) finish(request Request, result Result, state domain.State, reason
 	result.FailureReason = reason
 	refs := collectRefs(inputRef, decisionRef, result.Textual.CaptureRef(), result.Textual.CleanupRef(), result.Materialization.CaptureRef, result.Materialization.CleanupRef)
 	refs = append(refs, result.Combined.EvidenceRefs()...)
+	refs = append(refs, result.SourceVerificationEvidence...)
 	refs = collectRefs(refs...)
-	if err := verifyAllEvidence(refs); err != nil {
+	if err := g.verifyAllEvidence(refs); err != nil {
 		result.FailureReason = err.Error()
 		return result, err
 	}
@@ -274,10 +288,10 @@ func (g *Gate) transition(runID string, from, to domain.State, refs []ledger.Evi
 	if err := domain.ValidateTransition(from, to); err != nil {
 		return err
 	}
-	if len(refs) == 0 || len(refs) > maxEvidenceRefs {
-		return errors.New("every gate transition requires bounded evidence")
+	if len(refs) == 0 {
+		return errors.New("every gate transition requires evidence")
 	}
-	if err := verifyAllEvidence(refs); err != nil {
+	if err := g.verifyAllEvidence(refs); err != nil {
 		return err
 	}
 	event, err := ledger.NewEvent(runID, eventStateTransition, "integration-controller", "integration-gate")
@@ -293,14 +307,14 @@ func (g *Gate) writeVerified(name, kind string, data []byte) (ledger.EvidenceRef
 	if err != nil {
 		return ledger.EvidenceRef{}, err
 	}
-	actual, err := readVerified(ref)
+	actual, err := evidence.ReadVerifiedLocal(g.evidenceRoot, ref, maxEvidenceArtifactBytes)
 	if err != nil || !bytes.Equal(actual, data) || ref.Kind != kind {
 		return ledger.EvidenceRef{}, errors.New("evidence writer returned unavailable or mismatched evidence")
 	}
 	return ref, nil
 }
 
-func validateRequest(request Request) (Request, []byte, error) {
+func (g *Gate) validateRequest(ctx context.Context, request Request) (Request, []byte, error) {
 	if len(request.Authority.CanonicalJSON()) == 0 || digest(request.Authority.CanonicalJSON()) != request.Authority.SHA256() {
 		return Request{}, nil, errors.New("validated authority is required")
 	}
@@ -310,13 +324,28 @@ func validateRequest(request Request) (Request, []byte, error) {
 	if len(request.Candidates) == 0 || request.RiskReport.SHA256() == "" || digest(request.RiskReport.CanonicalJSON()) != request.RiskReport.SHA256() {
 		return Request{}, nil, errors.New("complete candidates and immutable risk report are required")
 	}
+	if len(request.Candidates) > maxCandidates {
+		return Request{}, nil, fmt.Errorf("candidate count %d exceeds maximum %d", len(request.Candidates), maxCandidates)
+	}
+	if count := len(request.Authority.Acceptance()); count > maxAcceptanceCommands {
+		return Request{}, nil, fmt.Errorf("governed acceptance command count %d exceeds merge-gate maximum %d", count, maxAcceptanceCommands)
+	}
 	if !validText(request.EvidencePrefix) || strings.ContainsAny(request.EvidencePrefix, `/\\`) {
 		return Request{}, nil, errors.New("safe evidence prefix is required")
 	}
 	if err := validateBlockers(request.Prerequisites); err != nil {
 		return Request{}, nil, err
 	}
-	if err := validateReviews(request.ReviewPolicy, request.Reviews); err != nil {
+	boundReview, present := request.Authority.MergeReviewPolicy()
+	if !present {
+		return Request{}, nil, errors.New("controller authority does not bind a merge review policy")
+	}
+	canonicalBound := canonicalReviewPolicy(boundReview)
+	if !emptyReviewPolicy(request.ReviewPolicy) && !sameReviewPolicy(canonicalReviewPolicy(request.ReviewPolicy), canonicalBound) {
+		return Request{}, nil, errors.New("caller-selected review policy does not match controller authority")
+	}
+	request.ReviewPolicy = canonicalBound
+	if err := g.validateReviews(ctx, request.Authority.Repository().Path, request.ReviewPolicy, request.Reviews); err != nil {
 		return Request{}, nil, err
 	}
 	request = canonicalRequest(request)
@@ -336,7 +365,10 @@ func validateRequest(request Request) (Request, []byte, error) {
 		if input.Repository != request.Authority.Repository().Path || input.StartSHA != request.BaselineSHA || input.AcceptancePolicyIdentity != request.Authority.PolicyVersion() {
 			return Request{}, nil, fmt.Errorf("candidate %d does not match authority or branch acceptance policy", i)
 		}
-		if err := verifyAllEvidence(input.AcceptanceEvidence); err != nil {
+		if len(input.AcceptanceEvidence) > maxCandidateEvidenceRefs {
+			return Request{}, nil, fmt.Errorf("candidate %d acceptance evidence count %d exceeds maximum %d", i, len(input.AcceptanceEvidence), maxCandidateEvidenceRefs)
+		}
+		if err := g.verifyAllEvidence(input.AcceptanceEvidence); err != nil {
 			return Request{}, nil, fmt.Errorf("candidate %d acceptance evidence: %w", i, err)
 		}
 	}
@@ -363,6 +395,9 @@ func validateRequest(request Request) (Request, []byte, error) {
 }
 
 func validateBlockers(prerequisites Prerequisites) error {
+	if len(prerequisites.Blockers) > maxBlockers {
+		return fmt.Errorf("blocker count %d exceeds maximum %d", len(prerequisites.Blockers), maxBlockers)
+	}
 	seen := map[string]struct{}{}
 	for _, blocker := range prerequisites.Blockers {
 		if !validText(blocker.ID) {
@@ -379,16 +414,22 @@ func validateBlockers(prerequisites Prerequisites) error {
 	return nil
 }
 
-func validateReviews(policy ReviewPolicy, reviews []ReviewAttestation) error {
-	if !validText(policy.PolicyIdentity) || len(policy.Required) == 0 {
+func (g *Gate) validateReviews(ctx context.Context, repository string, policy ReviewPolicy, reviews []ReviewAttestation) error {
+	if !validText(policy.PolicyIdentity) || len(policy.Required) == 0 || len(policy.Required) > maxReviewRequirements {
 		return errors.New("complete review policy is required")
+	}
+	if len(reviews) > maxReviewRequirements {
+		return fmt.Errorf("review attestation count %d exceeds maximum %d", len(reviews), maxReviewRequirements)
 	}
 	provided := map[string]ReviewAttestation{}
 	for _, review := range reviews {
 		if !validText(review.Component) || !validText(review.Provider) || !validText(review.Verdict) || !validSHA(review.ReviewedSHA) || len(review.Evidence) == 0 {
 			return errors.New("complete review attestation is required")
 		}
-		if err := verifyAllEvidence(review.Evidence); err != nil {
+		if len(review.Evidence) > maxReviewEvidenceRefs {
+			return fmt.Errorf("review %s evidence count %d exceeds maximum %d", review.Component, len(review.Evidence), maxReviewEvidenceRefs)
+		}
+		if err := g.verifyAllEvidence(review.Evidence); err != nil {
 			return fmt.Errorf("review %s evidence: %w", review.Component, err)
 		}
 		if review.Verdict != VerdictCleanCriticalMajor {
@@ -418,39 +459,90 @@ func validateReviews(policy ReviewPolicy, reviews []ReviewAttestation) error {
 		if review.Verdict != requirement.Verdict {
 			return fmt.Errorf("review %q has substantive non-clean verdict %q", requirement.Component, review.Verdict)
 		}
+		if err := verifyCommit(ctx, repository, requirement.ReviewedSHA); err != nil {
+			return fmt.Errorf("review %q reviewed SHA is not an exact governed repository commit: %w", requirement.Component, err)
+		}
+	}
+	if len(provided) != len(seen) {
+		return errors.New("review attestations contain a component not bound by controller authority")
 	}
 	return nil
 }
 
-func verifySourceHeads(ctx context.Context, candidates []scheduler.AcceptedCandidate) error {
+type sourceVerificationCommand struct {
+	Repository string   `json:"repository"`
+	Argv       []string `json:"argv"`
+	ExitCode   int      `json:"exit_code"`
+	Stdout     string   `json:"stdout"`
+	Stderr     string   `json:"stderr"`
+	Truncated  bool     `json:"truncated"`
+}
+
+func (g *Gate) verifySourceHeads(ctx context.Context, request Request, boundary string) (ledger.EvidenceRef, error) {
+	record := struct {
+		SchemaVersion int                           `json:"schema_version"`
+		Boundary      string                        `json:"boundary"`
+		Candidates    []scheduler.CandidateIdentity `json:"candidates"`
+		Commands      []sourceVerificationCommand   `json:"commands"`
+		Verified      bool                          `json:"verified"`
+		Failure       string                        `json:"failure,omitempty"`
+	}{SchemaVersion: 1, Boundary: boundary, Candidates: candidateOrder(request.Candidates)}
+	var verificationErr error
 	checkedRepositories := make(map[string]struct{})
-	for i, candidate := range candidates {
+	for i, candidate := range request.Candidates {
 		input := candidate.Input()
 		if _, checked := checkedRepositories[input.Repository]; !checked {
 			checkedRepositories[input.Repository] = struct{}{}
-			command := exec.CommandContext(ctx, "git", "--no-replace-objects", "for-each-ref", "--format=%(refname)", "refs/replace/")
-			command.Dir, command.Env = input.Repository, append(gitexec.Environment(), "LC_ALL=C")
-			var stdout, stderr limitedBuffer
-			command.Stdout, command.Stderr = &stdout, &stderr
-			err := command.Run()
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if err != nil || stdout.truncated || stderr.truncated || stdout.Len() != 0 || stderr.Len() != 0 {
-				return errors.New("replacement refs exist or could not be ruled out")
+			observation, err := runSourceVerification(ctx, input.Repository, []string{"git", "--no-replace-objects", "for-each-ref", "--format=%(refname)", "refs/replace/"})
+			record.Commands = append(record.Commands, observation)
+			if err != nil || observation.Truncated || observation.ExitCode != 0 || observation.Stdout != "" || observation.Stderr != "" {
+				verificationErr = errors.New("replacement refs exist or could not be ruled out")
+				break
 			}
 		}
-		command := exec.CommandContext(ctx, "git", "--no-replace-objects", "show-ref", "--verify", "--hash", "refs/heads/"+input.Branch)
-		command.Dir, command.Env = input.Repository, append(gitexec.Environment(), "LC_ALL=C")
-		var stdout, stderr limitedBuffer
-		command.Stdout, command.Stderr = &stdout, &stderr
-		err := command.Run()
-		if ctx.Err() != nil {
-			return ctx.Err()
+		observation, err := runSourceVerification(ctx, input.Repository, []string{"git", "--no-replace-objects", "show-ref", "--verify", "--hash", "refs/heads/" + input.Branch})
+		record.Commands = append(record.Commands, observation)
+		if err != nil || observation.Truncated || observation.ExitCode != 0 || observation.Stderr != "" || observation.Stdout != input.HeadSHA+"\n" {
+			verificationErr = fmt.Errorf("candidate %d source head changed or could not be verified", i)
+			break
 		}
-		if err != nil || stdout.truncated || stderr.truncated || stderr.Len() != 0 || stdout.String() != input.HeadSHA+"\n" {
-			return fmt.Errorf("candidate %d source head changed or could not be verified", i)
-		}
+	}
+	record.Verified = verificationErr == nil
+	if verificationErr != nil {
+		record.Failure = verificationErr.Error()
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return ledger.EvidenceRef{}, errors.Join(verificationErr, err)
+	}
+	ref, err := g.writeVerified(request.EvidencePrefix+"-source-heads-"+boundary+".json", sourceHeadsEvidenceKind, data)
+	if err != nil {
+		return ledger.EvidenceRef{}, errors.Join(verificationErr, err)
+	}
+	return ref, verificationErr
+}
+
+func runSourceVerification(ctx context.Context, repository string, argv []string) (sourceVerificationCommand, error) {
+	record := sourceVerificationCommand{Repository: repository, Argv: append([]string(nil), argv...), ExitCode: -1}
+	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	command.Dir, command.Env = repository, append(gitexec.Environment(), "LC_ALL=C")
+	var stdout, stderr limitedBuffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	err := command.Run()
+	record.Stdout, record.Stderr, record.Truncated = stdout.String(), stderr.String(), stdout.truncated || stderr.truncated
+	if command.ProcessState != nil {
+		record.ExitCode = command.ProcessState.ExitCode()
+	}
+	if ctx.Err() != nil {
+		return record, ctx.Err()
+	}
+	return record, err
+}
+
+func verifyCommit(ctx context.Context, repository, reviewedSHA string) error {
+	record, err := runSourceVerification(ctx, repository, []string{"git", "--no-replace-objects", "rev-parse", "--verify", "--end-of-options", reviewedSHA + "^{commit}"})
+	if err != nil || record.Truncated || record.ExitCode != 0 || record.Stderr != "" || record.Stdout != reviewedSHA+"\n" {
+		return errors.New("commit does not exist or resolved ambiguously")
 	}
 	return nil
 }
@@ -486,37 +578,16 @@ func candidateOrder(candidates []scheduler.AcceptedCandidate) []scheduler.Candid
 	return values
 }
 
-func verifyAllEvidence(refs []ledger.EvidenceRef) error {
-	if len(refs) == 0 || len(refs) > maxEvidenceRefs {
-		return errors.New("complete bounded evidence is required")
+func (g *Gate) verifyAllEvidence(refs []ledger.EvidenceRef) error {
+	if len(refs) == 0 {
+		return errors.New("complete evidence is required")
 	}
 	for i, ref := range refs {
-		if _, err := readVerified(ref); err != nil {
+		if _, err := evidence.ReadVerifiedLocal(g.evidenceRoot, ref, maxEvidenceArtifactBytes); err != nil {
 			return fmt.Errorf("evidence %d: %w", i, err)
 		}
 	}
 	return nil
-}
-func readVerified(ref ledger.EvidenceRef) ([]byte, error) {
-	if !filepath.IsAbs(ref.URI) || filepath.Clean(ref.URI) != ref.URI || !validDigest(ref.SHA256) || !validText(ref.Kind) {
-		return nil, errors.New("malformed evidence reference")
-	}
-	info, err := os.Lstat(ref.URI)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("evidence is unavailable or not a regular file")
-	}
-	canonical, err := filepath.EvalSymlinks(ref.URI)
-	if err != nil || canonical != ref.URI {
-		return nil, errors.New("evidence path contains ambiguous symlink resolution")
-	}
-	data, err := os.ReadFile(ref.URI)
-	if err != nil {
-		return nil, err
-	}
-	if digest(data) != ref.SHA256 {
-		return nil, errors.New("evidence digest mismatch")
-	}
-	return data, nil
 }
 func collectRefs(refs ...ledger.EvidenceRef) []ledger.EvidenceRef {
 	seen := map[string]struct{}{}
@@ -579,6 +650,22 @@ func canonicalRequest(request Request) Request {
 		return request.Prerequisites.Blockers[i].ID < request.Prerequisites.Blockers[j].ID
 	})
 	return request
+}
+
+func canonicalReviewPolicy(policy ReviewPolicy) ReviewPolicy {
+	policy.Required = append([]ReviewRequirement(nil), policy.Required...)
+	sort.Slice(policy.Required, func(i, j int) bool { return policy.Required[i].Component < policy.Required[j].Component })
+	return policy
+}
+
+func emptyReviewPolicy(policy ReviewPolicy) bool {
+	return policy.PolicyIdentity == "" && len(policy.Required) == 0
+}
+
+func sameReviewPolicy(left, right ReviewPolicy) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
 }
 
 func evidenceKey(ref ledger.EvidenceRef) string {

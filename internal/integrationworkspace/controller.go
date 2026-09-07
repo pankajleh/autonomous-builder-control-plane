@@ -16,6 +16,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/scheduler"
 )
@@ -25,6 +26,7 @@ const (
 	defaultStdoutLimit             = 4 * 1024 * 1024
 	defaultStderrLimit             = 1024 * 1024
 	maximumCandidateCount          = 256
+	maximumExistingEvidenceBytes   = 16 * 1024 * 1024
 	captureEvidenceKind            = "textual-integration-capture"
 	cleanupEvidenceKind            = "textual-integration-cleanup"
 	materializeEvidenceKind        = "textual-integration-materialization"
@@ -65,14 +67,14 @@ func (controller *Controller) UseMaterialized(
 	if expected.Status() != StatusClean || !expected.Cleanup().WorkspaceRemoved || len(expected.CanonicalJSON()) == 0 || expected.SHA256() != sha256Hex(expected.CanonicalJSON()) {
 		return outcome, errors.New("complete immutable clean integration result is required")
 	}
-	boundCaptureBytes, err := readExistingEvidence(expected.CaptureRef(), captureEvidenceKind)
+	boundCaptureBytes, err := readExistingEvidence(expected.CaptureRef(), captureEvidenceKind, controller.evidenceRoot)
 	if err != nil {
 		return outcome, fmt.Errorf("verify bound integration capture: %w", err)
 	}
 	if err := verifyPublishedEvidence(expected.CaptureRef(), captureEvidenceKind, boundCaptureBytes, controller.evidenceRoot, ""); err != nil {
 		return outcome, fmt.Errorf("verify bound integration capture: %w", err)
 	}
-	cleanupBytes, err := readExistingEvidence(expected.CleanupRef(), cleanupEvidenceKind)
+	cleanupBytes, err := readExistingEvidence(expected.CleanupRef(), cleanupEvidenceKind, controller.evidenceRoot)
 	if err != nil {
 		return outcome, fmt.Errorf("verify bound integration cleanup receipt: %w", err)
 	}
@@ -197,19 +199,11 @@ func (controller *Controller) cleanupAfterMaterialization(workspace, prefix stri
 	return cause
 }
 
-func readExistingEvidence(ref ledger.EvidenceRef, kind string) ([]byte, error) {
+func readExistingEvidence(ref ledger.EvidenceRef, kind, evidenceRoot string) ([]byte, error) {
 	if ref.Kind != kind || ref.URI == "" || !filepath.IsAbs(ref.URI) || filepath.Clean(ref.URI) != ref.URI {
 		return nil, errors.New("invalid evidence reference")
 	}
-	data, err := os.ReadFile(ref.URI)
-	if err != nil {
-		return nil, err
-	}
-	digest := sha256.Sum256(data)
-	if ref.SHA256 != hex.EncodeToString(digest[:]) {
-		return nil, errors.New("evidence digest does not match bytes")
-	}
-	return data, nil
+	return evidence.ReadVerifiedLocal(evidenceRoot, ref, maximumExistingEvidenceBytes)
 }
 
 func sha256Hex(data []byte) string {
@@ -800,23 +794,11 @@ func verifyPublishedEvidence(ref ledger.EvidenceRef, kind string, expected []byt
 	if forbiddenRoot != "" && pathWithin(forbiddenRoot, ref.URI) {
 		return errors.New("artifact writer published evidence inside the disposable workspace")
 	}
-	info, err := os.Lstat(ref.URI)
+	data, err := evidence.ReadVerifiedLocal(evidenceRoot, ref, maximumExistingEvidenceBytes)
 	if err != nil {
 		return err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("published evidence is not a regular non-symlink file")
-	}
-	canonical, err := filepath.EvalSymlinks(ref.URI)
-	if err != nil || canonical != ref.URI {
-		return errors.New("published evidence path is not canonical")
-	}
-	data, err := os.ReadFile(ref.URI)
-	if err != nil {
-		return err
-	}
-	digest := sha256.Sum256(data)
-	if !bytes.Equal(data, expected) || ref.SHA256 != hex.EncodeToString(digest[:]) {
+	if !bytes.Equal(data, expected) {
 		return errors.New("published evidence bytes or digest do not match")
 	}
 	return nil

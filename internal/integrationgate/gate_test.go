@@ -94,7 +94,7 @@ func TestGateRejectsChangedCandidateHeadsReviewsBlockersAndEvidence(t *testing.T
 	})
 	t.Run("review-sha", func(t *testing.T) {
 		fixture := newGateFixture(t, false, "pass")
-		fixture.request.Reviews[0].ReviewedSHA = strings.Repeat("c", 40)
+		fixture.request.Reviews[0].ReviewedSHA = fixture.base
 		_, err := fixture.gate.Run(context.Background(), fixture.request)
 		assertErrorContains(t, err, "SHA does not match")
 	})
@@ -125,7 +125,43 @@ func TestGateRejectsChangedCandidateHeadsReviewsBlockersAndEvidence(t *testing.T
 			t.Fatal(err)
 		}
 		_, err := fixture.gate.Run(context.Background(), fixture.request)
-		assertErrorContains(t, err, "digest mismatch")
+		assertErrorContains(t, err, "SHA256 mismatch")
+	})
+}
+
+func TestGateRejectsCallerSelectedReviewPolicyAndNonexistentReviewedCommit(t *testing.T) {
+	t.Run("caller-selected-without-authority", func(t *testing.T) {
+		fixture := newGateFixture(t, false, "pass")
+		manifest := fixture.request.Authority.Manifest()
+		manifest.MergeReview = nil
+		governed, err := authority.New(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.request.Authority = governed
+		_, err = fixture.gate.Run(context.Background(), fixture.request)
+		assertErrorContains(t, err, "does not bind a merge review policy")
+	})
+	t.Run("caller-policy-mismatch", func(t *testing.T) {
+		fixture := newGateFixture(t, false, "pass")
+		fixture.request.ReviewPolicy.PolicyIdentity = "fabricated-clean-policy"
+		_, err := fixture.gate.Run(context.Background(), fixture.request)
+		assertErrorContains(t, err, "caller-selected review policy")
+	})
+	t.Run("nonexistent-authority-reviewed-commit", func(t *testing.T) {
+		fixture := newGateFixture(t, false, "pass")
+		manifest := fixture.request.Authority.Manifest()
+		missing := strings.Repeat("d", 40)
+		manifest.MergeReview.Required[0].ReviewedSHA = missing
+		governed, err := authority.New(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.request.Authority = governed
+		fixture.request.ReviewPolicy = *manifest.MergeReview
+		fixture.request.Reviews[0].ReviewedSHA = missing
+		_, err = fixture.gate.Run(context.Background(), fixture.request)
+		assertErrorContains(t, err, "not an exact governed repository commit")
 	})
 }
 
@@ -140,20 +176,145 @@ func TestGateRequestHasNoCallerInjectableTrackBOrTrackCResult(t *testing.T) {
 
 func TestGateInputEvidenceCanonicalizesEquivalentOrdering(t *testing.T) {
 	fixture := newGateFixture(t, false, "pass")
-	_, left, err := validateRequest(fixture.request)
+	_, left, err := fixture.gate.validateRequest(context.Background(), fixture.request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rightRequest := fixture.request
 	rightRequest.Reviews = []ReviewAttestation{fixture.request.Reviews[1], fixture.request.Reviews[0]}
 	rightRequest.ReviewPolicy.Required = []ReviewRequirement{fixture.request.ReviewPolicy.Required[1], fixture.request.ReviewPolicy.Required[0]}
-	_, right, err := validateRequest(rightRequest)
+	_, right, err := fixture.gate.validateRequest(context.Background(), rightRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(left, right) {
 		t.Fatalf("equivalent input ordering changed canonical evidence:\n%s\n%s", left, right)
 	}
+}
+
+func TestGateSupportsLargeLegitimateAcceptanceEvidenceFanout(t *testing.T) {
+	fixture := newGateFixture(t, false, "pass")
+	manifest := fixture.request.Authority.Manifest()
+	command := manifest.Acceptance[0]
+	manifest.Acceptance = make([]authority.AcceptanceCommand, 48)
+	for index := range manifest.Acceptance {
+		manifest.Acceptance[index] = command
+		manifest.Acceptance[index].Name = fmt.Sprintf("combined-%03d", index+1)
+	}
+	governed, err := authority.New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.request.Authority = governed
+	result, err := fixture.gate.Run(context.Background(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.StateReadyForMerge || len(result.Combined.EvidenceRefs()) <= 128 {
+		t.Fatalf("large evidence result = state %s, refs %d", result.State, len(result.Combined.EvidenceRefs()))
+	}
+}
+
+func TestGateFanoutOverflowTerminalizesValidationUnavailable(t *testing.T) {
+	fixture := newGateFixture(t, false, "pass")
+	fixture.gate.workspace = &overflowEvidenceWorkspace{delegate: fixture.gate.workspace}
+	result, err := fixture.gate.Run(context.Background(), fixture.request)
+	if err != nil || result.State != domain.StateValidationUnavailable || !strings.Contains(result.FailureReason, "integration evidence count") {
+		t.Fatalf("overflow result = state %s, error %v", result.State, err)
+	}
+	states := fixture.events.states()
+	if len(states) == 0 || states[len(states)-1] != domain.StateValidationUnavailable {
+		t.Fatalf("overflow left nonterminal states %v", states)
+	}
+	terminal := fixture.events.events[len(fixture.events.events)-1]
+	if len(terminal.EvidenceRefs) == 0 || len(terminal.EvidenceRefs) > 16 {
+		t.Fatalf("overflow terminal evidence was not reduced and bounded: %d refs", len(terminal.EvidenceRefs))
+	}
+}
+
+type overflowEvidenceWorkspace struct{ delegate workspaceController }
+
+func (w *overflowEvidenceWorkspace) Integrate(ctx context.Context, request integrationworkspace.Request) (integrationworkspace.Result, error) {
+	return w.delegate.Integrate(ctx, request)
+}
+
+func (w *overflowEvidenceWorkspace) UseMaterialized(ctx context.Context, request integrationworkspace.Request, expected integrationworkspace.Result, prefix string, use func(integrationworkspace.MaterializedTarget) error) (integrationworkspace.MaterializationEvidence, error) {
+	return w.delegate.UseMaterialized(ctx, request, expected, prefix, func(target integrationworkspace.MaterializedTarget) error {
+		for len(target.Evidence) <= 64 {
+			target.Evidence = append(target.Evidence, target.Evidence[0])
+		}
+		return use(target)
+	})
+}
+
+func TestReadyForMergeCarriesDurableSourceHeadVerification(t *testing.T) {
+	fixture := newGateFixture(t, false, "pass")
+	result, err := fixture.gate.Run(context.Background(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.SourceVerificationEvidence) != 3 {
+		t.Fatalf("source verification evidence count = %d, want 3", len(result.SourceVerificationEvidence))
+	}
+	ready := fixture.events.events[len(fixture.events.events)-1]
+	found := false
+	for _, ref := range ready.EvidenceRefs {
+		if ref.Kind == sourceHeadsEvidenceKind {
+			found = true
+			data, readErr := evidence.ReadVerifiedLocal(fixture.gate.evidenceRoot, ref, maxEvidenceArtifactBytes)
+			if readErr != nil || !strings.Contains(string(data), `"boundary":"ready-for-merge"`) || !strings.Contains(string(data), `"verified":true`) {
+				t.Fatalf("ready source evidence = %s, %v", data, readErr)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("READY_FOR_MERGE transition omitted final source-head verification evidence")
+	}
+}
+
+func TestFinalSourceHeadDriftTerminalizesWithDurableEvidence(t *testing.T) {
+	fixture := newGateFixture(t, false, "pass")
+	first := fixture.request.Candidates[0].Input()
+	fixture.gate.workspace = &moveSourceAfterMaterializationWorkspace{
+		delegate: fixture.gate.workspace, repository: first.Repository, branch: first.Branch, target: fixture.base,
+	}
+	result, err := fixture.gate.Run(context.Background(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.StateValidationUnavailable || !strings.Contains(result.FailureReason, "source head changed") {
+		t.Fatalf("drift result = state %s, reason %q", result.State, result.FailureReason)
+	}
+	terminal := fixture.events.events[len(fixture.events.events)-1]
+	foundFailureProof := false
+	for _, ref := range terminal.EvidenceRefs {
+		if ref.Kind != sourceHeadsEvidenceKind {
+			continue
+		}
+		data, readErr := evidence.ReadVerifiedLocal(fixture.gate.evidenceRoot, ref, maxEvidenceArtifactBytes)
+		if readErr == nil && strings.Contains(string(data), `"boundary":"ready-for-merge"`) && strings.Contains(string(data), `"verified":false`) {
+			foundFailureProof = true
+		}
+	}
+	if !foundFailureProof {
+		t.Fatal("terminal transition omitted durable final source-head failure proof")
+	}
+}
+
+type moveSourceAfterMaterializationWorkspace struct {
+	delegate                   workspaceController
+	repository, branch, target string
+}
+
+func (w *moveSourceAfterMaterializationWorkspace) Integrate(ctx context.Context, request integrationworkspace.Request) (integrationworkspace.Result, error) {
+	return w.delegate.Integrate(ctx, request)
+}
+
+func (w *moveSourceAfterMaterializationWorkspace) UseMaterialized(ctx context.Context, request integrationworkspace.Request, expected integrationworkspace.Result, prefix string, use func(integrationworkspace.MaterializedTarget) error) (integrationworkspace.MaterializationEvidence, error) {
+	evidence, err := w.delegate.UseMaterialized(ctx, request, expected, prefix, use)
+	command := exec.Command("git", "update-ref", "refs/heads/"+w.branch, w.target)
+	command.Dir = w.repository
+	return evidence, errorsJoin(err, command.Run())
 }
 
 func TestCleanupFailureFailsClosed(t *testing.T) {
@@ -264,14 +425,15 @@ func newGateFixture(t *testing.T, conflict bool, mode string) gateFixture {
 	if mode == "unavailable" {
 		command.Argv = []string{"/definitely/not/a/program"}
 	}
-	governed, err := authority.New(authority.Manifest{RunID: "gate-run", Repository: authority.RepositoryManifest{Path: repository, Identity: "example/project", Remotes: map[string]string{"origin": "https://example.test/example/project.git"}, DefaultBranch: "main", StartSHA: base}, Plan: authority.PlanManifest{Path: filepath.Join(repository, "plan.md"), SHA256: fileDigest(t, filepath.Join(repository, "plan.md"))}, Ralphex: authority.RalphexManifest{BinaryPath: os.Args[0], BinarySHA256: fileDigest(t, os.Args[0]), Mode: ralphex.ModeFull, Timeout: "5s", WaitOnLimit: "0s"}, Acceptance: []authority.AcceptanceCommand{command}, PolicyVersion: "policy-v1"})
+	shaB, shaC := headOne, headTwo
+	reviewPolicy := ReviewPolicy{PolicyIdentity: "review-v1", Required: []ReviewRequirement{{Component: "track-b", ReviewedSHA: shaB, Verdict: VerdictCleanCriticalMajor}, {Component: "track-c", ReviewedSHA: shaC, Verdict: VerdictCleanCriticalMajor}}}
+	governed, err := authority.New(authority.Manifest{RunID: "gate-run", Repository: authority.RepositoryManifest{Path: repository, Identity: "example/project", Remotes: map[string]string{"origin": "https://example.test/example/project.git"}, DefaultBranch: "main", StartSHA: base}, Plan: authority.PlanManifest{Path: filepath.Join(repository, "plan.md"), SHA256: fileDigest(t, filepath.Join(repository, "plan.md"))}, MergeReview: &reviewPolicy, Ralphex: authority.RalphexManifest{BinaryPath: os.Args[0], BinarySHA256: fileDigest(t, os.Args[0]), Mode: ralphex.ModeFull, Timeout: "5s", WaitOnLimit: "0s"}, Acceptance: []authority.AcceptanceCommand{command}, PolicyVersion: "policy-v1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	reviewOne := writeEvidence(t, store, "review-track-b.json", "review", []byte("track b clean"))
 	reviewTwo := writeEvidence(t, store, "review-track-c.json", "review", []byte("track c clean"))
-	shaB, shaC := strings.Repeat("a", 40), strings.Repeat("b", 40)
-	request := Request{Authority: governed, BaselineSHA: base, Candidates: candidates, RiskReport: risk, CombinedPolicy: combinedacceptance.Policy{PolicyIdentity: "semantic-v1", CombinedAcceptancePolicyIdentity: "policy-v1", IntegrationPolicyIdentity: "integration-v1", RiskPolicyIdentity: "risk-v1", SemanticFailureClasses: []string{"unit"}}, ReviewPolicy: ReviewPolicy{PolicyIdentity: "review-v1", Required: []ReviewRequirement{{Component: "track-b", ReviewedSHA: shaB, Verdict: VerdictCleanCriticalMajor}, {Component: "track-c", ReviewedSHA: shaC, Verdict: VerdictCleanCriticalMajor}}}, Reviews: []ReviewAttestation{{Component: "track-b", ReviewedSHA: shaB, Verdict: VerdictCleanCriticalMajor, Provider: "reviewer-b", Evidence: []ledger.EvidenceRef{reviewOne}}, {Component: "track-c", ReviewedSHA: shaC, Verdict: VerdictCleanCriticalMajor, Provider: "reviewer-c", Evidence: []ledger.EvidenceRef{reviewTwo}}}, EvidencePrefix: "serial"}
+	request := Request{Authority: governed, BaselineSHA: base, Candidates: candidates, RiskReport: risk, CombinedPolicy: combinedacceptance.Policy{PolicyIdentity: "semantic-v1", CombinedAcceptancePolicyIdentity: "policy-v1", IntegrationPolicyIdentity: "integration-v1", RiskPolicyIdentity: "risk-v1", SemanticFailureClasses: []string{"unit"}}, ReviewPolicy: reviewPolicy, Reviews: []ReviewAttestation{{Component: "track-b", ReviewedSHA: shaB, Verdict: VerdictCleanCriticalMajor, Provider: "reviewer-b", Evidence: []ledger.EvidenceRef{reviewOne}}, {Component: "track-c", ReviewedSHA: shaC, Verdict: VerdictCleanCriticalMajor, Provider: "reviewer-c", Evidence: []ledger.EvidenceRef{reviewTwo}}}, EvidencePrefix: "serial"}
 	events := &recordingEvents{}
 	temporary := t.TempDir()
 	gate, err := New(Config{TemporaryRoot: temporary, Events: events, Artifacts: store, Processes: supervisor.New()})
