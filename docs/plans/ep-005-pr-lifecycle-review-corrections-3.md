@@ -299,6 +299,14 @@ Ralphex completion is not push-readiness. The exact correction head must pass AB
 
 Land this document as `docs/plans/ep-005-pr-lifecycle-review-corrections-3.md` first (it is the governing plan), then implement.
 
+### Task 1: Correct the resource-scoped prior-confirmed PR barrier
+
+- [ ] Implement Steps 1–5 below exactly as designed, including bounded lower-barrier exact replay only across provably zero-write later ordinals.
+- [ ] Implement every adversarial regression in §9, including abandoned revision, same-request re-entry, resume, barrier authentication, structural scan, lower-barrier replay blocking, and superseded resurrection.
+- [ ] Preserve every listed non-goal and all previously accepted one-submission/no-replay, exact-head, locking, recovery, evidence, transport, budget, and ledger invariants.
+- [ ] Run every validation in §10 and require all to pass.
+- [ ] Mark satisfied plan checkboxes, commit the implementation only after validation, and move this plan to `docs/plans/completed/`.
+
 ### Step 1 — `internal/prlifecycle/store_linux.go`
 
 1. Wrap the kind alternation of `admissionName` (line 19) in a third capture group, exactly as printed in §2. Do not change which names match. Verify capture indices 1 and 2 are unchanged so `nextPrepareRound` (`terminal.go:569`) and `inventory` (`store_linux.go:369`) need no edit.
