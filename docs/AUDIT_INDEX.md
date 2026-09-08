@@ -1,6 +1,6 @@
 # Audit Index
 
-This index links each accepted execution pack to its reviewed Git identity and merge evidence. Runtime run/evidence references are added when execution is launched through ABCP.
+This index links each accepted execution pack to its reviewed Git identity and merge evidence. Runtime run/evidence references are added as governed execution progresses.
 
 | EP | PR | Reviewed head | Merge SHA | Review mode |
 |---|---:|---|---|---|
@@ -10,9 +10,12 @@ This index links each accepted execution pack to its reviewed Git identity and m
 
 ## EP-005 active
 
-Roadmap authority: Phase 4 GitHub lifecycle.
-Execution pack: `docs/execution-packs/EP-005-github-lifecycle.md`.
-Foundation plan: `docs/plans/ep-005-github-lifecycle-foundation.md`.
-Independent corrected-design verdict: `DESIGN_CLEAN_CRITICAL_MAJOR`.
+Roadmap authority: Phase 4 GitHub lifecycle. Foundation merged in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 
-The EP-005 runtime row remains incomplete until the foundation is launched through ABCP and exact run/evidence identities exist.
+Exact-head lifecycle implementation `f986008ba11c69c3864f0b8977af440024d12048` passed ABCP acceptance but post-implementation review found 1 Critical and 9 Major defects. First governed correction round then passed ABCP acceptance at `d4e7e1d8fc6af9545f9f67e3c99fa94c3420a7ce`; fresh Claude Code / Opus exact-head review found 2 Critical and 4 Major defects, artifact SHA-256 `d07f9124d771a38caff86b5c3283a70c35d5fe71379b329b1513416392c99421`.
+
+Second correction plan `docs/plans/ep-005-pr-lifecycle-review-corrections-2.md` is design-clean at SHA-256 `86b469cb4ced969394854aa88ad91418721b64d27a83aed5a4a2c0eeda6c8527`. First Claude design review found 1 Critical + 3 Major gaps; revised-plan Claude re-review hit provider session limits, after which policy-authorized controller fallback returned `DESIGN_CLEAN_CRITICAL_MAJOR`, artifact SHA-256 `6851fe6a742e6bdb5cf49ed7587ec690936719d9510f6de243b1982041ebcbde`.
+
+Second correction implementation then reached ABCP `BRANCH_ACCEPTED` at `35faeec8b8314519ee6b9d36eba32a0c25ac6050`. Fresh Claude exact-head review verified the ten prior findings corrected and found one remaining Critical, artifact SHA-256 `9fa76414ce73fc9168de70d967e28539cf662a54802e09678d1a5de829266974`. Third correction design is clean at SHA-256 `cb7349da368084eb607e2e9d93f284e4801be831ddc08a1959c572eb3912ce60`; after Claude refinement hit a provider session limit, policy-authorized controller fallback returned `DESIGN_CLEAN_CRITICAL_MAJOR`, artifact SHA-256 `b82f3b3a84c31137c35fc7461acc9de152a916f5fd075d1521235a9f4bf4a984`. The first implementation launch failed pre-task because the plan lacked Ralphex task syntax; a syntax-only Task 1 amendment was reviewed clean at artifact SHA-256 `9874944142e54377f005f50cda1fa73af4b6e8290f136c73afdb8d6c0ee178e6` and changed no architecture semantics.
+
+EP-005 remains active and unpublishable. PR #8 has not been created and the branch has not been pushed. The final EP-005 row will be recorded only after an exact ABCP-accepted head receives a clean required review and is merged with final merge evidence.
