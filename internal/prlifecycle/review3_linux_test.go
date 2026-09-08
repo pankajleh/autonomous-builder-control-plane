@@ -298,9 +298,20 @@ func TestMarkerPresentResumeDoesNotLoadBarrier(t *testing.T) {
 	}
 }
 
-func writeAbandonedRevision(t *testing.T, controller *Controller, key PRResourceKeyV1, ordinal uint64, template revisionRecord, requestSHA string) {
+func writeAbandonedRevision(t *testing.T, controller *Controller, key PRResourceKeyV1, ordinal uint64, template revisionRecord) {
 	t.Helper()
 	template.Ordinal = ordinal
+	template.Title = "different abandoned request"
+	template.Body = "different abandoned body"
+	template.DocumentSHA256 = documentDigest(template.Title, template.Body)
+	requestSHA, err := canonicalDigest(struct {
+		Authority json.RawMessage `json:"authority"`
+		Title     string          `json:"title"`
+		Body      string          `json:"body"`
+	}{template.SourceAuthority, template.Title, template.Body})
+	if err != nil {
+		t.Fatal(err)
+	}
 	template.RequestSHA256 = requestSHA
 	data, err := json.Marshal(template)
 	if err != nil {
@@ -325,7 +336,7 @@ func TestNonConfirmedLowerBarrierCannotBeBypassed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeAbandonedRevision(t, controller, key, 2, revision1, digestBytes([]byte("different-abandoned-request")))
+	writeAbandonedRevision(t, controller, key, 2, revision1)
 	fixture.mu.Lock()
 	beforeRequests, beforeWrites := fixture.requests, fixture.writes
 	fixture.mu.Unlock()

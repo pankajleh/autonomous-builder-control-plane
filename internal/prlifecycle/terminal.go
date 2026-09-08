@@ -373,6 +373,27 @@ func validateCanonicalAuthority(raw json.RawMessage, expectedSHA string) error {
 	return nil
 }
 
+func validateRevisionIdentity(revision revisionRecord) error {
+	if err := validateCanonicalAuthority(revision.SourceAuthority, revision.SourceSHA256); err != nil {
+		return err
+	}
+	if err := validateCanonicalAuthority(revision.Authority, revision.AuthoritySHA256); err != nil {
+		return err
+	}
+	if documentDigest(revision.Title, revision.Body) != revision.DocumentSHA256 {
+		return &Error{Code: CodeIntegrityFailure, Cause: errors.New("revision document digest mismatch")}
+	}
+	requestSHA, err := canonicalDigest(struct {
+		Authority json.RawMessage `json:"authority"`
+		Title     string          `json:"title"`
+		Body      string          `json:"body"`
+	}{revision.SourceAuthority, revision.Title, revision.Body})
+	if err != nil || requestSHA != revision.RequestSHA256 {
+		return &Error{Code: CodeIntegrityFailure, Cause: firstError(err, errors.New("revision request digest mismatch"))}
+	}
+	return nil
+}
+
 func rebuildSnapshot(w snapshotRecoveryWire, limits githublifecycle.Limits) (githublifecycle.PullRequestSnapshot, error) {
 	repository, err := githublifecycle.NewRepository(w.RepositoryOwn, w.Repository)
 	if err != nil {
@@ -467,6 +488,9 @@ func readRevision(tx *resourceTxn, ordinal uint64) (revisionRecord, error) {
 	canonical, err := json.Marshal(value)
 	if err != nil || !bytes.Equal(canonical, b) {
 		return value, &Error{Code: CodeIntegrityFailure, Cause: firstError(err, errors.New("revision is not canonical"))}
+	}
+	if err := validateRevisionIdentity(value); err != nil {
+		return value, err
 	}
 	return value, nil
 }

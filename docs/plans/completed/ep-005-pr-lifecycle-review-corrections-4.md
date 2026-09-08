@@ -96,8 +96,8 @@ Ralphex completion does not authorize publication. The exact correction commit m
 
 ### Task 1: Authenticate persisted revision request identity before replay
 
-- [ ] Make `readRevision` reject any persisted revision whose source authority, derived authority, document digest, or request digest is not self-consistent.
-- [ ] Add all current-max and lower-barrier adversarial tamper regressions plus untampered positive replay controls.
-- [ ] Preserve round-3 barrier, resume, one-submission/no-replay, evidence, locking, capacity, transport, reconciliation, and terminal-chain invariants.
-- [ ] Run every verification command above successfully.
-- [ ] Move this plan to `docs/plans/completed/` and commit only after validation.
+- [x] Make `readRevision` reject any persisted revision whose source authority, derived authority, document digest, or request digest is not self-consistent.
+- [x] Add all current-max and lower-barrier adversarial tamper regressions plus untampered positive replay controls.
+- [x] Preserve round-3 barrier, resume, one-submission/no-replay, evidence, locking, capacity, transport, reconciliation, and terminal-chain invariants.
+- [x] Run every verification command above successfully.
+- [x] Move this plan to `docs/plans/completed/` and commit only after validation.
