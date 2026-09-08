@@ -600,6 +600,10 @@ func validateOperationAuthority(governed authority.Authority) (authority.Context
 	if verified.BaseSHA != governed.Repository().StartSHA {
 		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule base SHA %s does not match governed start SHA %s", verified.BaseSHA, governed.Repository().StartSHA)
 	}
+	mode := governed.Ralphex().Mode
+	if err := validateOperationMode(verified.OperationKind, mode); err != nil {
+		return authority.ContextCapsuleManifest{}, err
+	}
 	policy := governed.Executor()
 	if strings.EqualFold(strings.TrimSpace(policy.Executor), "codex") {
 		if policy.TaskEffort != "xhigh" {
@@ -609,7 +613,7 @@ func validateOperationAuthority(governed authority.Authority) (authority.Context
 			return authority.ContextCapsuleManifest{}, fmt.Errorf("Codex review_effort must be xhigh, got %q", policy.ReviewEffort)
 		}
 	}
-	if verified.OperationKind == contextcapsule.OperationImplementation {
+	if mode == ralphex.ModeFull || mode == ralphex.ModeTasksOnly {
 		plan, err := os.ReadFile(governed.Plan().Path)
 		if err != nil {
 			return authority.ContextCapsuleManifest{}, fmt.Errorf("read implementation task plan: %w", err)
@@ -625,6 +629,22 @@ func validateOperationAuthority(governed authority.Authority) (authority.Context
 	return capsule, nil
 }
 
+func validateOperationMode(kind contextcapsule.OperationKind, mode ralphex.Mode) error {
+	switch mode {
+	case ralphex.ModeFull, ralphex.ModeTasksOnly:
+		if kind != contextcapsule.OperationImplementation {
+			return fmt.Errorf("Ralphex mode %q requires operation kind %q, got %q", mode, contextcapsule.OperationImplementation, kind)
+		}
+	case ralphex.ModeReview:
+		if kind != contextcapsule.OperationDesignReview && kind != contextcapsule.OperationImplementationReview {
+			return fmt.Errorf("Ralphex mode %q requires operation kind %q or %q, got %q", mode, contextcapsule.OperationDesignReview, contextcapsule.OperationImplementationReview, kind)
+		}
+	default:
+		return fmt.Errorf("unsupported Ralphex mode %q for operation kind %q", mode, kind)
+	}
+	return nil
+}
+
 func countIncompleteExecutableSections(plan []byte) (int, error) {
 	scanner := bufio.NewScanner(strings.NewReader(string(plan)))
 	scanner.Buffer(make([]byte, 64<<10), 4<<20)
@@ -632,6 +652,8 @@ func countIncompleteExecutableSections(plan []byte) (int, error) {
 	currentIncomplete := false
 	inFence := false
 	fenceMarker := byte(0)
+	fenceLength := 0
+	fenceLine := 0
 	incompleteSections := 0
 	finishSection := func() {
 		if inExecutableSection && currentIncomplete {
@@ -640,20 +662,24 @@ func countIncompleteExecutableSections(plan []byte) (int, error) {
 		inExecutableSection = false
 		currentIncomplete = false
 	}
+	lineNumber := 0
 	for scanner.Scan() {
+		lineNumber++
 		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-		if marker, fence := markdownFence(trimmed); fence {
-			if !inFence {
-				inFence = true
-				fenceMarker = marker
-			} else if marker == fenceMarker {
+		if inFence {
+			if closesMarkdownFence(line, fenceMarker, fenceLength) {
 				inFence = false
 				fenceMarker = 0
+				fenceLength = 0
+				fenceLine = 0
 			}
 			continue
 		}
-		if inFence {
+		if marker, length, opens := opensMarkdownFence(line); opens {
+			inFence = true
+			fenceMarker = marker
+			fenceLength = length
+			fenceLine = lineNumber
 			continue
 		}
 		level := markdownHeadingLevel(line)
@@ -662,27 +688,66 @@ func countIncompleteExecutableSections(plan []byte) (int, error) {
 			inExecutableSection = level == 3 && executableSectionHeading(line)
 			continue
 		}
-		if inExecutableSection && incompleteCheckbox(trimmed) {
+		if inExecutableSection && incompleteCheckbox(strings.TrimSpace(line)) {
 			currentIncomplete = true
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return 0, err
 	}
+	if inFence {
+		return 0, fmt.Errorf("unterminated Markdown %c fence of length %d opened on line %d", fenceMarker, fenceLength, fenceLine)
+	}
 	finishSection()
 	return incompleteSections, nil
 }
 
-func markdownFence(trimmed string) (byte, bool) {
-	if len(trimmed) < 3 || trimmed[0] != '`' && trimmed[0] != '~' {
-		return 0, false
+func opensMarkdownFence(line string) (byte, int, bool) {
+	content, validIndent := markdownFenceContent(line)
+	if !validIndent || len(content) < 3 || content[0] != '`' && content[0] != '~' {
+		return 0, 0, false
 	}
-	marker := trimmed[0]
+	marker := content[0]
 	count := 0
-	for count < len(trimmed) && trimmed[count] == marker {
+	for count < len(content) && content[count] == marker {
 		count++
 	}
-	return marker, count >= 3
+	if count < 3 || marker == '`' && strings.ContainsRune(content[count:], '`') {
+		return 0, 0, false
+	}
+	return marker, count, true
+}
+
+func closesMarkdownFence(line string, marker byte, openingLength int) bool {
+	content, validIndent := markdownFenceContent(line)
+	if !validIndent || len(content) < openingLength || content[0] != marker {
+		return false
+	}
+	count := 0
+	for count < len(content) && content[count] == marker {
+		count++
+	}
+	return count >= openingLength && strings.Trim(content[count:], " \t") == ""
+}
+
+func markdownFenceContent(line string) (string, bool) {
+	column := 0
+	index := 0
+	for index < len(line) {
+		switch line[index] {
+		case ' ':
+			column++
+		case '\t':
+			column += 4 - column%4
+		default:
+			return line[index:], column <= 3
+		}
+		if column > 3 {
+			return "", false
+		}
+		index++
+	}
+	return "", true
 }
 
 func markdownHeadingLevel(line string) int {

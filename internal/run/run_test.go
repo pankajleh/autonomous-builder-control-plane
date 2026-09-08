@@ -232,29 +232,118 @@ func TestNewEnforcesCodexXHighEffort(t *testing.T) {
 	}
 }
 
-func TestNewRejectsMultipleIncompleteImplementationSections(t *testing.T) {
-	fixture := newRunFixture(t, 0, commandPath(t, "true"))
-	manifest := fixture.authority.Manifest()
-	plan := []byte("### Task 1: first\n\n- [ ] first action\n\n### Task 2: second\n\n- [ ] second action\n")
-	writeTestFile(t, manifest.Plan.Path, plan, 0o600)
-	manifest.Plan.SHA256 = testHash(t, manifest.Plan.Path)
-	governed, err := authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
+func TestNewEnforcesOperationKindAndRalphexModeMapping(t *testing.T) {
+	tests := []struct {
+		name    string
+		kind    contextcapsule.OperationKind
+		mode    ralphex.Mode
+		wantErr bool
+	}{
+		{name: "implementation full", kind: contextcapsule.OperationImplementation, mode: ralphex.ModeFull},
+		{name: "implementation tasks-only", kind: contextcapsule.OperationImplementation, mode: ralphex.ModeTasksOnly},
+		{name: "design review", kind: contextcapsule.OperationDesignReview, mode: ralphex.ModeReview},
+		{name: "implementation review", kind: contextcapsule.OperationImplementationReview, mode: ralphex.ModeReview},
+		{name: "design review cannot run full", kind: contextcapsule.OperationDesignReview, mode: ralphex.ModeFull, wantErr: true},
+		{name: "design review cannot run tasks-only", kind: contextcapsule.OperationDesignReview, mode: ralphex.ModeTasksOnly, wantErr: true},
+		{name: "implementation review cannot run full", kind: contextcapsule.OperationImplementationReview, mode: ralphex.ModeFull, wantErr: true},
+		{name: "implementation review cannot run tasks-only", kind: contextcapsule.OperationImplementationReview, mode: ralphex.ModeTasksOnly, wantErr: true},
+		{name: "implementation cannot run review", kind: contextcapsule.OperationImplementation, mode: ralphex.ModeReview, wantErr: true},
+		{name: "acceptance cannot run review", kind: contextcapsule.OperationAcceptance, mode: ralphex.ModeReview, wantErr: true},
 	}
-	if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), "2 incomplete executable") {
-		t.Fatalf("multiple incomplete task error = %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRunFixture(t, 0, commandPath(t, "true"))
+			manifest := fixture.authority.Manifest()
+			manifest.Ralphex.Mode = test.mode
+			bindOperationCapsule(t, &manifest, test.kind)
+			governed, err := authority.New(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = fixture.construct(t, governed)
+			if test.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "requires operation kind") {
+					t.Fatalf("operation kind %q with mode %q error = %v", test.kind, test.mode, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("operation kind %q with mode %q rejected: %v", test.kind, test.mode, err)
+			}
+		})
+	}
+}
+
+func TestNewRejectsMultipleIncompleteImplementationSectionsInEveryImplementationMode(t *testing.T) {
+	for _, mode := range []ralphex.Mode{ralphex.ModeFull, ralphex.ModeTasksOnly} {
+		t.Run(string(mode), func(t *testing.T) {
+			fixture := newRunFixture(t, 0, commandPath(t, "true"))
+			manifest := fixture.authority.Manifest()
+			manifest.Ralphex.Mode = mode
+			plan := []byte("### Task 1: first\n\n- [ ] first action\n\n### Task 2: second\n\n- [ ] second action\n")
+			writeTestFile(t, manifest.Plan.Path, plan, 0o600)
+			manifest.Plan.SHA256 = testHash(t, manifest.Plan.Path)
+			governed, err := authority.New(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), "2 incomplete executable") {
+				t.Fatalf("multiple incomplete task error = %v", err)
+			}
+		})
 	}
 }
 
 func TestCountIncompleteExecutableSections(t *testing.T) {
-	plan := []byte("## Overview\n- [ ] not executable\n\n### Task 1: done\n- [x] complete\n\n```md\n### Task 99: example\n- [ ] ignored\n```\n\n### Iteration 2: active\n- [ ] action\n")
+	tests := []struct {
+		name string
+		plan string
+		want int
+	}{
+		{
+			name: "backtick fence",
+			plan: "## Overview\n- [ ] not executable\n\n### Task 1: done\n- [x] complete\n\n```md\n### Task 99: example\n- [ ] ignored\n```\n\n### Iteration 2: active\n- [ ] action\n",
+			want: 1,
+		},
+		{
+			name: "indented backtick fence with longer closer",
+			plan: "   ````markdown\n### Task 98: example\n- [ ] ignored\n```\n   `````  \n\n### Task 1: active\n- [ ] action\n",
+			want: 1,
+		},
+		{
+			name: "tilde fence with backticks in info string",
+			plan: "~~~ language=`markdown`\n### Task 97: example\n- [ ] ignored\n  ~~~\n\n### Task 1: active\n- [ ] action\n",
+			want: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sections, err := countIncompleteExecutableSections([]byte(test.plan))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sections != test.want {
+				t.Fatalf("incomplete executable sections = %d, want %d", sections, test.want)
+			}
+		})
+	}
+}
+
+func TestCountIncompleteExecutableSectionsDoesNotTreatFourSpaceIndentAsFence(t *testing.T) {
+	plan := []byte("    ```\n\n### Task 1: first\n- [ ] first action\n\n### Task 2: second\n- [ ] second action\n")
 	sections, err := countIncompleteExecutableSections(plan)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sections != 1 {
-		t.Fatalf("incomplete executable sections = %d, want 1", sections)
+	if sections != 2 {
+		t.Fatalf("four-space-indented backticks hid executable sections: got %d, want 2", sections)
+	}
+}
+
+func TestCountIncompleteExecutableSectionsRejectsUnterminatedFence(t *testing.T) {
+	plan := []byte("```markdown\n### Task 1: hidden\n- [ ] hidden action\n")
+	if _, err := countIncompleteExecutableSections(plan); err == nil || !strings.Contains(err.Error(), "unterminated Markdown") {
+		t.Fatalf("unterminated fence error = %v", err)
 	}
 }
 
