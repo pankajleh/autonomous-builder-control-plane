@@ -742,15 +742,15 @@ Roadmap self-review: this implements only Phase 4’s “CI evidence ingestion�
 
 ### Task 2: Implement bounded GitHub reads and two-sweep stabilization
 
-- [ ] Before any task work, obtain the capsule path/hash from launch authority, independently verify its exact bytes and run `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`; stop on any mismatch or drift.
-- [ ] Implement the sealed authenticated GET-only transport with body/header/text/time/request caps and no retries.
-- [ ] Implement `/user`, exact head-ref, check-suite, check-run, and legacy-status readers using only the endpoint matrix above.
-- [ ] Implement locally numbered pagination, `filter=all` for both check-suite and check-run queries, total-count validation, status sentinel-page enumeration, duplicate/conflict/cycle detection, and complete-enumeration proof.
-- [ ] Implement suite/run relationship validation and exact per-item SHA binding.
-- [ ] Implement H0 → Sweep A → H1 → Sweep B → H2 and deterministic semantic normalization.
-- [ ] Implement A/B equality, request/response chain construction, collection identity, and separate time ranges.
-- [ ] Add adversarial local-server tests for rerequests, in-place mutation, pagination races, truncation, malformed state, cancellation, and authenticator mutation.
-- [ ] Assert stable pending/failed/empty evidence remains neutral and never becomes a policy result.
+- [x] Before any task work, obtain the capsule path/hash from launch authority, independently verify its exact bytes and run `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`; stop on any mismatch or drift.
+- [x] Implement the sealed authenticated GET-only transport with body/header/text/time/request caps and no retries.
+- [x] Implement `/user`, exact head-ref, check-suite, check-run, and legacy-status readers using only the endpoint matrix above.
+- [x] Implement locally numbered pagination, `filter=all` for both check-suite and check-run queries, total-count validation, status sentinel-page enumeration, duplicate/conflict/cycle detection, and complete-enumeration proof.
+- [x] Implement suite/run relationship validation and exact per-item SHA binding.
+- [x] Implement H0 → Sweep A → H1 → Sweep B → H2 and deterministic semantic normalization.
+- [x] Implement A/B equality, request/response chain construction, collection identity, and separate time ranges.
+- [x] Add adversarial local-server tests for rerequests, in-place mutation, pagination races, truncation, malformed state, cancellation, and authenticator mutation.
+- [x] Assert stable pending/failed/empty evidence remains neutral and never becomes a policy result.
 
 ### Task 3: Implement immutable evidence, ledger outcome, and replay
 

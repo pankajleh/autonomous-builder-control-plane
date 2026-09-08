@@ -328,7 +328,7 @@ type headObservationWireV1 struct {
 }
 
 func NewHeadObservationV1(in HeadObservationV1Input) (HeadObservationV1, error) {
-	if !headPhase[in.Phase] || !validText(in.Ref, MaxTextBytes) || in.ObjectType != "commit" || !validGitSHA(in.SHA) || in.RequestSequence <= 0 || in.ResponseObservedUnixNano <= 0 {
+	if !headPhase[in.Phase] || !validText(in.Ref, MaxTextBytes+len("refs/heads/")) || in.ObjectType != "commit" || !validGitSHA(in.SHA) || in.RequestSequence <= 0 || in.ResponseObservedUnixNano <= 0 {
 		return HeadObservationV1{}, errors.New("head observation is invalid")
 	}
 	v, err := newImmutable(in, headObservationWireV1{in.Phase, in.Ref, in.ObjectType, in.SHA, in.RequestSequence, in.ResponseObservedUnixNano})
@@ -401,6 +401,12 @@ func NewRequestProvenanceV1(in RequestProvenanceV1Input) (RequestProvenanceV1, e
 	}
 	if in.BodyTruncated && in.CapturedPrefixSHA256 == "" {
 		return RequestProvenanceV1{}, errors.New("truncated response requires prefix digest")
+	}
+	if (!in.BodyTruncated && in.CapturedPrefixSHA256 != "") || (in.BodyTruncated && in.ResponseBodySHA256 != "") {
+		return RequestProvenanceV1{}, errors.New("response digest and truncation fields are inconsistent")
+	}
+	if in.RequestSHA256 != requestIdentitySHA256(in) || in.ResponseEnvelopeSHA256 != responseEnvelopeSHA256(in) {
+		return RequestProvenanceV1{}, errors.New("request provenance digest mismatch")
 	}
 	v, err := newImmutable(in, requestProvenanceWire(in))
 	result := RequestProvenanceV1{v}
@@ -525,6 +531,10 @@ func validateBundleInput(in CIEvidenceBundleV1Input) error {
 	if !validText(in.RunID, MaxTextBytes) || !validOpaque(in.AttemptID, MaxAttemptIDBytes) || !validDigest(in.AttemptKeySHA256) || !validDigest(in.AuthoritySHA256) || in.LimitsSHA256 != ProductionLimitsSHA256() || repositoryErr != nil || repository.String() == "" || branchErr != nil || branch.String() == "" || shaErr != nil || sha.String() == "" || in.ActingKind != "user" || !validUserSubject(in.ActingSubject) || !in.Outcome.Valid() {
 		return errors.New("CI evidence bundle identity is invalid")
 	}
+	wantAttemptKey := deriveAttemptKey(in.RunID, in.AttemptID, in.AuthoritySHA256, in.RepositoryOwner, in.RepositoryName, in.HeadBranch, in.HeadSHA, in.ActingKind, in.ActingSubject)
+	if in.AttemptKeySHA256 != wantAttemptKey {
+		return errors.New("CI evidence attempt identity mismatch")
+	}
 	if in.AttemptStartedUnixNano <= 0 || in.AttemptEndedUnixNano < in.AttemptStartedUnixNano {
 		return errors.New("CI evidence attempt interval is invalid")
 	}
@@ -551,8 +561,17 @@ func validateBundleInput(in CIEvidenceBundleV1Input) error {
 	if !validOptionalToken(in.FailureCode, MaxStateBytes) || !validOptionalToken(in.FailedPhase, MaxStateBytes) || in.FailedPage < 0 {
 		return errors.New("CI evidence failure fields are invalid")
 	}
-	if !validOptionalDigest(in.RequestResponseChainSHA256) || !validOptionalDigest(in.CollectionIdentitySHA256) || !validOptionalDigest(in.SemanticDigestA) || !validOptionalDigest(in.SemanticDigestB) {
+	if !validDigest(in.RequestResponseChainSHA256) || !validOptionalDigest(in.CollectionIdentitySHA256) || !validOptionalDigest(in.SemanticDigestA) || !validOptionalDigest(in.SemanticDigestB) {
 		return errors.New("CI evidence digest is invalid")
+	}
+	chainDigest, links, err := requestResponseChain(in.RequestProvenance)
+	if err != nil || chainDigest != in.RequestResponseChainSHA256 {
+		return errors.New("request/response chain digest mismatch")
+	}
+	firstResponse, lastResponse := responseRange(in.RequestProvenance)
+	if firstResponse != in.FirstResponseObservedUnixNano || lastResponse != in.LastResponseObservedUnixNano ||
+		!attemptContainsProvenance(in.AttemptStartedUnixNano, in.AttemptEndedUnixNano, in.RequestProvenance) {
+		return errors.New("CI evidence response interval mismatch")
 	}
 	if in.SweepA != nil && in.SemanticDigestA != in.SweepA.SHA256() {
 		return errors.New("sweep A digest mismatch")
@@ -568,18 +587,35 @@ func validateBundleInput(in CIEvidenceBundleV1Input) error {
 			}
 		}
 	}
+	earliestProvider, latestProvider := providerTimestampRange(in.SweepA, in.SweepB)
+	if earliestProvider != in.EarliestProviderStateAt || latestProvider != in.LatestProviderStateAt {
+		return errors.New("CI evidence provider timestamp range mismatch")
+	}
 	if in.AuthenticatedID < 0 || !validOptionalText(in.AuthenticatedNode, MaxTextBytes) || !validOptionalText(in.AuthenticatedLogin, MaxTextBytes) ||
 		(in.AuthenticatedID == 0 && (in.AuthenticatedNode != "" || in.AuthenticatedLogin != "")) {
 		return errors.New("authenticated principal evidence is invalid")
+	}
+	actingUserID, _ := parseCanonicalUserSubject(in.ActingSubject)
+	if in.AuthenticatedID > 0 && in.AuthenticatedID != actingUserID &&
+		(in.Outcome != OutcomeIntegrityFailure || in.FailureCode != "authenticated_user_mismatch") {
+		return errors.New("authenticated principal does not match acting subject")
 	}
 	if in.Outcome == OutcomeStable {
 		if in.SweepA == nil || in.SweepB == nil || in.SemanticDigestA == "" || in.SemanticDigestA != in.SemanticDigestB || in.CollectionIdentitySHA256 == "" || in.RequestResponseChainSHA256 == "" || len(in.HeadObservations) != 3 || in.FailureCode != "" || in.AuthenticatedID <= 0 {
 			return errors.New("STABLE bundle does not prove repeated observational stability")
 		}
 		for i, head := range in.HeadObservations {
-			if head.value.data.Phase != []string{"H0", "H1", "H2"}[i] || head.value.data.SHA != in.HeadSHA {
+			if head.value.data.Phase != []string{"H0", "H1", "H2"}[i] || head.value.data.SHA != in.HeadSHA || head.value.data.Ref != "refs/heads/"+in.HeadBranch {
 				return errors.New("STABLE bundle head observations are incomplete or mismatched")
 			}
+			sequence := head.value.data.RequestSequence
+			if sequence > len(in.RequestProvenance) || in.RequestProvenance[sequence-1].value.data.ResponseObservedUnixNano != head.value.data.ResponseObservedUnixNano {
+				return errors.New("STABLE bundle head observation is not bound to its request")
+			}
+		}
+		wantIdentity := collectionIdentitySHA256(in.RepositoryOwner, in.RepositoryName, in.HeadSHA, in.SemanticDigestA, links)
+		if in.CollectionIdentitySHA256 != wantIdentity {
+			return errors.New("collection identity digest mismatch")
 		}
 	} else if in.CollectionIdentitySHA256 != "" {
 		return errors.New("only STABLE evidence has a collection identity")

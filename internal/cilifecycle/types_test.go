@@ -188,14 +188,17 @@ func TestExactMaximumEscapingAndAggregateProfiles(t *testing.T) {
 
 	heads := make([]HeadObservationV1, 3)
 	for i, phase := range []string{"H0", "H1", "H2"} {
-		heads[i], _ = NewHeadObservationV1(HeadObservationV1Input{Phase: phase, Ref: strings.Repeat("r", MaxTextBytes), ObjectType: "commit", SHA: testSHA64, RequestSequence: i + 2, ResponseObservedUnixNano: int64(i + 2)})
+		heads[i], _ = NewHeadObservationV1(HeadObservationV1Input{Phase: phase, Ref: strings.Repeat("r", MaxTextBytes), ObjectType: "commit", SHA: testSHA64, RequestSequence: i + 2, ResponseObservedUnixNano: int64(i + 3)})
 	}
 	provenance := make([]RequestProvenanceV1, MaxCollectionRequests)
 	for i := range provenance {
 		path := strings.Repeat("&", 300)
 		short := strings.Repeat("&", 50)
 		var err error
-		provenance[i], err = NewRequestProvenanceV1(RequestProvenanceV1Input{Sequence: i + 1, Phase: "statuses_b", Page: 5, Method: "GET", PathTemplate: path, EscapedPath: path, CanonicalQuery: short, APIOrigin: short, APIVersion: short, Accept: short, RequestSHA256: testSHA64, HTTPStatus: 200, ResponseBodySHA256: testSHA64, ResponseEnvelopeSHA256: testSHA64, RequestID: maxEscapedText(i), RequestStartedUnixNano: int64(i + 1), ResponseObservedUnixNano: int64(i + 2), ResponseBytes: MaxResponseBodyBytes})
+		provenanceInput := RequestProvenanceV1Input{Sequence: i + 1, Phase: "statuses_b", Page: 5, Method: "GET", PathTemplate: path, EscapedPath: path, CanonicalQuery: short, APIOrigin: short, APIVersion: short, Accept: short, HTTPStatus: 200, ResponseBodySHA256: testSHA64, RequestID: maxEscapedText(i), RequestStartedUnixNano: int64(i + 1), ResponseObservedUnixNano: int64(i + 2), ResponseBytes: MaxResponseBodyBytes}
+		provenanceInput.RequestSHA256 = requestIdentitySHA256(provenanceInput)
+		provenanceInput.ResponseEnvelopeSHA256 = responseEnvelopeSHA256(provenanceInput)
+		provenance[i], err = NewRequestProvenanceV1(provenanceInput)
 		if err != nil {
 			t.Fatalf("maximum provenance %d: %v", i, err)
 		}
@@ -204,7 +207,24 @@ func TestExactMaximumEscapingAndAggregateProfiles(t *testing.T) {
 		}
 	}
 	digest := sweep.SHA256()
-	bundle, err := NewCIEvidenceBundleV1(CIEvidenceBundleV1Input{RunID: strings.Repeat("r", MaxTextBytes), AttemptID: strings.Repeat("a", MaxAttemptIDBytes), AttemptKeySHA256: testSHA64, AuthoritySHA256: testSHA64, LimitsSHA256: ProductionLimitsSHA256(), RepositoryOwner: strings.Repeat("O", 100), RepositoryName: strings.Repeat("R", 100), HeadBranch: strings.Repeat("h", 255), HeadSHA: testSHA64, ActingKind: "user", ActingSubject: "github-user-id:9223372036854775807", AuthenticatedID: math.MaxInt64, AuthenticatedNode: maxEscapedText(1), AuthenticatedLogin: maxEscapedText(2), Outcome: OutcomeStable, AttemptStartedUnixNano: 1, AttemptEndedUnixNano: 100, CollectionStartedUnixNano: 2, CollectionEndedUnixNano: 99, FirstResponseObservedUnixNano: 2, LastResponseObservedUnixNano: 99, EarliestProviderStateAt: testTime, LatestProviderStateAt: testTime, HeadObservations: heads, SweepA: &sweep, SweepB: &sweep, SemanticDigestA: digest, SemanticDigestB: digest, RequestProvenance: provenance, RequestResponseChainSHA256: testSHA64, CollectionIdentitySHA256: testSHA64})
+	chain, links, err := requestResponseChain(provenance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := collectionIdentitySHA256(strings.Repeat("O", 100), strings.Repeat("R", 100), testSHA64, digest, links)
+	runID, attemptID := strings.Repeat("r", MaxTextBytes), strings.Repeat("a", MaxAttemptIDBytes)
+	owner, repository, branch := strings.Repeat("O", 100), strings.Repeat("R", 100), strings.Repeat("h", 255)
+	actingKind, actingSubject := "user", "github-user-id:9223372036854775807"
+	attemptKey := deriveAttemptKey(runID, attemptID, testSHA64, owner, repository, branch, testSHA64, actingKind, actingSubject)
+	for i := range heads {
+		headInput := heads[i].Input()
+		headInput.Ref = "refs/heads/" + branch
+		heads[i], err = NewHeadObservationV1(headInput)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	bundle, err := NewCIEvidenceBundleV1(CIEvidenceBundleV1Input{RunID: runID, AttemptID: attemptID, AttemptKeySHA256: attemptKey, AuthoritySHA256: testSHA64, LimitsSHA256: ProductionLimitsSHA256(), RepositoryOwner: owner, RepositoryName: repository, HeadBranch: branch, HeadSHA: testSHA64, ActingKind: actingKind, ActingSubject: actingSubject, AuthenticatedID: math.MaxInt64, AuthenticatedNode: maxEscapedText(1), AuthenticatedLogin: maxEscapedText(2), Outcome: OutcomeStable, AttemptStartedUnixNano: 1, AttemptEndedUnixNano: 100, CollectionStartedUnixNano: 2, CollectionEndedUnixNano: 99, FirstResponseObservedUnixNano: 2, LastResponseObservedUnixNano: 31, EarliestProviderStateAt: testTime, LatestProviderStateAt: testTime, HeadObservations: heads, SweepA: &sweep, SweepB: &sweep, SemanticDigestA: digest, SemanticDigestB: digest, RequestProvenance: provenance, RequestResponseChainSHA256: chain, CollectionIdentitySHA256: identity})
 	if err != nil {
 		t.Fatal(err)
 	}
