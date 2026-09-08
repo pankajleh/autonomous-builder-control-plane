@@ -8,7 +8,7 @@ Updated: 2026-09-08
 | Phase 1 — Governed single-plan execution | COMPLETE | PR #4 merged |
 | Phase 2 — Recovery and blocker control | COMPLETE | PR #5 merged |
 | Phase 3 — Cross-plan scheduler and integration | COMPLETE | PR #6 merged at `94e14ca749d31ac214e979aab03fbde37502dd7f` |
-| Phase 4 — GitHub lifecycle | IN PROGRESS | Foundation PR #7; exact-head PR lifecycle PR #8 merged at `ccf75d093625119cc39944fe7a47c3a03b30ad3b`; tracking PR #9 merged; CI evidence-ingestion design correction active |
+| Phase 4 — GitHub lifecycle | IN PROGRESS | Foundation PR #7; exact-head PR lifecycle PR #8; tracking PRs #9/#10; CI evidence-ingestion design accepted at `47a6d7b1…`, implementation authorized |
 | Phase 5 — Service/API/dashboard | NOT STARTED | roadmap only |
 | Phase 6 — Production hardening | NOT STARTED | roadmap only |
 
@@ -16,11 +16,11 @@ Updated: 2026-09-08
 
 EP-005 PR lifecycle is merged in PR #8. Final reviewed/accepted head: `6db075240ce87b751f8db98abb540c96410c515b`; merge SHA: `ccf75d093625119cc39944fe7a47c3a03b30ad3b`. Final post-implementation controller fallback review (Claude provider session-limit fallback) returned `CLEAN_CRITICAL_MAJOR` with 0 Critical + 0 Major; artifact SHA-256 `e34a632e290930bbfcccfbd4326d5aeab1b1d8012285d67a122a87b55d8196c5`.
 
-The next Phase-4 track is **CI evidence ingestion** on branch `ep-005-ci-ingestion`, based exactly on merged `main` SHA `ccf75d093625119cc39944fe7a47c3a03b30ad3b`. Claude's initial design was frozen at SHA-256 `d90099eeab3af74ea5dd25f50b7e87f920f7cb47eb523e4e7112882dc0524276`; independent Codex review returned `DESIGN_FINDINGS` with 1 Critical and 10 enumerated Major findings, artifact SHA-256 `659174158aecc5a690663f79e8a2b567a459b77af0cf08042d37cdfb6db265f3`. No implementation has started.
+The next Phase-4 track is **CI evidence ingestion** on branch `ep-005-ci-ingestion`, based on current `main` SHA `fd9ed5492b326f02833d68408ed415baacb89e01`. The initial over-scoped design was rejected after 1 Critical + 10 Major findings. The corrected read-only evidence-ingestion design is frozen at SHA-256 `47a6d7b1d4c93a853a26e4da3753894dedacfce930345c610cf24a4236b2b409`; final bounded Codex review returned `CLEAN_CRITICAL_MAJOR` with 0 Critical + 0 Major, artifact SHA-256 `aa5d86471ffcfe1d68eff9c49ef5b2df718355c0b4c825716d35d68217b3fa45`. Implementation is authorized; push/PR remain blocked until exact-head acceptance and post-implementation review.
 
 ## Next
 
-Re-scope the CI-ingestion design to the exact roadmap bullet: bounded, stable, immutable CI/check evidence collection tied to the exact candidate head SHA. Keep merge approval policy and merge authorization in the following Phase-4 track; do not import PR-write-style replay/admission semantics unless read-only evidence integrity demonstrably requires them. Correct all in-scope Critical/Major findings, then run a fresh independent Critical/Major design gate before creating implementation authority/context. Only after a 0 Critical + 0 Major design verdict may ABCP/Ralphex implementation begin.
+Freeze the accepted CI-ingestion plan in the governed branch, build and verify the authority-bound context capsule from that exact checkpoint, then execute the four-task plan through ABCP/Ralphex. Require deterministic exact-head acceptance and a fresh post-implementation Critical/Major review before publication.
 
 ## Remaining after Phase 4
 

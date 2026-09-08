@@ -20,11 +20,11 @@
 
 ## Current work
 
-EP-005 remains active. The PR lifecycle deliverable is merged and the next roadmap-ordered track is **CI evidence ingestion**. The working branch is `ep-005-ci-ingestion`, created from exact merged `main` SHA `ccf75d093625119cc39944fe7a47c3a03b30ad3b`. Claude's first CI-ingestion design was frozen at SHA-256 `d90099eeab3af74ea5dd25f50b7e87f920f7cb47eb523e4e7112882dc0524276`. Independent Codex review returned `DESIGN_FINDINGS` with 1 Critical and 10 enumerated Major findings; review artifact SHA-256 `659174158aecc5a690663f79e8a2b567a459b77af0cf08042d37cdfb6db265f3`. The design is being re-scoped to the roadmap-owned CI evidence-ingestion boundary before another design gate. No CI implementation authority has been issued and Codex/Ralphex implementation remains blocked.
+EP-005 remains active. The PR lifecycle deliverable is merged and the next roadmap-ordered track is **CI evidence ingestion** on `ep-005-ci-ingestion`, now based on current `main` SHA `fd9ed5492b326f02833d68408ed415baacb89e01` after tracking PR #10. The initial over-scoped CI design (`d90099ee…`) was rejected after Codex found 1 Critical + 10 Major findings. The track was re-scoped to read-only exact-SHA CI evidence collection/stability only. Final implementable design SHA-256 is `47a6d7b1d4c93a853a26e4da3753894dedacfce930345c610cf24a4236b2b409`; the final bounded Codex design gate returned `CLEAN_CRITICAL_MAJOR`, 0 Critical + 0 Major, artifact SHA-256 `aa5d86471ffcfe1d68eff9c49ef5b2df718355c0b4c825716d35d68217b3fa45`. CI implementation is now authorized; publication remains blocked until exact-head acceptance and post-implementation review.
 
 ## Current authority
 
 Canonical roadmap: `docs/roadmap/IMPLEMENTATION_ROADMAP.md`
 Execution pack: `docs/execution-packs/EP-005-github-lifecycle.md`
-Active track: EP-005 CI evidence ingestion (design correction/re-scope; implementation blocked)
+Active track: EP-005 CI evidence ingestion (design accepted; implementation authorized)
 Design gate: `docs/architecture/IMPLEMENTATION_DESIGN_GATE.md`
