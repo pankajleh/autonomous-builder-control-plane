@@ -12,6 +12,7 @@
 - Phase 2 / EP-003 recovery and blocker control merged in PR #5.
 - Phase 3 / EP-004 cross-plan scheduler and integration merged in PR #6 at `94e14ca749d31ac214e979aab03fbde37502dd7f`.
 - EP-005 GitHub lifecycle foundation merged in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
+- EP-005 exact-head PR lifecycle merged in PR #8 at `ccf75d093625119cc39944fe7a47c3a03b30ad3b`; tracking reconciliation PR #9 is also merged.
 - Initial exact-head PR lifecycle implementation reached ABCP `BRANCH_ACCEPTED` at `f986008ba11c69c3864f0b8977af440024d12048`; controller fallback review found 1 Critical and 9 Major defects.
 - First governed correction round reached ABCP `BRANCH_ACCEPTED` at exact clean head `d4e7e1d8fc6af9545f9f67e3c99fa94c3420a7ce`.
 - Second governed correction round reached ABCP `BRANCH_ACCEPTED` at exact clean head `35faeec8b8314519ee6b9d36eba32a0c25ac6050`; fresh Claude exact-head review verified ten prior findings corrected and found one remaining Critical.
