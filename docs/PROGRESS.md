@@ -8,7 +8,7 @@ Updated: 2026-09-08
 | Phase 1 — Governed single-plan execution | COMPLETE | PR #4 merged |
 | Phase 2 — Recovery and blocker control | COMPLETE | PR #5 merged |
 | Phase 3 — Cross-plan scheduler and integration | COMPLETE | PR #6 merged at `94e14ca749d31ac214e979aab03fbde37502dd7f` |
-| Phase 4 — GitHub lifecycle | IN PROGRESS | Foundation merged in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f` |
+| Phase 4 — GitHub lifecycle | IN PROGRESS | Foundation PR #7; exact-head PR lifecycle PR #8 merged at `ccf75d093625119cc39944fe7a47c3a03b30ad3b`; tracking PR #9 merged; CI evidence-ingestion design correction active |
 | Phase 5 — Service/API/dashboard | NOT STARTED | roadmap only |
 | Phase 6 — Production hardening | NOT STARTED | roadmap only |
 
