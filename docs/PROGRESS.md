@@ -1,6 +1,6 @@
 # Implementation Progress
 
-Updated: 2026-09-07
+Updated: 2026-09-08
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -14,11 +14,13 @@ Updated: 2026-09-07
 
 ## Current
 
-EP-005 exact-head PR lifecycle correction round 1 reached ABCP `BRANCH_ACCEPTED` at exact clean SHA `d4e7e1d8fc6af9545f9f67e3c99fa94c3420a7ce`. The required fresh Claude Code / Opus exact-head post-implementation review then found 2 Critical and 4 Major defects. The second correction plan is now design-clean at SHA-256 `86b469cb4ced969394854aa88ad91418721b64d27a83aed5a4a2c0eeda6c8527`: the first Claude design pass found 1 Critical + 3 Major plan gaps, those were corrected, and a re-review hit provider session limits; controller fallback then returned `DESIGN_CLEAN_CRITICAL_MAJOR` with artifact SHA-256 `6851fe6a742e6bdb5cf49ed7587ec690936719d9510f6de243b1982041ebcbde`. Push and PR #8 remain blocked.
+EP-005 correction round 2 completed through Ralphex/Codex and ABCP deterministic acceptance at exact clean SHA `35faeec8b8314519ee6b9d36eba32a0c25ac6050`. Fresh Claude Code / Opus exact-head review verified the ten prior findings corrected but found one remaining Critical: prior `applied_confirmed` protection was latest-revision-scoped and could be bypassed by an abandoned intermediate revision. Review artifact SHA-256: `9fa76414ce73fc9168de70d967e28539cf662a54802e09678d1a5de829266974`.
+
+Claude produced the bounded third-correction design; the independent design gate found one lower-barrier exact-replay inconsistency. Claude refinement then hit a genuine provider session limit (artifact SHA-256 `b97ac7242d3df4d64513e76279596e63bcaec08db28f03e41dbf2f4b8f0fe255`). Policy-authorized controller fallback corrected the design so lower-terminal replay is allowed only across provably zero-write later ordinals and is blocked by any later generation. The revised plan is design-clean at SHA-256 `05529f98759cccd635d7365b70a2f43542db7e3573b1727652abcc784305781a`; controller design-gate artifact SHA-256 `b82f3b3a84c31137c35fc7461acc9de152a916f5fd075d1521235a9f4bf4a984`. Push and PR #8 remain blocked.
 
 ## Next
 
-Commit the design-clean second correction authority/context checkpoint, run it through ABCP/Ralphex, then require exact-head deterministic acceptance and a fresh independent Critical/Major post-implementation review. Only a clean exact reviewed head may be published for PR #8.
+Commit the design-clean third correction checkpoint, rebuild/verify the context capsule and immutable ABCP authority from that exact SHA, then run the bounded correction through ABCP/Ralphex. Require deterministic exact-head acceptance and a fresh independent Critical/Major post-implementation review before any branch publication or PR #8.
 
 ## Remaining after Phase 4
 
