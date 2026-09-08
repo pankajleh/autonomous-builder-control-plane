@@ -729,7 +729,7 @@ The subtrack is complete only when:
 
 Roadmap self-review: this implements only Phase 4’s “CI evidence ingestion” bullet. Merge approval policy, expected-head/base protection, merge execution, and post-merge acceptance remain later serial Phase-4 work.
 
-### Task 1 — Freeze the v1 evidence contract and bounds
+### Task 1: Freeze the v1 evidence contract and bounds
 
 - [ ] Before any task work, obtain `ABCP_CONTEXT_CAPSULE_PATH` and `ABCP_CONTEXT_CAPSULE_SHA256` from launch authority; require both nonempty, compare `sha256sum -- "$ABCP_CONTEXT_CAPSULE_PATH"` with the supplied hash, then run `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`. Stop on missing binding, mismatch, source drift, or repository/base mismatch.
 - [ ] Confirm the verified capsule identifies EP-005 CI evidence ingestion, the exact task base, this accepted design, predecessor outputs, and explicit non-goals.
@@ -740,7 +740,7 @@ Roadmap self-review: this implements only Phase 4’s “CI evidence ingestion�
 - [ ] Add `CI_EVIDENCE_INGESTION_CONTRACT.md` recording neutral semantics and later-policy ownership.
 - [ ] Verify no frozen lifecycle or run-authority file changed.
 
-### Task 2 — Implement bounded GitHub reads and two-sweep stabilization
+### Task 2: Implement bounded GitHub reads and two-sweep stabilization
 
 - [ ] Before any task work, obtain the capsule path/hash from launch authority, independently verify its exact bytes and run `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`; stop on any mismatch or drift.
 - [ ] Implement the sealed authenticated GET-only transport with body/header/text/time/request caps and no retries.
@@ -752,7 +752,7 @@ Roadmap self-review: this implements only Phase 4’s “CI evidence ingestion�
 - [ ] Add adversarial local-server tests for rerequests, in-place mutation, pagination races, truncation, malformed state, cancellation, and authenticator mutation.
 - [ ] Assert stable pending/failed/empty evidence remains neutral and never becomes a policy result.
 
-### Task 3 — Implement immutable evidence, ledger outcome, and replay
+### Task 3: Implement immutable evidence, ledger outcome, and replay
 
 - [ ] Before any task work, obtain the capsule path/hash from launch authority, independently verify the supplied SHA-256 and execute `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`; stop before filesystem or network work if verification fails.
 - [ ] Implement the minimal Linux attempt allocator with pinned roots, verified locks, immutable reservations, and per-run/global/byte limits.
@@ -765,7 +765,7 @@ Roadmap self-review: this implements only Phase 4’s “CI evidence ingestion�
 - [ ] Add multiprocess/concurrency, capacity, reservation-file-as-lock, recoverable zero/partial-reservation crash-boundary, symlink/special-file, tamper, missing-artifact, conflicting-event, append, and fsync tests.
 - [ ] Confirm no PR revision/generation/submission/reconciliation types or semantics were introduced.
 
-### Task 4 — Acceptance, scope audit, and exact-head review handoff
+### Task 4: Acceptance, scope audit, and exact-head review handoff
 
 - [ ] Before any task work, obtain the final task capsule path/hash from launch authority, independently verify its exact SHA-256 and execute `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`; stop on missing binding, drift, or incorrect predecessor head.
 - [ ] Run formatting, vet, package, race, regression, and complete repository tests from the validation section.
