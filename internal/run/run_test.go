@@ -349,6 +349,62 @@ func TestRunnerRejectsDirtyInitialWorkingTree(t *testing.T) {
 	}
 }
 
+func TestRalphexEnvironmentUsesAuthorityBoundContextCapsule(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersion,
+		Project:       "ABCP", Plan: "EP-005", RoadmapPhase: "Phase 4", ExecutionPack: "EP-005",
+		Task: "capsule environment binding", Repository: "example/project", BaseSHA: manifest.Repository.StartSHA,
+		Invariants: []string{"Use only authority-bound context."}, NonGoals: []string{"No ambient capsule override."}, Sources: []string{"plan.md"},
+	}
+	_, capsuleJSON, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capsulePath := filepath.Join(t.TempDir(), "capsule.json")
+	writeTestFile(t, capsulePath, capsuleJSON, 0o600)
+	manifest.ContextCapsule = &authority.ContextCapsuleManifest{Path: capsulePath, SHA256: testHash(t, capsulePath)}
+	governed, err := authority.New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capsule, present := governed.ContextCapsule()
+	if !present {
+		t.Fatal("validated authority lost context capsule binding")
+	}
+
+	t.Setenv("ABCP_CONTEXT_CAPSULE_PATH", "/tmp/attacker-capsule.json")
+	t.Setenv("ABCP_CONTEXT_CAPSULE_SHA256", strings.Repeat("0", 64))
+
+	got := environmentMap(ralphexEnvironment(governed))
+	if got["ABCP_CONTEXT_CAPSULE_PATH"] != capsule.Path {
+		t.Fatalf("capsule path = %q, want authority path %q", got["ABCP_CONTEXT_CAPSULE_PATH"], capsule.Path)
+	}
+	if got["ABCP_CONTEXT_CAPSULE_SHA256"] != capsule.SHA256 {
+		t.Fatalf("capsule SHA256 = %q, want authority SHA256 %q", got["ABCP_CONTEXT_CAPSULE_SHA256"], capsule.SHA256)
+	}
+
+	withoutBinding := environmentMap(ralphexEnvironment(fixture.authority))
+	if _, ok := withoutBinding["ABCP_CONTEXT_CAPSULE_PATH"]; ok {
+		t.Fatal("ambient capsule path leaked into run without an authority binding")
+	}
+	if _, ok := withoutBinding["ABCP_CONTEXT_CAPSULE_SHA256"]; ok {
+		t.Fatal("ambient capsule SHA256 leaked into run without an authority binding")
+	}
+}
+
+func environmentMap(environment []string) map[string]string {
+	result := make(map[string]string, len(environment))
+	for _, entry := range environment {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			result[key] = value
+		}
+	}
+	return result
+}
+
 func TestRunnerUsesAllowlistedRalphexEnvironment(t *testing.T) {
 	t.Setenv("ABCP_TEST_SECRET", "must-not-leak")
 	t.Setenv("OPENAI_API_KEY", "authorized-provider-key")

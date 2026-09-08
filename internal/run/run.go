@@ -30,7 +30,7 @@ import (
 const (
 	eventStateTransition     = "STATE_TRANSITION"
 	actorController          = "control-plane"
-	ralphexEnvironmentPolicy = "ralphex-env-v1"
+	ralphexEnvironmentPolicy = "ralphex-env-v2"
 )
 
 // EventAppender is the durable, append-only operation required by a Runner.
@@ -163,7 +163,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	process, processErr := r.processes.Run(ctx, supervisor.Command{
 		Argv:    argv,
 		Cwd:     r.governed.Repository().Path,
-		Env:     ralphexEnvironment(r.governed.Executor().Executor),
+		Env:     ralphexEnvironment(r.governed),
 		Timeout: ralphexTimeout,
 		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stdout.log", Kind: "ralphex-stdout"},
 		Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stderr.log", Kind: "ralphex-stderr"},
@@ -542,7 +542,8 @@ func validateRalphexLocalConfiguration(repositoryPath string) error {
 	return nil
 }
 
-func ralphexEnvironment(executor string) []string {
+func ralphexEnvironment(governed authority.Authority) []string {
+	executor := governed.Executor().Executor
 	keys := []string{
 		"HOME", "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
 		"TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -560,11 +561,20 @@ func ralphexEnvironment(executor string) []string {
 			"CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
 		)
 	}
-	environment := make([]string, 0, len(keys))
+	environment := make([]string, 0, len(keys)+2)
 	for _, key := range keys {
 		if value, ok := os.LookupEnv(key); ok {
 			environment = append(environment, key+"="+value)
 		}
+	}
+	if capsule, present := governed.ContextCapsule(); present {
+		// Capsule identity is derived only from validated run authority. Ambient
+		// ABCP_CONTEXT_CAPSULE_* values are deliberately not inherited and cannot
+		// override this binding.
+		environment = append(environment,
+			"ABCP_CONTEXT_CAPSULE_PATH="+capsule.Path,
+			"ABCP_CONTEXT_CAPSULE_SHA256="+capsule.SHA256,
+		)
 	}
 	return environment
 }
