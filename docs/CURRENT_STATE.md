@@ -19,11 +19,11 @@
 
 ## Current work
 
-EP-005 remains active. The PR lifecycle deliverable is merged and the next roadmap-ordered track is **CI evidence ingestion**. The new working branch is `ep-005-ci-ingestion`, created from exact merged `main` SHA `ccf75d093625119cc39944fe7a47c3a03b30ad3b`. Per the revised workflow, Claude Opus is the preferred primary designer before implementation; Codex/Ralphex implementation remains blocked until the CI-ingestion design passes the Critical/Major design gate.
+EP-005 remains active. The PR lifecycle deliverable is merged and the next roadmap-ordered track is **CI evidence ingestion**. The working branch is `ep-005-ci-ingestion`, created from exact merged `main` SHA `ccf75d093625119cc39944fe7a47c3a03b30ad3b`. Claude's first CI-ingestion design was frozen at SHA-256 `d90099eeab3af74ea5dd25f50b7e87f920f7cb47eb523e4e7112882dc0524276`. Independent Codex review returned `DESIGN_FINDINGS` with 1 Critical and 10 enumerated Major findings; review artifact SHA-256 `659174158aecc5a690663f79e8a2b567a459b77af0cf08042d37cdfb6db265f3`. The design is being re-scoped to the roadmap-owned CI evidence-ingestion boundary before another design gate. No CI implementation authority has been issued and Codex/Ralphex implementation remains blocked.
 
 ## Current authority
 
 Canonical roadmap: `docs/roadmap/IMPLEMENTATION_ROADMAP.md`
 Execution pack: `docs/execution-packs/EP-005-github-lifecycle.md`
-Active track: EP-005 CI evidence ingestion (design pending)
+Active track: EP-005 CI evidence ingestion (design correction/re-scope; implementation blocked)
 Design gate: `docs/architecture/IMPLEMENTATION_DESIGN_GATE.md`
