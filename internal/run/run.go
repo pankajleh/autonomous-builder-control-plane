@@ -4,6 +4,7 @@
 package run
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -30,7 +31,7 @@ import (
 const (
 	eventStateTransition     = "STATE_TRANSITION"
 	actorController          = "control-plane"
-	ralphexEnvironmentPolicy = "ralphex-env-v1"
+	ralphexEnvironmentPolicy = "ralphex-env-v2"
 )
 
 // EventAppender is the durable, append-only operation required by a Runner.
@@ -66,6 +67,7 @@ func (r Result) Accepted() bool {
 // Runner owns the state transitions for one validated authority.
 type Runner struct {
 	governed  authority.Authority
+	capsule   authority.ContextCapsuleManifest
 	events    EventAppender
 	artifacts supervisor.ArtifactWriter
 	processes CommandRunner
@@ -86,7 +88,11 @@ func New(governed authority.Authority, events EventAppender, artifacts superviso
 	if processes == nil {
 		return nil, errors.New("process supervisor is required")
 	}
-	return &Runner{governed: governed, events: events, artifacts: artifacts, processes: processes}, nil
+	capsule, err := validateOperationAuthority(governed)
+	if err != nil {
+		return nil, err
+	}
+	return &Runner{governed: governed, capsule: capsule, events: events, artifacts: artifacts, processes: processes}, nil
 }
 
 // Run executes exactly one governed implementation and branch-acceptance
@@ -163,7 +169,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	process, processErr := r.processes.Run(ctx, supervisor.Command{
 		Argv:    argv,
 		Cwd:     r.governed.Repository().Path,
-		Env:     ralphexEnvironment(r.governed.Executor().Executor),
+		Env:     ralphexEnvironment(r.governed.Executor().Executor, r.capsule),
 		Timeout: ralphexTimeout,
 		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stdout.log", Kind: "ralphex-stdout"},
 		Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stderr.log", Kind: "ralphex-stderr"},
@@ -406,17 +412,20 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	if validation.BinarySHA256 != binary.BinarySHA256 {
 		return validation, errors.New("Ralphex binary SHA256 changed after authority validation")
 	}
-	if capsule, present := governed.ContextCapsule(); present {
-		validation.ContextCapsuleSHA256, err = hashFile(capsule.Path)
-		if err != nil {
-			return validation, fmt.Errorf("hash context capsule: %w", err)
-		}
-		if validation.ContextCapsuleSHA256 != capsule.SHA256 {
-			return validation, errors.New("context capsule SHA256 changed after authority validation")
-		}
-		if _, err := contextcapsule.VerifyFile(repository.Path, capsule.Path); err != nil {
-			return validation, fmt.Errorf("verify context capsule before execution: %w", err)
-		}
+	capsule, present := governed.ContextCapsule()
+	if !present {
+		return validation, errors.New("verified v2 context capsule is required before execution")
+	}
+	verified, err := contextcapsule.VerifyFile(repository.Path, capsule.Path)
+	if err != nil {
+		return validation, fmt.Errorf("verify context capsule before execution: %w", err)
+	}
+	validation.ContextCapsuleSHA256 = verified.SHA256
+	if validation.ContextCapsuleSHA256 != capsule.SHA256 {
+		return validation, errors.New("context capsule SHA256 changed after authority validation")
+	}
+	if verified.PolicyVersion != contextcapsule.PolicyVersionV2 {
+		return validation, fmt.Errorf("context capsule policy version changed to %q after authority validation", verified.PolicyVersion)
 	}
 	repositoryRoot, err := gitOutput(ctx, repository.Path, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -542,7 +551,7 @@ func validateRalphexLocalConfiguration(repositoryPath string) error {
 	return nil
 }
 
-func ralphexEnvironment(executor string) []string {
+func ralphexEnvironment(executor string, capsule authority.ContextCapsuleManifest) []string {
 	keys := []string{
 		"HOME", "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
 		"TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -560,13 +569,166 @@ func ralphexEnvironment(executor string) []string {
 			"CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
 		)
 	}
-	environment := make([]string, 0, len(keys))
+	environment := make([]string, 0, len(keys)+2)
 	for _, key := range keys {
 		if value, ok := os.LookupEnv(key); ok {
 			environment = append(environment, key+"="+value)
 		}
 	}
+	environment = append(environment,
+		"ABCP_CONTEXT_CAPSULE_PATH="+capsule.Path,
+		"ABCP_CONTEXT_CAPSULE_SHA256="+capsule.SHA256,
+	)
 	return environment
+}
+
+func validateOperationAuthority(governed authority.Authority) (authority.ContextCapsuleManifest, error) {
+	capsule, present := governed.ContextCapsule()
+	if !present {
+		return authority.ContextCapsuleManifest{}, errors.New("verified v2 context capsule is required for governed execution")
+	}
+	verified, err := contextcapsule.VerifyFile(governed.Repository().Path, capsule.Path)
+	if err != nil {
+		return authority.ContextCapsuleManifest{}, fmt.Errorf("verify v2 operation context capsule: %w", err)
+	}
+	if verified.SHA256 != capsule.SHA256 {
+		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule SHA256 mismatch: authority binds %s, verified exact bytes are %s", capsule.SHA256, verified.SHA256)
+	}
+	if verified.PolicyVersion != contextcapsule.PolicyVersionV2 {
+		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule policy version %q cannot authorize new governed execution; %s is required", verified.PolicyVersion, contextcapsule.PolicyVersionV2)
+	}
+	if verified.BaseSHA != governed.Repository().StartSHA {
+		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule base SHA %s does not match governed start SHA %s", verified.BaseSHA, governed.Repository().StartSHA)
+	}
+	policy := governed.Executor()
+	if strings.EqualFold(strings.TrimSpace(policy.Executor), "codex") {
+		if policy.TaskEffort != "xhigh" {
+			return authority.ContextCapsuleManifest{}, fmt.Errorf("Codex task_effort must be xhigh, got %q", policy.TaskEffort)
+		}
+		if policy.ReviewEffort != "xhigh" {
+			return authority.ContextCapsuleManifest{}, fmt.Errorf("Codex review_effort must be xhigh, got %q", policy.ReviewEffort)
+		}
+	}
+	if verified.OperationKind == contextcapsule.OperationImplementation {
+		plan, err := os.ReadFile(governed.Plan().Path)
+		if err != nil {
+			return authority.ContextCapsuleManifest{}, fmt.Errorf("read implementation task plan: %w", err)
+		}
+		sections, err := countIncompleteExecutableSections(plan)
+		if err != nil {
+			return authority.ContextCapsuleManifest{}, fmt.Errorf("inspect implementation task plan: %w", err)
+		}
+		if sections > 1 {
+			return authority.ContextCapsuleManifest{}, fmt.Errorf("implementation operation plan contains %d incomplete executable Task/Iteration sections; maximum is 1", sections)
+		}
+	}
+	return capsule, nil
+}
+
+func countIncompleteExecutableSections(plan []byte) (int, error) {
+	scanner := bufio.NewScanner(strings.NewReader(string(plan)))
+	scanner.Buffer(make([]byte, 64<<10), 4<<20)
+	inExecutableSection := false
+	currentIncomplete := false
+	inFence := false
+	fenceMarker := byte(0)
+	incompleteSections := 0
+	finishSection := func() {
+		if inExecutableSection && currentIncomplete {
+			incompleteSections++
+		}
+		inExecutableSection = false
+		currentIncomplete = false
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if marker, fence := markdownFence(trimmed); fence {
+			if !inFence {
+				inFence = true
+				fenceMarker = marker
+			} else if marker == fenceMarker {
+				inFence = false
+				fenceMarker = 0
+			}
+			continue
+		}
+		if inFence {
+			continue
+		}
+		level := markdownHeadingLevel(line)
+		if level > 0 && level <= 3 {
+			finishSection()
+			inExecutableSection = level == 3 && executableSectionHeading(line)
+			continue
+		}
+		if inExecutableSection && incompleteCheckbox(trimmed) {
+			currentIncomplete = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	finishSection()
+	return incompleteSections, nil
+}
+
+func markdownFence(trimmed string) (byte, bool) {
+	if len(trimmed) < 3 || trimmed[0] != '`' && trimmed[0] != '~' {
+		return 0, false
+	}
+	marker := trimmed[0]
+	count := 0
+	for count < len(trimmed) && trimmed[count] == marker {
+		count++
+	}
+	return marker, count >= 3
+}
+
+func markdownHeadingLevel(line string) int {
+	spaces := 0
+	for spaces < len(line) && line[spaces] == ' ' {
+		spaces++
+	}
+	if spaces > 3 {
+		return 0
+	}
+	line = line[spaces:]
+	level := 0
+	for level < len(line) && line[level] == '#' {
+		level++
+	}
+	if level == 0 || level > 6 || level == len(line) || line[level] != ' ' && line[level] != '\t' {
+		return 0
+	}
+	return level
+}
+
+func executableSectionHeading(line string) bool {
+	spaces := 0
+	for spaces < len(line) && line[spaces] == ' ' {
+		spaces++
+	}
+	title := strings.TrimSpace(line[spaces+3:])
+	for _, prefix := range []string{"Task ", "Iteration "} {
+		if !strings.HasPrefix(title, prefix) {
+			continue
+		}
+		remainder := title[len(prefix):]
+		digits := 0
+		for digits < len(remainder) && remainder[digits] >= '0' && remainder[digits] <= '9' {
+			digits++
+		}
+		return digits > 0 && digits < len(remainder) && remainder[digits] == ':'
+	}
+	return false
+}
+
+func incompleteCheckbox(trimmed string) bool {
+	if len(trimmed) < len("- [ ]") {
+		return false
+	}
+	return strings.HasPrefix(trimmed, "- [ ]") || strings.HasPrefix(trimmed, "* [ ]") || strings.HasPrefix(trimmed, "+ [ ]")
 }
 
 func hashFile(path string) (string, error) {

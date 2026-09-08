@@ -4,7 +4,9 @@
 
 Fresh coding/review sessions must be able to execute correctly without ChatGPT history or a long-lived agent conversation. Project context is durable in the repository; model context is disposable.
 
-This policy is effective for EP-004 and later. EP-003 is not retroactively represented as having used generated capsules.
+The original capsule policy became effective for EP-004. Historical artifacts are not retroactively represented as having stronger authority than they had when created.
+
+The universal rule for new work is: no governed autonomous operation may start without a purpose-specific, verified `context-capsule-v2`. Verification binds the exact capsule bytes, repository, operation base SHA, and source bytes. A base or source change invalidates that authority and requires a newly authorized capsule; an executor must never carry a capsule across a commit/HEAD boundary into a fresh operation.
 
 ## Authority hierarchy
 
@@ -21,19 +23,21 @@ A task must not invent missing architecture. Missing required authority becomes 
 
 ## Context layers
 
-Every fresh task receives a compact context capsule made of three layers:
+Every fresh operation receives a compact context capsule made of three layers:
 
 - **Global guardrails** — project purpose, authority hierarchy, state/security invariants, completion rules, and non-negotiable boundaries.
 - **Execution-pack context** — roadmap phase, parent goal, in-scope deliverables, explicit non-goals, relevant components, and expected end state.
-- **Task context** — exact objective, relevant files/contracts, predecessor outputs, edge cases, and acceptance criteria.
+- **Operation context** — exact objective and operation kind, owned scope, blocking criteria, relevant files/contracts, predecessor outputs, edge cases, and acceptance criteria.
 
 The default is relevant context, not the entire architecture corpus.
 
 ## Capsule requirements
 
-Each capsule must record:
+Every v2 capsule must record:
 
 - project/plan/task identity;
+- one recognized operation kind: `design-planning`, `design-review`, `implementation`, `implementation-review`, `acceptance`, `merge-authorization`, `deployment`, `recovery`, or `maintenance`;
+- explicit owned scope and blocking criteria;
 - exact base SHA;
 - roadmap phase and execution-pack ID;
 - selected source paths plus SHA256 hashes;
@@ -42,7 +46,11 @@ Each capsule must record:
 - context policy version;
 - capsule SHA256.
 
-Run authority may bind `context_capsule.path` and `context_capsule.sha256`. When present, the controller verifies the exact capsule bytes, its internal canonical hash, repository/base SHA, and every source hash before launching Ralphex. Manifests from before this policy may omit the binding.
+`context-capsule-v2` adds operation context without changing the canonical representation or verification rules for `context-capsule-v1`. Historical v1 capsules and authorities remain parseable and evidence-readable, but a v1 capsule cannot authorize a new governed execution.
+
+New run authority must bind `context_capsule.path` and `context_capsule.sha256`. The controller verifies the bound exact bytes, internal canonical hash, repository/base SHA, and every source hash both when authority is constructed and immediately before execution. The capsule base must equal the governed start SHA. A missing binding, wrong byte hash, wrong version, base drift, or source drift fails closed before subprocess launch. Optional bindings remain parseable only so pre-policy authority evidence retains its historical shape.
+
+For Codex-governed execution, both `task_effort` and `review_effort` must be exactly `xhigh`. Missing or lower effort fails closed before launch.
 
 ## Token-efficiency rules
 
@@ -54,14 +62,20 @@ Run authority may bind `context_capsule.path` and `context_capsule.sha256`. When
 
 ## Fresh-task startup contract
 
-Before implementation, every fresh task must read its capsule, verify the referenced repository/base identity, and inspect the task's relevant source files. If a referenced source hash no longer matches, execution must stop for re-authorization rather than silently using newer context.
+Before any governed autonomous operation, every fresh executor must read its capsule, verify the environment-provided capsule path and SHA256 against exact bytes, independently run `abcp context-verify` against the governed repository/base, and inspect the operation's relevant source files. If the binding is missing or any base/source/hash check fails, execution stops for re-authorization rather than silently using newer context.
+
+The controller supplies `ABCP_CONTEXT_CAPSULE_PATH` and `ABCP_CONTEXT_CAPSULE_SHA256` to Ralphex/Codex only from its validated immutable authority. Ambient variables with those names cannot create a binding and cannot override the governed values.
 
 The intended invariant is: **durable external project memory + small fresh agent sessions**, not one indefinitely growing model conversation.
 
 ## Immediate operating rule
 
-Starting with EP-004, every executable Ralphex plan must point fresh tasks to the context capsule path and SHA256 bound by governed run authority. Before any task work begins, each fresh task must read that capsule and run independent capsule verification against the governed repository. A missing binding, failed verification, or drift is a blocker; the task must not continue with unverified context.
+Every executable Ralphex plan must point fresh operations to the context capsule path and SHA256 bound by governed run authority. Before any operation work begins, each fresh executor must read that capsule and run independent capsule verification against the governed repository. A missing binding, failed verification, or drift is a blocker; work must not continue with unverified context.
 
-Every task section must include that startup instruction before its implementation steps. The capsule supplies compact invariants, non-goals, predecessor outcomes, and hashed source references; the agent may open those referenced documents on demand, but entire documents are not pasted into the capsule.
+Every task section must include that startup instruction before its implementation steps. An `implementation` operation plan may contain at most one incomplete executable `### Task N:` or `### Iteration N:` section. Completing that section changes the commit/HEAD boundary, so any next section is a fresh operation requiring fresh authority and a capsule built at the accepted predecessor HEAD.
+
+For `design-review` and `implementation-review`, only Critical or Major findings that apply to the capsule's current owned scope and blocking criteria block the current operation. Valid concerns for future work or outside the owned scope are recorded as deferred observations. They cannot be promoted into current blockers without new authority that brings them into scope.
+
+The capsule supplies compact invariants, non-goals, predecessor outcomes, and hashed source references; the executor may open those referenced documents on demand, but entire documents are not pasted into the capsule.
 
 Capsules are built from structured specs with `abcp context-build --repository <path> --spec <path> --output <path>` and independently checked with `abcp context-verify --repository <path> --capsule <path>`. Source selection remains explicit and deterministic; no semantic retrieval is performed.
