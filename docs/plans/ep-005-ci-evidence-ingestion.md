@@ -731,14 +731,14 @@ Roadmap self-review: this implements only Phase 4’s “CI evidence ingestion�
 
 ### Task 1: Freeze the v1 evidence contract and bounds
 
-- [ ] Before any task work, obtain `ABCP_CONTEXT_CAPSULE_PATH` and `ABCP_CONTEXT_CAPSULE_SHA256` from launch authority; require both nonempty, compare `sha256sum -- "$ABCP_CONTEXT_CAPSULE_PATH"` with the supplied hash, then run `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`. Stop on missing binding, mismatch, source drift, or repository/base mismatch.
-- [ ] Confirm the verified capsule identifies EP-005 CI evidence ingestion, the exact task base, this accepted design, predecessor outputs, and explicit non-goals.
-- [ ] Add `internal/cilifecycle` v1 observation, sweep, provenance, bundle, outcome, failure, and immutable-constructor types.
-- [ ] Implement fixed canonical wires, strict readers, defensive copying, exact digest helpers, relationship validation, and raw-state representability tables.
-- [ ] Implement controller-owned production limits and their canonical SHA-256 identity.
-- [ ] Add exact maximum-profile size tests, including `<`, `>`, `&`, `"`, `\`, U+2028, U+2029, and boundary cardinalities.
-- [ ] Add `CI_EVIDENCE_INGESTION_CONTRACT.md` recording neutral semantics and later-policy ownership.
-- [ ] Verify no frozen lifecycle or run-authority file changed.
+- [x] Before any task work, obtain `ABCP_CONTEXT_CAPSULE_PATH` and `ABCP_CONTEXT_CAPSULE_SHA256` from launch authority; require both nonempty, compare `sha256sum -- "$ABCP_CONTEXT_CAPSULE_PATH"` with the supplied hash, then run `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`. Stop on missing binding, mismatch, source drift, or repository/base mismatch.
+- [x] Confirm the verified capsule identifies EP-005 CI evidence ingestion, the exact task base, this accepted design, predecessor outputs, and explicit non-goals.
+- [x] Add `internal/cilifecycle` v1 observation, sweep, provenance, bundle, outcome, failure, and immutable-constructor types.
+- [x] Implement fixed canonical wires, strict readers, defensive copying, exact digest helpers, relationship validation, and raw-state representability tables.
+- [x] Implement controller-owned production limits and their canonical SHA-256 identity.
+- [x] Add exact maximum-profile size tests, including `<`, `>`, `&`, `"`, `\`, U+2028, U+2029, and boundary cardinalities.
+- [x] Add `CI_EVIDENCE_INGESTION_CONTRACT.md` recording neutral semantics and later-policy ownership.
+- [x] Verify no frozen lifecycle or run-authority file changed.
 
 ### Task 2: Implement bounded GitHub reads and two-sweep stabilization
 
