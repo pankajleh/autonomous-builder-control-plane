@@ -38,6 +38,9 @@ type Controller struct {
 	// postSubmitFailure is an unexported deterministic fault boundary used by
 	// same-package adversarial tests to prove submitted error provenance.
 	postSubmitFailure func(stage string) error
+	// beforeMarker is an unexported deterministic fault boundary used by
+	// same-package adversarial tests to prove pre-submission resume behavior.
+	beforeMarker func() error
 }
 
 func newController(config ControllerConfig) (*Controller, error) {
@@ -262,66 +265,76 @@ func (c *Controller) upsertLocked(ctx context.Context, tx *resourceTxn, request 
 	if err := c.ensureResourceRecord(tx, request.Authority); err != nil {
 		return zero, err
 	}
-	latest, err := latestRevision(c.store, tx.key)
+	state, err := scanResource(tx)
 	if err != nil {
 		return zero, err
 	}
 	var previous *terminalV1
 	var ordinal uint64 = 1
-	if latest > 0 {
-		ordinal = latest
-		revision, err := readRevision(tx, latest)
+	if state.maxOrdinal > 0 {
+		ordinal = state.maxOrdinal
+		revision, err := readRevision(tx, state.maxOrdinal)
 		if err != nil {
 			return zero, err
 		}
-		terminalName := recordPrefix(tx.key, latest) + "terminal.json"
-		terminalExists, err := tx.exists(terminalName)
-		if err != nil {
-			return zero, err
-		}
-		if revision.RequestSHA256 == requestSHA && terminalExists {
+		terminalName := recordPrefix(tx.key, state.maxOrdinal) + "terminal.json"
+		if revision.RequestSHA256 == requestSHA && state.has(state.maxOrdinal, kindTerminal) {
 			recovered, recoverErr := c.recoverTerminal(tx, terminalName, request.RunID)
 			if recoverErr != nil {
-				return recovered, submittedControllerError(recoverErr, deterministicWriteID(tx.key, latest))
+				return recovered, submittedControllerError(recoverErr, deterministicWriteID(tx.key, state.maxOrdinal))
 			}
 			return recovered, nil
 		}
-		generationExists, err := tx.exists(recordPrefix(tx.key, latest) + "generation.json")
-		if err != nil {
-			return zero, err
+		if state.barrierOrdinal > 0 && state.barrierOrdinal < state.maxOrdinal && state.zeroWriteAfterBarrier() {
+			barrierRevision, err := readRevision(tx, state.barrierOrdinal)
+			if err != nil {
+				return zero, err
+			}
+			if barrierRevision.RequestSHA256 == requestSHA {
+				barrierName := recordPrefix(tx.key, state.barrierOrdinal) + "terminal.json"
+				recovered, recoverErr := c.recoverTerminal(tx, barrierName, request.RunID)
+				if recoverErr != nil {
+					return recovered, submittedControllerError(recoverErr, deterministicWriteID(tx.key, state.barrierOrdinal))
+				}
+				return recovered, nil
+			}
 		}
 		if revision.RequestSHA256 != requestSHA {
-			if generationExists {
-				if !terminalExists {
-					return zero, &Error{Code: CodeRevisionConflict, Cause: errors.New("active revision has a generation")}
-				}
-				prior, err := readTerminal(tx, terminalName)
-				if err != nil {
-					return zero, err
-				}
-				_, priorGenerationSHA, priorMarkerSHA, err := readGenerationAndMarker(tx, latest)
-				if err != nil || prior.Core.GenerationSHA256 != priorGenerationSHA || prior.Core.SubmittedSHA256 != priorMarkerSHA {
-					return zero, &Error{Code: CodeIntegrityFailure, Cause: firstError(err, errors.New("prior terminal admission chain differs"))}
-				}
-				if prior.Core.ResultCore.Disposition != AppliedConfirmed {
-					return zero, &Error{Code: CodeRevisionConflict, Cause: errors.New("ambiguous or divergent history barriers later revisions")}
-				}
-				previous = &prior
-			} else {
-				_, _, err := tx.createJSON(recordPrefix(tx.key, latest)+"superseded.json", struct {
+			if state.unresolved() {
+				return zero, &Error{Code: CodeRevisionConflict, Cause: errors.New("active revision has a generation")}
+			}
+			previous, err = c.barrierTerminal(tx, state, request.Authority)
+			if err != nil {
+				return zero, err
+			}
+			if !state.has(state.maxOrdinal, kindTerminal|kindSuperseded) {
+				_, _, err := tx.createJSON(recordPrefix(tx.key, state.maxOrdinal)+"superseded.json", struct {
 					SchemaVersion int    `json:"schema_version"`
 					ResourceKey   string `json:"resource_key"`
 					Revision      uint64 `json:"revision"`
 					Reason        string `json:"reason"`
-				}{SchemaVersion, tx.key.String(), latest, "superseded_zero_write"}, false, false)
+				}{SchemaVersion, tx.key.String(), state.maxOrdinal, "superseded_zero_write"}, false, false)
 				if err != nil {
 					return zero, err
 				}
 			}
-			ordinal = latest + 1
-		} else if generationExists {
-			return c.resumeGeneration(ctx, tx, request, revision)
+			ordinal = state.maxOrdinal + 1
+		} else if state.unresolved() {
+			return c.resumeGeneration(ctx, tx, request, revision, state)
+		} else if state.has(state.maxOrdinal, kindSuperseded) {
+			return zero, &Error{Code: CodeRevisionConflict, Cause: errors.New("superseded revision cannot be re-entered")}
+		} else {
+			previous, err = c.barrierTerminal(tx, state, request.Authority)
+			if err != nil {
+				return zero, err
+			}
+			if previous != nil && (revision.Mode != "UPDATE" || revision.PRNumber != previous.Core.ResultCore.PRNumber || revision.PRNodeID != previous.Core.ResultCore.PRNodeID) {
+				return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("re-entered revision differs from prior confirmed PR")}
+			}
 		}
+	}
+	if state.barrierOrdinal >= ordinal {
+		return zero, &Error{Code: CodeIntegrityFailure, Cause: errors.New("barrier ordinal does not precede admitted revision")}
 	}
 
 	prepareRound, err := nextPrepareRound(tx, request.RunID, ordinal, c.github.limits.MaxReadRetries+1)
@@ -541,6 +554,11 @@ func (c *Controller) submit(ctx context.Context, tx *resourceTxn, request Reques
 	_ = genBytes
 	marker := submittedRecord{SchemaVersion, tx.key.String(), revision.Ordinal, 1, writeID, genSHA, digestBytes(proof), c.now().UTC().UnixNano(), MaxTerminalBytes}
 	markerName := recordPrefix(tx.key, revision.Ordinal) + "submitted.json"
+	if c.beforeMarker != nil {
+		if err := c.beforeMarker(); err != nil {
+			return zero, err
+		}
+	}
 	_, markerSHA, err := tx.createJSON(markerName, marker, true, false)
 	if err != nil {
 		return zero, err // marker durability is uncertain; never call HTTP.
@@ -557,7 +575,7 @@ func (c *Controller) submit(ctx context.Context, tx *resourceTxn, request Reques
 	return result, nil
 }
 
-func (c *Controller) resumeGeneration(ctx context.Context, tx *resourceTxn, request Request, revision revisionRecord) (PRLifecycleResultV1, error) {
+func (c *Controller) resumeGeneration(ctx context.Context, tx *resourceTxn, request Request, revision revisionRecord, state resourceStateV1) (PRLifecycleResultV1, error) {
 	storedGeneration, _, err := readGeneration(tx, revision.Ordinal)
 	if err != nil || storedGeneration.AuthoritySHA256 != revision.AuthoritySHA256 || storedGeneration.Mode != revision.Mode || storedGeneration.PRNumber != revision.PRNumber || storedGeneration.PRNodeID != revision.PRNodeID {
 		return PRLifecycleResultV1{}, &Error{Code: CodeIntegrityFailure, Cause: firstError(err, errors.New("generation does not bind active revision"))}
@@ -586,11 +604,18 @@ func (c *Controller) resumeGeneration(ctx context.Context, tx *resourceTxn, requ
 		}
 		return result, nil
 	}
+	previous, err := c.barrierTerminal(tx, state, request.Authority)
+	if err != nil {
+		return PRLifecycleResultV1{}, err
+	}
+	if previous != nil && (revision.Mode != "UPDATE" || revision.PRNumber != previous.Core.ResultCore.PRNumber || revision.PRNodeID != previous.Core.ResultCore.PRNodeID) {
+		return PRLifecycleResultV1{}, &Error{Code: CodeIntegrityFailure, Cause: errors.New("resumed revision differs from prior confirmed PR")}
+	}
 	resumeRound := nextLegacyRound(c.store, tx.key, revision.Ordinal, "resume", MaxResumeRounds)
 	if resumeRound == 0 {
 		return PRLifecycleResultV1{}, &Error{Code: CodeResumeBudgetExhausted, Cause: errors.New("four resume rounds exhausted")}
 	}
-	prep, proof, ref, err := c.prepare(ctx, tx.key, revision.Ordinal, resumeRound, "resume", request, nil)
+	prep, proof, ref, err := c.prepare(ctx, tx.key, revision.Ordinal, resumeRound, "resume", request, previous)
 	if err != nil {
 		return PRLifecycleResultV1{}, err
 	}

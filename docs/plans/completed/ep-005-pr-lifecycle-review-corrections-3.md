@@ -238,45 +238,45 @@ New tests live in `internal/prlifecycle/review3_linux_test.go` and reuse `lifecy
 
 **Primary — the reported Critical**
 
-- [ ] rev1 `applied_confirmed` on PR #7 → rev2 abandoned between `revision.json` and `generation.json` → PR #7 closed remotely → third differing request: fails closed (`EXISTING_INELIGIBLE_OPEN_PR`), fixture `writes == 1`, **no `POST /repos/{owner}/{repo}/pulls` ever observed**, `listReads` unchanged, no `rev-3-generation.json`/`submitted.json`/`terminal.json`; store gains exactly `rev-2-superseded.json` plus one `rev-3` prepare record.
-- [ ] Same setup, PR #7 left open and unmodified: third differing request succeeds as **UPDATE on #7** at ordinal 3, `writes == 2`, `listReads` unchanged, and every `*-terminal.json` for the resource binds the same `PRNumber`/`PRNodeID`.
-- [ ] Same setup, PR #7 title edited remotely: `REVISION_CONFLICT`, `writes == 1`, zero `POST`.
-- [ ] Explicit `superseded.json` assertions (the review noted no test greps for it): the abandoned ordinal owns exactly `revision.json` + `superseded.json`, never a generation, and re-supersede by another differing request is byte-identical/idempotent.
+- [x] rev1 `applied_confirmed` on PR #7 → rev2 abandoned between `revision.json` and `generation.json` → PR #7 closed remotely → third differing request: fails closed (`EXISTING_INELIGIBLE_OPEN_PR`), fixture `writes == 1`, **no `POST /repos/{owner}/{repo}/pulls` ever observed**, `listReads` unchanged, no `rev-3-generation.json`/`submitted.json`/`terminal.json`; store gains exactly `rev-2-superseded.json` plus one `rev-3` prepare record.
+- [x] Same setup, PR #7 left open and unmodified: third differing request succeeds as **UPDATE on #7** at ordinal 3, `writes == 2`, `listReads` unchanged, and every `*-terminal.json` for the resource binds the same `PRNumber`/`PRNodeID`.
+- [x] Same setup, PR #7 title edited remotely: `REVISION_CONFLICT`, `writes == 1`, zero `POST`.
+- [x] Explicit `superseded.json` assertions (the review noted no test greps for it): the abandoned ordinal owns exactly `revision.json` + `superseded.json`, never a generation, and re-supersede by another differing request is byte-identical/idempotent.
 
 **Same-request re-entry**
 
-- [ ] rev1 confirmed → differing request creates `rev-2-revision.json` then fails at `prepareWrite` → hook cleared → the **same** second request re-enters: with PR #7 remotely edited ⇒ `REVISION_CONFLICT`; with PR #7 closed ⇒ `EXISTING_INELIGIBLE_OPEN_PR` and no `POST /pulls`; unmodified ⇒ succeeds as UPDATE at ordinal 2 with `writes == 2` and `listReads` unchanged.
-- [ ] A pre-fix-shaped `rev-2-revision.json` with `Mode == "CREATE"` above a confirmed barrier is refused with `ADMISSION_INTEGRITY_FAILURE` and **zero GitHub requests**.
-- [ ] Re-entry with no barrier at all (first revision of a resource) still takes the discovery fallback — no regression for the no-prior-terminal case.
+- [x] rev1 confirmed → differing request creates `rev-2-revision.json` then fails at `prepareWrite` → hook cleared → the **same** second request re-enters: with PR #7 remotely edited ⇒ `REVISION_CONFLICT`; with PR #7 closed ⇒ `EXISTING_INELIGIBLE_OPEN_PR` and no `POST /pulls`; unmodified ⇒ succeeds as UPDATE at ordinal 2 with `writes == 2` and `listReads` unchanged.
+- [x] A pre-fix-shaped `rev-2-revision.json` with `Mode == "CREATE"` above a confirmed barrier is refused with `ADMISSION_INTEGRITY_FAILURE` and **zero GitHub requests**.
+- [x] Re-entry with no barrier at all (first revision of a resource) still takes the discovery fallback — no regression for the no-prior-terminal case.
 
 **Resume**
 
-- [ ] rev1 confirmed → rev2 generation allocated with `beforeMarker` failing → PR #7 title edited remotely → same request resumes: `REVISION_CONFLICT`, no `submitted.json` for rev2, `writes == 1`.
-- [ ] Same construction, PR #7 untouched: resume completes as UPDATE, `writes == 2`, exactly one `submitted.json` for rev2, `listReads` unchanged (resume now issues no discovery call).
-- [ ] Marker-present resume (`corrections_linux_test.go:275` shape) still reconciles read-only with **no barrier load**: with the barrier terminal made non-confirmed or corrupt, reconciliation still returns `RECONCILIATION_BUDGET_EXHAUSTED`, not an integrity/conflict error.
+- [x] rev1 confirmed → rev2 generation allocated with `beforeMarker` failing → PR #7 title edited remotely → same request resumes: `REVISION_CONFLICT`, no `submitted.json` for rev2, `writes == 1`.
+- [x] Same construction, PR #7 untouched: resume completes as UPDATE, `writes == 2`, exactly one `submitted.json` for rev2, `listReads` unchanged (resume now issues no discovery call).
+- [x] Marker-present resume (`corrections_linux_test.go:275` shape) still reconciles read-only with **no barrier load**: with the barrier terminal made non-confirmed or corrupt, reconciliation still returns `RECONCILIATION_BUDGET_EXHAUSTED`, not an integrity/conflict error.
 
 **Barrier selection, authentication, gating**
 
-- [ ] Non-confirmed barrier is not bypassable by an abandoned ordinal: rev1 `remote_diverged_after_write` (principal-mismatch fixture) → rev2 abandoned → third differing request ⇒ `REVISION_CONFLICT`, zero GitHub writes; and the exact replay of rev1's request still returns the identical `TerminalSHA256()` with zero GitHub requests because rev2 has no generation/submitted/terminal.
-- [ ] Lower-barrier replay is forbidden once any later ordinal owns `generation.json`: rev1 terminal → rev2 generation allocated (with or without marker) → request matching rev1 must not recover rev1; it follows the active-generation conflict/reconciliation path with zero replay of the older terminal.
-- [ ] Barrier authentication at an ordinal **below** `maxOrdinal`: independently tamper the barrier's `generation.json`, `submitted.json`, `revision.json`, and `terminal.json` bytes (names left grammar-valid) ⇒ `ADMISSION_INTEGRITY_FAILURE` with zero GitHub requests in each case.
-- [ ] Barrier `PolicySHA256`/`LimitsSHA256` mismatch ⇒ `ADMISSION_POLICY_MISMATCH`, zero GitHub requests.
-- [ ] Barrier whose `ResultCore.Repository`/`BaseBranch`/`HeadBranch` do not match the live authority ⇒ `ADMISSION_INTEGRITY_FAILURE`.
-- [ ] Exactly one `terminal.json` read per `Upsert` on the barrier path, and a barrier-driven prepare issues no `GET …/pulls?` (assert `listReads` and per-path request counts).
+- [x] Non-confirmed barrier is not bypassable by an abandoned ordinal: rev1 `remote_diverged_after_write` (principal-mismatch fixture) → rev2 abandoned → third differing request ⇒ `REVISION_CONFLICT`, zero GitHub writes; and the exact replay of rev1's request still returns the identical `TerminalSHA256()` with zero GitHub requests because rev2 has no generation/submitted/terminal.
+- [x] Lower-barrier replay is forbidden once any later ordinal owns `generation.json`: rev1 terminal → rev2 generation allocated (with or without marker) → request matching rev1 must not recover rev1; it follows the active-generation conflict/reconciliation path with zero replay of the older terminal.
+- [x] Barrier authentication at an ordinal **below** `maxOrdinal`: independently tamper the barrier's `generation.json`, `submitted.json`, `revision.json`, and `terminal.json` bytes (names left grammar-valid) ⇒ `ADMISSION_INTEGRITY_FAILURE` with zero GitHub requests in each case.
+- [x] Barrier `PolicySHA256`/`LimitsSHA256` mismatch ⇒ `ADMISSION_POLICY_MISMATCH`, zero GitHub requests.
+- [x] Barrier whose `ResultCore.Repository`/`BaseBranch`/`HeadBranch` do not match the live authority ⇒ `ADMISSION_INTEGRITY_FAILURE`.
+- [x] Exactly one `terminal.json` read per `Upsert` on the barrier path, and a barrier-driven prepare issues no `GET …/pulls?` (assert `listReads` and per-path request counts).
 
 **Structural scan**
 
-- [ ] Each of: generation-without-terminal at an ordinal below `maxOrdinal`; `submitted` without `generation`; `terminal` without `submitted`; revision-ordinal gap (`rev-1`, `rev-3`); `superseded` + `generation` at one ordinal ⇒ `ADMISSION_INTEGRITY_FAILURE` with zero GitHub requests.
-- [ ] Prepare-only ordinals (24 seeded records, no `revision.json`) do not enter resource state — `PREFLIGHT_HISTORY_EXHAUSTED` behaviour is unchanged.
-- [ ] A non-matching leftover (`…-terminal.json.saved`) does not fail the read-only paths, and the first path that creates a file still fails closed via `inventory`.
+- [x] Each of: generation-without-terminal at an ordinal below `maxOrdinal`; `submitted` without `generation`; `terminal` without `submitted`; revision-ordinal gap (`rev-1`, `rev-3`); `superseded` + `generation` at one ordinal ⇒ `ADMISSION_INTEGRITY_FAILURE` with zero GitHub requests.
+- [x] Prepare-only ordinals (24 seeded records, no `revision.json`) do not enter resource state — `PREFLIGHT_HISTORY_EXHAUSTED` behaviour is unchanged.
+- [x] A non-matching leftover (`…-terminal.json.saved`) does not fail the read-only paths, and the first path that creates a file still fails closed via `inventory`.
 
 **Superseded resurrection**
 
-- [ ] rev1 confirmed → rev2 abandoned → differing request supersedes rev2 and then fails at prepare (no `rev-3-revision.json`) → re-issuing the **rev2** request ⇒ `REVISION_CONFLICT`, zero writes, no `rev-2-generation.json`; a further differing request still advances to ordinal 3.
+- [x] rev1 confirmed → rev2 abandoned → differing request supersedes rev2 and then fails at prepare (no `rev-3-revision.json`) → re-issuing the **rev2** request ⇒ `REVISION_CONFLICT`, zero writes, no `rev-2-generation.json`; a further differing request still advances to ordinal 3.
 
 **Unchanged regressions must stay green**
 
-- [ ] One-submission/no-replay, descriptor-relative locking and inode recheck, two-phase reconciliation with 8-round/interval/aggregate bounds, divergence terminals, cross-run terminal recovery and evidence republish, sealed authenticated transport and header/body caps, CREATE list-vs-full identity, persisted-diagnostic sanitization, capacity/reservation accounting, run-scoped prepare history and the 24-record ceiling, `TerminalBudgetV1`, material-ledger idempotence, and the non-Linux fail-closed build.
+- [x] One-submission/no-replay, descriptor-relative locking and inode recheck, two-phase reconciliation with 8-round/interval/aggregate bounds, divergence terminals, cross-run terminal recovery and evidence republish, sealed authenticated transport and header/body caps, CREATE list-vs-full identity, persisted-diagnostic sanitization, capacity/reservation accounting, run-scoped prepare history and the 24-record ceiling, `TerminalBudgetV1`, material-ledger idempotence, and the non-Linux fail-closed build.
 
 ## 10. Verification
 
@@ -301,11 +301,11 @@ Land this document as `docs/plans/ep-005-pr-lifecycle-review-corrections-3.md` f
 
 ### Task 1: Correct the resource-scoped prior-confirmed PR barrier
 
-- [ ] Implement Steps 1–5 below exactly as designed, including bounded lower-barrier exact replay only across provably zero-write later ordinals.
-- [ ] Implement every adversarial regression in §9, including abandoned revision, same-request re-entry, resume, barrier authentication, structural scan, lower-barrier replay blocking, and superseded resurrection.
-- [ ] Preserve every listed non-goal and all previously accepted one-submission/no-replay, exact-head, locking, recovery, evidence, transport, budget, and ledger invariants.
-- [ ] Run every validation in §10 and require all to pass.
-- [ ] Mark satisfied plan checkboxes, commit the implementation only after validation, and move this plan to `docs/plans/completed/`.
+- [x] Implement Steps 1–5 below exactly as designed, including bounded lower-barrier exact replay only across provably zero-write later ordinals.
+- [x] Implement every adversarial regression in §9, including abandoned revision, same-request re-entry, resume, barrier authentication, structural scan, lower-barrier replay blocking, and superseded resurrection.
+- [x] Preserve every listed non-goal and all previously accepted one-submission/no-replay, exact-head, locking, recovery, evidence, transport, budget, and ledger invariants.
+- [x] Run every validation in §10 and require all to pass.
+- [x] Mark satisfied plan checkboxes, commit the implementation only after validation, and move this plan to `docs/plans/completed/`.
 
 ### Step 1 — `internal/prlifecycle/store_linux.go`
 

@@ -16,7 +16,7 @@ import (
 	"syscall"
 )
 
-var admissionName = regexp.MustCompile(`^r-([0-9a-f]{64})(?:\.lock|-resource\.json|-rev-([1-9][0-9]*)-(?:revision|generation|submitted|terminal|superseded|prepare-run-[0-9a-f]{64}-[1-3]|resume-[1-4]|reconcile-[1-8]-(?:start|observation))\.json)$`)
+var admissionName = regexp.MustCompile(`^r-([0-9a-f]{64})(?:\.lock|-resource\.json|-rev-([1-9][0-9]*)-((?:revision|generation|submitted|terminal|superseded|prepare-run-[0-9a-f]{64}-[1-3]|resume-[1-4]|reconcile-[1-8]-(?:start|observation)))\.json)$`)
 
 type fileIdentity struct{ dev, ino uint64 }
 
@@ -31,6 +31,9 @@ type PRWriteAdmissionStore struct {
 	// afterResourceLockOpen is an unexported deterministic race hook used only
 	// by same-package adversarial tests.
 	afterResourceLockOpen func()
+	// afterRecordRead is an unexported observation hook used only by
+	// same-package adversarial tests to assert bounded admission reads.
+	afterRecordRead func(name string)
 }
 
 var processResourceLocks sync.Map // canonical-root + NUL + resource-key -> *sync.Mutex
@@ -294,6 +297,9 @@ func (t *resourceTxn) read(name string, maximum int) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(f, int64(maximum)+1))
 	if err != nil || len(data) > maximum {
 		return nil, errors.New(CodeIntegrityFailure + ": admission record oversized or unreadable")
+	}
+	if t.store.afterRecordRead != nil {
+		t.store.afterRecordRead(name)
 	}
 	return data, nil
 }

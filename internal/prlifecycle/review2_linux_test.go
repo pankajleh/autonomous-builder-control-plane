@@ -25,6 +25,8 @@ type review2Fixture struct {
 	headSHA                string
 	exists                 bool
 	writes                 int
+	prCreates              int
+	prReads                int
 	requests               int
 	listReads              int
 	title                  string
@@ -86,6 +88,7 @@ func (f *review2Fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, `[]`)
 		}
 	case r.Method == http.MethodGet && r.URL.Path == "/repos/octo/control/pulls/7":
+		f.prReads++
 		if !f.exists {
 			http.NotFound(w, r)
 			return
@@ -103,6 +106,7 @@ func (f *review2Fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.title, f.body, f.exists = input.Title, input.Body, true
 		f.writes++
 		if r.Method == http.MethodPost {
+			f.prCreates++
 			w.WriteHeader(http.StatusCreated)
 		}
 		f.writePR(w)

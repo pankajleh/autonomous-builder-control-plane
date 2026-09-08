@@ -464,6 +464,10 @@ func readRevision(tx *resourceTxn, ordinal uint64) (revisionRecord, error) {
 	if err := strictJSON(b, &value); err != nil || value.SchemaVersion != SchemaVersion || value.ResourceKey != tx.key.String() || value.Ordinal != ordinal {
 		return value, &Error{Code: CodeIntegrityFailure, Cause: firstError(err, errors.New("revision identity mismatch"))}
 	}
+	canonical, err := json.Marshal(value)
+	if err != nil || !bytes.Equal(canonical, b) {
+		return value, &Error{Code: CodeIntegrityFailure, Cause: firstError(err, errors.New("revision is not canonical"))}
+	}
 	return value, nil
 }
 
@@ -500,26 +504,151 @@ func readGeneration(tx *resourceTxn, revision uint64) (generationRecord, string,
 	return generation, digestBytes(gb), nil
 }
 
-func latestRevision(store *PRWriteAdmissionStore, key PRResourceKeyV1) (uint64, error) {
-	entries, err := store.readDir()
-	if err != nil {
-		return 0, err
+const (
+	kindRevision uint8 = 1 << iota
+	kindGeneration
+	kindSubmitted
+	kindTerminal
+	kindSuperseded
+)
+
+type resourceStateV1 struct {
+	maxOrdinal     uint64
+	barrierOrdinal uint64
+	present        map[uint64]uint8
+}
+
+func (s resourceStateV1) has(ordinal uint64, mask uint8) bool {
+	return s.present[ordinal]&mask != 0
+}
+
+func (s resourceStateV1) unresolved() bool {
+	return s.maxOrdinal > 0 && s.has(s.maxOrdinal, kindGeneration) && !s.has(s.maxOrdinal, kindTerminal)
+}
+
+func (s resourceStateV1) zeroWriteAfterBarrier() bool {
+	if s.barrierOrdinal == 0 {
+		return false
 	}
-	prefix, suffix := "r-"+key.String()+"-rev-", "-revision.json"
-	var latest uint64
+	for ordinal, flags := range s.present {
+		if ordinal > s.barrierOrdinal && flags&(kindGeneration|kindSubmitted|kindTerminal) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func scanResource(tx *resourceTxn) (resourceStateV1, error) {
+	state := resourceStateV1{present: make(map[uint64]uint8)}
+	entries, err := tx.store.readDir()
+	if err != nil {
+		return state, err
+	}
+	prefix := "r-" + tx.key.String() + "-rev-"
 	for _, entry := range entries {
 		name := entry.Name()
-		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) {
-			ordinal, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix), 10, 64)
-			if err != nil || ordinal == 0 {
-				return 0, errors.New(CodeIntegrityFailure + ": malformed revision name")
-			}
-			if ordinal > latest {
-				latest = ordinal
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		match := admissionName.FindStringSubmatch(name)
+		if match == nil || match[1] != tx.key.String() || match[2] == "" {
+			continue
+		}
+		ordinal, parseErr := strconv.ParseUint(match[2], 10, 64)
+		if parseErr != nil || ordinal == 0 {
+			return state, &Error{Code: CodeIntegrityFailure, Cause: errors.New("malformed resource revision ordinal")}
+		}
+		var flag uint8
+		switch match[3] {
+		case "revision":
+			flag = kindRevision
+		case "generation":
+			flag = kindGeneration
+		case "submitted":
+			flag = kindSubmitted
+		case "terminal":
+			flag = kindTerminal
+		case "superseded":
+			flag = kindSuperseded
+		default:
+			continue
+		}
+		if state.present[ordinal]&flag != 0 {
+			return state, &Error{Code: CodeIntegrityFailure, Cause: errors.New("duplicate structural admission record")}
+		}
+		state.present[ordinal] |= flag
+		if flag == kindRevision && ordinal > state.maxOrdinal {
+			state.maxOrdinal = ordinal
+		}
+		if flag == kindTerminal && ordinal > state.barrierOrdinal {
+			state.barrierOrdinal = ordinal
+		}
+	}
+	unsettled := 0
+	for ordinal, flags := range state.present {
+		if flags&kindRevision == 0 {
+			return state, &Error{Code: CodeIntegrityFailure, Cause: errors.New("structural record has no revision")}
+		}
+		if flags&(kindSubmitted|kindTerminal) != 0 && flags&kindGeneration == 0 {
+			return state, &Error{Code: CodeIntegrityFailure, Cause: errors.New("submitted or terminal record has no generation")}
+		}
+		if flags&kindTerminal != 0 && flags&kindSubmitted == 0 {
+			return state, &Error{Code: CodeIntegrityFailure, Cause: errors.New("terminal record has no submitted marker")}
+		}
+		if flags&kindSuperseded != 0 && flags&kindGeneration != 0 {
+			return state, &Error{Code: CodeIntegrityFailure, Cause: errors.New("superseded revision owns a generation")}
+		}
+		if flags&(kindTerminal|kindSuperseded) == 0 {
+			unsettled++
+			if ordinal != state.maxOrdinal || unsettled > 1 {
+				return state, &Error{Code: CodeIntegrityFailure, Cause: errors.New("unsettled revision is not the resource maximum")}
 			}
 		}
 	}
-	return latest, nil
+	if uint64(len(state.present)) != state.maxOrdinal {
+		return state, &Error{Code: CodeIntegrityFailure, Cause: errors.New("revision ordinal sequence has a gap")}
+	}
+	if state.barrierOrdinal > state.maxOrdinal {
+		return state, &Error{Code: CodeIntegrityFailure, Cause: errors.New("terminal barrier exceeds maximum revision")}
+	}
+	return state, nil
+}
+
+func (c *Controller) barrierTerminal(tx *resourceTxn, state resourceStateV1, authority githublifecycle.Authority) (*terminalV1, error) {
+	if state.barrierOrdinal == 0 {
+		return nil, nil
+	}
+	ordinal := state.barrierOrdinal
+	prior, err := readTerminal(tx, recordPrefix(tx.key, ordinal)+"terminal.json")
+	if err != nil {
+		return nil, err
+	}
+	generation, generationSHA, markerSHA, err := readGenerationAndMarker(tx, ordinal)
+	if err != nil || prior.Core.GenerationSHA256 != generationSHA || prior.Core.SubmittedSHA256 != markerSHA || prior.Core.ResultCore.WriteID != generation.WriteID {
+		return nil, &Error{Code: CodeIntegrityFailure, Cause: firstError(err, errors.New("barrier terminal admission chain differs"))}
+	}
+	revision, err := readRevision(tx, ordinal)
+	if err != nil || revision.SourceSHA256 != prior.Core.SourceAuthoritySHA || revision.AuthoritySHA256 != prior.Core.DerivedAuthoritySHA || revision.DocumentSHA256 != prior.Core.DocumentSHA256 ||
+		generation.AuthoritySHA256 != prior.Core.DerivedAuthoritySHA || generation.AttemptSHA256 != prior.Core.AttemptSHA256 {
+		return nil, &Error{Code: CodeIntegrityFailure, Cause: firstError(err, errors.New("barrier revision or generation binding differs"))}
+	}
+	policySHA, _ := c.store.policy.SHA256()
+	limitsSHA, _ := c.github.limits.SHA256()
+	if prior.Core.PolicySHA256 != policySHA || prior.Core.LimitsSHA256 != limitsSHA {
+		return nil, &Error{Code: CodePolicyMismatch, Cause: errors.New("barrier policy identity differs")}
+	}
+	if prior.Core.ResourceKey != tx.key.String() || prior.Core.Revision != ordinal || prior.Core.ResultCore.ResourceKey != tx.key.String() || prior.Core.ResultCore.Revision != ordinal ||
+		prior.Core.ResultCore.Generation != 1 || documentDigest(prior.Core.Title, prior.Core.Body) != prior.Core.DocumentSHA256 {
+		return nil, &Error{Code: CodeIntegrityFailure, Cause: errors.New("barrier resource or revision identity differs")}
+	}
+	if prior.Core.ResultCore.Disposition != AppliedConfirmed {
+		return nil, &Error{Code: CodeRevisionConflict, Cause: errors.New("ambiguous or divergent history barriers later revisions")}
+	}
+	if prior.Core.ResultCore.PRNumber <= 0 || prior.Core.ResultCore.PRNodeID == "" || prior.Core.ResultCore.PRNumber != prior.Core.PullRequest.Number || prior.Core.ResultCore.PRNodeID != prior.Core.PullRequest.NodeID ||
+		prior.Core.ResultCore.Repository != authority.Repository().String() || prior.Core.ResultCore.BaseBranch != authority.BaseBranch().String() || prior.Core.ResultCore.HeadBranch != authority.HeadBranch().String() {
+		return nil, &Error{Code: CodeIntegrityFailure, Cause: errors.New("confirmed barrier PR or authority identity differs")}
+	}
+	return &prior, nil
 }
 
 func nextLegacyRound(store *PRWriteAdmissionStore, key PRResourceKeyV1, revision uint64, kind string, maximum int) int {
