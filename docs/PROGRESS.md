@@ -14,13 +14,13 @@ Updated: 2026-09-08
 
 ## Current
 
-EP-005 correction round 2 completed through Ralphex/Codex and ABCP deterministic acceptance at exact clean SHA `35faeec8b8314519ee6b9d36eba32a0c25ac6050`. Fresh Claude Code / Opus exact-head review verified the ten prior findings corrected but found one remaining Critical: prior `applied_confirmed` protection was latest-revision-scoped and could be bypassed by an abandoned intermediate revision. Review artifact SHA-256: `9fa76414ce73fc9168de70d967e28539cf662a54802e09678d1a5de829266974`.
+EP-005 PR lifecycle is merged in PR #8. Final reviewed/accepted head: `6db075240ce87b751f8db98abb540c96410c515b`; merge SHA: `ccf75d093625119cc39944fe7a47c3a03b30ad3b`. Final post-implementation controller fallback review (Claude provider session-limit fallback) returned `CLEAN_CRITICAL_MAJOR` with 0 Critical + 0 Major; artifact SHA-256 `e34a632e290930bbfcccfbd4326d5aeab1b1d8012285d67a122a87b55d8196c5`.
 
-Claude produced the bounded third-correction design; the independent design gate found one lower-barrier exact-replay inconsistency. Claude refinement then hit a genuine provider session limit (artifact SHA-256 `b97ac7242d3df4d64513e76279596e63bcaec08db28f03e41dbf2f4b8f0fe255`). Policy-authorized controller fallback corrected the design so lower-terminal replay is allowed only across provably zero-write later ordinals and is blocked by any later generation. The revised plan is design-clean at SHA-256 `cb7349da368084eb607e2e9d93f284e4801be831ddc08a1959c572eb3912ce60`; controller design-gate artifact SHA-256 `b82f3b3a84c31137c35fc7461acc9de152a916f5fd075d1521235a9f4bf4a984`. A first round-3 launch failed before task execution because the plan lacked an executable `### Task N:` section; no code changed. A syntax-only amendment added the required Task 1 wrapper without changing design semantics; amendment review artifact SHA-256 `9874944142e54377f005f50cda1fa73af4b6e8290f136c73afdb8d6c0ee178e6`. Push and PR #8 remain blocked.
+The next Phase-4 track is **CI evidence ingestion** on branch `ep-005-ci-ingestion`, based exactly on merged `main` SHA `ccf75d093625119cc39944fe7a47c3a03b30ad3b`.
 
 ## Next
 
-Commit the design-clean third correction checkpoint, rebuild/verify the context capsule and immutable ABCP authority from that exact SHA, then run the bounded correction through ABCP/Ralphex. Require deterministic exact-head acceptance and a fresh independent Critical/Major post-implementation review before any branch publication or PR #8.
+Have Claude Opus design the bounded CI-ingestion track from the frozen EP-005 and GitHub-lifecycle contracts. Require the design to bind every CI/check observation to the exact candidate head SHA and fail closed on pending, missing, stale, truncated, malformed, or ambiguous evidence. Run the independent Critical/Major design gate before creating implementation authority/context; then execute through ABCP/Ralphex, deterministic acceptance, exact-head implementation review, publication, and PR merge.
 
 ## Remaining after Phase 4
 
