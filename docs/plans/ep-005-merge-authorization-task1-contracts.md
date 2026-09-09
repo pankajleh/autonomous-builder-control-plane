@@ -14,7 +14,7 @@ Task 1 may amend only the network-free lifecycle contracts/tests and the foundat
 - Task 2 controller/runtime and Task 3 live provider remain out of scope until this exact Task-1 candidate is independently accepted and reviewed.
 - `CURRENT_STATE.md`, `PROGRESS.md`, and `AUDIT_INDEX.md` are not updated in this operation.
 
-## Implementation
+### Task 1: Implement lifecycle contract corrections
 
 - [ ] Add full READY/repository/policy authority bindings and strict canonical recovery; bind them through `Authority`, `MergeInput`, attempt identity, results, and validation.
 - [ ] Add authoritative open/non-draft/unmerged PR snapshots, trusted check producer/app/context, stable reviewer identities, conservative exact-head dismissal handling, and independent per-source pagination-closure contracts while preserving unordered review semantics.
