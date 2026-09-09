@@ -1,6 +1,6 @@
 # IMPLEMENTABLE_PLAN
 
-Checkpoint verified read-only: branch `ep-005-ci-ingestion`, commit `fd9ed5492b326f02833d68408ed415baacb89e01`, clean worktree.
+Execution checkpoint: Tasks 1 and 2 are complete on `ep-005-ci-ingestion`. Task 2 at exact clean commit `da8ffea4582539067724b363b3144d9601dee086` passed all 10 deterministic acceptance gates; acceptance result SHA-256 is `03d6f291f7606854d214b718892434a9f42eaab809e6da4bca0c431a047356d3` and final-Git evidence SHA-256 is `06a404b5ed0d300b7a643f1df75929cf75f8d41f869d8a10313970a9773021f0`. The containing reconciliation commit preserves those accepted implementation bytes and merges exact current policy through `e11afb7d7356a0df36566d98c34adbd07a0097ae`. Before Task 3 begins, resolve that commit's exact SHA and issue a fresh Task-3-only `context-capsule-v2` and immutable run authority bound to it.
 
 This replacement follows the boundaries in [IMPLEMENTATION_ROADMAP.md](/home/devagent/autonomous-builder-control-plane/docs/roadmap/IMPLEMENTATION_ROADMAP.md), [EP-005-github-lifecycle.md](/home/devagent/autonomous-builder-control-plane/docs/execution-packs/EP-005-github-lifecycle.md), and the repository architecture contracts. It deliberately removes the rejected design’s CI-policy evaluator and PR-write state machine.
 
@@ -696,12 +696,15 @@ Forbidden-change check:
 ```bash
 test -z "$(git diff --name-only fd9ed5492b326f02833d68408ed415baacb89e01 -- \
   internal/githublifecycle \
-  internal/authority \
   internal/prlifecycle \
   internal/integrationgate \
   internal/scheduler \
   internal/domain)"
+test -z "$(git diff --name-only e11afb7d7356a0df36566d98c34adbd07a0097ae -- \
+  internal/authority)"
 ```
+
+The split baseline preserves the CI scope barrier while recognizing that `internal/authority` is owned by merged-main v2 operation policy.
 
 Forbidden-semantics checks:
 
@@ -765,18 +768,20 @@ Roadmap self-review: this implements only Phase 4’s “CI evidence ingestion�
 - [ ] Add multiprocess/concurrency, capacity, reservation-file-as-lock, recoverable zero/partial-reservation crash-boundary, symlink/special-file, tamper, missing-artifact, conflicting-event, append, and fsync tests.
 - [ ] Confirm no PR revision/generation/submission/reconciliation types or semantics were introduced.
 
-### Task 4: Acceptance, scope audit, and exact-head review handoff
+## Deferred Task 4 requirements: Acceptance, scope audit, and exact-head review handoff
 
-- [ ] Before any task work, obtain the final task capsule path/hash from launch authority, independently verify its exact SHA-256 and execute `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`; stop on missing binding, drift, or incorrect predecessor head.
-- [ ] Run formatting, vet, package, race, regression, and complete repository tests from the validation section.
-- [ ] Run the forbidden-package and forbidden-semantics checks.
-- [ ] Verify maximum requests, artifacts, encoded bytes, attempts, ledger scans, and duration are all tested at their exact limits and at limit+1.
-- [ ] Verify every durable completed non-success outcome is ledger-reachable and replayable.
-- [ ] Verify every `STABLE` result states bounded observational stability only and contains no acceptance/approval field.
-- [ ] Verify app-installation rejection occurs before allocator, evidence, ledger, and network hooks.
-- [ ] Reconcile implementation documentation against the roadmap and EP-005 boundaries.
-- [ ] Produce deterministic ABCP acceptance evidence for the exact implementation SHA.
-- [ ] Submit that same exact SHA to a fresh Critical/Major review under the repository fallback policy.
-- [ ] Do not authorize publication or later Phase-4 work unless the exact-head verdict is zero Critical and zero Major.
+These requirements are intentionally non-executable during the Task 3 operation. After Task 3 commits, freeze a separate Task-4-only plan and issue a fresh v2 capsule and immutable authority at that exact predecessor.
+
+- Verify the final-task capsule's supplied SHA-256 and run `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`; stop on a missing binding, drift, or incorrect predecessor head.
+- Run formatting, vet, package, race, regression, and complete repository tests from the validation section.
+- Run the forbidden-package and forbidden-semantics checks.
+- Verify maximum requests, artifacts, encoded bytes, attempts, ledger scans, and duration at their exact limits and at limit+1.
+- Verify every durable completed non-success outcome is ledger-reachable and replayable.
+- Verify every `STABLE` result states bounded observational stability only and contains no acceptance or approval field.
+- Verify app-installation rejection occurs before allocator, evidence, ledger, and network hooks.
+- Reconcile implementation documentation against the roadmap and EP-005 boundaries.
+- Produce deterministic ABCP acceptance evidence for the exact implementation SHA.
+- Submit that same exact SHA to a fresh Critical/Major review under the repository fallback policy.
+- Do not authorize publication or later Phase-4 work unless the exact-head verdict is zero Critical and zero Major.
 
 DESIGN_READY_FOR_GATE

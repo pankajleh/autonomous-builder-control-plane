@@ -40,7 +40,7 @@ func TestRunnerSuccessReachesBranchAcceptedWithOrderedEvidence(t *testing.T) {
 	}
 	configDir := result.Ralphex.Argv[2]
 	wantArgs := []string{
-		"--codex", "--wait", "0s", "--task-model", "test-model:high", "--tasks-only", fixture.authority.Plan().Path,
+		"--codex", "--wait", "0s", "--task-model", "test-model:xhigh", "--review-model", "test-review:xhigh", "--tasks-only", fixture.authority.Plan().Path,
 	}
 	if !reflect.DeepEqual(result.Ralphex.Argv[3:], wantArgs) {
 		t.Fatalf("Ralphex args mismatch\nwant: %#v\n got: %#v", wantArgs, result.Ralphex.Argv[3:])
@@ -132,10 +132,15 @@ func TestRunnerReverifiesBoundContextCapsuleBeforeRalphexLaunch(t *testing.T) {
 	runGit(t, manifest.Repository.Path, "commit", "-m", "context source")
 	manifest.Repository.StartSHA = runGit(t, manifest.Repository.Path, "rev-parse", "HEAD")
 	spec := contextcapsule.Spec{
-		PolicyVersion: contextcapsule.PolicyVersion,
+		PolicyVersion: contextcapsule.PolicyVersionV2,
 		Project:       "ABCP", Plan: "EP-004", RoadmapPhase: "Phase 3", ExecutionPack: "EP-004",
 		Task: "Task 1", Repository: "example/project", BaseSHA: manifest.Repository.StartSHA,
-		Invariants: []string{"Fail closed."}, NonGoals: []string{"No retrieval."}, Sources: []string{"context.md"},
+		OperationContext: &contextcapsule.OperationContext{
+			Kind: contextcapsule.OperationImplementation, OwnedScope: []string{"Task 1"},
+			BlockingCriteria: []string{"Current owned-scope Critical or Major findings."},
+		},
+		Invariants: []string{"Fail closed."}, NonGoals: []string{"No retrieval."},
+		PredecessorOutcomes: []contextcapsule.Outcome{}, Sources: []string{"context.md"},
 	}
 	_, capsuleJSON, err := contextcapsule.Build(manifest.Repository.Path, spec)
 	if err != nil {
@@ -148,14 +153,197 @@ func TestRunnerReverifiesBoundContextCapsuleBeforeRalphexLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	runner := fixture.runner(t)
 
 	writeTestFile(t, sourcePath, []byte("drift after authority construction"), 0o600)
-	result, err := fixture.runner(t).Run(context.Background())
+	result, err := runner.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "verify context capsule before execution") {
 		t.Fatalf("expected pre-launch capsule verification failure, got result=%+v err=%v", result, err)
 	}
 	if _, statErr := os.Stat(filepath.Join(manifest.Repository.Path, "candidate.txt")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("Ralphex launched despite capsule drift: %v", statErr)
+	}
+}
+
+func TestNewRequiresVerifiedV2OperationCapsule(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+
+	missing := fixture.authority.Manifest()
+	missing.ContextCapsule = nil
+	governed, err := authority.New(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), "verified v2 context capsule is required") {
+		t.Fatalf("missing capsule error = %v", err)
+	}
+
+	historical := fixture.authority.Manifest()
+	bindHistoricalCapsule(t, &historical)
+	governed, err = authority.New(historical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), contextcapsule.PolicyVersionV2) {
+		t.Fatalf("historical v1 capsule authorized new execution: %v", err)
+	}
+}
+
+func TestNewRequiresExactOperationBase(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	manifest.Repository.StartSHA = strings.Repeat("0", 40)
+	governed, err := authority.New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), "does not match governed start SHA") {
+		t.Fatalf("operation/base mismatch error = %v", err)
+	}
+}
+
+func TestNewEnforcesCodexXHighEffort(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	tests := []struct {
+		name   string
+		mutate func(*authority.ExecutorPolicy)
+		field  string
+	}{
+		{name: "high task", mutate: func(policy *authority.ExecutorPolicy) { policy.TaskEffort = "high" }, field: "task_effort"},
+		{name: "empty task", mutate: func(policy *authority.ExecutorPolicy) { policy.TaskEffort = "" }, field: "task_effort"},
+		{name: "high review", mutate: func(policy *authority.ExecutorPolicy) { policy.ReviewEffort = "high" }, field: "review_effort"},
+		{name: "empty review", mutate: func(policy *authority.ExecutorPolicy) { policy.ReviewEffort = "" }, field: "review_effort"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := fixture.authority.Manifest()
+			test.mutate(&manifest.Executor)
+			governed, err := authority.New(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("effort policy error = %v", err)
+			}
+		})
+	}
+	if _, err := fixture.construct(t, fixture.authority); err != nil {
+		t.Fatalf("xhigh Codex policy was rejected: %v", err)
+	}
+}
+
+func TestNewEnforcesOperationKindAndRalphexModeMapping(t *testing.T) {
+	tests := []struct {
+		name    string
+		kind    contextcapsule.OperationKind
+		mode    ralphex.Mode
+		wantErr bool
+	}{
+		{name: "implementation full", kind: contextcapsule.OperationImplementation, mode: ralphex.ModeFull},
+		{name: "implementation tasks-only", kind: contextcapsule.OperationImplementation, mode: ralphex.ModeTasksOnly},
+		{name: "design review", kind: contextcapsule.OperationDesignReview, mode: ralphex.ModeReview},
+		{name: "implementation review", kind: contextcapsule.OperationImplementationReview, mode: ralphex.ModeReview},
+		{name: "design review cannot run full", kind: contextcapsule.OperationDesignReview, mode: ralphex.ModeFull, wantErr: true},
+		{name: "design review cannot run tasks-only", kind: contextcapsule.OperationDesignReview, mode: ralphex.ModeTasksOnly, wantErr: true},
+		{name: "implementation review cannot run full", kind: contextcapsule.OperationImplementationReview, mode: ralphex.ModeFull, wantErr: true},
+		{name: "implementation review cannot run tasks-only", kind: contextcapsule.OperationImplementationReview, mode: ralphex.ModeTasksOnly, wantErr: true},
+		{name: "implementation cannot run review", kind: contextcapsule.OperationImplementation, mode: ralphex.ModeReview, wantErr: true},
+		{name: "acceptance cannot run review", kind: contextcapsule.OperationAcceptance, mode: ralphex.ModeReview, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRunFixture(t, 0, commandPath(t, "true"))
+			manifest := fixture.authority.Manifest()
+			manifest.Ralphex.Mode = test.mode
+			bindOperationCapsule(t, &manifest, test.kind)
+			governed, err := authority.New(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = fixture.construct(t, governed)
+			if test.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "requires operation kind") {
+					t.Fatalf("operation kind %q with mode %q error = %v", test.kind, test.mode, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("operation kind %q with mode %q rejected: %v", test.kind, test.mode, err)
+			}
+		})
+	}
+}
+
+func TestNewRejectsMultipleIncompleteImplementationSectionsInEveryImplementationMode(t *testing.T) {
+	for _, mode := range []ralphex.Mode{ralphex.ModeFull, ralphex.ModeTasksOnly} {
+		t.Run(string(mode), func(t *testing.T) {
+			fixture := newRunFixture(t, 0, commandPath(t, "true"))
+			manifest := fixture.authority.Manifest()
+			manifest.Ralphex.Mode = mode
+			plan := []byte("### Task 1: first\n\n- [ ] first action\n\n### Task 2: second\n\n- [ ] second action\n")
+			writeTestFile(t, manifest.Plan.Path, plan, 0o600)
+			manifest.Plan.SHA256 = testHash(t, manifest.Plan.Path)
+			governed, err := authority.New(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), "2 incomplete executable") {
+				t.Fatalf("multiple incomplete task error = %v", err)
+			}
+		})
+	}
+}
+
+func TestCountIncompleteExecutableSections(t *testing.T) {
+	tests := []struct {
+		name string
+		plan string
+		want int
+	}{
+		{
+			name: "backtick fence",
+			plan: "## Overview\n- [ ] not executable\n\n### Task 1: done\n- [x] complete\n\n```md\n### Task 99: example\n- [ ] ignored\n```\n\n### Iteration 2: active\n- [ ] action\n",
+			want: 1,
+		},
+		{
+			name: "indented backtick fence with longer closer",
+			plan: "   ````markdown\n### Task 98: example\n- [ ] ignored\n```\n   `````  \n\n### Task 1: active\n- [ ] action\n",
+			want: 1,
+		},
+		{
+			name: "tilde fence with backticks in info string",
+			plan: "~~~ language=`markdown`\n### Task 97: example\n- [ ] ignored\n  ~~~\n\n### Task 1: active\n- [ ] action\n",
+			want: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sections, err := countIncompleteExecutableSections([]byte(test.plan))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sections != test.want {
+				t.Fatalf("incomplete executable sections = %d, want %d", sections, test.want)
+			}
+		})
+	}
+}
+
+func TestCountIncompleteExecutableSectionsDoesNotTreatFourSpaceIndentAsFence(t *testing.T) {
+	plan := []byte("    ```\n\n### Task 1: first\n- [ ] first action\n\n### Task 2: second\n- [ ] second action\n")
+	sections, err := countIncompleteExecutableSections(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sections != 2 {
+		t.Fatalf("four-space-indented backticks hid executable sections: got %d, want 2", sections)
+	}
+}
+
+func TestCountIncompleteExecutableSectionsRejectsUnterminatedFence(t *testing.T) {
+	plan := []byte("```markdown\n### Task 1: hidden\n- [ ] hidden action\n")
+	if _, err := countIncompleteExecutableSections(plan); err == nil || !strings.Contains(err.Error(), "unterminated Markdown") {
+		t.Fatalf("unterminated fence error = %v", err)
 	}
 }
 
@@ -351,24 +539,7 @@ func TestRunnerRejectsDirtyInitialWorkingTree(t *testing.T) {
 
 func TestRalphexEnvironmentUsesAuthorityBoundContextCapsule(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
-	manifest := fixture.authority.Manifest()
-	spec := contextcapsule.Spec{
-		PolicyVersion: contextcapsule.PolicyVersion,
-		Project:       "ABCP", Plan: "EP-005", RoadmapPhase: "Phase 4", ExecutionPack: "EP-005",
-		Task: "capsule environment binding", Repository: "example/project", BaseSHA: manifest.Repository.StartSHA,
-		Invariants: []string{"Use only authority-bound context."}, NonGoals: []string{"No ambient capsule override."}, Sources: []string{"plan.md"},
-	}
-	_, capsuleJSON, err := contextcapsule.Build(manifest.Repository.Path, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	capsulePath := filepath.Join(t.TempDir(), "capsule.json")
-	writeTestFile(t, capsulePath, capsuleJSON, 0o600)
-	manifest.ContextCapsule = &authority.ContextCapsuleManifest{Path: capsulePath, SHA256: testHash(t, capsulePath)}
-	governed, err := authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	governed := fixture.authority
 	capsule, present := governed.ContextCapsule()
 	if !present {
 		t.Fatal("validated authority lost context capsule binding")
@@ -377,20 +548,12 @@ func TestRalphexEnvironmentUsesAuthorityBoundContextCapsule(t *testing.T) {
 	t.Setenv("ABCP_CONTEXT_CAPSULE_PATH", "/tmp/attacker-capsule.json")
 	t.Setenv("ABCP_CONTEXT_CAPSULE_SHA256", strings.Repeat("0", 64))
 
-	got := environmentMap(ralphexEnvironment(governed))
+	got := environmentMap(ralphexEnvironment(governed.Executor().Executor, capsule))
 	if got["ABCP_CONTEXT_CAPSULE_PATH"] != capsule.Path {
 		t.Fatalf("capsule path = %q, want authority path %q", got["ABCP_CONTEXT_CAPSULE_PATH"], capsule.Path)
 	}
 	if got["ABCP_CONTEXT_CAPSULE_SHA256"] != capsule.SHA256 {
 		t.Fatalf("capsule SHA256 = %q, want authority SHA256 %q", got["ABCP_CONTEXT_CAPSULE_SHA256"], capsule.SHA256)
-	}
-
-	withoutBinding := environmentMap(ralphexEnvironment(fixture.authority))
-	if _, ok := withoutBinding["ABCP_CONTEXT_CAPSULE_PATH"]; ok {
-		t.Fatal("ambient capsule path leaked into run without an authority binding")
-	}
-	if _, ok := withoutBinding["ABCP_CONTEXT_CAPSULE_SHA256"]; ok {
-		t.Fatal("ambient capsule SHA256 leaked into run without an authority binding")
 	}
 }
 
@@ -408,9 +571,15 @@ func environmentMap(environment []string) map[string]string {
 func TestRunnerUsesAllowlistedRalphexEnvironment(t *testing.T) {
 	t.Setenv("ABCP_TEST_SECRET", "must-not-leak")
 	t.Setenv("OPENAI_API_KEY", "authorized-provider-key")
+	t.Setenv("ABCP_CONTEXT_CAPSULE_PATH", "/attacker/ambient-capsule.json")
+	t.Setenv("ABCP_CONTEXT_CAPSULE_SHA256", strings.Repeat("f", 64))
 	script := `#!/bin/sh
 if [ -n "$ABCP_TEST_SECRET" ]; then exit 41; fi
 if [ "$OPENAI_API_KEY" != "authorized-provider-key" ]; then exit 42; fi
+if [ "$ABCP_CONTEXT_CAPSULE_PATH" = "/attacker/ambient-capsule.json" ]; then exit 45; fi
+if [ ! -f "$ABCP_CONTEXT_CAPSULE_PATH" ]; then exit 46; fi
+actual_capsule_sha="$(sha256sum "$ABCP_CONTEXT_CAPSULE_PATH" | awk '{print $1}')"
+if [ "$actual_capsule_sha" != "$ABCP_CONTEXT_CAPSULE_SHA256" ]; then exit 47; fi
 printf 'candidate\n' > candidate.txt
 git add candidate.txt || exit 43
 git commit -qm 'candidate implementation' || exit 44
@@ -503,17 +672,8 @@ func TestRunnerRejectsRepositorySubdirectoryAsGovernedRoot(t *testing.T) {
 	manifest.Repository.Path = subdirectory
 	manifest.Plan.Path = planPath
 	manifest.Plan.SHA256 = testHash(t, planPath)
-	governed, err := authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture.authority = governed
-	result, err := fixture.runner(t).Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "not Git repository root") {
-		t.Fatalf("expected repository-root rejection, got %v", err)
-	}
-	if result.State != domain.StateFailed {
-		t.Fatalf("subdirectory repository state = %s, want FAILED", result.State)
+	if _, err := authority.New(manifest); err == nil || !strings.Contains(err.Error(), "not Git root") {
+		t.Fatalf("expected capsule-bound repository-root rejection, got %v", err)
 	}
 }
 
@@ -701,7 +861,8 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 	runGit(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
 	planPath := filepath.Join(repository, "plan.md")
 	writeTestFile(t, planPath, []byte("# governed plan\n"), 0o600)
-	runGit(t, repository, "add", "plan.md")
+	writeTestFile(t, filepath.Join(repository, "context.md"), []byte("governed operation context\n"), 0o600)
+	runGit(t, repository, "add", "plan.md", "context.md")
 	runGit(t, repository, "commit", "-m", "initial plan")
 	startSHA := runGit(t, repository, "rev-parse", "HEAD")
 
@@ -721,13 +882,17 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 		Ralphex: authority.RalphexManifest{
 			BinaryPath: binaryPath, BinarySHA256: testHash(t, binaryPath), SourceSHA: "source-test", Mode: ralphex.ModeTasksOnly, Timeout: "5s", WaitOnLimit: "0s",
 		},
-		Executor: authority.ExecutorPolicy{Executor: "codex", TaskModel: "test-model", TaskEffort: "high"},
+		Executor: authority.ExecutorPolicy{
+			Executor: "codex", TaskModel: "test-model", TaskEffort: "xhigh",
+			ReviewModel: "test-review", ReviewEffort: "xhigh",
+		},
 		Worktree: worktree,
 		Acceptance: []authority.AcceptanceCommand{{
 			Name: "deterministic check", Class: "unit", Required: true, Timeout: "5s", Argv: acceptanceArgv,
 		}},
 		PolicyVersion: "branch-test-v1",
 	}
+	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
 	governed, err := authority.New(manifest)
 	if err != nil {
 		t.Fatal(err)
@@ -780,19 +945,24 @@ func waitForRunFile(t *testing.T, path string) {
 
 func (f runFixture) runner(t *testing.T) *Runner {
 	t.Helper()
-	events, err := ledger.NewJSONLLedger(f.ledgerPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	artifacts, err := evidence.NewStore(f.evidence, f.authority.RunID())
-	if err != nil {
-		t.Fatal(err)
-	}
-	runner, err := New(f.authority, events, artifacts, supervisor.New())
+	runner, err := f.construct(t, f.authority)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return runner
+}
+
+func (f runFixture) construct(t *testing.T, governed authority.Authority) (*Runner, error) {
+	t.Helper()
+	events, err := ledger.NewJSONLLedger(f.ledgerPath)
+	if err != nil {
+		return nil, err
+	}
+	artifacts, err := evidence.NewStore(f.evidence, governed.RunID())
+	if err != nil {
+		return nil, err
+	}
+	return New(governed, events, artifacts, supervisor.New())
 }
 
 func (f runFixture) execute(t *testing.T) Result {
@@ -808,12 +978,54 @@ func (f runFixture) atCurrentHead(t *testing.T) runFixture {
 	t.Helper()
 	manifest := f.authority.Manifest()
 	manifest.Repository.StartSHA = runGit(t, manifest.Repository.Path, "rev-parse", "HEAD")
+	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
 	governed, err := authority.New(manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.authority = governed
 	return f
+}
+
+func bindOperationCapsule(t *testing.T, manifest *authority.Manifest, kind contextcapsule.OperationKind) {
+	t.Helper()
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersionV2,
+		Project:       "ABCP", Plan: "governed plan", RoadmapPhase: "test", ExecutionPack: "test",
+		Task: "Task 1", Repository: manifest.Repository.Identity, BaseSHA: manifest.Repository.StartSHA,
+		OperationContext: &contextcapsule.OperationContext{
+			Kind: kind, OwnedScope: []string{"Task 1"},
+			BlockingCriteria: []string{"Current owned-scope Critical or Major findings."},
+		},
+		Invariants: []string{"Fail closed."}, NonGoals: []string{"No out-of-scope changes."},
+		PredecessorOutcomes: []contextcapsule.Outcome{},
+		Sources:             []string{"context.md"},
+	}
+	_, data, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "context-capsule.json")
+	writeTestFile(t, path, data, 0o600)
+	manifest.ContextCapsule = &authority.ContextCapsuleManifest{Path: path, SHA256: testHash(t, path)}
+}
+
+func bindHistoricalCapsule(t *testing.T, manifest *authority.Manifest) {
+	t.Helper()
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersionV1,
+		Project:       "ABCP", Plan: "historical plan", RoadmapPhase: "test", ExecutionPack: "test",
+		Task: "Task 1", Repository: manifest.Repository.Identity, BaseSHA: manifest.Repository.StartSHA,
+		Invariants: []string{"Fail closed."}, NonGoals: []string{"No out-of-scope changes."},
+		Sources: []string{"context.md"},
+	}
+	_, data, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "historical-context-capsule.json")
+	writeTestFile(t, path, data, 0o600)
+	manifest.ContextCapsule = &authority.ContextCapsuleManifest{Path: path, SHA256: testHash(t, path)}
 }
 
 func readEvents(t *testing.T, path string) []ledger.Event {

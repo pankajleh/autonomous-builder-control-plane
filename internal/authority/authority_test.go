@@ -404,7 +404,7 @@ func boundCapsuleManifest(t *testing.T) Manifest {
 	head := gitAuthorityCommand(t, manifest.Repository.Path, "rev-parse", "HEAD")
 	manifest.Repository.StartSHA = head
 	spec := contextcapsule.Spec{
-		PolicyVersion: contextcapsule.PolicyVersion,
+		PolicyVersion: contextcapsule.PolicyVersionV1,
 		Project:       "ABCP", Plan: "EP-004", RoadmapPhase: "Phase 3", ExecutionPack: "EP-004",
 		Task: "Task 1", Repository: "example/project", BaseSHA: head,
 		Invariants: []string{"Fail closed."}, NonGoals: []string{"No retrieval."}, Sources: []string{"source.md"},

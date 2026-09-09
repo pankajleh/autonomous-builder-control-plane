@@ -1,24 +1,48 @@
 # Audit Index
 
-This index links each accepted execution pack to its reviewed Git identity and merge evidence. Runtime run/evidence references are added as governed execution progresses.
+Operational role: this file indexes accepted, reviewed, and merged evidence identities. It must be consulted before planning or starting governed work. It is a human-readable projection and pointer set, not a substitute for controller ledgers, immutable evidence artifacts, verified capsules/authorities, or Git object/ref evidence.
 
-| EP | PR | Reviewed head | Merge SHA | Review mode |
+## Accepted, reviewed, and merged implementation identities
+
+| Scope | PR | Accepted/reviewed head | Merge SHA | Review evidence |
 |---|---:|---|---|---|
 | EP-002 | #4 | `0668397491394964d06ddf7ad00ae8032b2ac49d` | `f7ca8e6e59f04e7bece0582f3febcd37ec2cb4f7` | Claude cross-model clean after correction |
-| EP-003 | #5 | `f345a910ff14c15be3fdc872eab89c13c5b89caa` | `db56b1f8cf32561be6b707db4bbf046f4c24e067` | controller fallback after Claude capacity failure; prior Claude Majors corrected |
-| EP-004 | #6 | `d3193cf5615c5ea33e2f74398519106863ed4b06` | `94e14ca749d31ac214e979aab03fbde37502dd7f` | controller fallback after Claude session failure; all prior Claude/controller Majors corrected |
-| EP-005 (active) | #7, #8 | latest reviewed implementation head `6db075240ce87b751f8db98abb540c96410c515b`; CI design `47a6d7b1…` | latest functional merge `ccf75d093625119cc39944fe7a47c3a03b30ad3b` | foundation + PR lifecycle merged; CI evidence-ingestion design 0C/0M, implementation authorized |
+| EP-003 | #5 | `f345a910ff14c15be3fdc872eab89c13c5b89caa` | `db56b1f8cf32561be6b707db4bbf046f4c24e067` | Controller fallback after Claude capacity failure; prior Claude Majors corrected |
+| EP-004 | #6 | `d3193cf5615c5ea33e2f74398519106863ed4b06` | `94e14ca749d31ac214e979aab03fbde37502dd7f` | Controller fallback after Claude session failure; prior Claude/controller Majors corrected |
+| EP-005 exact-head PR lifecycle | #8 | `6db075240ce87b751f8db98abb540c96410c515b` | `ccf75d093625119cc39944fe7a47c3a03b30ad3b` | Controller fallback 0C/0M artifact SHA-256 `e34a632e290930bbfcccfbd4326d5aeab1b1d8012285d67a122a87b55d8196c5` |
+| Context-bound autonomous operations | #11 | `84c6a8ee4b6d6a315eeaa1e7de17fbf5f94a1dec` | `454ea4dce3c674e0d8e55273319cfb4ea4a077a5` | Exact-head 0C/0M artifact SHA-256 `85405bc64c0703319cad881d4b4aa3f07ba7aa91fb97ef16b8172dcb56beebe5` |
+| Operational state projections | #12 | `2ab636f2b118e7e77bcb6656a0afb163f2082461` | `e11afb7d7356a0df36566d98c34adbd07a0097ae` | Exact-head 0C/0M artifact SHA-256 `ab16a9b1711d54391dbe317078879da765aca6de36626f1a95e7ad274546dd78` |
 
-## EP-005 active
+EP-005 foundation merged in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f` before the exact-head PR lifecycle subtrack.
 
-Roadmap authority: Phase 4 GitHub lifecycle. Foundation merged in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
+## Current-policy evidence
 
-Exact-head lifecycle implementation `f986008ba11c69c3864f0b8977af440024d12048` passed ABCP acceptance but post-implementation review found 1 Critical and 9 Major defects. First governed correction round then passed ABCP acceptance at `d4e7e1d8fc6af9545f9f67e3c99fa94c3420a7ce`; fresh Claude Code / Opus exact-head review found 2 Critical and 4 Major defects, artifact SHA-256 `d07f9124d771a38caff86b5c3283a70c35d5fe71379b329b1513416392c99421`.
+- Context-bound operation policy candidate: `84c6a8ee4b6d6a315eeaa1e7de17fbf5f94a1dec`.
+- Policy controller result: `BRANCH_ACCEPTED`, with final-Git evidence SHA-256 `1de3bb8bf42f8a9e231d0d9e4ef0b699c8ac3534fd66778c03b316b28a48ee5c`.
+- Policy final review: `CLEAN_CRITICAL_MAJOR`, 0 Critical and 0 Major, artifact SHA-256 `85405bc64c0703319cad881d4b4aa3f07ba7aa91fb97ef16b8172dcb56beebe5`.
+- Policy merge: PR #11 at `454ea4dce3c674e0d8e55273319cfb4ea4a077a5`.
+- Projection correction candidate: `2ab636f2b118e7e77bcb6656a0afb163f2082461`.
+- Projection controller result: `BRANCH_ACCEPTED`, with final-Git evidence SHA-256 `c28140c17923fe3f68ea0f5d16488752c7a22779784c0ffcbbd7845264ed64d4`.
+- Projection final review: `IMPLEMENTATION_CLEAN_CRITICAL_MAJOR`, 0 Critical and 0 Major, artifact SHA-256 `ab16a9b1711d54391dbe317078879da765aca6de36626f1a95e7ad274546dd78`.
+- Projection merge: PR #12 at `e11afb7d7356a0df36566d98c34adbd07a0097ae`.
 
-Second correction plan `docs/plans/ep-005-pr-lifecycle-review-corrections-2.md` is design-clean at SHA-256 `86b469cb4ced969394854aa88ad91418721b64d27a83aed5a4a2c0eeda6c8527`. First Claude design review found 1 Critical + 3 Major gaps; revised-plan Claude re-review hit provider session limits, after which policy-authorized controller fallback returned `DESIGN_CLEAN_CRITICAL_MAJOR`, artifact SHA-256 `6851fe6a742e6bdb5cf49ed7587ec690936719d9510f6de243b1982041ebcbde`.
+These identities establish the current universal operation rule: each new governed operation requires a fresh verified `context-capsule-v2` and immutable authority bound to its exact base and sources.
 
-Second correction implementation then reached ABCP `BRANCH_ACCEPTED` at `35faeec8b8314519ee6b9d36eba32a0c25ac6050`. Fresh Claude exact-head review verified the ten prior findings corrected and found one remaining Critical, artifact SHA-256 `9fa76414ce73fc9168de70d967e28539cf662a54802e09678d1a5de829266974`. Third correction design is clean at SHA-256 `cb7349da368084eb607e2e9d93f284e4801be831ddc08a1959c572eb3912ce60`; after Claude refinement hit a provider session limit, policy-authorized controller fallback returned `DESIGN_CLEAN_CRITICAL_MAJOR`, artifact SHA-256 `b82f3b3a84c31137c35fc7461acc9de152a916f5fd075d1521235a9f4bf4a984`. The first implementation launch failed pre-task because the plan lacked Ralphex task syntax; a syntax-only Task 1 amendment was reviewed clean at artifact SHA-256 `9874944142e54377f005f50cda1fa73af4b6e8290f136c73afdb8d6c0ee178e6` and changed no architecture semantics.
+## EP-005 CI evidence-ingestion evidence
 
-The exact-head PR lifecycle subtrack ultimately reached final ABCP `BRANCH_ACCEPTED` at `6db075240ce87b751f8db98abb540c96410c515b`. Final controller fallback review, permitted after Claude provider session-limit failure, returned `CLEAN_CRITICAL_MAJOR` with 0 Critical + 0 Major; review artifact SHA-256 `e34a632e290930bbfcccfbd4326d5aeab1b1d8012285d67a122a87b55d8196c5`. PR #8 merged that exact reviewed head into `main` at merge SHA `ccf75d093625119cc39944fe7a47c3a03b30ad3b`.
+The initial CI evidence-ingestion design SHA-256 `d90099eeab3af74ea5dd25f50b7e87f920f7cb47eb523e4e7112882dc0524276` was rejected after review found 1 Critical and 10 Major findings; review artifact SHA-256 `659174158aecc5a690663f79e8a2b567a459b77af0cf08042d37cdfb6db265f3`. The corrected neutral, read-only design is frozen at SHA-256 `47a6d7b1d4c93a853a26e4da3753894dedacfce930345c610cf24a4236b2b409`; final bounded review returned 0 Critical and 0 Major, artifact SHA-256 `aa5d86471ffcfe1d68eff9c49ef5b2df718355c0b4c825716d35d68217b3fa45`.
 
-EP-005 remains active because Phase 4 also requires CI evidence ingestion, merge approval policy, expected-head merge protection, and serial post-merge acceptance. The initial CI design SHA `d90099ee…` was rejected after Codex found 1 Critical + 10 Major findings. The corrected scope owns read-only exact-SHA CI evidence collection/stability only. Final design SHA-256 `47a6d7b1d4c93a853a26e4da3753894dedacfce930345c610cf24a4236b2b409` passed the final bounded Codex gate with 0 Critical + 0 Major; review artifact SHA-256 `aa5d86471ffcfe1d68eff9c49ef5b2df718355c0b4c825716d35d68217b3fa45`. CI implementation is authorized; publication remains blocked pending exact-head acceptance/review.
+| CI checkpoint | Commit | Evidence and lifecycle status |
+|---|---|---|
+| Task 1 — v1 evidence contract and bounds | `e1740f4be8df06571a3299c3fb31ecc31b0a1aea` | Implemented predecessor checkpoint |
+| Task 2 — bounded GitHub reads and stabilization | `da8ffea4582539067724b363b3144d9601dee086` | Deterministic acceptance PASS; result SHA-256 `03d6f291f7606854d214b718892434a9f42eaab809e6da4bca0c431a047356d3`; final-Git evidence SHA-256 `06a404b5ed0d300b7a643f1df75929cf75f8d41f869d8a10313970a9773021f0` |
+| Task 2 current-policy reconciliation | containing commit | Authority base `d869fb068a69c8f7bb5ea4f5313ee31784423a0b`; exact main parent `e11afb7d7356a0df36566d98c34adbd07a0097ae`; resolve exact reconciliation SHA after commit |
+| Task 3 — immutable evidence, ledger, replay | none | Not started; the exact reconciliation commit is the eligible predecessor and requires fresh Task-3-only v2 authority |
+
+The accepted Task 1/Task 2 implementation remains neutral evidence collection and bounded observational stability only. No evidence here authorizes merge, defines approval policy, protects an expected head, executes a merge, or performs post-merge acceptance. Task 4 requirements remain deferred and non-executable until Task 3 completes under its own authority.
+
+## Projection cutoff and reconciliation rule
+
+The explicit immutable-evidence cutoff for this projection candidate is the CI Task 2 current-policy reconciliation authority at base `d869fb068a69c8f7bb5ea4f5313ee31784423a0b`. The candidate materializes all required evidence through Task 2 deterministic acceptance and the accepted, reviewed, and merged PR #12 boundary at `e11afb7d7356a0df36566d98c34adbd07a0097ae`.
+
+It cannot self-record its later commit, acceptance, review, or merge identities. Those events become authoritative immediately in immutable evidence and are materialized in the next separately governed reconciliation. Before any non-reconciliation governed operation, cross-check this index with `CURRENT_STATE.md`, `PROGRESS.md`, immutable controller evidence, and Git; stale-through-boundary or contradictory projections block planning.
