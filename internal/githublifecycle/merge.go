@@ -21,23 +21,25 @@ type CommitLineage struct {
 }
 
 type MergeResultInput struct {
-	Snapshot         SnapshotIdentity
-	Repository       Repository
-	PullRequest      PullRequestIdentity
-	Actor            ActingIdentity
-	AcceptedHeadSHA  GitSHA
-	AcceptedHeadTree GitSHA
-	BaseBeforeSHA    GitSHA
-	Method           MergeMethod
-	ResultSHA        GitSHA
-	ResultTree       GitSHA
-	Parents          []GitSHA
-	Lineage          []CommitLineage
-	EvidenceRefs     []ledger.EvidenceRef
-	Metadata         map[string]string
-	Attempt          WriteAttempt
-	ExpectedContent  ExpectedMergeContent
-	LimitsSHA256     string
+	Snapshot            SnapshotIdentity
+	Repository          Repository
+	PullRequest         PullRequestIdentity
+	Actor               ActingIdentity
+	AcceptedHeadSHA     GitSHA
+	AcceptedHeadTree    GitSHA
+	BaseBeforeSHA       GitSHA
+	Method              MergeMethod
+	ResultSHA           GitSHA
+	ResultTree          GitSHA
+	Parents             []GitSHA
+	Lineage             []CommitLineage
+	EvidenceRefs        []ledger.EvidenceRef
+	Metadata            map[string]string
+	Attempt             WriteAttempt
+	ExpectedContent     ExpectedMergeContent
+	SealedAuthorization SealedMergeAuthorizationV1
+	Recipe              MergeCommitRecipeV1
+	LimitsSHA256        string
 }
 
 // MergeResult is immutable bounded evidence returned by a write operation.
@@ -57,6 +59,11 @@ func NewMergeResult(input MergeResultInput, limits Limits) (MergeResult, error) 
 		input.Attempt, input.ExpectedContent, limits); err != nil {
 		return MergeResult{}, err
 	}
+	if !input.SealedAuthorization.valid() || input.SealedAuthorization.input.MergeInput.attempt != input.Attempt ||
+		input.ExpectedContent.SHA256() != input.SealedAuthorization.input.MergeInput.expectedContent.SHA256() ||
+		!input.Recipe.valid() || input.Recipe.SHA256() != input.SealedAuthorization.input.MergeInput.recipe.SHA256() || input.ResultSHA != input.Recipe.ExpectedResultSHA() {
+		return MergeResult{}, errors.New("merge result does not bind the sealed deterministic recipe")
+	}
 	if err := canonicalizeCommon(&input.EvidenceRefs, input.Metadata, limits); err != nil {
 		return MergeResult{}, err
 	}
@@ -74,25 +81,28 @@ func (r MergeResult) MarshalJSON() ([]byte, error) { return r.immutable.marshal(
 func (r MergeResult) valid() bool                  { return len(r.immutable.canonical) > 0 && r.immutable.digest != "" }
 
 type PostMergeObservationInput struct {
-	Snapshot         SnapshotIdentity
-	Repository       Repository
-	BaseBranch       Branch
-	PullRequest      PullRequestIdentity
-	Actor            ActingIdentity
-	AcceptedHeadSHA  GitSHA
-	AcceptedHeadTree GitSHA
-	BaseBeforeSHA    GitSHA
-	Method           MergeMethod
-	ResultSHA        GitSHA
-	BaseAfterSHA     GitSHA
-	ResultTree       GitSHA
-	Parents          []GitSHA
-	Lineage          []CommitLineage
-	EvidenceRefs     []ledger.EvidenceRef
-	Metadata         map[string]string
-	Attempt          WriteAttempt
-	ExpectedContent  ExpectedMergeContent
-	LimitsSHA256     string
+	Snapshot             SnapshotIdentity
+	Repository           Repository
+	BaseBranch           Branch
+	PullRequest          PullRequestIdentity
+	Actor                ActingIdentity
+	AcceptedHeadSHA      GitSHA
+	AcceptedHeadTree     GitSHA
+	BaseBeforeSHA        GitSHA
+	Method               MergeMethod
+	ResultSHA            GitSHA
+	ObservedTargetTipSHA GitSHA
+	ResultTree           GitSHA
+	Parents              []GitSHA
+	Lineage              []CommitLineage
+	EvidenceRefs         []ledger.EvidenceRef
+	Metadata             map[string]string
+	Attempt              WriteAttempt
+	ExpectedContent      ExpectedMergeContent
+	SealedAuthorization  SealedMergeAuthorizationV1
+	ResultObject         ResultCommitObservationV1
+	ContainmentProof     TargetContainmentProofV1
+	LimitsSHA256         string
 }
 
 // PostMergeObservation is an immutable target-branch observation. ResultSHA
@@ -108,7 +118,7 @@ func NewPostMergeObservation(input PostMergeObservationInput, limits Limits) (Po
 		return PostMergeObservation{}, err
 	}
 	input.LimitsSHA256 = limitsSHA
-	if !input.BaseBranch.valid() || !input.BaseAfterSHA.valid() {
+	if !input.BaseBranch.valid() || !input.ObservedTargetTipSHA.valid() || !input.SealedAuthorization.valid() || !input.ResultObject.valid() || !input.ContainmentProof.valid() {
 		return PostMergeObservation{}, errors.New("post-merge base identity is invalid")
 	}
 	if err := validateMergeFields(input.Snapshot, input.Repository, input.PullRequest, input.Actor, input.AcceptedHeadSHA,
@@ -204,16 +214,20 @@ func validateMergeInput(input MergeInput, limits Limits) error {
 	if !input.attempt.valid(limits) || !input.attempt.matchesAuthority(input.authority) || input.attempt.operation != OperationMerge {
 		return errors.New("merge write attempt is invalid")
 	}
+	if !validSHA256(input.policyDecisionSHA256) || !input.initialPullRequest.valid() || !input.capability.valid() || !input.recipe.valid() ||
+		input.recipe.ExpectedResultSHA().String() == "" || input.digest != input.attempt.payloadSHA256 {
+		return errors.New("merge authorization inputs are incomplete")
+	}
+	if err := EvaluateMergePolicyV1(input.authority, input.initialPullRequest, input.checks, input.checkRunsClosure, input.commitStatusesClosure, limits); err != nil {
+		return err
+	}
 	evidence := append([]ledger.EvidenceRef(nil), input.approvalEvidence...)
 	if len(evidence) == 0 || canonicalizeEvidence(&evidence, limits) != nil {
 		return errors.New("merge approval evidence fails bounded revalidation")
 	}
-	payload, payloadSHA, err := canonicalJSON(struct {
-		Authority       Authority            `json:"authority"`
-		ExpectedContent ExpectedMergeContent `json:"expected_merge_content"`
-		Evidence        []ledger.EvidenceRef `json:"approval_evidence"`
-		LimitsSHA256    string               `json:"limits_sha256"`
-	}{input.authority, input.expectedContent, evidence, input.limitsSHA256})
+	authorizationInput := MergeAuthorizationInputV1{input.authority, input.policyDecisionSHA256, input.initialPullRequest, input.checks,
+		input.checkRunsClosure, input.commitStatusesClosure, input.capability, input.recipe, evidence}
+	payload, payloadSHA, err := canonicalJSON(mergeAuthorizationPayloadWire(authorizationInput, input.authority, input.limitsSHA256))
 	if err != nil || payloadSHA != input.attempt.payloadSHA256 || !bytes.Equal(payload, input.canonicalPayload) {
 		return errors.New("merge canonical payload does not match write attempt")
 	}
@@ -325,7 +339,15 @@ func ValidateCI(authority Authority, snapshot CISnapshot, limits Limits) error {
 
 // ValidateMergeResult binds the provider write result back to every merge
 // authority field, including the authenticated actor and pre-merge base tip.
-func ValidateMergeResult(input MergeInput, result MergeResult, limits Limits) error {
+func ValidateMergeResult(sealed SealedMergeAuthorizationV1, result MergeResult, limits Limits) error {
+	if !sealed.valid() {
+		return errors.New("sealed merge authorization is incomplete")
+	}
+	recoveredSeal, err := ParseCanonicalSealedMergeAuthorizationV1(sealed.CanonicalJSON(), limits)
+	if err != nil || recoveredSeal.SHA256() != sealed.SHA256() {
+		return errors.New("sealed merge authorization fails independent revalidation")
+	}
+	input := sealed.input.MergeInput
 	if err := validateMergeInput(input, limits); err != nil {
 		return err
 	}
@@ -352,6 +374,9 @@ func ValidateMergeResult(input MergeInput, result MergeResult, limits Limits) er
 	if data.Attempt != input.attempt || data.Attempt.operation != OperationMerge {
 		return errors.New("merge result replaced or mismatched the write attempt")
 	}
+	if data.SealedAuthorization.SHA256() != sealed.SHA256() || data.Recipe.SHA256() != input.recipe.SHA256() || data.ResultSHA != input.recipe.ExpectedResultSHA() {
+		return errors.New("merge result does not match sealed authorization or deterministic result OID")
+	}
 	if data.ExpectedContent.SHA256() != input.expectedContent.SHA256() || data.ResultTree != input.expectedContent.ExpectedResultTreeSHA() ||
 		data.AcceptedHeadTree != input.expectedContent.ExpectedResultTreeSHA() {
 		return errors.New("merge result does not match controller-owned expected merge content")
@@ -361,10 +386,11 @@ func ValidateMergeResult(input MergeInput, result MergeResult, limits Limits) er
 
 // VerifyPostMerge proves agreement among authority, write result, observed base
 // tip, content tree, ordered parents, and method-specific lineage.
-func VerifyPostMerge(input MergeInput, result MergeResult, observation PostMergeObservation, limits Limits) error {
-	if err := ValidateMergeResult(input, result, limits); err != nil {
+func VerifyPostMerge(sealed SealedMergeAuthorizationV1, result MergeResult, observation PostMergeObservation, limits Limits) error {
+	if err := ValidateMergeResult(sealed, result, limits); err != nil {
 		return err
 	}
+	input := sealed.input.MergeInput
 	if !observation.valid() {
 		return errors.New("post-merge observation is incomplete")
 	}
@@ -383,8 +409,8 @@ func VerifyPostMerge(input MergeInput, result MergeResult, observation PostMerge
 	if o.AcceptedHeadSHA != m.AcceptedHeadSHA || o.AcceptedHeadTree != m.AcceptedHeadTree || o.BaseBeforeSHA != m.BaseBeforeSHA || o.Method != m.Method {
 		return errors.New("post-merge accepted head, tree, base-before, or method changed")
 	}
-	if o.ResultSHA != m.ResultSHA || o.BaseAfterSHA != m.ResultSHA || o.ResultTree != m.ResultTree {
-		return errors.New("post-merge result SHA, base-after SHA, or result tree does not match merge result")
+	if o.ResultSHA != m.ResultSHA || o.ObservedTargetTipSHA != o.ContainmentProof.input.ObservedTargetTipSHA || o.ResultTree != m.ResultTree {
+		return errors.New("post-merge result SHA, observed target tip, or result tree does not match merge result")
 	}
 	if o.Attempt != input.attempt || o.ExpectedContent.SHA256() != input.expectedContent.SHA256() ||
 		o.ResultTree != input.expectedContent.ExpectedResultTreeSHA() {
@@ -392,6 +418,15 @@ func VerifyPostMerge(input MergeInput, result MergeResult, observation PostMerge
 	}
 	if !equalSHAs(o.Parents, m.Parents) || !equalLineage(o.Lineage, m.Lineage) {
 		return errors.New("post-merge parent or lineage proof does not match merge result")
+	}
+	if o.SealedAuthorization.SHA256() != sealed.SHA256() {
+		return errors.New("post-merge observation changed sealed authorization")
+	}
+	if err := ValidateResultCommitObservationV1(sealed, result, o.ResultObject, limits); err != nil {
+		return err
+	}
+	if err := ValidateTargetContainmentProofV1(sealed, result, o.ContainmentProof, limits); err != nil {
+		return err
 	}
 	return verifyStrategy(o.Method, o.AcceptedHeadSHA, o.AcceptedHeadTree, o.BaseBeforeSHA, o.ResultSHA, o.ResultTree, o.Parents, o.Lineage)
 }
@@ -446,6 +481,8 @@ func cloneMergeInput(input MergeResultInput) MergeResultInput {
 	input.EvidenceRefs = append([]ledger.EvidenceRef(nil), input.EvidenceRefs...)
 	input.Metadata = cloneMap(input.Metadata)
 	input.ExpectedContent = cloneExpectedContent(input.ExpectedContent)
+	input.SealedAuthorization = cloneSealedAuthorization(input.SealedAuthorization)
+	input.Recipe = cloneRecipe(input.Recipe)
 	return input
 }
 func clonePostMergeInput(input PostMergeObservationInput) PostMergeObservationInput {
@@ -454,6 +491,9 @@ func clonePostMergeInput(input PostMergeObservationInput) PostMergeObservationIn
 	input.EvidenceRefs = append([]ledger.EvidenceRef(nil), input.EvidenceRefs...)
 	input.Metadata = cloneMap(input.Metadata)
 	input.ExpectedContent = cloneExpectedContent(input.ExpectedContent)
+	input.SealedAuthorization = cloneSealedAuthorization(input.SealedAuthorization)
+	input.ResultObject = cloneResultObjectProof(input.ResultObject)
+	input.ContainmentProof = cloneContainmentProof(input.ContainmentProof)
 	return input
 }
 func equalSHAs(a, b []GitSHA) bool {
@@ -511,45 +551,55 @@ func lineageWires(values []CommitLineage) []lineageWire {
 }
 func mergeWire(input MergeResultInput) any {
 	return struct {
-		Snapshot         identityWire         `json:"snapshot"`
-		Repository       repoWire             `json:"repository"`
-		PullRequest      prIdentityWire       `json:"pull_request"`
-		Actor            actorWire            `json:"actor"`
-		AcceptedHeadSHA  string               `json:"accepted_head_sha"`
-		AcceptedHeadTree string               `json:"accepted_head_tree"`
-		BaseBeforeSHA    string               `json:"base_before_sha"`
-		Method           MergeMethod          `json:"method"`
-		ResultSHA        string               `json:"result_sha"`
-		ResultTree       string               `json:"result_tree"`
-		Parents          []string             `json:"parents"`
-		Lineage          []lineageWire        `json:"lineage"`
-		EvidenceRefs     []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
-		Metadata         map[string]string    `json:"metadata,omitempty"`
-		Attempt          writeAttemptWire     `json:"write_attempt"`
-		ExpectedContent  json.RawMessage      `json:"expected_merge_content"`
-		LimitsSHA256     string               `json:"limits_sha256"`
-	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), pullRequestWire(input.PullRequest), actingWire(input.Actor), input.AcceptedHeadSHA.String(), input.AcceptedHeadTree.String(), input.BaseBeforeSHA.String(), input.Method, input.ResultSHA.String(), input.ResultTree.String(), shaStrings(input.Parents), lineageWires(input.Lineage), input.EvidenceRefs, input.Metadata, attemptWire(input.Attempt), input.ExpectedContent.CanonicalJSON(), input.LimitsSHA256}
+		Snapshot                  identityWire         `json:"snapshot"`
+		Repository                repoWire             `json:"repository"`
+		PullRequest               prIdentityWire       `json:"pull_request"`
+		Actor                     actorWire            `json:"actor"`
+		AcceptedHeadSHA           string               `json:"accepted_head_sha"`
+		AcceptedHeadTree          string               `json:"accepted_head_tree"`
+		BaseBeforeSHA             string               `json:"base_before_sha"`
+		Method                    MergeMethod          `json:"method"`
+		ResultSHA                 string               `json:"result_sha"`
+		ResultTree                string               `json:"result_tree"`
+		Parents                   []string             `json:"parents"`
+		Lineage                   []lineageWire        `json:"lineage"`
+		EvidenceRefs              []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
+		Metadata                  map[string]string    `json:"metadata,omitempty"`
+		Attempt                   writeAttemptWire     `json:"write_attempt"`
+		ExpectedContent           json.RawMessage      `json:"expected_merge_content"`
+		SealedAuthorization       json.RawMessage      `json:"sealed_authorization"`
+		SealedAuthorizationSHA256 string               `json:"sealed_authorization_sha256"`
+		Recipe                    json.RawMessage      `json:"merge_commit_recipe"`
+		RecipeSHA256              string               `json:"merge_commit_recipe_sha256"`
+		LimitsSHA256              string               `json:"limits_sha256"`
+	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), pullRequestWire(input.PullRequest), actingWire(input.Actor), input.AcceptedHeadSHA.String(), input.AcceptedHeadTree.String(), input.BaseBeforeSHA.String(), input.Method, input.ResultSHA.String(), input.ResultTree.String(), shaStrings(input.Parents), lineageWires(input.Lineage), input.EvidenceRefs, input.Metadata, attemptWire(input.Attempt), input.ExpectedContent.CanonicalJSON(), input.SealedAuthorization.CanonicalJSON(), input.SealedAuthorization.SHA256(), input.Recipe.CanonicalJSON(), input.Recipe.SHA256(), input.LimitsSHA256}
 }
 func postMergeWire(input PostMergeObservationInput) any {
 	return struct {
-		Snapshot         identityWire         `json:"snapshot"`
-		Repository       repoWire             `json:"repository"`
-		BaseBranch       string               `json:"base_branch"`
-		PullRequest      prIdentityWire       `json:"pull_request"`
-		Actor            actorWire            `json:"actor"`
-		AcceptedHeadSHA  string               `json:"accepted_head_sha"`
-		AcceptedHeadTree string               `json:"accepted_head_tree"`
-		BaseBeforeSHA    string               `json:"base_before_sha"`
-		Method           MergeMethod          `json:"method"`
-		ResultSHA        string               `json:"result_sha"`
-		BaseAfterSHA     string               `json:"base_after_sha"`
-		ResultTree       string               `json:"result_tree"`
-		Parents          []string             `json:"parents"`
-		Lineage          []lineageWire        `json:"lineage"`
-		EvidenceRefs     []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
-		Metadata         map[string]string    `json:"metadata,omitempty"`
-		Attempt          writeAttemptWire     `json:"write_attempt"`
-		ExpectedContent  json.RawMessage      `json:"expected_merge_content"`
-		LimitsSHA256     string               `json:"limits_sha256"`
-	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), input.BaseBranch.String(), pullRequestWire(input.PullRequest), actingWire(input.Actor), input.AcceptedHeadSHA.String(), input.AcceptedHeadTree.String(), input.BaseBeforeSHA.String(), input.Method, input.ResultSHA.String(), input.BaseAfterSHA.String(), input.ResultTree.String(), shaStrings(input.Parents), lineageWires(input.Lineage), input.EvidenceRefs, input.Metadata, attemptWire(input.Attempt), input.ExpectedContent.CanonicalJSON(), input.LimitsSHA256}
+		Snapshot                  identityWire         `json:"snapshot"`
+		Repository                repoWire             `json:"repository"`
+		BaseBranch                string               `json:"base_branch"`
+		PullRequest               prIdentityWire       `json:"pull_request"`
+		Actor                     actorWire            `json:"actor"`
+		AcceptedHeadSHA           string               `json:"accepted_head_sha"`
+		AcceptedHeadTree          string               `json:"accepted_head_tree"`
+		BaseBeforeSHA             string               `json:"base_before_sha"`
+		Method                    MergeMethod          `json:"method"`
+		ResultSHA                 string               `json:"result_sha"`
+		ObservedTargetTipSHA      string               `json:"observed_target_tip_sha"`
+		ResultTree                string               `json:"result_tree"`
+		Parents                   []string             `json:"parents"`
+		Lineage                   []lineageWire        `json:"lineage"`
+		EvidenceRefs              []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
+		Metadata                  map[string]string    `json:"metadata,omitempty"`
+		Attempt                   writeAttemptWire     `json:"write_attempt"`
+		ExpectedContent           json.RawMessage      `json:"expected_merge_content"`
+		SealedAuthorization       json.RawMessage      `json:"sealed_authorization"`
+		SealedAuthorizationSHA256 string               `json:"sealed_authorization_sha256"`
+		ResultObject              json.RawMessage      `json:"result_object"`
+		ResultObjectSHA256        string               `json:"result_object_sha256"`
+		ContainmentProof          json.RawMessage      `json:"target_containment_proof"`
+		ContainmentProofSHA256    string               `json:"target_containment_proof_sha256"`
+		LimitsSHA256              string               `json:"limits_sha256"`
+	}{snapshotWire(input.Snapshot), repositoryWire(input.Repository), input.BaseBranch.String(), pullRequestWire(input.PullRequest), actingWire(input.Actor), input.AcceptedHeadSHA.String(), input.AcceptedHeadTree.String(), input.BaseBeforeSHA.String(), input.Method, input.ResultSHA.String(), input.ObservedTargetTipSHA.String(), input.ResultTree.String(), shaStrings(input.Parents), lineageWires(input.Lineage), input.EvidenceRefs, input.Metadata, attemptWire(input.Attempt), input.ExpectedContent.CanonicalJSON(), input.SealedAuthorization.CanonicalJSON(), input.SealedAuthorization.SHA256(), input.ResultObject.CanonicalJSON(), input.ResultObject.SHA256(), input.ContainmentProof.CanonicalJSON(), input.ContainmentProof.SHA256(), input.LimitsSHA256}
 }

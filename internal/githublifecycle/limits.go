@@ -11,25 +11,27 @@ import (
 // Limits bounds every provider-facing collection and field. A Limits value is
 // immutable because it contains scalars only.
 type Limits struct {
-	MaxPages            int
-	MaxItemsPerPage     int
-	MaxTotalItems       int
-	MaxTextBytes        int
-	MaxEvidenceRefs     int
-	MaxMetadataItems    int
-	MaxParents          int
-	MaxLineageEntries   int
-	CallTimeout         time.Duration
-	MaxReadRetries      int
-	MaxWriteRetries     int
-	MaxAmbiguousRetries int
+	MaxPages                  int
+	MaxItemsPerPage           int
+	MaxTotalItems             int
+	MaxTextBytes              int
+	MaxEvidenceRefs           int
+	MaxMetadataItems          int
+	MaxParents                int
+	MaxLineageEntries         int
+	MaxPaginationClosureBytes int
+	MaxDescendantDistance     int
+	CallTimeout               time.Duration
+	MaxReadRetries            int
+	MaxWriteRetries           int
+	MaxAmbiguousRetries       int
 }
 
 func DefaultLimits() Limits {
 	return Limits{
 		MaxPages: 10, MaxItemsPerPage: 100, MaxTotalItems: 500,
 		MaxTextBytes: 4096, MaxEvidenceRefs: 64, MaxMetadataItems: 32,
-		MaxParents: 16, MaxLineageEntries: 256, CallTimeout: 30 * time.Second,
+		MaxParents: 16, MaxLineageEntries: 256, MaxPaginationClosureBytes: 4 * 1024 * 1024, MaxDescendantDistance: 500, CallTimeout: 30 * time.Second,
 		MaxReadRetries: 2, MaxWriteRetries: 1, MaxAmbiguousRetries: 0,
 	}
 }
@@ -37,7 +39,7 @@ func DefaultLimits() Limits {
 func (l Limits) Validate() error {
 	if l.MaxPages <= 0 || l.MaxItemsPerPage <= 0 || l.MaxTotalItems <= 0 ||
 		l.MaxTextBytes <= 0 || l.MaxEvidenceRefs <= 0 || l.MaxMetadataItems <= 0 ||
-		l.MaxParents <= 0 || l.MaxLineageEntries <= 0 || l.CallTimeout <= 0 ||
+		l.MaxParents <= 0 || l.MaxLineageEntries <= 0 || l.MaxPaginationClosureBytes <= 0 || l.MaxDescendantDistance <= 0 || l.CallTimeout <= 0 ||
 		l.MaxReadRetries < 0 || l.MaxWriteRetries < 0 || l.MaxAmbiguousRetries != 0 {
 		return errors.New("resource limits must be positive and ambiguous-write retries must be zero")
 	}
@@ -55,21 +57,23 @@ func (l Limits) CanonicalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(struct {
-		SchemaVersion       int   `json:"schema_version"`
-		MaxPages            int   `json:"max_pages"`
-		MaxItemsPerPage     int   `json:"max_items_per_page"`
-		MaxTotalItems       int   `json:"max_total_items"`
-		MaxTextBytes        int   `json:"max_text_bytes"`
-		MaxEvidenceRefs     int   `json:"max_evidence_refs"`
-		MaxMetadataItems    int   `json:"max_metadata_items"`
-		MaxParents          int   `json:"max_parents"`
-		MaxLineageEntries   int   `json:"max_lineage_entries"`
-		CallTimeoutNanos    int64 `json:"call_timeout_nanos"`
-		MaxReadRetries      int   `json:"max_read_retries"`
-		MaxWriteRetries     int   `json:"max_write_retries"`
-		MaxAmbiguousRetries int   `json:"max_ambiguous_retries"`
+		SchemaVersion             int   `json:"schema_version"`
+		MaxPages                  int   `json:"max_pages"`
+		MaxItemsPerPage           int   `json:"max_items_per_page"`
+		MaxTotalItems             int   `json:"max_total_items"`
+		MaxTextBytes              int   `json:"max_text_bytes"`
+		MaxEvidenceRefs           int   `json:"max_evidence_refs"`
+		MaxMetadataItems          int   `json:"max_metadata_items"`
+		MaxParents                int   `json:"max_parents"`
+		MaxLineageEntries         int   `json:"max_lineage_entries"`
+		MaxPaginationClosureBytes int   `json:"max_pagination_closure_bytes"`
+		MaxDescendantDistance     int   `json:"max_descendant_distance"`
+		CallTimeoutNanos          int64 `json:"call_timeout_nanos"`
+		MaxReadRetries            int   `json:"max_read_retries"`
+		MaxWriteRetries           int   `json:"max_write_retries"`
+		MaxAmbiguousRetries       int   `json:"max_ambiguous_retries"`
 	}{1, l.MaxPages, l.MaxItemsPerPage, l.MaxTotalItems, l.MaxTextBytes, l.MaxEvidenceRefs,
-		l.MaxMetadataItems, l.MaxParents, l.MaxLineageEntries, int64(l.CallTimeout),
+		l.MaxMetadataItems, l.MaxParents, l.MaxLineageEntries, l.MaxPaginationClosureBytes, l.MaxDescendantDistance, int64(l.CallTimeout),
 		l.MaxReadRetries, l.MaxWriteRetries, l.MaxAmbiguousRetries})
 }
 

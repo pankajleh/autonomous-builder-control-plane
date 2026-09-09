@@ -30,10 +30,11 @@ const (
 )
 
 type Review struct {
-	NodeID     string      `json:"node_id"`
-	ReviewerID string      `json:"reviewer_id"`
-	State      ReviewState `json:"state"`
-	CommitSHA  GitSHA      `json:"-"`
+	NodeID     string           `json:"node_id"`
+	DatabaseID int64            `json:"database_id"`
+	Reviewer   StableIdentityV1 `json:"reviewer"`
+	State      ReviewState      `json:"state"`
+	CommitSHA  GitSHA           `json:"-"`
 }
 
 type PullRequestSnapshotInput struct {
@@ -79,7 +80,7 @@ func NewPullRequestSnapshot(input PullRequestSnapshotInput, limits Limits) (Pull
 	}
 	seen := make(map[string]struct{}, len(input.Reviews))
 	for index, review := range input.Reviews {
-		if !validOpaqueID(review.NodeID, limits.MaxTextBytes) || !validOpaqueID(review.ReviewerID, limits.MaxTextBytes) || !review.CommitSHA.valid() ||
+		if !validOpaqueID(review.NodeID, limits.MaxTextBytes) || review.DatabaseID <= 0 || !review.Reviewer.valid() || !review.CommitSHA.valid() ||
 			(review.State != ReviewApproved && review.State != ReviewChangesRequested && review.State != ReviewCommented && review.State != ReviewDismissed) {
 			return PullRequestSnapshot{}, fmt.Errorf("review %d is invalid", index)
 		}
@@ -129,12 +130,13 @@ const (
 )
 
 type Check struct {
-	NodeID       string               `json:"node_id"`
-	Name         string               `json:"name"`
-	Status       CheckStatus          `json:"status"`
-	Conclusion   CheckConclusion      `json:"conclusion,omitempty"`
-	HeadSHA      GitSHA               `json:"-"`
-	EvidenceRefs []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
+	NodeID       string                 `json:"node_id"`
+	Name         string                 `json:"name"`
+	Identity     TrustedCheckIdentityV1 `json:"identity"`
+	Status       CheckStatus            `json:"status"`
+	Conclusion   CheckConclusion        `json:"conclusion,omitempty"`
+	HeadSHA      GitSHA                 `json:"-"`
+	EvidenceRefs []ledger.EvidenceRef   `json:"evidence_refs,omitempty"`
 }
 
 type CISnapshotInput struct {
@@ -168,7 +170,7 @@ func NewCISnapshot(input CISnapshotInput, limits Limits) (CISnapshot, error) {
 	seen := make(map[string]struct{}, len(input.Checks))
 	for index := range input.Checks {
 		check := &input.Checks[index]
-		if !validOpaqueID(check.NodeID, limits.MaxTextBytes) || !validText(check.Name, limits.MaxTextBytes, false) || !check.HeadSHA.valid() || check.HeadSHA != input.HeadSHA ||
+		if !validOpaqueID(check.NodeID, limits.MaxTextBytes) || !validText(check.Name, limits.MaxTextBytes, false) || !check.Identity.valid(limits) || check.Name != check.Identity.Context || !check.HeadSHA.valid() || check.HeadSHA != input.HeadSHA ||
 			(check.Status != CheckQueued && check.Status != CheckInProgress && check.Status != CheckCompleted) {
 			return CISnapshot{}, fmt.Errorf("check %d is invalid or tied to a different head SHA", index)
 		}
@@ -329,10 +331,10 @@ func evidenceKey(ref ledger.EvidenceRef) string {
 	return strings.Join([]string{ref.URI, ref.SHA256, ref.Kind}, "\x00")
 }
 func reviewKey(review Review) string {
-	return strings.Join([]string{review.NodeID, review.ReviewerID, string(review.State), review.CommitSHA.String()}, "\x00")
+	return strings.Join([]string{stableIdentityKey(review.Reviewer), review.NodeID, string(review.State), review.CommitSHA.String()}, "\x00")
 }
 func checkKey(check Check) string {
-	return strings.Join([]string{check.NodeID, check.Name, check.HeadSHA.String()}, "\x00")
+	return strings.Join([]string{checkIdentityKey(check.Identity), check.NodeID, check.HeadSHA.String()}, "\x00")
 }
 
 func clonePRInput(input PullRequestSnapshotInput) PullRequestSnapshotInput {
@@ -377,18 +379,20 @@ type prIdentityWire struct {
 	NodeID string `json:"node_id"`
 }
 type reviewWire struct {
-	NodeID     string      `json:"node_id"`
-	ReviewerID string      `json:"reviewer_id"`
-	State      ReviewState `json:"state"`
-	CommitSHA  string      `json:"commit_sha"`
+	NodeID     string           `json:"node_id"`
+	DatabaseID int64            `json:"database_id"`
+	Reviewer   StableIdentityV1 `json:"reviewer"`
+	State      ReviewState      `json:"state"`
+	CommitSHA  string           `json:"commit_sha"`
 }
 type checkWire struct {
-	NodeID       string               `json:"node_id"`
-	Name         string               `json:"name"`
-	Status       CheckStatus          `json:"status"`
-	Conclusion   CheckConclusion      `json:"conclusion,omitempty"`
-	HeadSHA      string               `json:"head_sha"`
-	EvidenceRefs []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
+	NodeID       string                 `json:"node_id"`
+	Name         string                 `json:"name"`
+	Identity     TrustedCheckIdentityV1 `json:"identity"`
+	Status       CheckStatus            `json:"status"`
+	Conclusion   CheckConclusion        `json:"conclusion,omitempty"`
+	HeadSHA      string                 `json:"head_sha"`
+	EvidenceRefs []ledger.EvidenceRef   `json:"evidence_refs,omitempty"`
 }
 
 func snapshotWire(s SnapshotIdentity) identityWire {
@@ -401,7 +405,7 @@ func pullRequestWire(p PullRequestIdentity) prIdentityWire {
 func prWire(input PullRequestSnapshotInput) any {
 	reviews := make([]reviewWire, len(input.Reviews))
 	for i, r := range input.Reviews {
-		reviews[i] = reviewWire{r.NodeID, r.ReviewerID, r.State, r.CommitSHA.String()}
+		reviews[i] = reviewWire{r.NodeID, r.DatabaseID, r.Reviewer, r.State, r.CommitSHA.String()}
 	}
 	return struct {
 		Snapshot     identityWire         `json:"snapshot"`
@@ -422,7 +426,7 @@ func prWire(input PullRequestSnapshotInput) any {
 func ciWire(input CISnapshotInput) any {
 	checks := make([]checkWire, len(input.Checks))
 	for i, c := range input.Checks {
-		checks[i] = checkWire{c.NodeID, c.Name, c.Status, c.Conclusion, c.HeadSHA.String(), c.EvidenceRefs}
+		checks[i] = checkWire{c.NodeID, c.Name, c.Identity, c.Status, c.Conclusion, c.HeadSHA.String(), c.EvidenceRefs}
 	}
 	return struct {
 		Snapshot     identityWire         `json:"snapshot"`

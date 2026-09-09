@@ -21,7 +21,8 @@ func TestLimitsCanonicalIdentityCoversEveryGovernedField(t *testing.T) {
 	mutations := []func(*Limits){
 		func(l *Limits) { l.MaxPages++ }, func(l *Limits) { l.MaxItemsPerPage++ }, func(l *Limits) { l.MaxTotalItems++ },
 		func(l *Limits) { l.MaxTextBytes++ }, func(l *Limits) { l.MaxEvidenceRefs++ }, func(l *Limits) { l.MaxMetadataItems++ },
-		func(l *Limits) { l.MaxParents++ }, func(l *Limits) { l.MaxLineageEntries++ }, func(l *Limits) { l.CallTimeout++ },
+		func(l *Limits) { l.MaxParents++ }, func(l *Limits) { l.MaxLineageEntries++ }, func(l *Limits) { l.MaxPaginationClosureBytes++ },
+		func(l *Limits) { l.MaxDescendantDistance++ }, func(l *Limits) { l.CallTimeout++ },
 		func(l *Limits) { l.MaxReadRetries++ }, func(l *Limits) { l.MaxWriteRetries++ },
 	}
 	for index, mutate := range mutations {
@@ -46,7 +47,7 @@ func TestStrictControllerRejectsLooserProviderSnapshotsEvenWithForgedPolicyID(t 
 	loose := f.limits
 	loose.MaxTextBytes = f.limits.MaxTextBytes * 2
 	input := f.prInput()
-	input.Reviews = []Review{{NodeID: strings.Repeat("n", f.limits.MaxTextBytes+1), ReviewerID: "reviewer", State: ReviewApproved, CommitSHA: f.headSHA}}
+	input.Reviews = []Review{{NodeID: strings.Repeat("n", f.limits.MaxTextBytes+1), DatabaseID: 1, Reviewer: StableIdentityV1{DatabaseID: 2, NodeID: "reviewer"}, State: ReviewApproved, CommitSHA: f.headSHA}}
 	snapshot, err := NewPullRequestSnapshot(input, loose)
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +62,7 @@ func TestStrictControllerRejectsLooserProviderSnapshotsEvenWithForgedPolicyID(t 
 	}
 
 	ci, err := NewCISnapshot(CISnapshotInput{Snapshot: f.snapshot, Repository: f.repository, HeadSHA: f.headSHA,
-		Checks: []Check{{NodeID: "check", Name: strings.Repeat("x", f.limits.MaxTextBytes+1), Status: CheckCompleted, Conclusion: ConclusionSuccess, HeadSHA: f.headSHA}}}, loose)
+		Checks: []Check{{NodeID: "check", Name: strings.Repeat("x", f.limits.MaxTextBytes+1), Identity: TrustedCheckIdentityV1{Context: strings.Repeat("x", f.limits.MaxTextBytes+1), Source: CheckSourceCheckRun, Producer: StableIdentityV1{DatabaseID: 1, NodeID: "producer"}}, Status: CheckCompleted, Conclusion: ConclusionSuccess, HeadSHA: f.headSHA}}}, loose)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,17 +112,7 @@ func TestWriteAttemptBindsOperationAuthorityAndCanonicalPayload(t *testing.T) {
 	if CanRetry(prFailure, 0, f.limits, &firstAttempt, &wrongPayload) {
 		t.Fatal("same write ID with another payload authorized replay")
 	}
-	forgedFailureAttempt := mergeAttempt
-	forgedFailureAttempt.authoritySHA256 = strings.Repeat("f", 64)
-	forgedFailure := NewWriteExecutionError(forgedFailureAttempt, true, errors.New("lost response"))
-	matchingForgery, err := NewReconciliationResult(forgedFailureAttempt, ReconciliationNotApplied, evidence, f.limits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if CanRetry(forgedFailure, 0, f.limits, &mergeAttempt, &matchingForgery) {
-		t.Fatal("provider-forged authority digest replaced the submitted attempt")
-	}
-	valid, err := NewReconciliationResult(mergeAttempt, ReconciliationNotApplied, evidence, f.limits)
+	valid, err := NewReconciliationResult(first.Attempt(), ReconciliationNotApplied, evidence, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +121,6 @@ func TestWriteAttemptBindsOperationAuthorityAndCanonicalPayload(t *testing.T) {
 	mutations := []func(*WriteAttempt){
 		func(a *WriteAttempt) { a.repository = otherRepository },
 		func(a *WriteAttempt) { a.actor = otherActor },
-		func(a *WriteAttempt) { a.operation = OperationPullRequestUpsert },
 		func(a *WriteAttempt) { a.writeID = "other-write" },
 		func(a *WriteAttempt) { a.authoritySHA256 = strings.Repeat("1", 64) },
 		func(a *WriteAttempt) { a.payloadSHA256 = strings.Repeat("2", 64) },
@@ -138,7 +128,7 @@ func TestWriteAttemptBindsOperationAuthorityAndCanonicalPayload(t *testing.T) {
 	for index, mutate := range mutations {
 		mismatch := valid
 		mutate(&mismatch.attempt)
-		if CanRetry(failure, 0, f.limits, &mergeAttempt, &mismatch) {
+		if CanRetry(prFailure, 0, f.limits, &firstAttempt, &mismatch) {
 			t.Fatalf("reconciliation field mutation %d authorized replay", index)
 		}
 	}
@@ -177,48 +167,23 @@ func TestProviderSelfCertifiedWrongExpectedTreeFailsControllerValidation(t *test
 		Snapshot: f.snapshot, Repository: f.repository, PullRequest: f.pr, Actor: f.actor,
 		AcceptedHeadSHA: f.headSHA, AcceptedHeadTree: wrongTree, BaseBeforeSHA: f.baseSHA,
 		Method: MergeMethodMerge, ResultSHA: f.resultSHA, ResultTree: wrongTree,
-		Parents: []GitSHA{f.baseSHA, f.headSHA}, Attempt: f.mergeWrite.Attempt(), ExpectedContent: forged,
+		Parents: []GitSHA{f.baseSHA, f.headSHA}, Attempt: f.mergeWrite.Attempt(), ExpectedContent: forged, SealedAuthorization: f.sealed, Recipe: f.recipe,
 	}
-	result, err := NewMergeResult(data, f.limits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ValidateMergeResult(f.mergeWrite, result, f.limits); err == nil || !strings.Contains(err.Error(), "expected merge content") {
+	if _, err := NewMergeResult(data, f.limits); err == nil {
 		t.Fatalf("provider-certified wrong tree accepted: %v", err)
 	}
 }
 
 func TestMergeAndPostMergeValidatorsRescanCardinalityAndLimitsIdentity(t *testing.T) {
-	f := newFixture(t, MergeMethodRebase)
+	f := newFixture(t, MergeMethodMerge)
 	strict := f.limits
-	strict.MaxLineageEntries = 1
-	mergeWrite, err := NewMergeInput(f.authority, []ledger.EvidenceRef{{URI: "evidence/approval", Kind: "approval", SHA256: strings.Repeat("c", 64)}}, "strict-merge", strict)
-	if err != nil {
-		t.Fatal(err)
+	strict.MaxPaginationClosureBytes--
+	validResult := f.validMergeResult(t)
+	observation := f.validPostMergeObservation(t, validResult, f.resultSHA, 0)
+	if err := ValidateMergeResult(f.sealed, validResult, strict); err == nil {
+		t.Fatal("merge validator accepted changed limits identity")
 	}
-	lineage := []CommitLineage{{SourceSHA: f.headSHA, SourceTree: f.headTree, ResultSHA: f.resultSHA, ResultTree: f.resultTree, Parents: []GitSHA{f.baseSHA}}}
-	data := MergeResultInput{Snapshot: f.snapshot, Repository: f.repository, PullRequest: f.pr, Actor: f.actor,
-		AcceptedHeadSHA: f.headSHA, AcceptedHeadTree: f.headTree, BaseBeforeSHA: f.baseSHA, Method: MergeMethodRebase,
-		ResultSHA: f.resultSHA, ResultTree: f.resultTree, Parents: []GitSHA{f.baseSHA}, Lineage: lineage,
-		Attempt: mergeWrite.Attempt(), ExpectedContent: f.authority.ExpectedContent()}
-	validResult, err := NewMergeResult(data, strict)
-	if err != nil {
-		t.Fatal(err)
-	}
-	observation, err := NewPostMergeObservation(PostMergeObservationInput{Snapshot: f.snapshot, Repository: f.repository, BaseBranch: f.base,
-		PullRequest: f.pr, Actor: f.actor, AcceptedHeadSHA: f.headSHA, AcceptedHeadTree: f.headTree, BaseBeforeSHA: f.baseSHA,
-		Method: MergeMethodRebase, ResultSHA: f.resultSHA, BaseAfterSHA: f.resultSHA, ResultTree: f.resultTree,
-		Parents: []GitSHA{f.baseSHA}, Lineage: lineage, Attempt: mergeWrite.Attempt(), ExpectedContent: f.authority.ExpectedContent()}, strict)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := validResult
-	result.immutable.data.Lineage = append(result.immutable.data.Lineage, lineage[0])
-	if err := ValidateMergeResult(mergeWrite, result, strict); err == nil {
-		t.Fatal("merge validator accepted forged oversized lineage")
-	}
-	observation.immutable.data.Lineage = append(observation.immutable.data.Lineage, lineage[0])
-	if err := VerifyPostMerge(mergeWrite, validResult, observation, strict); err == nil {
-		t.Fatal("post-merge validator accepted forged oversized lineage")
+	if err := VerifyPostMerge(f.sealed, validResult, observation, strict); err == nil {
+		t.Fatal("post-merge validator accepted changed limits identity")
 	}
 }

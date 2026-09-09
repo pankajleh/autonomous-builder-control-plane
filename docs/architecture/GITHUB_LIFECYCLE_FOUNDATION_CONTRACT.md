@@ -3,151 +3,216 @@
 ## Scope
 
 `internal/githublifecycle` is the frozen, network-free contract boundary for
-EP-005. It defines what later PR, CI, merge-authorization, and post-merge tracks
-may exchange with a provider. It does not implement a provider, make network
-requests, execute GitHub CLI commands, hold credentials, perform a merge, or
-emit a state transition.
+EP-005. It defines what PR, CI, merge-authorization, reconciliation, and
+post-merge tracks may exchange with a provider. It does not implement a
+provider, make a network request, hold a credential, execute a GitHub command,
+perform a merge, or emit a state transition.
 
-## Authority
+The frozen `github-update-refs-atomic-base-head-v1` value is a capability
+contract, not a claim that a live GitHub deployment supports it. Live
+capability proof and transport remain Task 3. The ordinary PR merge endpoint
+and REST ref-update mutation are outside this foundation.
 
-An immutable `Authority` binds these exact, case-sensitive values:
+## Authority and Phase-3 READY provenance
 
-- repository owner and name;
-- base and head branch;
-- accepted head SHA;
-- expected pre-merge base-tip SHA;
-- optional pull-request number plus node ID;
-- the one allowed merge method (`merge`, `squash`, or `rebase`); and
-- the authenticated user or app-installation identity that may perform a
-  remote write; and
-- controller-owned `ExpectedMergeContent` for the accepted head/base pair.
+An immutable `Authority` binds exact case-sensitive repository, base/head
+branches, accepted head, pre-merge base tip, optional stable PR identity,
+acting identity, `ExpectedMergeContent`, `ReadyAuthorityBindingV1`, and
+controller-owned `MergePolicyV1` values.
 
-`ExpectedMergeContent` can only be produced by the controller derivation
-boundary. `DeriveExpectedMergeContent` verifies an immutable
-`serial-integration-gate-decision` whose state is `READY_FOR_MERGE` and whose
-combined-acceptance target binds the exact Phase 3 integrated head and
-baseline. It then resolves that exact local commit to its tree using an
-explicit, pinned Git executable under `--no-replace-objects` and the governed
-Git environment. That environment disables lazy promisor fetching with
-`GIT_NO_LAZY_FETCH=1`: every required object must already exist locally, and a
-missing object makes derivation fail closed rather than consulting a promisor
-remote. The frozen object records `phase3-ready-tree-v1`, the source
-integrated-head and baseline SHAs, the complete source evidence reference, the
-canonical Git executable path/version/binary SHA-256, and the expected result
-tree SHA. Missing, altered, wrong-kind, wrong-state, wrong-head, wrong-baseline,
-or unverifiable evidence blocks authority construction.
+`ExpectedMergeContent` is content proof, not merge authority. Its controller
+derivation verifies exact immutable Phase-3 `READY_FOR_MERGE` evidence and
+resolves the integrated commit tree with a pinned local Git executable under
+replacement-ref-resistant and no-lazy-fetch settings.
 
-All constructors preserve spelling and case. They do not trim, fold case, or
-turn distinct inputs into equal identities. Git object IDs must be complete
-lowercase 40- or 64-hex values. Repository and branch constructors reject
-path, ref, revision-expression, control-character, and traversal ambiguity.
+`ReadyAuthorityBindingV1` binds:
 
-The acting identity is deliberately non-secret. It can contain an authenticated
-subject and app installation number, but the contract has no credential,
-password, private key, or token field. `Authority.CanonicalJSON` is therefore
-safe to bind into evidence, subject to the caller's normal identity-data policy.
+- the exact canonical Phase-3 authority bytes/digest, including run,
+  repository, plan, and policy identities;
+- every accepted source project/plan/run/attempt, repository/branch/start/head,
+  acceptance policy, and evidence closure;
+- the stable `RepositoryBindingV1`;
+- exact canonical `INTEGRATION_ACCEPTED -> READY_FOR_MERGE` ledger event bytes,
+  digest, IDs, time, physical ledger identity/offset, run-state sequence, and
+  transition ordinal;
+- the bounded ledger-prefix identity and complete READY evidence closure; and
+- the integrated head, baseline, expected tree, and exact READY decision ref
+  used by `ExpectedMergeContent`.
 
-## Provider boundary
+`RepositoryBindingV1` binds Phase-3 repository identity/path/canonical remote/
+start SHA to exact GitHub owner/name and stable repository node/database IDs,
+under immutable mapping-configuration evidence. Fork or mutable display text
+is never an equivalent repository identity.
 
-The `Provider` interface accepts `context.Context` on every operation and only
-structured inputs. No operation accepts a shell command, API URL, query string,
-or free-form authority fragment. The interface freezes reads for PR and CI
-observations, writes for PR upsert and merge, post-merge observation, and
-explicit write reconciliation.
+`PolicyAuthorityBindingV1` binds immutable configuration evidence, repository,
+Phase-3 authority, READY binding, and exact stable acting principal.
+`MergePolicyV1` additionally binds method, trusted required checks, stable
+eligible/required reviewers, minimum unique approvals, and deterministic
+commit-recipe policy. Authority method and actor must equal policy-derived
+values; request values cannot select them.
 
-Every PR or merge write input contains one immutable `WriteAttempt`, created
-while constructing the exact request and before submission. The attempt binds
-the repository, acting identity, typed operation kind (`pr_upsert` or `merge`),
-write ID, authority SHA-256, canonical operation-payload SHA-256, and limits
-policy SHA-256. The payload digest covers the complete operation payload but
-excludes the attempt itself, avoiding circular hashing. Successful results,
-execution errors, reconciliation inputs, and reconciliation results carry that
-same value. Result validators compare it with the original request; providers
-cannot invent or replace it.
+Compatibility authorities retained for the already-frozen PR/CI observation
+tracks cannot create a `MergeInput`. Merge admission requires the complete
+READY/repository/policy chain.
 
-A provider implementation must authenticate the bound principal out of band.
-Deadlines are bounded by `Limits.CallTimeout`; provider implementations must
-return no collection or text beyond the supplied limits.
+Strict parsers re-run ordinary constructors for repository, READY, policy,
+authority, expected content, and every nested durable merge value. They accept
+only byte-identical canonical JSON. Unknown or duplicate fields, whitespace,
+key reordering, omitted/defaulted values, altered nested bytes, digest
+disagreement, and invalid constructor inputs fail closed.
 
-## Immutable remote evidence
+## Stable PR, check, review, and pagination evidence
 
-`PullRequestSnapshot`, `CISnapshot`, `PullRequestPage`, `MergeResult`, and
-`PostMergeObservation` bind the exact limits-policy SHA-256 and are built only
-through validating constructors. They:
+`AuthoritativePullRequestSnapshotV1` requires concrete `OPEN`,
+`isDraft=false`, `merged=false`, and absent `mergedAt` observations together
+with stable repository and PR node/database identities, exact same-repository
+full base/head refs and OIDs, API version, authenticated acting principal,
+provider request identity, response digest, evidence, limits, and independently
+validated reviews closure. Closed, draft, merged, contradictory, missing,
+synthetic/deleted-ref, or fork-head observations are invalid.
 
-- deep-copy caller slices and maps;
-- expose defensive copies;
-- reject duplicate identities and oversized text, item, evidence, metadata,
-  parent, and lineage collections;
-- sort set-like reviews, checks, and evidence references;
-- preserve ordered Git parent and rewritten-commit lineage sequences; and
-- expose stable canonical JSON and its lowercase SHA-256 digest.
+Every `Check` has a `TrustedCheckIdentityV1`: exact context, source kind
+(`check_run` or `commit_status`), stable producer identity, and stable GitHub
+App identity when applicable. Name-only, mutable-login, wrong-context/App,
+missing-producer, stale-head, duplicate, pending, or non-success observations
+cannot satisfy a required check.
 
-Remote bodies, logs, and arbitrary response payloads are never embedded. Large
-material belongs in immutable bounded artifacts referenced by
-`ledger.EvidenceRef`.
+Every `Review` has stable review and reviewer node/database identities, state,
+and exact reviewed commit. Sorting is deterministic set ordering only and
+never chronology. At most one exact-head approval counts per eligible
+reviewer. Any eligible exact-head `changes_requested` blocks, including beside
+an approval. Every eligible exact-head `dismissed` record blocks as unproved
+history. This foundation exposes no positive GitHub-v1 authenticated review
+history capability. Stale-head, commented, and ineligible reviews grant no
+approval.
 
-Before policy evaluation, consumers pass the controller's expected `Limits` to
-`ValidatePullRequest`, `ValidateCI`, `ValidatePullRequestWriteResult`,
-`ValidateMergeResult`, `VerifyPostMerge`, or `SelectPullRequest`. Each requires
-the embedded limits identity to match and independently reconstructs/rescans
-the actual text, nested evidence, metadata, collection, parent, and lineage
-data under those limits. A result constructed under a looser provider policy
-cannot be accepted by a stricter controller merely by presenting a plausible
-snapshot digest. PR discovery uses `PullRequestPage` and `SelectPullRequest`;
-absence, repeated identity, or multiple matching PRs is an error rather than a
-provider-dependent choice.
+`PaginationClosureV1` is independent for reviews, check runs, and commit
+statuses. Each closure binds its exact source/query/filters, ordered page or
+cursor requests, provider request/body identities, canonical response
+envelopes, stable item keys/digests, closure-wide set digest, evidence, and
+limits. REST termination comes only from a valid final `Link` relation set
+without `next`; GraphQL termination comes only from final
+`hasNextPage=false`. Missing, skipped, repeated, reordered, duplicate,
+conflicting, altered, invented-terminal, or truncated chains fail.
+`ValidatePaginationClosureV1` reconstructs the chain and exact canonical item
+set rather than trusting collector summaries.
 
-## Strategy-aware merge proof
+All immutable values deep-copy slices, maps, nested bytes, and optional values;
+accessors return defensive copies. Canonical set ordering never changes the
+semantic ordering of Git parents, lineage, or pagination chains.
 
-The accepted head commit and provider-created result commit are separate
-identities. `MergeInput`, `MergeResult`, and `PostMergeObservation` all bind the
-authority-owned expected-content object. For every merge method, both the
-accepted-head tree observation and final result tree must equal the exact
-Phase-3-derived expected tree; provider parent/lineage claims are provenance,
-never content authority. `VerifyPostMerge` also requires agreement among the
-original merge request, result, and target-branch observation for repository,
-branch, PR, actor, write attempt, accepted head and tree, base-before SHA,
-method, result/base-after SHA, result tree, ordered parents, and rewritten
-lineage.
+## Deterministic merge input
 
-- `merge` requires ordered base-before and accepted-head parents.
-- `squash` requires the base-before parent and one entry binding the accepted
-  head/tree to the synthesized result SHA/tree.
-- `rebase` requires an ordered, continuous first-parent chain whose final entry
-  binds the accepted head/tree to the observed result SHA/tree.
+Production-v1 merge admission is method `merge` only.
+`MergeCommitRecipeV1` binds exact repository/full target ref, expected tree,
+ordered `[base, head]` parents, deterministic message and attempt trailer,
+author/committer identity and timestamps, object format, write/authority/
+policy/READY/limits identities, canonical Git commit bytes, and locally
+computed result OID. Changing any recipe field cannot retain the old OID.
 
-Consequently, a correct synthesized SHA is accepted only with its exact
-method-specific content/lineage proof. Equality between post-merge SHA and the
-accepted head SHA is never assumed.
+`MergeInput` owns the full authority, initial authoritative PR and policy
+decision, canonical checks, all three independently validated source closures,
+frozen provider capability, exact recipe/result OID, evidence, limits, and
+attempt. A merge `WriteAttempt` explicitly binds READY and policy digests in
+addition to repository, principal, operation, write ID, authority digest,
+payload digest, and limits. `ParseCanonicalMergeInput` must reconstruct
+byte-identical input and attempt identities.
 
-## Failure and retry rules
+Generic squash/rebase lineage remains representable by foundation strategy
+contracts. That representation and its tests do not claim production support.
 
-`OperationError` keeps provider unavailability and ambiguous remote execution
-separate from substantive policy, CI, review, and invalid-remote-evidence
-failures. A write error after possible submission is always
-`FailureAmbiguousWrite`, including cancellation and deadline expiry.
+## Authorization seal and exact target commitment
 
-`CanRetry` grants no implicit replay:
+`AuthorizationSealV1` binds one unchanged `MergeInput` to freshly validated
+final PR/review/check observations, exact authorized verdict and PR
+eligibility, base/head refs and OIDs, recipe/result, capability, cumulative
+counters, evidence, limits, and the fact that no target request was attempted.
+It is immutable and one-use.
 
-- substantive failures are never retried;
-- unavailable reads and known-not-submitted writes are limited separately;
-- ambiguous writes have zero retry authority by default; and
-- an ambiguous write can enter the normal bounded write-retry allowance only
-  when the error still contains the request's exact attempt and reconciliation
-  proves that exact repository/actor/operation/write-ID/authority/payload tuple
-  was not applied.
+`ProviderCapabilityV1` accepts only
+`github-update-refs-atomic-base-head-v1` with immutable evidence for atomic,
+all-or-nothing, no-op, base-then-head ordering, and `force=false` behavior.
+`TargetRefCommitmentV1` contains exactly two ordered entries:
 
-An applied, unknown, missing, or identity-mismatched reconciliation never
-authorizes retry.
+1. base: `before=ExpectedBaseTip`, `after=ExpectedResult`, `force=false`;
+2. head: `before=AcceptedHead`, `after=AcceptedHead`, `force=false`.
 
-## Foundation limits
+`SealedMergeAuthorizationV1` owns the original input, seal, and exact
+commitment. Merge execution accepts this sealed value, never an unsealed
+input. Strict parsers recover the seal, commitment, and sealed chain by all
+nested canonical bytes and digests.
 
-`DefaultLimits` bounds remote pages, items per page, total items, UTF-8 text,
-evidence references, metadata, parents, rewritten lineage, call duration, and
-read/write retries. `Limits.CanonicalJSON` is a versioned deterministic encoding
-of every governed field (duration is nanoseconds), and `Limits.SHA256` is its
-policy identity. Read/write inputs and all provider-returned snapshots/results
-carry that identity. `MaxAmbiguousRetries` is invariantly zero. Later tracks may
-choose stricter validated limits but must not bypass constructors, validator
-rescans, or interpret truncation as successful evidence.
+## Exact reconciliation
+
+Merge reconciliation owns the full `SealedMergeAuthorizationV1`, not an
+attempt alone. `APPLIED` requires the identical materialized and validated
+`MergeResult`. `NOT_APPLIED` requires exact typed zero-request-byte or
+authenticated all-or-nothing base/head before-OID rejection proof. `UNKNOWN`
+contains no result or non-application claim. Absent/open PR, old/unrelated
+target, missing expected object, truncation, or generic provider assertions
+remain `UNKNOWN`.
+
+`ValidateReconciliationResult` checks the full input, seal, commitment,
+attempt, result/proof, evidence, and limits. Merge mutations have no implicit
+retry right even after `NOT_APPLIED`; future retry authority requires a
+separately versioned controller contract. Existing non-merge retries retain
+their independently bounded rules.
+
+## Cancellation authority
+
+`CancellationAuthorityV1` is immutable strict-canonical controller authority.
+It binds project/plan/run, repository and Phase-3 authority, exact READY event/
+digest/sequence and ledger prefix, current-READY proof, a closed requested-at
+boundary and controller receipt ordering, every reached admission/attempt/
+write/seal/commitment identity, stable authenticated requester, controller
+cancellation policy/source/grant/allow decision, unique source request,
+ingress identity, exact submission proof, evidence closure, and limits.
+
+Boundary construction enforces exact absence/presence for `PRE_ADMISSION`,
+`ADMITTED_PRE_TARGET_SUBMISSION`, `TARGET_SUBMISSION_UNKNOWN`, and
+`TARGET_NOT_APPLIED`. Independent validation receives expected READY, policy,
+principal, boundary, attempt/write/seal/commitment, source/ingress ordering,
+and proof identities.
+
+Raw context cancellation, deadline, signal, disconnect, mutable login, caller
+boolean, or merge credential is never cancellation authority.
+`DurableCancellationAuthorityV1` additionally binds validated fsynced channel
+and single-use replay-index evidence. Only this prior durable form may
+authorize `CANCELLED`; submitted boundaries also need exact typed
+`NOT_APPLIED` proof. `APPLIED` always defeats cancellation.
+
+## Post-merge result and containment
+
+The exact result object is independent of the moving target ref.
+`ResultCommitObservationV1` proves result OID/tree/ordered parents/message/
+author/committer/timestamps and recipe digest. `TargetContainmentProofV1`
+separately binds repository/full target ref, result and observed-tip OIDs,
+provider request identity, proof mechanism, merge base, bounded descendant
+distance, evidence, and limits.
+
+`github-compare-v1` accepts only `identical`, or `ahead` with merge base equal
+to the exact result and distance within the configured bound.
+`VerifyPostMerge` validates the original sealed authorization, merge result,
+exact result object, and equal-or-descendant containment. Wrong tree/OID/
+parents/recipe, sibling, rewind, force move, wrong repository/ref, excessive
+distance, unavailable ancestry, or truncation fails closed.
+
+Foundation strategy proof still distinguishes accepted head and synthesized
+result identities: merge requires ordered base/head parents; squash binds one
+base parent and exact content lineage; rebase binds a continuous ordered
+first-parent lineage. No strategy may substitute provider claims for the
+controller-derived expected tree.
+
+## Limits and failure semantics
+
+`Limits` deterministically binds numeric page, per-page, total-item, text,
+evidence, metadata, parent, lineage, pagination-closure-byte, descendant-
+distance, call-time, and retry bounds. Constructor and independent-validator
+rescans use the controller's exact limits digest. Exact `limit` is accepted;
+`limit+1` fails.
+
+Provider unavailability, ambiguous possible writes, policy/CI/review failure,
+and invalid evidence remain distinct. Cancellation or deadline after possible
+request bytes is ambiguous, not `CANCELLED`. No substantive failure retries.
+No caller URL, shell fragment, credential, or free-form provider authority is
+part of these network-free contracts.

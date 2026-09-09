@@ -16,16 +16,16 @@ Task 1 may amend only the network-free lifecycle contracts/tests and the foundat
 
 ### Task 1: Implement lifecycle contract corrections
 
-- [ ] Add full READY/repository/policy authority bindings and strict canonical recovery; bind them through `Authority`, `MergeInput`, attempt identity, results, and validation.
-- [ ] Add authoritative open/non-draft/unmerged PR snapshots, trusted check producer/app/context, stable reviewer identities, conservative exact-head dismissal handling, and independent per-source pagination-closure contracts while preserving unordered review semantics.
-- [ ] Add deterministic merge-commit recipe/expected result OID and full-input reconciliation contracts; require applied reconciliation to materialize a validated `MergeResult`.
-- [ ] Add immutable `AuthorizationSealV1` / `SealedMergeAuthorizationV1` contracts and frozen `github-update-refs-atomic-base-head-v1` capability binding without claiming live provider support.
-- [ ] Add immutable strict-canonical `CancellationAuthorityV1`, independent validation, exact READY/attempt/write/request-boundary/principal/policy/source-evidence binding, and require its prior durable validated form for `CANCELLED` authority.
-- [ ] Amend post-merge observation/verification for exact result-object proof plus equal-or-descendant target containment.
-- [ ] Update `docs/architecture/GITHUB_LIFECYCLE_FOUNDATION_CONTRACT.md` and contract tests only for these narrow amendments.
-- [ ] Add adversarial and boundary tests required by the accepted master design for all Task-1-owned contract behavior.
-- [ ] Run gofmt, vet, package tests, race tests, full repository tests, non-Linux compile-only validation, scope/forbidden-semantic checks, and `git diff --check`.
-- [ ] Commit the implementation and move this plan to `docs/plans/completed/` only after all Task-1 work/tests are complete. Do not claim deterministic ABCP acceptance or independent exact-head review inside the implementation task.
+- [x] Add full READY/repository/policy authority bindings and strict canonical recovery; bind them through `Authority`, `MergeInput`, attempt identity, results, and validation.
+- [x] Add authoritative open/non-draft/unmerged PR snapshots, trusted check producer/app/context, stable reviewer identities, conservative exact-head dismissal handling, and independent per-source pagination-closure contracts while preserving unordered review semantics.
+- [x] Add deterministic merge-commit recipe/expected result OID and full-input reconciliation contracts; require applied reconciliation to materialize a validated `MergeResult`.
+- [x] Add immutable `AuthorizationSealV1` / `SealedMergeAuthorizationV1` contracts and frozen `github-update-refs-atomic-base-head-v1` capability binding without claiming live provider support.
+- [x] Add immutable strict-canonical `CancellationAuthorityV1`, independent validation, exact READY/attempt/write/request-boundary/principal/policy/source-evidence binding, and require its prior durable validated form for `CANCELLED` authority.
+- [x] Amend post-merge observation/verification for exact result-object proof plus equal-or-descendant target containment.
+- [x] Update `docs/architecture/GITHUB_LIFECYCLE_FOUNDATION_CONTRACT.md` and contract tests only for these narrow amendments.
+- [x] Add adversarial and boundary tests required by the accepted master design for all Task-1-owned contract behavior.
+- [x] Run gofmt, vet, package tests, race tests, full repository tests, non-Linux compile-only validation, scope/forbidden-semantic checks, and `git diff --check`.
+- [x] Commit the implementation and move this plan to `docs/plans/completed/` only after all Task-1 work/tests are complete. Do not claim deterministic ABCP acceptance or independent exact-head review inside the implementation task.
 
 ## Completion boundary
 
