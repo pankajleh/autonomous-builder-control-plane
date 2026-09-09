@@ -9,8 +9,8 @@ Operational role: this file is the present checkpoint and authority projection f
 - Repository: `pankajleh/autonomous-builder-control-plane`.
 - Active implementation branch: `ep-005-ci-ingestion`.
 - Current-policy merge boundary: exact `origin/main` commit `e11afb7d7356a0df36566d98c34adbd07a0097ae`, the merge commit for PR #12 and descendant of PR #11 merge `454ea4dce3c674e0d8e55273319cfb4ea4a077a5`.
-- This Task 3 review-materialization operation began from exact clean base `b0080793683a0a8f4aa145b7840b41eb529a4478`.
-- Its fresh `context-capsule-v2` at `/home/devagent/abcp-runtime/ep005-ci-task3-review-materialization/context.json` has exact byte SHA-256 `58981771da6a66effd68566951851e62c5d1f30218ca6c9ce26f2af626426c97`; independent verification confirmed the base, implementation operation kind, internal capsule SHA-256 `e787239116f8d98ae726366457b5e96582f951877e9c04039629dca812680501`, and all 7 bound source hashes before editing.
+- This Task 3 correction-review materialization operation began from exact clean base `91585261fcde05874a8750f5840904ada69fbb82`.
+- Its fresh `context-capsule-v2` at `/home/devagent/abcp-runtime/ep005-ci-task3-correction-review-materialization/context.json` has exact byte SHA-256 `05b16a3a62b92f2afd808b435de2c5007095a5b2d49853d1d1df42cfa0f8f779`; independent verification confirmed the base, implementation operation kind, internal capsule SHA-256 `87cd459e080189f6ad5dfb4a0b03f2c4b51862b07ce22e7e9d0e16a7797b5341`, and all 7 bound source hashes before editing.
 - Current roadmap phase: Phase 4 — GitHub lifecycle.
 - Current execution pack: EP-005 — GitHub Lifecycle.
 - Canonical roadmap: `docs/roadmap/IMPLEMENTATION_ROADMAP.md`.
@@ -34,28 +34,31 @@ The corrected read-only CI evidence-ingestion design is frozen at SHA-256 `47a6d
 - At that accepted correction head, current-policy-owned `internal/run`, `internal/context`, `internal/authority`, and `cmd/abcp` are byte-identical to merged main `e11afb7d7356a0df36566d98c34adbd07a0097ae`, while accepted Task 2 `internal/cilifecycle` remains byte-identical to `da8ffea4582539067724b363b3144d9601dee086`.
 - Task 3, immutable evidence, ledger outcome, and replay, reached controller `BRANCH_ACCEPTED` at exact clean technical head `b5c7e2cd0ea3cc223f481b1d73a78c6276846639` after all 16 deterministic gates passed. Its final-Git evidence SHA-256 is `24f3ceebf733c596c9638f9d9693b2fa49375d3721222a45dc4cc565e00cd1b7`.
 - The fresh exact-head implementation review of `b5c7e2cd0ea3cc223f481b1d73a78c6276846639` returned exactly `IMPLEMENTATION_FINDINGS`, 0 Critical and 5 Major. The review artifact SHA-256 is `d0a3f692f19d9dc5b42a13abf8c71bbd18469a57d8920183ca86345953ccf6f3`.
-- Task 3 is accepted but review-blocked. The sole next eligible CI operation is a freshly authorized correction of M-001 through M-005; Task 4 and publication are ineligible until a corrected exact head passes deterministic acceptance and a fresh exact-head implementation review reaches 0 Critical and 0 Major.
+- The Task 3 correction reached controller `BRANCH_ACCEPTED` at exact clean head `39db34bd4f04dd6b85b9e5444eee86a2f1ea1b05` after all 16 required gates passed. Its final-Git evidence SHA-256 is `14e6500bce762de792cefd2c509188e83dde799d438dd053cb306659d63214ef`; its correction-run ledger SHA-256 is `84cc4756ea8cf6f27d498977a6211da32c32ae68f3a72e5c0b6d534ff193b027`.
+- The fresh exact-head implementation review of `39db34bd4f04dd6b85b9e5444eee86a2f1ea1b05` returned exactly `IMPLEMENTATION_FINDINGS`, 0 Critical and 3 Major. The review artifact SHA-256 is `be18740a9c60d110d9acd4487d70ba0c21fafd4485b7d046e39693f5312e6364`.
+- Task 3's correction is accepted but review-blocked. The sole next eligible CI operation is a freshly authorized correction-only operation for M-001, M-003, and M-006; Task 4 and publication are ineligible until a corrected exact head passes deterministic acceptance and a fresh exact-head implementation review reaches 0 Critical and 0 Major.
 
 CI evidence ingestion remains neutral, read-only collection and bounded observational stability only. It does not define merge policy, approval, required-check acceptance, expected-head merge protection, merge execution, or post-merge acceptance. The CI subtrack remains unpublished and cannot advance to publication or later Phase-4 work without final deterministic acceptance and an exact-head 0 Critical/0 Major implementation review.
 
 ## Current blocking correction set
 
-The exact 0C/5M review artifact records this blocking set; its verdict and severity counts are authoritative and are not reinterpreted here:
+The exact 0C/3M correction review artifact records these dispositions; its verdict and severity counts are authoritative and are not reinterpreted here:
 
-- M-001: a newly created normal reservation can survive the detection of pre-existing event or bundle material, so a retry can treat pre-positioned material as historical proof rather than remaining fail-closed.
-- M-002: artifact publication does not durably remove its temporary hard link or prove the final single-link pathname durable, and immediate read-back can mask a directory-fsync failure.
-- M-003: ledger append/read-back can mask append or fsync failure; the append lacks serialized projected bounds and safe partial-tail rollback, permitting a non-durable completed outcome or a permanently poisoned ledger.
-- M-004: an exact readable reservation encountered after reservation file or directory sync failure is accepted on retry without successful resync and named-inode/byte revalidation.
-- M-005: allocator inventory reads an unbounded directory before enforcing the 64-attempt limit, and keyed process locks are never removed, leaving direct memory-exhaustion paths.
+- M-001 — OPEN: a transient error while stabilizing pre-positioned bundle material can leave a newly created reservation unpoisoned, allowing the next retry to use that material as historical proof.
+- M-002 — CLOSED: publication now checks temporary-link removal, verifies the single-link final inode, and completes the required file and directory durability checks without masking failures.
+- M-003 — OPEN: after ledger fsync failure leaves a readable appended line, the controller retry path can replay it without successfully stabilizing the ledger.
+- M-004 — CLOSED: retry now requires reservation file and directory sync followed by named-inode and exact-byte revalidation.
+- M-005 — CLOSED: attempt inventory is bounded before allocation, and keyed process locks use lifecycle-safe reference counting and removal.
+- M-006 — OPEN, NEW: `attemptLease.poison` has no non-Linux implementation, so `internal/cilifecycle` fails to compile on non-Linux targets instead of returning its fail-closed unsupported error.
 
 ## Projection reconciliation boundary
 
-The immutable-evidence cutoff for this projection candidate is Task 3 deterministic acceptance and exact-head review at exact clean technical head `b5c7e2cd0ea3cc223f481b1d73a78c6276846639`. The final-Git evidence SHA-256 is `24f3ceebf733c596c9638f9d9693b2fa49375d3721222a45dc4cc565e00cd1b7`; the exact review artifact SHA-256 is `d0a3f692f19d9dc5b42a13abf8c71bbd18469a57d8920183ca86345953ccf6f3`, with exact verdict `IMPLEMENTATION_FINDINGS`, 0 Critical and 5 Major. These bytes materialize all required evidence through that cutoff, including the accepted Task 2/current-policy and merged PR #12 boundaries described above.
+The immutable-evidence cutoff for this projection candidate is Task 3 correction acceptance and exact-head review at exact clean head `39db34bd4f04dd6b85b9e5444eee86a2f1ea1b05`. All 16 required acceptance gates passed; final-Git evidence SHA-256 is `14e6500bce762de792cefd2c509188e83dde799d438dd053cb306659d63214ef`, and the correction-run ledger SHA-256 is `84cc4756ea8cf6f27d498977a6211da32c32ae68f3a72e5c0b6d534ff193b027`. The exact review artifact SHA-256 is `be18740a9c60d110d9acd4487d70ba0c21fafd4485b7d046e39693f5312e6364`, with exact verdict `IMPLEMENTATION_FINDINGS`, 0 Critical and 3 Major. These bytes materialize all required evidence through that cutoff, including the original Task 3, accepted Task 2/current-policy, and merged PR #12 boundaries described above.
 
 This materialization candidate cannot self-record lifecycle events that occur after its bytes are frozen. Its resulting commit identity and any later acceptance or review are authoritative immediately in immutable evidence and belong in the next separately governed reconciliation. Once this candidate commits and reaches controller acceptance, resolve its exact accepted head from Git/controller evidence before issuing fresh correction-only authority. That bounded lag is expected and is not itself a contradiction.
 
 ## Separate cross-cutting design track
 
-Automatic operation handoff remains a separate controller-workflow design track. Its drafts do not authorize the Task 3 correction, do not change CI deliverable semantics, and are not a substitute for the required fresh correction-only capsule and authority.
+Automatic operation handoff remains a separate controller-workflow design track. Its drafts do not authorize the remaining Task 3 correction, do not change CI deliverable semantics, and are not a substitute for the required fresh correction-only capsule and authority.
 
 Before any non-reconciliation governed operation, reconcile all projections through the latest relevant predecessor boundary. A projection stale through that boundary or contradicting immutable evidence is a planning blocker; immutable controller and Git evidence governs.
