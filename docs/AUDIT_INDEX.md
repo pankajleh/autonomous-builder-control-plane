@@ -23,6 +23,12 @@ EP-005 foundation merged in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f` 
 
 These identities establish the current universal operation rule: each new governed operation requires a fresh verified `context-capsule-v2` and immutable authority bound to its exact base and sources.
 
+## State-projection reconciliation evidence and cutoff
+
+The state-projection reconciliation candidate `51a2e84c4ff412aaedb7d352bd2b33781992f4ab` passed deterministic acceptance at that exact clean head. Its subsequent exact-head review returned `IMPLEMENTATION_FINDINGS`, with 0 Critical and 2 Major; review artifact SHA-256 `ce7c7088a0468104392bd040ee5835e24cba1d35285b0c05606d512e93904638`. The correction operation is authority-bound to plan/base commit `5ad4304eee996697efedf909a61bbb2cdcdc2f2a`. Neither the review findings nor this later correction may be written into the already accepted/reviewed candidate's bytes.
+
+The explicit immutable-evidence cutoff for the current projection candidate is that correction operation authority at `5ad4304eee996697efedf909a61bbb2cdcdc2f2a`, including the prior candidate's acceptance and review evidence above. The current candidate materializes required evidence through that cutoff only. Its own later acceptance, review, or merge evidence is authoritative immediately when emitted but belongs in the next separately governed reconciliation. This bounded projection lag is expected and is not itself a contradiction.
+
 ## EP-005 active evidence
 
 The PR-lifecycle subtrack ultimately reached controller `BRANCH_ACCEPTED` at `6db075240ce87b751f8db98abb540c96410c515b`. Its final policy-authorized controller fallback review returned `CLEAN_CRITICAL_MAJOR` with 0 Critical and 0 Major; artifact SHA-256 `e34a632e290930bbfcccfbd4326d5aeab1b1d8012285d67a122a87b55d8196c5`. PR #8 merged that exact reviewed head at `ccf75d093625119cc39944fe7a47c3a03b30ad3b`.
@@ -34,10 +40,10 @@ The initial CI evidence-ingestion design SHA-256 `d90099eeab3af74ea5dd25f50b7e87
 | CI task | Commit | Lifecycle status |
 |---|---|---|
 | Task 1 — v1 evidence contract and bounds | `e1740f4be8df06571a3299c3fb31ecc31b0a1aea` | Implemented; no controller acceptance, exact-head implementation review, or merge identity recorded |
-| Task 2 — bounded GitHub reads and stabilization | `da8ffea4582539067724b363b3144d9601dee086` | Implemented; no controller acceptance, exact-head implementation review, or merge identity recorded |
-| Task 3 — immutable evidence, ledger, replay | none | Not started; prior capsule cannot cross from `e1740f4be8df06571a3299c3fb31ecc31b0a1aea` to Task 2 HEAD `da8ffea4582539067724b363b3144d9601dee086` |
+| Task 2 — bounded GitHub reads and stabilization | `da8ffea4582539067724b363b3144d9601dee086` | Implementation checkpoint only; no controller acceptance, exact-head implementation review, or merge identity recorded; predates merged PR #11 policy |
+| Task 3 — immutable evidence, ledger, replay | none | Not started; no eligible predecessor established. The prior capsule cannot cross from `e1740f4be8df06571a3299c3fb31ecc31b0a1aea`, and unaccepted/policy-stale Task 2 HEAD `da8ffea4582539067724b363b3144d9601dee086` is not an authorized base |
 
-These checkpoints must not be promoted into the accepted/reviewed/merged table until the corresponding immutable controller and review evidence exists. EP-005 remains active; CI evidence ingestion, merge approval/expected-head protection, and serial post-merge acceptance are not merged.
+These checkpoints must not be promoted into the accepted/reviewed/merged table until the corresponding immutable controller and review evidence exists. The next CI action is deterministic Task 2 acceptance and governed reconciliation of its branch/plan with current merged policy, not Task 3 implementation. Only the resulting verified eligible checkpoint may become the Task 3 predecessor, at which point Task 3 requires a fresh Task-3-only executable plan/capsule at that exact base. EP-005 remains active; CI evidence ingestion, merge approval/expected-head protection, and serial post-merge acceptance are not merged.
 
 ## Automatic operation handoff design status
 
@@ -47,4 +53,6 @@ Do not treat those drafts as EP-005 authority or evidence. Once the design is fr
 
 ## Reconciliation rule
 
-At operation planning/start, verify identities here against controller/Git evidence and cross-check the present authority in `CURRENT_STATE.md` and the next action in `PROGRESS.md`. At each accepted, reviewed, or merged boundary, update all three projections. A contradiction or missing identity is a planning blocker until reconciled from immutable evidence.
+At operation planning/start, verify identities here against controller/Git evidence and cross-check the present authority in `CURRENT_STATE.md` and the next action in `PROGRESS.md`. Before any non-reconciliation governed operation, all three projections must materialize immutable evidence through the latest relevant predecessor boundary. A contradiction or stale/missing identity through that boundary is a planning blocker.
+
+A purpose-specific projection-reconciliation operation is the explicit exception allowed to repair that bounded lag under fresh exact-base authority. It selects an immutable-evidence cutoff, materializes every required event through the cutoff, and freezes new candidate bytes. It never mutates an accepted or reviewed candidate to self-record acceptance, review, or merge events that occurred after that candidate's freeze; those immediately authoritative immutable events are materialized in the next reconciliation.
