@@ -46,6 +46,24 @@ func TestRunCLIEndToEnd(t *testing.T) {
 		Acceptance:    []authority.AcceptanceCommand{{Required: true, Timeout: "5s", Argv: []string{truePath}}},
 		PolicyVersion: "cli-v1",
 	}
+	capsuleSpec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersionV2,
+		Project:       "ABCP", Plan: "CLI plan", RoadmapPhase: "test", ExecutionPack: "test",
+		Task: "Task 1", Repository: "example/project", BaseSHA: startSHA,
+		OperationContext: &contextcapsule.OperationContext{
+			Kind: contextcapsule.OperationImplementation, OwnedScope: []string{"CLI plan"},
+			BlockingCriteria: []string{"Current owned-scope Critical or Major findings."},
+		},
+		Invariants: []string{"Fail closed."}, NonGoals: []string{"No out-of-scope changes."},
+		PredecessorOutcomes: []contextcapsule.Outcome{}, Sources: []string{"plan.md"},
+	}
+	_, capsuleBytes, err := contextcapsule.Build(repository, capsuleSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capsulePath := filepath.Join(t.TempDir(), "context-capsule.json")
+	writeCLIFile(t, capsulePath, capsuleBytes, 0o600)
+	manifest.ContextCapsule = &authority.ContextCapsuleManifest{Path: capsulePath, SHA256: cliFileHash(t, capsulePath)}
 	manifestBytes, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatal(err)
@@ -99,11 +117,15 @@ func TestContextBuildAndVerifyCLI(t *testing.T) {
 	gitCommand(t, repository, "commit", "-m", "authority")
 	head := gitCommand(t, repository, "rev-parse", "HEAD")
 	spec := contextcapsule.Spec{
-		PolicyVersion: contextcapsule.PolicyVersion,
+		PolicyVersion: contextcapsule.PolicyVersionV2,
 		Project:       "ABCP", Plan: "EP-004", RoadmapPhase: "Phase 3", ExecutionPack: "EP-004",
 		Task: "Task 1", Repository: "example/project", BaseSHA: head,
+		OperationContext: &contextcapsule.OperationContext{
+			Kind: contextcapsule.OperationImplementationReview, OwnedScope: []string{"authority.md"},
+			BlockingCriteria: []string{"Current owned-scope Critical or Major findings."},
+		},
 		Invariants: []string{"Fail closed."}, NonGoals: []string{"No semantic retrieval."},
-		Sources: []string{"authority.md"},
+		PredecessorOutcomes: []contextcapsule.Outcome{}, Sources: []string{"authority.md"},
 	}
 	specJSON, err := json.Marshal(spec)
 	if err != nil {

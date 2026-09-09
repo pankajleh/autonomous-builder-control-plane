@@ -36,8 +36,93 @@ func TestBuildIsDeterministicAndCompact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Verify(repository, parsed); err != nil {
+	verified, err := Verify(repository, parsed)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if parsed.OperationContext != nil || verified.PolicyVersion != PolicyVersionV1 || verified.OperationKind != "" {
+		t.Fatalf("historical v1 capsule changed meaning: parsed=%+v verified=%+v", parsed.OperationContext, verified)
+	}
+	if bytes.Contains(firstJSON, []byte("operation_context")) {
+		t.Fatal("historical v1 canonical JSON gained v2 fields")
+	}
+}
+
+func TestBuildV2BindsOperationContext(t *testing.T) {
+	repository, head := capsuleRepository(t)
+	spec := v2FixtureSpec(head, OperationImplementation)
+	capsule, data, err := Build(repository, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capsule.OperationContext == nil || capsule.OperationContext.Kind != OperationImplementation {
+		t.Fatalf("v2 operation context = %+v", capsule.OperationContext)
+	}
+	parsed, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := Verify(repository, parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.PolicyVersion != PolicyVersionV2 || verified.OperationKind != OperationImplementation || verified.BaseSHA != head {
+		t.Fatalf("v2 verification = %+v", verified)
+	}
+	if len(parsed.NonGoals) == 0 || len(parsed.PredecessorOutcomes) == 0 || len(parsed.Sources) == 0 {
+		t.Fatalf("v2 omitted bound context: %+v", parsed)
+	}
+}
+
+func TestBuildV2RequiresOperationFields(t *testing.T) {
+	repository, head := capsuleRepository(t)
+	tests := []struct {
+		name   string
+		mutate func(*Spec)
+		field  string
+	}{
+		{name: "operation context", mutate: func(spec *Spec) { spec.OperationContext = nil }, field: "operation_context"},
+		{name: "recognized kind", mutate: func(spec *Spec) { spec.OperationContext.Kind = "unknown" }, field: "operation kind"},
+		{name: "owned scope", mutate: func(spec *Spec) { spec.OperationContext.OwnedScope = nil }, field: "owned_scope"},
+		{name: "blocking criteria", mutate: func(spec *Spec) { spec.OperationContext.BlockingCriteria = nil }, field: "blocking_criteria"},
+		{name: "explicit non-goals", mutate: func(spec *Spec) { spec.NonGoals = nil }, field: "non_goals"},
+		{name: "exact base", mutate: func(spec *Spec) { spec.BaseSHA = "" }, field: "base_sha"},
+		{name: "predecessor outcomes", mutate: func(spec *Spec) { spec.PredecessorOutcomes = nil }, field: "predecessor_outcomes"},
+		{name: "hashed sources", mutate: func(spec *Spec) { spec.Sources = nil }, field: "sources"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			spec := v2FixtureSpec(head, OperationImplementation)
+			test.mutate(&spec)
+			if _, _, err := Build(repository, spec); err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("expected %s rejection, got %v", test.field, err)
+			}
+		})
+	}
+}
+
+func TestBuildV2RecognizesEveryOperationKind(t *testing.T) {
+	repository, head := capsuleRepository(t)
+	kinds := []OperationKind{
+		OperationDesignPlanning, OperationDesignReview, OperationImplementation,
+		OperationImplementationReview, OperationAcceptance, OperationMergeAuthorization,
+		OperationDeployment, OperationRecovery, OperationMaintenance,
+	}
+	for _, kind := range kinds {
+		t.Run(string(kind), func(t *testing.T) {
+			if _, _, err := Build(repository, v2FixtureSpec(head, kind)); err != nil {
+				t.Fatalf("recognized operation kind %q was rejected: %v", kind, err)
+			}
+		})
+	}
+}
+
+func TestBuildV1RejectsV2OperationContext(t *testing.T) {
+	repository, head := capsuleRepository(t)
+	spec := fixtureSpec(head)
+	spec.OperationContext = v2FixtureSpec(head, OperationImplementation).OperationContext
+	if _, _, err := Build(repository, spec); err == nil || !strings.Contains(err.Error(), "not valid") {
+		t.Fatalf("expected mixed-version rejection, got %v", err)
 	}
 }
 
@@ -168,7 +253,7 @@ func capsuleRepository(t *testing.T) (string, string) {
 
 func fixtureSpec(head string) Spec {
 	return Spec{
-		PolicyVersion: PolicyVersion,
+		PolicyVersion: PolicyVersionV1,
 		Project:       "Autonomous Builder Control Plane",
 		Plan:          "EP-004 plan",
 		RoadmapPhase:  "Phase 3",
@@ -183,6 +268,17 @@ func fixtureSpec(head string) Spec {
 		}},
 		Sources: []string{"docs/source.md"},
 	}
+}
+
+func v2FixtureSpec(head string, kind OperationKind) Spec {
+	spec := fixtureSpec(head)
+	spec.PolicyVersion = PolicyVersionV2
+	spec.OperationContext = &OperationContext{
+		Kind:             kind,
+		OwnedScope:       []string{"The exact task and files named by this capsule."},
+		BlockingCriteria: []string{"Current owned-scope Critical or Major findings."},
+	}
+	return spec
 }
 
 func writeContextFile(t *testing.T, path string, data []byte) {

@@ -21,8 +21,12 @@ import (
 )
 
 const (
-	// PolicyVersion is the first deterministic context-capsule format.
-	PolicyVersion = "context-capsule-v1"
+	// PolicyVersionV1 is the historical deterministic context-capsule format.
+	PolicyVersionV1 = "context-capsule-v1"
+	// PolicyVersionV2 adds purpose-specific operation authority.
+	PolicyVersionV2 = "context-capsule-v2"
+	// PolicyVersion is the current format for newly built operation capsules.
+	PolicyVersion = PolicyVersionV2
 
 	// Conservative bounds keep capsules small enough to be fresh-task context.
 	MaxSources      = 32
@@ -33,21 +37,45 @@ const (
 	MaxCapsuleBytes = 64 << 10
 )
 
+// OperationKind identifies the governed purpose for one context capsule.
+type OperationKind string
+
+const (
+	OperationDesignPlanning       OperationKind = "design-planning"
+	OperationDesignReview         OperationKind = "design-review"
+	OperationImplementation       OperationKind = "implementation"
+	OperationImplementationReview OperationKind = "implementation-review"
+	OperationAcceptance           OperationKind = "acceptance"
+	OperationMergeAuthorization   OperationKind = "merge-authorization"
+	OperationDeployment           OperationKind = "deployment"
+	OperationRecovery             OperationKind = "recovery"
+	OperationMaintenance          OperationKind = "maintenance"
+)
+
+// OperationContext bounds one governed operation to an explicit purpose,
+// owned scope, and blocking policy.
+type OperationContext struct {
+	Kind             OperationKind `json:"kind"`
+	OwnedScope       []string      `json:"owned_scope"`
+	BlockingCriteria []string      `json:"blocking_criteria"`
+}
+
 // Spec is the structured input used to build a Capsule. Sources contains only
 // repository-relative paths; source contents are never copied into a capsule.
 type Spec struct {
-	PolicyVersion       string    `json:"policy_version"`
-	Project             string    `json:"project"`
-	Plan                string    `json:"plan"`
-	RoadmapPhase        string    `json:"roadmap_phase"`
-	ExecutionPack       string    `json:"execution_pack"`
-	Task                string    `json:"task"`
-	Repository          string    `json:"repository"`
-	BaseSHA             string    `json:"base_sha"`
-	Invariants          []string  `json:"invariants"`
-	NonGoals            []string  `json:"non_goals"`
-	PredecessorOutcomes []Outcome `json:"predecessor_outcomes"`
-	Sources             []string  `json:"sources"`
+	PolicyVersion       string            `json:"policy_version"`
+	Project             string            `json:"project"`
+	Plan                string            `json:"plan"`
+	RoadmapPhase        string            `json:"roadmap_phase"`
+	ExecutionPack       string            `json:"execution_pack"`
+	Task                string            `json:"task"`
+	OperationContext    *OperationContext `json:"operation_context,omitempty"`
+	Repository          string            `json:"repository"`
+	BaseSHA             string            `json:"base_sha"`
+	Invariants          []string          `json:"invariants"`
+	NonGoals            []string          `json:"non_goals"`
+	PredecessorOutcomes []Outcome         `json:"predecessor_outcomes"`
+	Sources             []string          `json:"sources"`
 }
 
 // Source binds a repository-relative path to the SHA256 of its exact bytes.
@@ -66,42 +94,46 @@ type Outcome struct {
 // Capsule is the compact, self-verifying context supplied to a fresh task.
 // CapsuleSHA256 hashes the canonical JSON payload excluding that field.
 type Capsule struct {
-	PolicyVersion       string    `json:"policy_version"`
-	Project             string    `json:"project"`
-	Plan                string    `json:"plan"`
-	RoadmapPhase        string    `json:"roadmap_phase"`
-	ExecutionPack       string    `json:"execution_pack"`
-	Task                string    `json:"task"`
-	Repository          string    `json:"repository"`
-	BaseSHA             string    `json:"base_sha"`
-	Invariants          []string  `json:"invariants"`
-	NonGoals            []string  `json:"non_goals"`
-	PredecessorOutcomes []Outcome `json:"predecessor_outcomes"`
-	Sources             []Source  `json:"sources"`
-	CapsuleSHA256       string    `json:"capsule_sha256"`
+	PolicyVersion       string            `json:"policy_version"`
+	Project             string            `json:"project"`
+	Plan                string            `json:"plan"`
+	RoadmapPhase        string            `json:"roadmap_phase"`
+	ExecutionPack       string            `json:"execution_pack"`
+	Task                string            `json:"task"`
+	OperationContext    *OperationContext `json:"operation_context,omitempty"`
+	Repository          string            `json:"repository"`
+	BaseSHA             string            `json:"base_sha"`
+	Invariants          []string          `json:"invariants"`
+	NonGoals            []string          `json:"non_goals"`
+	PredecessorOutcomes []Outcome         `json:"predecessor_outcomes"`
+	Sources             []Source          `json:"sources"`
+	CapsuleSHA256       string            `json:"capsule_sha256"`
 }
 
 // Verification summarizes a successful fail-closed capsule verification.
 type Verification struct {
-	SHA256          string `json:"sha256,omitempty"`
-	CapsuleSHA256   string `json:"capsule_sha256"`
-	BaseSHA         string `json:"base_sha"`
-	SourcesVerified int    `json:"sources_verified"`
+	SHA256          string        `json:"sha256,omitempty"`
+	CapsuleSHA256   string        `json:"capsule_sha256"`
+	BaseSHA         string        `json:"base_sha"`
+	SourcesVerified int           `json:"sources_verified"`
+	PolicyVersion   string        `json:"policy_version"`
+	OperationKind   OperationKind `json:"operation_kind,omitempty"`
 }
 
 type payload struct {
-	PolicyVersion       string    `json:"policy_version"`
-	Project             string    `json:"project"`
-	Plan                string    `json:"plan"`
-	RoadmapPhase        string    `json:"roadmap_phase"`
-	ExecutionPack       string    `json:"execution_pack"`
-	Task                string    `json:"task"`
-	Repository          string    `json:"repository"`
-	BaseSHA             string    `json:"base_sha"`
-	Invariants          []string  `json:"invariants"`
-	NonGoals            []string  `json:"non_goals"`
-	PredecessorOutcomes []Outcome `json:"predecessor_outcomes"`
-	Sources             []Source  `json:"sources"`
+	PolicyVersion       string            `json:"policy_version"`
+	Project             string            `json:"project"`
+	Plan                string            `json:"plan"`
+	RoadmapPhase        string            `json:"roadmap_phase"`
+	ExecutionPack       string            `json:"execution_pack"`
+	Task                string            `json:"task"`
+	OperationContext    *OperationContext `json:"operation_context,omitempty"`
+	Repository          string            `json:"repository"`
+	BaseSHA             string            `json:"base_sha"`
+	Invariants          []string          `json:"invariants"`
+	NonGoals            []string          `json:"non_goals"`
+	PredecessorOutcomes []Outcome         `json:"predecessor_outcomes"`
+	Sources             []Source          `json:"sources"`
 }
 
 // Build resolves and hashes the explicit sources in spec and returns canonical
@@ -140,6 +172,7 @@ func Build(repository string, spec Spec) (Capsule, []byte, error) {
 		RoadmapPhase:        spec.RoadmapPhase,
 		ExecutionPack:       spec.ExecutionPack,
 		Task:                spec.Task,
+		OperationContext:    cloneOperationContext(spec.OperationContext),
 		Repository:          spec.Repository,
 		BaseSHA:             strings.ToLower(spec.BaseSHA),
 		Invariants:          append([]string{}, spec.Invariants...),
@@ -227,7 +260,16 @@ func Verify(repository string, capsule Capsule) (Verification, error) {
 			return Verification{}, fmt.Errorf("source %q SHA256 mismatch: expected %s, got %s", source.Path, source.SHA256, actual)
 		}
 	}
-	return Verification{CapsuleSHA256: capsule.CapsuleSHA256, BaseSHA: capsule.BaseSHA, SourcesVerified: len(capsule.Sources)}, nil
+	verified := Verification{
+		CapsuleSHA256:   capsule.CapsuleSHA256,
+		BaseSHA:         capsule.BaseSHA,
+		SourcesVerified: len(capsule.Sources),
+		PolicyVersion:   capsule.PolicyVersion,
+	}
+	if capsule.OperationContext != nil {
+		verified.OperationKind = capsule.OperationContext.Kind
+	}
+	return verified, nil
 }
 
 // VerifyFile parses and verifies a canonical capsule file. The capsule path
@@ -256,7 +298,22 @@ func VerifyFile(repository, capsulePath string) (Verification, error) {
 }
 
 func validateSpec(spec Spec) error {
-	if spec.PolicyVersion != PolicyVersion {
+	switch spec.PolicyVersion {
+	case PolicyVersionV1:
+		if spec.OperationContext != nil {
+			return errors.New("operation_context is not valid for context-capsule-v1")
+		}
+	case PolicyVersionV2:
+		if spec.OperationContext == nil {
+			return errors.New("operation_context is required for context-capsule-v2")
+		}
+		if err := validateOperationContext(*spec.OperationContext); err != nil {
+			return err
+		}
+		if spec.PredecessorOutcomes == nil {
+			return errors.New("predecessor_outcomes must be an explicit array for context-capsule-v2")
+		}
+	default:
 		return fmt.Errorf("unsupported context policy version %q", spec.PolicyVersion)
 	}
 	for _, field := range []struct {
@@ -316,7 +373,8 @@ func validateCapsule(capsule Capsule) error {
 	spec := Spec{
 		PolicyVersion: capsule.PolicyVersion, Project: capsule.Project, Plan: capsule.Plan,
 		RoadmapPhase: capsule.RoadmapPhase, ExecutionPack: capsule.ExecutionPack, Task: capsule.Task,
-		Repository: capsule.Repository, BaseSHA: capsule.BaseSHA, Invariants: capsule.Invariants,
+		OperationContext: capsule.OperationContext,
+		Repository:       capsule.Repository, BaseSHA: capsule.BaseSHA, Invariants: capsule.Invariants,
 		NonGoals: capsule.NonGoals, PredecessorOutcomes: capsule.PredecessorOutcomes,
 		Sources: make([]string, len(capsule.Sources)),
 	}
@@ -338,6 +396,33 @@ func validateCapsule(capsule Capsule) error {
 	}
 	if len(data) > MaxCapsuleBytes {
 		return fmt.Errorf("capsule is %d bytes; maximum is %d", len(data), MaxCapsuleBytes)
+	}
+	return nil
+}
+
+func validateOperationContext(operation OperationContext) error {
+	switch operation.Kind {
+	case OperationDesignPlanning, OperationDesignReview, OperationImplementation,
+		OperationImplementationReview, OperationAcceptance, OperationMergeAuthorization,
+		OperationDeployment, OperationRecovery, OperationMaintenance:
+	default:
+		return fmt.Errorf("unsupported operation kind %q", operation.Kind)
+	}
+	if len(operation.OwnedScope) == 0 || len(operation.OwnedScope) > MaxListItems {
+		return fmt.Errorf("operation_context.owned_scope count must be between 1 and %d", MaxListItems)
+	}
+	if len(operation.BlockingCriteria) == 0 || len(operation.BlockingCriteria) > MaxListItems {
+		return fmt.Errorf("operation_context.blocking_criteria count must be between 1 and %d", MaxListItems)
+	}
+	for index, item := range operation.OwnedScope {
+		if err := validateText(fmt.Sprintf("operation_context.owned_scope[%d]", index), item); err != nil {
+			return err
+		}
+	}
+	for index, item := range operation.BlockingCriteria {
+		if err := validateText(fmt.Sprintf("operation_context.blocking_criteria[%d]", index), item); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -525,7 +610,8 @@ func payloadHash(capsule Capsule) (string, error) {
 	data, err := json.Marshal(payload{
 		PolicyVersion: capsule.PolicyVersion, Project: capsule.Project, Plan: capsule.Plan,
 		RoadmapPhase: capsule.RoadmapPhase, ExecutionPack: capsule.ExecutionPack, Task: capsule.Task,
-		Repository: capsule.Repository, BaseSHA: capsule.BaseSHA, Invariants: capsule.Invariants,
+		OperationContext: capsule.OperationContext,
+		Repository:       capsule.Repository, BaseSHA: capsule.BaseSHA, Invariants: capsule.Invariants,
 		NonGoals: capsule.NonGoals, PredecessorOutcomes: capsule.PredecessorOutcomes, Sources: capsule.Sources,
 	})
 	if err != nil {
@@ -533,6 +619,16 @@ func payloadHash(capsule Capsule) (string, error) {
 	}
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+func cloneOperationContext(operation *OperationContext) *OperationContext {
+	if operation == nil {
+		return nil
+	}
+	clone := *operation
+	clone.OwnedScope = append([]string{}, operation.OwnedScope...)
+	clone.BlockingCriteria = append([]string{}, operation.BlockingCriteria...)
+	return &clone
 }
 
 func gitOutput(repository string, args ...string) (string, error) {
