@@ -1,27 +1,56 @@
 # Implementation Progress
 
-Updated: 2026-09-08
+Updated: 2026-09-09
 
-| Phase | Status | Evidence |
+Operational role: this file projects roadmap and subtrack progress plus the next authorized action. It must be consulted before planning or starting an operation and reconciled at accepted, reviewed, and merged lifecycle boundaries. It is not completion authority; immutable controller and Git evidence remain authoritative.
+
+## Roadmap
+
+| Phase | Status | Evidence and current boundary |
 |---|---|---|
 | Phase 0 — Foundation | COMPLETE | EP-001 merged |
 | Phase 1 — Governed single-plan execution | COMPLETE | PR #4 merged |
 | Phase 2 — Recovery and blocker control | COMPLETE | PR #5 merged |
 | Phase 3 — Cross-plan scheduler and integration | COMPLETE | PR #6 merged at `94e14ca749d31ac214e979aab03fbde37502dd7f` |
-| Phase 4 — GitHub lifecycle | IN PROGRESS | Foundation PR #7; exact-head PR lifecycle PR #8 merged at `ccf75d093625119cc39944fe7a47c3a03b30ad3b`; tracking PR #9 merged; CI evidence-ingestion design correction active |
-| Phase 5 — Service/API/dashboard | NOT STARTED | roadmap only |
-| Phase 6 — Production hardening | NOT STARTED | roadmap only |
+| Phase 4 — GitHub lifecycle | IN PROGRESS | Foundation PR #7 and exact-head PR lifecycle PR #8 merged; CI evidence ingestion has Tasks 1–2 implemented but not accepted/reviewed/merged |
+| Phase 5 — Service/API/dashboard | NOT STARTED | Roadmap only |
+| Phase 6 — Production hardening | NOT STARTED | Roadmap only |
 
-## Current
+## Phase 4 subtracks
 
-EP-005 PR lifecycle is merged in PR #8. Final reviewed/accepted head: `6db075240ce87b751f8db98abb540c96410c515b`; merge SHA: `ccf75d093625119cc39944fe7a47c3a03b30ad3b`. Final post-implementation controller fallback review (Claude provider session-limit fallback) returned `CLEAN_CRITICAL_MAJOR` with 0 Critical + 0 Major; artifact SHA-256 `e34a632e290930bbfcccfbd4326d5aeab1b1d8012285d67a122a87b55d8196c5`.
+| Subtrack | Status | Exact checkpoint | Next action |
+|---|---|---|---|
+| GitHub lifecycle foundation | MERGED | PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f` | Preserve frozen behavior |
+| Exact-head PR lifecycle | MERGED | Accepted/reviewed head `6db075240ce87b751f8db98abb540c96410c515b`; PR #8 merge `ccf75d093625119cc39944fe7a47c3a03b30ad3b` | Preserve frozen behavior |
+| CI evidence-ingestion design | ACCEPTED | Design SHA-256 `47a6d7b1d4c93a853a26e4da3753894dedacfce930345c610cf24a4236b2b409`; 0C/0M review `aa5d86471ffcfe1d68eff9c49ef5b2df718355c0b4c825716d35d68217b3fa45` | Keep implementation within neutral read-only collection semantics |
+| CI Task 1 — contract and bounds | IMPLEMENTED, NOT ACCEPTED | `e1740f4be8df06571a3299c3fb31ecc31b0a1aea` | Retain as predecessor checkpoint |
+| CI Task 2 — bounded reads and stabilization | IMPLEMENTED, NOT ACCEPTED | `da8ffea4582539067724b363b3144d9601dee086` | Run deterministic acceptance and governedly reconcile the branch/plan with current merged policy |
+| CI Task 3 — immutable evidence, ledger, replay | BLOCKED PENDING ELIGIBLE PREDECESSOR | No Task 3 implementation commit; no eligible predecessor established | Wait for Task 2 acceptance/current-policy reconciliation, then use the resulting verified eligible checkpoint for a fresh Task-3-only plan/capsule |
+| CI Task 4 — acceptance and review handoff | WAITING | No implementation checkpoint | Begin only after Task 3 completes under a separate fresh operation |
+| Merge approval and expected-head protection | NOT STARTED | Roadmap only | Wait for accepted/reviewed/merged CI subtrack |
+| Serial post-merge acceptance | NOT STARTED | Roadmap only | Follow merge protection in roadmap order |
 
-The next Phase-4 track is **CI evidence ingestion** on branch `ep-005-ci-ingestion`, based exactly on merged `main` SHA `ccf75d093625119cc39944fe7a47c3a03b30ad3b`. Claude's initial design was frozen at SHA-256 `d90099eeab3af74ea5dd25f50b7e87f920f7cb47eb523e4e7112882dc0524276`; independent Codex review returned `DESIGN_FINDINGS` with 1 Critical and 10 enumerated Major findings, artifact SHA-256 `659174158aecc5a690663f79e8a2b567a459b77af0cf08042d37cdfb6db265f3`. No implementation has started.
+The prior CI launch correctly failed closed at the Task 3 handoff: its capsule was bound to Task 2's start SHA `e1740f4be8df06571a3299c3fb31ecc31b0a1aea`, while Task 2 committed a new HEAD `da8ffea4582539067724b363b3144d9601dee086`. Task completion cannot silently extend the old capsule across that commit boundary. The Task 2 commit is also unaccepted and predates merged PR #11 policy, so it is not an authorized Task 3 base and must not be presented as one.
 
-## Next
+## Cross-cutting operational governance
 
-Re-scope the CI-ingestion design to the exact roadmap bullet: bounded, stable, immutable CI/check evidence collection tied to the exact candidate head SHA. Keep merge approval policy and merge authorization in the following Phase-4 track; do not import PR-write-style replay/admission semantics unless read-only evidence integrity demonstrably requires them. Correct all in-scope Critical/Major findings, then run a fresh independent Critical/Major design gate before creating implementation authority/context. Only after a 0 Critical + 0 Major design verdict may ABCP/Ralphex implementation begin.
+| Track | Status | Exact checkpoint | Next action |
+|---|---|---|---|
+| Context-bound autonomous operations | MERGED | Candidate `84c6a8ee4b6d6a315eeaa1e7de17fbf5f94a1dec` accepted and reviewed 0C/0M; PR #11 merge `454ea4dce3c674e0d8e55273319cfb4ea4a077a5` | Enforce the v2 capsule/authority boundary for every new operation |
+| Automatic operation handoff | DESIGN DRAFT, NOT GATED | Separate worktree at base `454ea4dce3c674e0d8e55273319cfb4ea4a077a5`; draft files are uncommitted | Freeze exact design artifacts, run the design gate, then create implementation authority only after a clean decision |
+| Operational state projections | PRIOR CANDIDATE ACCEPTED; REVIEW CORRECTIONS ACTIVE | `51a2e84c4ff412aaedb7d352bd2b33781992f4ab` passed deterministic acceptance; exact-head review reported 0C/2M in artifact `ce7c7088a0468104392bd040ee5835e24cba1d35285b0c05606d512e93904638`; correction base `5ad4304eee996697efedf909a61bbb2cdcdc2f2a` | Correct predecessor eligibility and cutoff semantics without changing the accepted/reviewed candidate |
 
-## Remaining after Phase 4
+Automatic handoff is independent of EP-005 deliverable semantics. It may automate future controller transitions, but it does not authorize CI Task 3 and must not import or redefine CI collection, merge-policy, or post-merge behavior.
 
-After exact-head PR lifecycle acceptance/review/merge, continue Phase 4 in roadmap order: CI evidence ingestion, merge approval/expected-head protection, then serial post-merge acceptance. Service/API/dashboard and production hardening remain deferred to Phases 5–6.
+## Next authorized actions
+
+1. For EP-005 CI, perform deterministic Task 2 acceptance and a governed reconciliation of the CI branch and plan with current merged policy. `da8ffea4582539067724b363b3144d9601dee086` remains only an implementation checkpoint, not advance authority.
+2. Verify the resulting checkpoint is an eligible Task 3 predecessor. Only then establish a separate Task 3 operation with a Task-3-only executable plan and a newly verified v2 capsule/authority at that exact, then-known base.
+3. After the final CI implementation head, produce deterministic controller acceptance and obtain a fresh exact-head 0 Critical/0 Major implementation review before publication.
+4. Independently, freeze and review the automatic-handoff design. Do not make its draft status a substitute for the manual fresh-authority steps above.
+
+## Projection materialization rule
+
+This candidate's immutable-evidence cutoff is the projection-correction authority at base `5ad4304eee996697efedf909a61bbb2cdcdc2f2a`, including the acceptance and exact-head review evidence for `51a2e84c4ff412aaedb7d352bd2b33781992f4ab`. It materializes all required evidence through that cutoff. Its own acceptance, review, or merge necessarily occurs after its bytes are frozen and must not be written back into this accepted/reviewed candidate.
+
+Acceptance, review, and merge evidence is authoritative immediately in immutable evidence. The next separately governed projection reconciliation materializes events after the prior cutoff; this expected bounded lag is not itself a contradiction. Before any non-reconciliation governed operation, all three projections must be reconciled through the latest relevant predecessor boundary, and any stale-through-boundary or contradictory projection blocks planning. Purpose-specific projection reconciliation is the explicit exception allowed to repair the lag under fresh exact-base authority while preserving accepted/reviewed candidate bytes.
