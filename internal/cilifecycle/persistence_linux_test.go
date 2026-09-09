@@ -856,6 +856,90 @@ func TestMaterialLedgerRollsBackAppendFailures(t *testing.T) {
 	}
 }
 
+func TestMaterialLedgerRollbackSerializesOrdinaryAppend(t *testing.T) {
+	material, path := newTestMaterialLedger(t)
+	ordinaryLedger, err := ledger.NewJSONLLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciEvent, ciCanonical := testMaterialRecord(t, 15)
+	ordinaryEvent, err := ledger.NewEvent("ordinary-run", "ORDINARY_EVENT", "controller", "unit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	injected := errors.New("injected ambiguous partial CI append")
+	partialWritten := make(chan struct{})
+	releaseCI := make(chan struct{})
+	material.writeLine = func(file *os.File, data []byte) (int, error) {
+		n, writeErr := file.Write(data[:len(data)/2])
+		close(partialWritten)
+		<-releaseCI
+		return n, errors.Join(injected, writeErr)
+	}
+	ciDone := make(chan error, 1)
+	go func() { ciDone <- material.record(ciEvent, ciCanonical) }()
+	<-partialWritten
+
+	appendStarted := make(chan struct{})
+	appendDone := make(chan error, 1)
+	go func() {
+		close(appendStarted)
+		appendDone <- ordinaryLedger.Append(ordinaryEvent)
+	}()
+	<-appendStarted
+
+	var earlyAppendErr error
+	appendCompletedEarly := false
+	select {
+	case earlyAppendErr = <-appendDone:
+		appendCompletedEarly = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(releaseCI)
+	ciErr := <-ciDone
+	if ciErr == nil || !errors.Is(ciErr, injected) {
+		t.Fatalf("partial CI append was not rolled back as a failure: %v", ciErr)
+	}
+	if appendCompletedEarly {
+		t.Fatalf("ordinary append escaped the CI ledger transaction: %v", earlyAppendErr)
+	}
+	select {
+	case err = <-appendDone:
+		if err != nil {
+			t.Fatalf("serialized ordinary append failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ordinary append did not resume after CI rollback")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Count(data, []byte{'\n'}) != 1 || data[len(data)-1] != '\n' {
+		t.Fatalf("ledger is not one bounded canonical line after rollback: %q", data)
+	}
+	line := bytes.TrimSuffix(data, []byte{'\n'})
+	var observed ledger.Event
+	if err := json.Unmarshal(line, &observed); err != nil {
+		t.Fatalf("ordinary event is not valid JSON: %v", err)
+	}
+	reencoded, err := json.Marshal(observed)
+	if err != nil || !bytes.Equal(reencoded, line) || observed.EventID != ordinaryEvent.EventID {
+		t.Fatalf("ordinary event was lost or made noncanonical: event=%#v error=%v", observed, err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	_, foundCI, snapshot, scanErr := scanMaterialLedger(file, ciEvent.EventID, material.maxBytes, material.maxLines)
+	if scanErr != nil || foundCI || snapshot.lines != 1 || snapshot.bytes != int64(len(data)) || snapshot.bytes > material.maxBytes {
+		t.Fatalf("ledger did not remain canonical and bounded: found_ci=%t snapshot=%+v error=%v", foundCI, snapshot, scanErr)
+	}
+}
+
 func TestMaterialLedgerFsyncFailureRequiresSuccessfulRetry(t *testing.T) {
 	material, path := newTestMaterialLedger(t)
 	event, canonical := testMaterialRecord(t, 20)
