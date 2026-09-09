@@ -26,6 +26,8 @@ type artifactBoundary struct {
 	runDirFile *os.File
 	rootID     ciFileID
 	runDirID   ciFileID
+	syncFile   func(*os.File) error
+	syncDir    func(*os.File) error
 }
 
 func newArtifactBoundary(store ArtifactStore) (*artifactBoundary, error) {
@@ -52,6 +54,8 @@ func newArtifactBoundary(store ArtifactStore) (*artifactBoundary, error) {
 	return &artifactBoundary{
 		store: store, rootPath: store.Root(), runPath: store.RunDir(), boundRunID: store.RunID(),
 		rootDir: rootDir, runDirFile: runDir, rootID: rootID, runDirID: runID,
+		syncFile: func(file *os.File) error { return file.Sync() },
+		syncDir:  func(file *os.File) error { return file.Sync() },
 	}, nil
 }
 
@@ -157,6 +161,46 @@ func (b *artifactBoundary) readExisting(name, kind string, maximum int) ([]byte,
 		return nil, ledger.EvidenceRef{}, false, fmt.Errorf("verify deterministic evidence: %w", err)
 	}
 	return verified, ref, true, nil
+}
+
+func (b *artifactBoundary) stabilize(name string) error {
+	if err := validBundleArtifactName(name); err != nil {
+		return err
+	}
+	if err := b.verify(); err != nil {
+		return err
+	}
+	file, id, err := openCIAt(b.runDirFile, name, syscall.O_RDONLY|syscall.O_NONBLOCK, false, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := b.syncFile(file); err != nil {
+		return fmt.Errorf("sync deterministic evidence file: %w", err)
+	}
+	resolved, resolvedID, err := openCIAt(b.runDirFile, name, syscall.O_RDONLY|syscall.O_NONBLOCK, false, 0o600)
+	if err != nil {
+		return err
+	}
+	_ = resolved.Close()
+	if resolvedID != id {
+		return errors.New("deterministic evidence path was replaced during sync")
+	}
+	if err := b.syncDir(b.runDirFile); err != nil {
+		return fmt.Errorf("sync deterministic evidence directory: %w", err)
+	}
+	if err := b.verify(); err != nil {
+		return err
+	}
+	resolved, resolvedID, err = openCIAt(b.runDirFile, name, syscall.O_RDONLY|syscall.O_NONBLOCK, false, 0o600)
+	if err != nil {
+		return err
+	}
+	_ = resolved.Close()
+	if resolvedID != id {
+		return errors.New("deterministic evidence path changed after directory sync")
+	}
+	return nil
 }
 
 type artifactSnapshot struct {

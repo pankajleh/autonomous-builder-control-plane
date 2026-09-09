@@ -50,6 +50,7 @@ func (*artifactBoundary) readVerified(string, ledger.EvidenceRef, int) ([]byte, 
 func (*artifactBoundary) readExisting(string, string, int) ([]byte, ledger.EvidenceRef, bool, error) {
 	return nil, ledger.EvidenceRef{}, false, errUnsupportedCIDurability
 }
+func (*artifactBoundary) stabilize(string) error { return errUnsupportedCIDurability }
 
 type materialLedger struct{}
 

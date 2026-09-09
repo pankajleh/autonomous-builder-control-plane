@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
@@ -121,7 +122,7 @@ func (c *Controller) Collect(ctx context.Context, request CollectRequest) (CIEvi
 		}
 	}
 	if lease.created && found {
-		return CIEvidenceBundleV1{}, integrityError("event_missing_reservation", nil)
+		return CIEvidenceBundleV1{}, integrityError("event_missing_reservation", lease.poison())
 	}
 	if found {
 		return c.replay(request, identity, observed)
@@ -133,7 +134,7 @@ func (c *Controller) Collect(ctx context.Context, request CollectRequest) (CIEvi
 	}
 	if artifactFound {
 		if lease.created {
-			return CIEvidenceBundleV1{}, integrityError("bundle_missing_reservation", nil)
+			return CIEvidenceBundleV1{}, integrityError("bundle_missing_reservation", lease.poison())
 		}
 		if err := c.completeEvent(bundle, ref); err != nil {
 			return CIEvidenceBundleV1{}, integrityError("ledger_completion_failed", err)
@@ -196,6 +197,13 @@ func (c *Controller) readAttemptBundle(request CollectRequest, identity attemptI
 	if err != nil || !found {
 		return CIEvidenceBundleV1{}, ledger.EvidenceRef{}, found, err
 	}
+	if err := c.artifacts.stabilize(name); err != nil {
+		return CIEvidenceBundleV1{}, ledger.EvidenceRef{}, true, err
+	}
+	data, err = c.artifacts.readVerified(name, ref, MaxBundleBytes)
+	if err != nil {
+		return CIEvidenceBundleV1{}, ledger.EvidenceRef{}, true, err
+	}
 	bundle, err := ReadCIEvidenceBundleV1(data)
 	if err != nil || !bytes.Equal(data, bundle.CanonicalJSON()) {
 		return CIEvidenceBundleV1{}, ledger.EvidenceRef{}, true, errors.New("deterministic bundle is malformed or noncanonical")
@@ -218,6 +226,12 @@ func (c *Controller) publishOrVerify(bundle CIEvidenceBundleV1) (ledger.Evidence
 	}
 	if writeErr == nil && written != expected {
 		return ledger.EvidenceRef{}, errors.New("evidence store returned a conflicting reference")
+	}
+	if writeErr != nil && !errors.Is(writeErr, evidence.ErrArtifactExists) {
+		return ledger.EvidenceRef{}, writeErr
+	}
+	if err := c.artifacts.stabilize(name); err != nil {
+		return ledger.EvidenceRef{}, errors.Join(writeErr, err)
 	}
 	verified, readErr := c.artifacts.readVerified(name, expected, MaxBundleBytes)
 	if readErr != nil {

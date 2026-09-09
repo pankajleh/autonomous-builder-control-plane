@@ -45,6 +45,7 @@ type attemptStore struct {
 	limits     attemptLimits
 	syncFile   func(*os.File) error
 	syncDir    func(*os.File) error
+	readDir    func(*os.File, int) ([]os.DirEntry, error)
 }
 
 type attemptLease struct {
@@ -53,7 +54,8 @@ type attemptLease struct {
 	fileID      ciFileID
 	name        string
 	expected    []byte
-	local       *sync.Mutex
+	lockKey     string
+	local       *processAttemptLock
 	capacity    *os.File
 	created     bool
 	needsRepair bool
@@ -66,7 +68,52 @@ type attemptInventory struct {
 	byRun      map[string]int
 }
 
-var processAttemptLocks sync.Map
+type processAttemptLock struct {
+	mutex sync.Mutex
+	refs  int
+}
+
+var processAttemptLocks = struct {
+	sync.Mutex
+	entries map[string]*processAttemptLock
+}{entries: make(map[string]*processAttemptLock)}
+
+func tryProcessAttemptLock(key string) (*processAttemptLock, error) {
+	processAttemptLocks.Lock()
+	local := processAttemptLocks.entries[key]
+	if local == nil {
+		local = &processAttemptLock{}
+		processAttemptLocks.entries[key] = local
+	}
+	local.refs++
+	processAttemptLocks.Unlock()
+	if local.mutex.TryLock() {
+		return local, nil
+	}
+	releaseProcessAttemptLock(key, local, false)
+	return nil, errors.New("CI attempt is busy in this process")
+}
+
+func releaseProcessAttemptLock(key string, local *processAttemptLock, held bool) {
+	if local == nil {
+		return
+	}
+	if held {
+		local.mutex.Unlock()
+	}
+	processAttemptLocks.Lock()
+	local.refs--
+	if local.refs == 0 && processAttemptLocks.entries[key] == local {
+		delete(processAttemptLocks.entries, key)
+	}
+	processAttemptLocks.Unlock()
+}
+
+func processAttemptLockCount() int {
+	processAttemptLocks.Lock()
+	defer processAttemptLocks.Unlock()
+	return len(processAttemptLocks.entries)
+}
 
 func newAttemptStore(root string, limits attemptLimits) (*attemptStore, error) {
 	if !limits.valid() || !filepath.IsAbs(root) || filepath.Clean(root) != root {
@@ -90,6 +137,7 @@ func newAttemptStore(root string, limits attemptLimits) (*attemptStore, error) {
 		root: root, rootDir: rootDir, rootID: rootID, capacityID: capacityID, limits: limits,
 		syncFile: func(file *os.File) error { return file.Sync() },
 		syncDir:  func(file *os.File) error { return file.Sync() },
+		readDir:  func(directory *os.File, count int) ([]os.DirEntry, error) { return directory.ReadDir(count) },
 	}
 	if err := store.checkRoot(); err != nil {
 		_ = rootDir.Close()
@@ -117,13 +165,12 @@ func (s *attemptStore) acquire(reservation attemptReservationV1) (*attemptLease,
 	}
 	name := attemptReservationFilename(reservation.AttemptKeySHA256)
 	lockKey := fmt.Sprintf("%d:%d\x00%s", s.rootID.device, s.rootID.inode, name)
-	value, _ := processAttemptLocks.LoadOrStore(lockKey, &sync.Mutex{})
-	local := value.(*sync.Mutex)
-	if !local.TryLock() {
-		return nil, errors.New("CI attempt is busy in this process")
+	local, err := tryProcessAttemptLock(lockKey)
+	if err != nil {
+		return nil, err
 	}
 	fail := func(err error) (*attemptLease, error) {
-		local.Unlock()
+		releaseProcessAttemptLock(lockKey, local, true)
 		return nil, err
 	}
 
@@ -152,7 +199,7 @@ func (s *attemptStore) acquire(reservation attemptReservationV1) (*attemptLease,
 			releaseCapacity()
 			return fail(fmt.Errorf("acquire existing attempt lock: %w", err))
 		}
-		lease := &attemptLease{store: s, file: file, fileID: fileID, name: name, expected: expected, local: local, capacity: capacity}
+		lease := &attemptLease{store: s, file: file, fileID: fileID, name: name, expected: expected, lockKey: lockKey, local: local, capacity: capacity}
 		if err := lease.verifyNamedFile(); err != nil {
 			lease.close()
 			return nil, err
@@ -164,6 +211,23 @@ func (s *attemptStore) acquire(reservation attemptReservationV1) (*attemptLease,
 		}
 		switch {
 		case bytes.Equal(data, expected):
+			if err := s.syncFile(file); err != nil {
+				lease.close()
+				return nil, fmt.Errorf("sync existing CI attempt reservation: %w", err)
+			}
+			if err := s.syncDir(s.rootDir); err != nil {
+				lease.close()
+				return nil, fmt.Errorf("sync existing CI attempt root: %w", err)
+			}
+			if err := lease.verifyNamedFile(); err != nil {
+				lease.close()
+				return nil, err
+			}
+			confirmed, err := readBoundedFile(file, MaxReservationBytes)
+			if err != nil || !bytes.Equal(confirmed, expected) {
+				lease.close()
+				return nil, errors.New("existing CI attempt reservation changed during persistence")
+			}
 			lease.releaseCapacity()
 			return lease, nil
 		case len(data) < len(expected) && bytes.Equal(data, expected[:len(data)]):
@@ -210,7 +274,7 @@ func (s *attemptStore) acquire(reservation attemptReservationV1) (*attemptLease,
 		releaseCapacity()
 		return fail(err)
 	}
-	lease := &attemptLease{store: s, file: file, fileID: fileID, name: name, expected: expected, local: local, capacity: capacity, created: true}
+	lease := &attemptLease{store: s, file: file, fileID: fileID, name: name, expected: expected, lockKey: lockKey, local: local, capacity: capacity, created: true}
 	if err := writeFullCI(file, expected); err != nil {
 		lease.close()
 		return nil, err
@@ -262,6 +326,38 @@ func (l *attemptLease) repair() error {
 	return nil
 }
 
+func (l *attemptLease) poison() error {
+	if l == nil || l.closed || !l.created || len(l.expected) == 0 {
+		return errors.New("CI attempt reservation cannot be poisoned")
+	}
+	if err := l.verifyNamedFile(); err != nil {
+		return err
+	}
+	data, err := readBoundedFile(l.file, MaxReservationBytes)
+	if err != nil || !bytes.Equal(data, l.expected) {
+		return errors.New("CI attempt reservation changed before conflict poisoning")
+	}
+	n, writeErr := l.file.WriteAt([]byte{'!'}, 0)
+	if writeErr != nil || n != 1 {
+		return errors.Join(errors.New("poison CI attempt reservation"), writeErr)
+	}
+	if err := l.store.syncFile(l.file); err != nil {
+		return fmt.Errorf("sync poisoned CI attempt reservation: %w", err)
+	}
+	if err := l.store.syncDir(l.store.rootDir); err != nil {
+		return fmt.Errorf("sync poisoned CI attempt root: %w", err)
+	}
+	if err := l.verifyNamedFile(); err != nil {
+		return err
+	}
+	poisoned, err := readBoundedFile(l.file, MaxReservationBytes)
+	if err != nil || len(poisoned) != len(l.expected) || bytes.Equal(poisoned, l.expected) ||
+		(len(poisoned) < len(l.expected) && bytes.Equal(poisoned, l.expected[:len(poisoned)])) {
+		return errors.New("poisoned CI attempt reservation did not verify")
+	}
+	return nil
+}
+
 func (l *attemptLease) verifyNamedFile() error {
 	resolved, id, err := openCIAt(l.store.rootDir, l.name, syscall.O_RDWR|syscall.O_NONBLOCK, false, 0o600)
 	if err != nil {
@@ -293,7 +389,8 @@ func (l *attemptLease) close() error {
 		closeErr = l.file.Close()
 	}
 	if l.local != nil {
-		l.local.Unlock()
+		releaseProcessAttemptLock(l.lockKey, l.local, true)
+		l.local = nil
 	}
 	return errors.Join(unlockErr, closeErr)
 }
@@ -305,10 +402,16 @@ func (s *attemptStore) inventory() (attemptInventory, error) {
 		return result, err
 	}
 	directory := os.NewFile(uintptr(directoryFD), s.root)
-	entries, err := directory.ReadDir(-1)
+	// capacity.lock plus maxGlobal reservations are the only admissible entries.
+	// Read one additional sentinel so a contaminated directory is rejected
+	// without first allocating its complete contents.
+	entries, err := s.readDir(directory, s.limits.maxGlobal+2)
 	_ = directory.Close()
 	if err != nil {
 		return result, err
+	}
+	if len(entries) == s.limits.maxGlobal+2 {
+		return result, errors.New("CI attempt-root inventory exceeds its bound")
 	}
 	seenCapacity := false
 	for _, entry := range entries {

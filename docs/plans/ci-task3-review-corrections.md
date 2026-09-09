@@ -10,15 +10,15 @@ Correct only M-001 through M-005 at their root causes while preserving Task 3's 
 
 ### Task 1: Close M-001 through M-005
 
-- [ ] Before code changes, independently verify the launch-authority v2 capsule and exact base SHA; stop on any mismatch.
-- [ ] M-001: make pre-positioned event/bundle material remain fail-closed when discovered around a newly created reservation; a retry must never convert that failed first encounter into historical proof. Add regression tests proving repeated retries cannot promote pre-positioned material.
-- [ ] M-002: make deterministic evidence publication durably end with exactly one verified final link/path; temporary-link removal must be checked and directory-synced, and read-back must not convert failed durability into success. Add crash/fault tests around link, unlink, final-file sync, and directory sync.
-- [ ] M-003: make authoritative outcome append a serialized bounded transaction: check projected bytes/lines before append, handle owned partial-tail writes safely, and require successful fsync before success. Readability/page-cache confirmation must not mask append/fsync failure. Add boundary, partial-write, append-error, fsync-error, and concurrency tests.
-- [ ] M-004: before accepting an existing exact reservation after a prior persistence failure, successfully sync the reservation and pinned directory and revalidate named inode + canonical bytes. Add file-sync and directory-sync retry tests.
-- [ ] M-005: make allocator inventory bounded before allocation (configured limit plus sentinel only), and lifecycle/refcount process-local keyed locks so inactive keys are removed safely. Add contaminated-directory and repeated-unique-attempt memory/lifecycle tests.
-- [ ] Preserve exact Task-3 evidence semantics: immutable/create-or-verify artifacts, deterministic attempt/bundle identity, same-attempt recovery, exact zero-network replay, empty event transition fields, bounded local state, and no merge-policy semantics.
-- [ ] Run focused unit/race tests for `internal/cilifecycle`, supporting `internal/evidence`/`internal/ledger` tests, full repository tests/vet/smoke, frozen-policy checks, forbidden-semantics checks, and `git diff --check`.
-- [ ] Commit one correction feature commit with all five findings closed; leave Task 4 non-executable.
+- [x] Before code changes, independently verify the launch-authority v2 capsule and exact base SHA; stop on any mismatch.
+- [x] M-001: make pre-positioned event/bundle material remain fail-closed when discovered around a newly created reservation; a retry must never convert that failed first encounter into historical proof. Add regression tests proving repeated retries cannot promote pre-positioned material.
+- [x] M-002: make deterministic evidence publication durably end with exactly one verified final link/path; temporary-link removal must be checked and directory-synced, and read-back must not convert failed durability into success. Add crash/fault tests around link, unlink, final-file sync, and directory sync.
+- [x] M-003: make authoritative outcome append a serialized bounded transaction: check projected bytes/lines before append, handle owned partial-tail writes safely, and require successful fsync before success. Readability/page-cache confirmation must not mask append/fsync failure. Add boundary, partial-write, append-error, fsync-error, and concurrency tests.
+- [x] M-004: before accepting an existing exact reservation after a prior persistence failure, successfully sync the reservation and pinned directory and revalidate named inode + canonical bytes. Add file-sync and directory-sync retry tests.
+- [x] M-005: make allocator inventory bounded before allocation (configured limit plus sentinel only), and lifecycle/refcount process-local keyed locks so inactive keys are removed safely. Add contaminated-directory and repeated-unique-attempt memory/lifecycle tests.
+- [x] Preserve exact Task-3 evidence semantics: immutable/create-or-verify artifacts, deterministic attempt/bundle identity, same-attempt recovery, exact zero-network replay, empty event transition fields, bounded local state, and no merge-policy semantics.
+- [x] Run focused unit/race tests for `internal/cilifecycle`, supporting `internal/evidence`/`internal/ledger` tests, full repository tests/vet/smoke, frozen-policy checks, forbidden-semantics checks, and `git diff --check`.
+- [x] Commit one correction feature commit with all five findings closed; leave Task 4 non-executable.
 
 ## Required correction evidence
 
