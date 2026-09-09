@@ -652,6 +652,102 @@ func TestTextLinkRequestAndClockCaps(t *testing.T) {
 	}
 }
 
+func TestRepeatedResponseHeaderValuesAreBoundedAndUnambiguous(t *testing.T) {
+	clock := newIncrementingClock()
+	spec := requestSpec{phase: "principal", pathTemplate: "/user", escapedPath: "/user"}
+
+	for _, test := range []struct {
+		name   string
+		values []string
+		failed bool
+	}{
+		{name: "aggregate-exact-limit", values: []string{"1234", "5678"}},
+		{name: "aggregate-limit-plus-one", values: []string{"1234", "56789"}, failed: true},
+	} {
+		t.Run("link-"+test.name, func(t *testing.T) {
+			limits := productionLimits()
+			limits.maxLinkBytes = 8
+			header := http.Header{"Link": append([]string(nil), test.values...)}
+			adapter, err := newGitHubAdapter(responseTransport([]byte(`{}`), header), sealedTestAuth, "https://example.invalid", limits, clock.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, failure := (&requestSession{adapter: adapter}).get(context.Background(), spec)
+			if test.failed {
+				if failure == nil || failure.outcome != OutcomeTruncated || failure.code != "link_header_too_large" {
+					t.Fatalf("aggregate Link failure=%#v", failure)
+				}
+			} else if failure != nil {
+				t.Fatalf("exact aggregate Link limit failed: %#v", failure)
+			}
+		})
+	}
+
+	limits := productionLimits()
+	header := http.Header{"X-Github-Request-Id": []string{"request-one", "request-two"}}
+	adapter, err := newGitHubAdapter(responseTransport([]byte(`{}`), header), sealedTestAuth, "https://example.invalid", limits, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &requestSession{adapter: adapter}
+	_, failed := session.get(context.Background(), spec)
+	if failed == nil || failed.outcome != OutcomeIntegrityFailure || failed.code != "request_id_ambiguous" {
+		t.Fatalf("repeated request ID failure=%#v", failed)
+	}
+	if len(session.provenance) != 1 || session.provenance[0].Input().RequestID != "" {
+		t.Fatalf("ambiguous request ID entered provenance: %#v", session.provenance)
+	}
+}
+
+func TestLaterRepeatedLinkValueDrivesEveryPaginator(t *testing.T) {
+	link := http.Header{"Link": []string{
+		`<https://example.invalid/previous>; rel="prev"`,
+		`<https://example.invalid/next>; rel="next"`,
+	}}
+	head := strings.Repeat("a", 40)
+	tests := []struct {
+		name string
+		body string
+		code string
+		run  func(*requestSession) *collectionFailure
+	}{
+		{
+			name: "check-suites", body: `{"total_count":0,"check_suites":[]}`, code: "suite_next_beyond_total",
+			run: func(session *requestSession) *collectionFailure {
+				_, _, failed := session.suites(context.Background(), "o", "r", head, "suites_a")
+				return failed
+			},
+		},
+		{
+			name: "check-runs", body: `{"total_count":0,"check_runs":[]}`, code: "run_next_beyond_total",
+			run: func(session *requestSession) *collectionFailure {
+				_, _, failed := session.runs(context.Background(), "o", "r", head, "runs_a")
+				return failed
+			},
+		},
+		{
+			name: "commit-statuses", body: `[]`, code: "status_sentinel_not_empty",
+			run: func(session *requestSession) *collectionFailure {
+				_, failed := session.statuses(context.Background(), "o", "r", head, "statuses_a")
+				return failed
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newIncrementingClock()
+			adapter, err := newGitHubAdapter(responseTransport([]byte(test.body), link), sealedTestAuth, "https://example.invalid", productionLimits(), clock.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failed := test.run(&requestSession{adapter: adapter})
+			if failed == nil || failed.code != test.code {
+				t.Fatalf("later repeated Link value was ignored: failure=%#v", failed)
+			}
+		})
+	}
+}
+
 func TestSealedAuthenticatorRejectsRequestMutationBeforeNetwork(t *testing.T) {
 	mutations := map[string]func(*http.Request){
 		"method":         func(r *http.Request) { r.Method = "POST" },

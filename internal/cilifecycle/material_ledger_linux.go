@@ -12,24 +12,24 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
 
 type materialLedger struct {
-	path        string
-	parentPath  string
-	base        string
-	parentDir   *os.File
-	parentID    ciFileID
-	parentPerm  os.FileMode
-	syncFile    func(*os.File) error
-	syncDir     func(*os.File) error
-	writeLine   func(*os.File, []byte) (int, error)
-	appendFault func(string) error
-	maxBytes    int64
-	maxLines    int
+	authoritative *ledger.JSONLLedger
+	path          string
+	parentPath    string
+	base          string
+	parentDir     *os.File
+	parentID      ciFileID
+	parentPerm    os.FileMode
+	syncFile      func(*os.File) error
+	syncDir       func(*os.File) error
+	writeLine     func(*os.File, []byte) (int, error)
+	appendFault   func(string) error
+	maxBytes      int64
+	maxLines      int
 }
 
 func newMaterialLedger(supplied *ledger.JSONLLedger) (*materialLedger, error) {
@@ -54,7 +54,7 @@ func newMaterialLedger(supplied *ledger.JSONLLedger) (*materialLedger, error) {
 		return nil, err
 	}
 	result := &materialLedger{
-		path: path, parentPath: parentPath, base: filepath.Base(path), parentDir: parent,
+		authoritative: supplied, path: path, parentPath: parentPath, base: filepath.Base(path), parentDir: parent,
 		parentID: parentID, parentPerm: info.Mode().Perm(),
 		syncFile:  func(file *os.File) error { return file.Sync() },
 		syncDir:   func(file *os.File) error { return file.Sync() },
@@ -93,30 +93,29 @@ func (r *materialLedger) find(eventID string) (materialEvent, bool, error) {
 		return materialEvent{}, false, err
 	}
 	defer file.Close()
-	if err := lockCIFile(file, 2*time.Second); err != nil {
-		return materialEvent{}, false, fmt.Errorf("lock authoritative ledger for scan: %w", err)
-	}
-	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-	observed, found, _, err := scanMaterialLedger(file, eventID, r.maxBytes, r.maxLines)
+	var observed materialEvent
+	var found bool
+	err = r.authoritative.WithFileLock(file, func() error {
+		var scanErr error
+		observed, found, _, scanErr = scanMaterialLedger(file, eventID, r.maxBytes, r.maxLines)
+		if scanErr != nil {
+			return scanErr
+		}
+		if found {
+			if err := r.syncFile(file); err != nil {
+				return fmt.Errorf("sync existing deterministic CI outcome event: %w", err)
+			}
+			if err := r.syncDir(r.parentDir); err != nil {
+				return fmt.Errorf("sync authoritative ledger parent for replay: %w", err)
+			}
+			return r.confirm(file, id, eventID, observed.canonical)
+		}
+		return r.verifyLedgerPath(id)
+	})
 	if err != nil {
 		return materialEvent{}, false, err
 	}
-	if found {
-		if err := r.syncFile(file); err != nil {
-			return materialEvent{}, false, fmt.Errorf("sync existing deterministic CI outcome event: %w", err)
-		}
-		if err := r.syncDir(r.parentDir); err != nil {
-			return materialEvent{}, false, fmt.Errorf("sync authoritative ledger parent for replay: %w", err)
-		}
-		if err := r.confirm(file, id, eventID, observed.canonical); err != nil {
-			return materialEvent{}, false, err
-		}
-		return observed, true, nil
-	}
-	if err := r.verifyLedgerPath(id); err != nil {
-		return materialEvent{}, false, err
-	}
-	return materialEvent{}, false, nil
+	return observed, found, nil
 }
 
 func (r *materialLedger) record(expected ledger.Event, canonical []byte) error {
@@ -133,73 +132,70 @@ func (r *materialLedger) record(expected ledger.Event, canonical []byte) error {
 		return err
 	}
 	defer file.Close()
-	if err := lockCIFile(file, 2*time.Second); err != nil {
-		return fmt.Errorf("lock authoritative ledger for append: %w", err)
-	}
-	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-	if err := r.syncDir(r.parentDir); err != nil {
-		return fmt.Errorf("sync authoritative ledger parent before append: %w", err)
-	}
-	if err := r.verifyLedgerPath(id); err != nil {
-		return err
-	}
-	observed, found, snapshot, err := scanMaterialLedger(file, expected.EventID, r.maxBytes, r.maxLines)
-	if err != nil {
-		return err
-	}
-	if found {
-		if !bytes.Equal(observed.canonical, canonical) {
-			return errors.New("deterministic CI outcome event conflicts")
+	return r.authoritative.WithFileLock(file, func() error {
+		if err := r.syncDir(r.parentDir); err != nil {
+			return fmt.Errorf("sync authoritative ledger parent before append: %w", err)
 		}
-		if err := r.syncFile(file); err != nil {
-			return fmt.Errorf("sync existing deterministic CI outcome event: %w", err)
-		}
-		return r.confirm(file, id, expected.EventID, canonical)
-	}
-	if r.appendFault != nil {
-		if err := r.appendFault("before_append"); err != nil {
+		if err := r.verifyLedgerPath(id); err != nil {
 			return err
 		}
-	}
-	line := append(append(make([]byte, 0, len(canonical)+1), canonical...), '\n')
-	if snapshot.bytes > r.maxBytes-int64(len(line)) || snapshot.lines >= r.maxLines {
-		return errors.New("authoritative ledger projected bound exceeded")
-	}
-	n, writeErr := r.writeLine(file, line)
-	if writeErr == nil && n != len(line) {
-		writeErr = io.ErrShortWrite
-	}
-	if writeErr == nil && r.appendFault != nil {
-		writeErr = r.appendFault("after_append")
-	}
-	if writeErr != nil {
-		if n < 0 || n > len(line) {
-			return fmt.Errorf("invalid CI outcome append count %d/%d: %w", n, len(line), writeErr)
+		observed, found, snapshot, err := scanMaterialLedger(file, expected.EventID, r.maxBytes, r.maxLines)
+		if err != nil {
+			return err
 		}
-		if err := file.Truncate(snapshot.bytes); err != nil {
-			return fmt.Errorf("rollback failed CI outcome append after %d/%d bytes: %w", n, len(line), errors.Join(writeErr, err))
+		if found {
+			if !bytes.Equal(observed.canonical, canonical) {
+				return errors.New("deterministic CI outcome event conflicts")
+			}
+			if err := r.syncFile(file); err != nil {
+				return fmt.Errorf("sync existing deterministic CI outcome event: %w", err)
+			}
+			return r.confirm(file, id, expected.EventID, canonical)
+		}
+		if r.appendFault != nil {
+			if err := r.appendFault("before_append"); err != nil {
+				return err
+			}
+		}
+		line := append(append(make([]byte, 0, len(canonical)+1), canonical...), '\n')
+		if snapshot.bytes > r.maxBytes-int64(len(line)) || snapshot.lines >= r.maxLines {
+			return errors.New("authoritative ledger projected bound exceeded")
+		}
+		n, writeErr := r.writeLine(file, line)
+		if writeErr == nil && n != len(line) {
+			writeErr = io.ErrShortWrite
+		}
+		if writeErr == nil && r.appendFault != nil {
+			writeErr = r.appendFault("after_append")
+		}
+		if writeErr != nil {
+			if n < 0 || n > len(line) {
+				return fmt.Errorf("invalid CI outcome append count %d/%d: %w", n, len(line), writeErr)
+			}
+			if err := file.Truncate(snapshot.bytes); err != nil {
+				return fmt.Errorf("rollback failed CI outcome append after %d/%d bytes: %w", n, len(line), errors.Join(writeErr, err))
+			}
+			if err := r.syncFile(file); err != nil {
+				return fmt.Errorf("sync rolled-back CI outcome append after %d/%d bytes: %w", n, len(line), errors.Join(writeErr, err))
+			}
+			if stat, err := file.Stat(); err != nil || stat.Size() != snapshot.bytes {
+				return errors.Join(errors.New("rolled-back CI outcome append did not verify"), err)
+			}
+			return fmt.Errorf("append deterministic CI outcome: wrote %d/%d: %w", n, len(line), writeErr)
 		}
 		if err := r.syncFile(file); err != nil {
-			return fmt.Errorf("sync rolled-back CI outcome append after %d/%d bytes: %w", n, len(line), errors.Join(writeErr, err))
+			return fmt.Errorf("sync deterministic CI outcome: %w", err)
 		}
-		if stat, err := file.Stat(); err != nil || stat.Size() != snapshot.bytes {
-			return errors.Join(errors.New("rolled-back CI outcome append did not verify"), err)
-		}
-		return fmt.Errorf("append deterministic CI outcome: wrote %d/%d: %w", n, len(line), writeErr)
-	}
-	syncErr := r.syncFile(file)
-	if syncErr != nil {
-		return fmt.Errorf("sync deterministic CI outcome: %w", syncErr)
-	}
-	if r.appendFault != nil {
-		if err := r.appendFault("after_fsync"); err != nil {
-			if confirmErr := r.confirm(file, id, expected.EventID, canonical); confirmErr != nil {
-				return errors.Join(err, confirmErr)
+		if r.appendFault != nil {
+			if err := r.appendFault("after_fsync"); err != nil {
+				if confirmErr := r.confirm(file, id, expected.EventID, canonical); confirmErr != nil {
+					return errors.Join(err, confirmErr)
+				}
+				return nil
 			}
-			return nil
 		}
-	}
-	return r.confirm(file, id, expected.EventID, canonical)
+		return r.confirm(file, id, expected.EventID, canonical)
+	})
 }
 
 func (r *materialLedger) confirm(file *os.File, id ciFileID, eventID string, canonical []byte) error {

@@ -6,13 +6,13 @@ Close only M-001 and M-002 from the fresh post-Task-4 review of exact CI impleme
 
 ### Task 1: Close M-001 and M-002
 
-- [ ] Verify the fresh v2 capsule path/hash and run independent `context-verify` before any edit; stop on mismatch or drift.
-- [ ] M-001: treat repeated GitHub `Link` header fields as one bounded semantic input, enforce the aggregate Link-data cap, and detect `rel=next` across every field value for every paginated endpoint. Require `X-GitHub-Request-Id` to be unambiguous (exactly zero or one value) and bounded; repeated/ambiguous request IDs must fail closed.
-- [ ] Add regression coverage for a later repeated `Link` value carrying `rel=next`, aggregate repeated-Link exact-limit/limit+1 behavior, and repeated request-ID rejection.
-- [ ] M-002: make ordinary authoritative `JSONLLedger.Append` and CI material-ledger snapshot/check/append/rollback participate in the same file-level serialization so an unrelated append cannot be truncated or invalidate projected bounds while CI owns the transaction.
-- [ ] Add regression coverage that overlaps an ordinary authoritative append with an injected partial/ambiguous CI append and proves the unrelated event remains intact and the ledger remains canonical/bounded.
-- [ ] Preserve M-001/M-003/M-006 Task-3 closures, M-002/M-004/M-005 preservation, immutable evidence behavior, replay durability, bounded-resource rules, non-Linux fail-closed compilation, and zero merge-policy/write/transition semantics.
-- [ ] Run focused tests, race tests, ledger tests, full repository tests/vet, non-Linux compile, forbidden-semantics/scope checks, and `git diff --check`; mark this task complete and commit only this correction.
+- [x] Verify the fresh v2 capsule path/hash and run independent `context-verify` before any edit; stop on mismatch or drift.
+- [x] M-001: treat repeated GitHub `Link` header fields as one bounded semantic input, enforce the aggregate Link-data cap, and detect `rel=next` across every field value for every paginated endpoint. Require `X-GitHub-Request-Id` to be unambiguous (exactly zero or one value) and bounded; repeated/ambiguous request IDs must fail closed.
+- [x] Add regression coverage for a later repeated `Link` value carrying `rel=next`, aggregate repeated-Link exact-limit/limit+1 behavior, and repeated request-ID rejection.
+- [x] M-002: make ordinary authoritative `JSONLLedger.Append` and CI material-ledger snapshot/check/append/rollback participate in the same file-level serialization so an unrelated append cannot be truncated or invalidate projected bounds while CI owns the transaction.
+- [x] Add regression coverage that overlaps an ordinary authoritative append with an injected partial/ambiguous CI append and proves the unrelated event remains intact and the ledger remains canonical/bounded.
+- [x] Preserve M-001/M-003/M-006 Task-3 closures, M-002/M-004/M-005 preservation, immutable evidence behavior, replay durability, bounded-resource rules, non-Linux fail-closed compilation, and zero merge-policy/write/transition semantics.
+- [x] Run focused tests, race tests, ledger tests, full repository tests/vet, non-Linux compile, forbidden-semantics/scope checks, and `git diff --check`; mark this task complete and commit only this correction.
 
 ## Gate
 

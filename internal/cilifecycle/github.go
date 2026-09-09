@@ -184,7 +184,7 @@ type requestSpec struct {
 type responseData struct {
 	status  int
 	body    []byte
-	headers http.Header
+	hasNext bool
 }
 
 type requestSession struct {
@@ -302,9 +302,10 @@ func (s *requestSession) get(ctx context.Context, spec requestSpec) (responseDat
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, int64(s.adapter.limits.maxResponseBodyBytes)+1))
 	observed := s.adapter.now().UTC().UnixNano()
 	status := response.StatusCode
-	requestID := response.Header.Get("X-GitHub-Request-Id")
+	requestIDs := responseHeaderValues(response.Header, "X-GitHub-Request-Id")
 	headerBytes := responseHeaderBytes(response.Header)
-	link := response.Header.Get("Link")
+	linkValues := responseHeaderValues(response.Header, "Link")
+	hasNext := false
 
 	provenance := RequestProvenanceV1Input{
 		Sequence: len(s.provenance) + 1, Phase: spec.phase, Page: spec.page, Method: http.MethodGet,
@@ -329,15 +330,25 @@ func (s *requestSession) get(ctx context.Context, spec requestSpec) (responseDat
 		provenance.FailureCode = "response_headers_too_large"
 		completedFailure = failure(OutcomeTruncated, provenance.FailureCode, spec.phase, spec.page, nil)
 	}
-	if completedFailure == nil && len(link) > s.adapter.limits.maxLinkBytes {
+	if completedFailure == nil && !headerValuesWithinBound(linkValues, s.adapter.limits.maxLinkBytes) {
 		provenance.FailureCode = "link_header_too_large"
 		completedFailure = failure(OutcomeTruncated, provenance.FailureCode, spec.phase, spec.page, nil)
-	}
-	if len(requestID) <= s.adapter.limits.maxRequestIDBytes && validOptionalText(requestID, s.adapter.limits.maxRequestIDBytes) {
-		provenance.RequestID = requestID
 	} else if completedFailure == nil {
-		provenance.FailureCode = "request_id_too_large"
-		completedFailure = failure(OutcomeTruncated, provenance.FailureCode, spec.phase, spec.page, nil)
+		hasNext = hasNextLinkValues(linkValues)
+	}
+	if len(requestIDs) > 1 {
+		if completedFailure == nil {
+			provenance.FailureCode = "request_id_ambiguous"
+			completedFailure = failure(OutcomeIntegrityFailure, provenance.FailureCode, spec.phase, spec.page, nil)
+		}
+	} else if len(requestIDs) == 1 {
+		requestID := requestIDs[0]
+		if len(requestID) <= s.adapter.limits.maxRequestIDBytes && validOptionalText(requestID, s.adapter.limits.maxRequestIDBytes) {
+			provenance.RequestID = requestID
+		} else if completedFailure == nil {
+			provenance.FailureCode = "request_id_too_large"
+			completedFailure = failure(OutcomeTruncated, provenance.FailureCode, spec.phase, spec.page, nil)
+		}
 	}
 	if completedFailure == nil && status != http.StatusOK {
 		outcome, code := OutcomeProviderUnavailable, "provider_http_status"
@@ -357,7 +368,7 @@ func (s *requestSession) get(ctx context.Context, spec requestSpec) (responseDat
 	if completedFailure != nil {
 		return responseData{}, completedFailure
 	}
-	return responseData{status: status, body: append([]byte(nil), body...), headers: response.Header.Clone()}, nil
+	return responseData{status: status, body: append([]byte(nil), body...), hasNext: hasNext}, nil
 }
 
 func (s *requestSession) appendProvenance(in RequestProvenanceV1Input) *collectionFailure {
@@ -384,6 +395,30 @@ func responseHeaderBytes(header http.Header) int {
 	return total
 }
 
+// responseHeaderValues reads every field value case-insensitively. Production
+// net/http responses canonicalize field names, while injected transports are
+// not required to do so.
+func responseHeaderValues(header http.Header, name string) []string {
+	var result []string
+	for observedName, values := range header {
+		if strings.EqualFold(observedName, name) {
+			result = append(result, values...)
+		}
+	}
+	return result
+}
+
+func headerValuesWithinBound(values []string, maximum int) bool {
+	total := 0
+	for _, value := range values {
+		if len(value) > maximum-total {
+			return false
+		}
+		total += len(value)
+	}
+	return true
+}
+
 func decodeProviderJSON(data []byte, target any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(target); err != nil {
@@ -395,18 +430,20 @@ func decodeProviderJSON(data []byte, target any) error {
 	return nil
 }
 
-func hasNextLink(link string) bool {
-	for _, entry := range strings.Split(link, ",") {
-		parts := strings.Split(entry, ";")
-		for _, parameter := range parts[1:] {
-			name, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
-			if !ok || !strings.EqualFold(strings.TrimSpace(name), "rel") {
-				continue
-			}
-			value = strings.Trim(strings.TrimSpace(value), `"`)
-			for _, relation := range strings.Fields(value) {
-				if strings.EqualFold(relation, "next") {
-					return true
+func hasNextLinkValues(values []string) bool {
+	for _, link := range values {
+		for _, entry := range strings.Split(link, ",") {
+			parts := strings.Split(entry, ";")
+			for _, parameter := range parts[1:] {
+				name, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+				if !ok || !strings.EqualFold(strings.TrimSpace(name), "rel") {
+					continue
+				}
+				value = strings.Trim(strings.TrimSpace(value), `"`)
+				for _, relation := range strings.Fields(value) {
+					if strings.EqualFold(relation, "next") {
+						return true
+					}
 				}
 			}
 		}
@@ -682,7 +719,7 @@ func (s *requestSession) suites(ctx context.Context, owner, name, sha, phase str
 			}
 			observations = append(observations, observation)
 		}
-		next := hasNextLink(response.headers.Get("Link"))
+		next := response.hasNext
 		if len(observations) == declaredTotal {
 			if next {
 				if len(observations) == s.adapter.limits.maxSuites {
@@ -769,7 +806,7 @@ func (s *requestSession) runs(ctx context.Context, owner, name, sha, phase strin
 			}
 			observations = append(observations, observation)
 		}
-		next := hasNextLink(response.headers.Get("Link"))
+		next := response.hasNext
 		if len(observations) == declaredTotal {
 			if next {
 				if len(observations) == s.adapter.limits.maxRuns {
@@ -844,7 +881,7 @@ func (s *requestSession) statuses(ctx context.Context, owner, name, sha, phase s
 				return nil, failure(OutcomeTruncated, "status_total_too_large", phase, page, nil)
 			}
 		}
-		next := hasNextLink(response.headers.Get("Link"))
+		next := response.hasNext
 		if page == s.adapter.limits.maxStatusPages {
 			if len(wire) != 0 || next {
 				return nil, failure(OutcomeTruncated, "status_sentinel_not_empty", phase, page, nil)
