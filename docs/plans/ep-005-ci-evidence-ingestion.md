@@ -757,16 +757,16 @@ Roadmap self-review: this implements only Phase 4’s “CI evidence ingestion�
 
 ### Task 3: Implement immutable evidence, ledger outcome, and replay
 
-- [ ] Before any task work, obtain the capsule path/hash from launch authority, independently verify the supplied SHA-256 and execute `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`; stop before filesystem or network work if verification fails.
-- [ ] Implement the minimal Linux attempt allocator with pinned roots, verified locks, immutable reservations, and per-run/global/byte limits.
-- [ ] Implement one deterministic bundle pathname per attempt (`ci-<attempt_key>.json`) and create-or-verify publication using the existing evidence store and verified reader; the authoritative evidence ref carries the content SHA-256.
-- [ ] Implement the deterministic `ci_evidence_collection_outcome` event with empty transition fields.
-- [ ] Implement bounded append-or-verify ledger handling and ambiguous-append rescan.
-- [ ] Implement exact replay with no network calls and full bundle reconstruction.
-- [ ] Treat reservation-without-event material as same-attempt recoverable: finalize a valid deterministic bundle if present, otherwise recollect under the same reservation/AttemptID; never consume a fresh slot solely because of a crash.
-- [ ] Add non-Linux fail-closed stubs.
-- [ ] Add multiprocess/concurrency, capacity, reservation-file-as-lock, recoverable zero/partial-reservation crash-boundary, symlink/special-file, tamper, missing-artifact, conflicting-event, append, and fsync tests.
-- [ ] Confirm no PR revision/generation/submission/reconciliation types or semantics were introduced.
+- [x] Before any task work, obtain the capsule path/hash from launch authority, independently verify the supplied SHA-256 and execute `go run ./cmd/abcp context-verify --repository "$PWD" --capsule "$ABCP_CONTEXT_CAPSULE_PATH"`; stop before filesystem or network work if verification fails.
+- [x] Implement the minimal Linux attempt allocator with pinned roots, verified locks, immutable reservations, and per-run/global/byte limits.
+- [x] Implement one deterministic bundle pathname per attempt (`ci-<attempt_key>.json`) and create-or-verify publication using the existing evidence store and verified reader; the authoritative evidence ref carries the content SHA-256.
+- [x] Implement the deterministic `ci_evidence_collection_outcome` event with empty transition fields.
+- [x] Implement bounded append-or-verify ledger handling and ambiguous-append rescan.
+- [x] Implement exact replay with no network calls and full bundle reconstruction.
+- [x] Treat reservation-without-event material as same-attempt recoverable: finalize a valid deterministic bundle if present, otherwise recollect under the same reservation/AttemptID; never consume a fresh slot solely because of a crash.
+- [x] Add non-Linux fail-closed stubs.
+- [x] Add multiprocess/concurrency, capacity, reservation-file-as-lock, recoverable zero/partial-reservation crash-boundary, symlink/special-file, tamper, missing-artifact, conflicting-event, append, and fsync tests.
+- [x] Confirm no PR revision/generation/submission/reconciliation types or semantics were introduced.
 
 ## Deferred Task 4 requirements: Acceptance, scope audit, and exact-head review handoff
 
