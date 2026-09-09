@@ -34,6 +34,7 @@ func (*attemptStore) acquire(attemptReservationV1) (*attemptLease, error) {
 }
 func (*attemptStore) close() error  { return nil }
 func (*attemptLease) repair() error { return errUnsupportedCIDurability }
+func (*attemptLease) poison() error { return errUnsupportedCIDurability }
 func (*attemptLease) close() error  { return nil }
 
 type artifactBoundary struct{ store ArtifactStore }

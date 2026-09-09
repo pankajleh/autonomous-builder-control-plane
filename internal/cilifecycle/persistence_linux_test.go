@@ -272,6 +272,72 @@ func TestPrepositionedMaterialNeverBecomesHistoricalProof(t *testing.T) {
 	}
 }
 
+func TestPrepositionedMaterialInspectionFailureCannotAuthorizeRetry(t *testing.T) {
+	for _, stage := range []string{"bundle-file", "bundle-directory", "event-file", "event-directory"} {
+		t.Run(stage, func(t *testing.T) {
+			fixture := newDurableFixture(t, modeSuccess)
+			request := durableRequest(fixture, "prepositioned-inspection-"+stage)
+			identity, requestErr := validateCollectRequest(request)
+			if requestErr != nil {
+				t.Fatal(requestErr)
+			}
+			bundle, err := fixture.controller.github.collectRemote(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.github.requests.Store(0)
+			ref, err := fixture.artifacts.WriteBytes(attemptBundleName(identity.attemptKey), EvidenceBundleKindV1, bundle.CanonicalJSON())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(stage, "event-") {
+				event, _, err := deterministicOutcomeEvent(bundle, ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := fixture.ledger.Append(event); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			injected := errors.New("injected pre-positioned material inspection failure")
+			switch stage {
+			case "bundle-file":
+				fixture.controller.artifacts.syncFile = func(*os.File) error { return injected }
+			case "bundle-directory":
+				fixture.controller.artifacts.syncDir = func(*os.File) error { return injected }
+			case "event-file":
+				fixture.controller.material.syncFile = func(*os.File) error { return injected }
+			case "event-directory":
+				fixture.controller.material.syncDir = func(*os.File) error { return injected }
+			}
+			got, collectErr := fixture.controller.Collect(context.Background(), request)
+			if collectErr == nil || len(got.CanonicalJSON()) != 0 {
+				t.Fatalf("%s inspection failure became authoritative: bundle=%s error=%v", stage, got.CanonicalJSON(), collectErr)
+			}
+
+			fixture.controller.artifacts.syncFile = func(file *os.File) error { return file.Sync() }
+			fixture.controller.artifacts.syncDir = func(file *os.File) error { return file.Sync() }
+			fixture.controller.material.syncFile = func(file *os.File) error { return file.Sync() }
+			fixture.controller.material.syncDir = func(file *os.File) error { return file.Sync() }
+			for retry := 0; retry < 2; retry++ {
+				got, collectErr = fixture.controller.Collect(context.Background(), request)
+				if collectErr == nil || len(got.CanonicalJSON()) != 0 {
+					t.Fatalf("retry %d promoted %s material: bundle=%s error=%v", retry, stage, got.CanonicalJSON(), collectErr)
+				}
+			}
+			if fixture.github.requests.Load() != 0 {
+				t.Fatalf("%s inspection failure reached GitHub: %d requests", stage, fixture.github.requests.Load())
+			}
+			reservationPath := filepath.Join(fixture.attemptRoot, attemptReservationFilename(identity.attemptKey))
+			reservationBytes, err := os.ReadFile(reservationPath)
+			if err != nil || len(reservationBytes) == 0 || reservationBytes[0] != '!' {
+				t.Fatalf("%s did not remain durably fail-closed: bytes=%q error=%v", stage, reservationBytes, err)
+			}
+		})
+	}
+}
+
 func TestZeroAndPartialReservationsRecoverInPlace(t *testing.T) {
 	for _, size := range []int{0, 17} {
 		t.Run(fmtTestName("bytes", size), func(t *testing.T) {
@@ -330,6 +396,9 @@ func TestAttemptAllocatorCapacityAndReservationLock(t *testing.T) {
 	_ = other.Close()
 	if _, err := store.acquire(newAttemptReservation(requestA, identityA)); err == nil {
 		t.Fatal("same-process same-attempt concurrency was accepted")
+	}
+	if err := lease.repair(); err != nil {
+		t.Fatal(err)
 	}
 	_ = lease.close()
 
@@ -670,8 +739,11 @@ func TestReservationPersistenceFailureMustBeRetried(t *testing.T) {
 			if err != nil {
 				t.Fatalf("same reservation did not recover after %s sync: %v", stage, err)
 			}
-			if lease.created || lease.needsRepair {
+			if lease.created || !lease.needsRepair {
 				t.Fatalf("same-attempt recovery consumed a new slot: %#v", lease)
+			}
+			if err := lease.repair(); err != nil {
+				t.Fatalf("same-attempt guard did not complete after %s sync: %v", stage, err)
 			}
 			_ = lease.close()
 		})
@@ -802,6 +874,59 @@ func TestMaterialLedgerFsyncFailureRequiresSuccessfulRetry(t *testing.T) {
 	data, err = os.ReadFile(path)
 	if err != nil || bytes.Count(data, []byte{'\n'}) != 1 {
 		t.Fatalf("fsync retry duplicated the event: bytes=%q error=%v", data, err)
+	}
+}
+
+func TestControllerReplayRequiresSuccessfulLedgerFsync(t *testing.T) {
+	fixture := newDurableFixture(t, modeEmpty)
+	request := durableRequest(fixture, "controller-ledger-fsync-retry")
+	injected := errors.New("injected controller ledger fsync failure")
+	syncAttempts := 0
+	fixture.controller.material.syncFile = func(file *os.File) error {
+		syncAttempts++
+		if syncAttempts <= 2 {
+			return injected
+		}
+		return file.Sync()
+	}
+
+	first, firstErr := fixture.controller.Collect(context.Background(), request)
+	if firstErr == nil || len(first.CanonicalJSON()) != 0 {
+		t.Fatalf("initial fsync failure became authoritative: bundle=%s error=%v", first.CanonicalJSON(), firstErr)
+	}
+	ledgerBytes, err := os.ReadFile(fixture.ledger.Path())
+	if err != nil || bytes.Count(ledgerBytes, []byte{'\n'}) != 1 {
+		t.Fatalf("initial fsync failure did not retain one retryable line: bytes=%q error=%v", ledgerBytes, err)
+	}
+	requests := fixture.github.requests.Load()
+
+	second, secondErr := fixture.controller.Collect(context.Background(), request)
+	if secondErr == nil || len(second.CanonicalJSON()) != 0 {
+		t.Fatalf("retry replayed without successful ledger fsync: bundle=%s error=%v", second.CanonicalJSON(), secondErr)
+	}
+	if fixture.github.requests.Load() != requests {
+		t.Fatalf("ledger fsync retry contacted GitHub: requests=%d, want %d", fixture.github.requests.Load(), requests)
+	}
+
+	third, thirdErr := fixture.controller.Collect(context.Background(), request)
+	if thirdErr != nil || third.Input().Outcome != OutcomeStable {
+		t.Fatalf("successful ledger stabilization did not authorize replay: bundle=%s error=%v", third.CanonicalJSON(), thirdErr)
+	}
+	if fixture.github.requests.Load() != requests || syncAttempts < 3 {
+		t.Fatalf("replay requests=%d/%d sync attempts=%d", fixture.github.requests.Load(), requests, syncAttempts)
+	}
+	ledgerBytes, err = os.ReadFile(fixture.ledger.Path())
+	if err != nil || bytes.Count(ledgerBytes, []byte{'\n'}) != 1 {
+		t.Fatalf("ledger stabilization duplicated the event: bytes=%q error=%v", ledgerBytes, err)
+	}
+}
+
+func TestCILifecycleCrossCompilesForNonLinux(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "cilifecycle-darwin.test")
+	command := exec.Command("go", "test", "-c", "-o", output, ".")
+	command.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=darwin", "GOARCH=amd64")
+	if combined, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("non-Linux cross-compilation failed: %v: %s", err, combined)
 	}
 }
 

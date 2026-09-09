@@ -109,17 +109,32 @@ func (c *Controller) Collect(ctx context.Context, request CollectRequest) (CIEvi
 	defer lease.close()
 
 	eventID := outcomeEventID(identity.attemptKey)
-	observed, found, err := c.material.find(eventID)
-	if err != nil {
-		return CIEvidenceBundleV1{}, integrityError("ledger_scan_failed", err)
-	}
 	if lease.needsRepair {
-		if found {
-			return CIEvidenceBundleV1{}, integrityError("incomplete_reservation_has_event", nil)
+		_, eventFound, inspectErr := c.material.find(eventID)
+		if inspectErr != nil {
+			return CIEvidenceBundleV1{}, integrityError("reservation_material_inspection_failed", inspectErr)
+		}
+		if eventFound {
+			return CIEvidenceBundleV1{}, integrityError("incomplete_reservation_has_event", lease.poison())
+		}
+		_, _, artifactFound, inspectErr := c.readAttemptBundle(request, identity)
+		if inspectErr != nil {
+			if artifactFound {
+				inspectErr = errors.Join(inspectErr, lease.poison())
+			}
+			return CIEvidenceBundleV1{}, integrityError("reservation_material_inspection_failed", inspectErr)
+		}
+		if artifactFound {
+			return CIEvidenceBundleV1{}, integrityError("incomplete_reservation_has_bundle", lease.poison())
 		}
 		if err := lease.repair(); err != nil {
 			return CIEvidenceBundleV1{}, integrityError("reservation_recovery_failed", err)
 		}
+	}
+
+	observed, found, err := c.material.find(eventID)
+	if err != nil {
+		return CIEvidenceBundleV1{}, integrityError("ledger_scan_failed", err)
 	}
 	if lease.created && found {
 		return CIEvidenceBundleV1{}, integrityError("event_missing_reservation", lease.poison())

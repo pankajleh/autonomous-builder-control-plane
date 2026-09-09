@@ -101,10 +101,22 @@ func (r *materialLedger) find(eventID string) (materialEvent, bool, error) {
 	if err != nil {
 		return materialEvent{}, false, err
 	}
+	if found {
+		if err := r.syncFile(file); err != nil {
+			return materialEvent{}, false, fmt.Errorf("sync existing deterministic CI outcome event: %w", err)
+		}
+		if err := r.syncDir(r.parentDir); err != nil {
+			return materialEvent{}, false, fmt.Errorf("sync authoritative ledger parent for replay: %w", err)
+		}
+		if err := r.confirm(file, id, eventID, observed.canonical); err != nil {
+			return materialEvent{}, false, err
+		}
+		return observed, true, nil
+	}
 	if err := r.verifyLedgerPath(id); err != nil {
 		return materialEvent{}, false, err
 	}
-	return observed, found, nil
+	return materialEvent{}, false, nil
 }
 
 func (r *materialLedger) record(expected ledger.Event, canonical []byte) error {

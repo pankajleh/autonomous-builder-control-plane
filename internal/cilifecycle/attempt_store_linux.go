@@ -231,6 +231,23 @@ func (s *attemptStore) acquire(reservation attemptReservationV1) (*attemptLease,
 			lease.releaseCapacity()
 			return lease, nil
 		case len(data) < len(expected) && bytes.Equal(data, expected[:len(data)]):
+			if err := s.syncFile(file); err != nil {
+				lease.close()
+				return nil, fmt.Errorf("sync incomplete CI attempt reservation: %w", err)
+			}
+			if err := s.syncDir(s.rootDir); err != nil {
+				lease.close()
+				return nil, fmt.Errorf("sync incomplete CI attempt root: %w", err)
+			}
+			if err := lease.verifyNamedFile(); err != nil {
+				lease.close()
+				return nil, err
+			}
+			confirmed, err := readBoundedFile(file, MaxReservationBytes)
+			if err != nil || !bytes.Equal(confirmed, data) {
+				lease.close()
+				return nil, errors.New("incomplete CI attempt reservation changed during persistence")
+			}
 			lease.needsRepair = true
 			return lease, nil
 		default:
@@ -274,10 +291,13 @@ func (s *attemptStore) acquire(reservation attemptReservationV1) (*attemptLease,
 		releaseCapacity()
 		return fail(err)
 	}
-	lease := &attemptLease{store: s, file: file, fileID: fileID, name: name, expected: expected, lockKey: lockKey, local: local, capacity: capacity, created: true}
-	if err := writeFullCI(file, expected); err != nil {
-		lease.close()
-		return nil, err
+	// A newly allocated reservation remains an incomplete canonical prefix
+	// until the controller has proved that no deterministic event or bundle
+	// predates it. A crash or inspection failure therefore cannot turn
+	// pre-positioned material into historical proof on retry.
+	lease := &attemptLease{
+		store: s, file: file, fileID: fileID, name: name, expected: expected,
+		lockKey: lockKey, local: local, capacity: capacity, created: true, needsRepair: true,
 	}
 	if err := s.syncFile(file); err != nil {
 		lease.close()
@@ -291,7 +311,11 @@ func (s *attemptStore) acquire(reservation attemptReservationV1) (*attemptLease,
 		lease.close()
 		return nil, err
 	}
-	lease.releaseCapacity()
+	data, err := readBoundedFile(file, MaxReservationBytes)
+	if err != nil || len(data) != 0 {
+		lease.close()
+		return nil, errors.New("new CI attempt guard did not verify")
+	}
 	return lease, nil
 }
 
@@ -327,14 +351,15 @@ func (l *attemptLease) repair() error {
 }
 
 func (l *attemptLease) poison() error {
-	if l == nil || l.closed || !l.created || len(l.expected) == 0 {
+	if l == nil || l.closed || (!l.created && !l.needsRepair) || len(l.expected) == 0 {
 		return errors.New("CI attempt reservation cannot be poisoned")
 	}
 	if err := l.verifyNamedFile(); err != nil {
 		return err
 	}
 	data, err := readBoundedFile(l.file, MaxReservationBytes)
-	if err != nil || !bytes.Equal(data, l.expected) {
+	if err != nil || (!bytes.Equal(data, l.expected) &&
+		!(len(data) < len(l.expected) && bytes.Equal(data, l.expected[:len(data)]))) {
 		return errors.New("CI attempt reservation changed before conflict poisoning")
 	}
 	n, writeErr := l.file.WriteAt([]byte{'!'}, 0)
@@ -351,7 +376,7 @@ func (l *attemptLease) poison() error {
 		return err
 	}
 	poisoned, err := readBoundedFile(l.file, MaxReservationBytes)
-	if err != nil || len(poisoned) != len(l.expected) || bytes.Equal(poisoned, l.expected) ||
+	if err != nil || len(poisoned) == 0 || bytes.Equal(poisoned, l.expected) ||
 		(len(poisoned) < len(l.expected) && bytes.Equal(poisoned, l.expected[:len(poisoned)])) {
 		return errors.New("poisoned CI attempt reservation did not verify")
 	}
