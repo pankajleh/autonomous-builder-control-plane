@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -204,5 +205,83 @@ func TestNewStoreRejectsSymlinkRunDirectory(t *testing.T) {
 	}
 	if _, err := NewStore(root, "run-link"); err == nil {
 		t.Fatal("NewStore accepted a symlink run directory")
+	}
+}
+
+func TestWriteBytesDurabilityFaultsFailClosed(t *testing.T) {
+	t.Run("link", func(t *testing.T) {
+		store, err := NewStore(t.TempDir(), "run-link-fault")
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.link = func(string, string) error { return errors.New("injected link failure") }
+		if _, err := store.WriteBytes("result.txt", "test", []byte("payload")); err == nil {
+			t.Fatal("link failure was ignored")
+		}
+		if _, err := os.Lstat(filepath.Join(store.RunDir(), "result.txt")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("link failure published a destination: %v", err)
+		}
+	})
+
+	t.Run("unlink", func(t *testing.T) {
+		store, err := NewStore(t.TempDir(), "run-unlink-fault")
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.remove = func(string) error { return errors.New("injected unlink failure") }
+		if _, err := store.WriteBytes("result.txt", "test", []byte("payload")); err == nil {
+			t.Fatal("temporary-link removal failure was ignored")
+		}
+		info, err := os.Lstat(filepath.Join(store.RunDir(), "result.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			t.Fatal("evidence stat is not syscall.Stat_t")
+		}
+		if stat.Nlink != 2 {
+			t.Fatalf("failed temporary-link removal left nlink=%d, want 2", stat.Nlink)
+		}
+	})
+
+	for _, stage := range []string{"final-file-sync", "directory-sync"} {
+		t.Run(stage, func(t *testing.T) {
+			store, err := NewStore(t.TempDir(), "run-"+stage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stage == "final-file-sync" {
+				calls := 0
+				store.syncFile = func(file *os.File) error {
+					calls++
+					if calls == 2 {
+						return errors.New("injected final file sync failure")
+					}
+					return file.Sync()
+				}
+			} else {
+				store.syncDir = func(string) error { return errors.New("injected directory sync failure") }
+			}
+			if _, err := store.WriteBytes("result.txt", "test", []byte("payload")); err == nil {
+				t.Fatalf("%s was ignored", stage)
+			}
+			store.syncFile = func(file *os.File) error { return file.Sync() }
+			store.syncDir = syncDirectory
+			if _, err := store.WriteBytes("result.txt", "test", []byte("payload")); !errors.Is(err, ErrArtifactExists) {
+				t.Fatalf("%s retry did not durably verify the existing path: %v", stage, err)
+			}
+			info, err := os.Lstat(filepath.Join(store.RunDir(), "result.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				t.Fatal("evidence stat is not syscall.Stat_t")
+			}
+			if stat.Nlink != 1 {
+				t.Fatalf("%s retry left nlink=%d, want 1", stage, stat.Nlink)
+			}
+		})
 	}
 }
