@@ -575,9 +575,6 @@ func ralphexEnvironment(executor string, capsule authority.ContextCapsuleManifes
 			environment = append(environment, key+"="+value)
 		}
 	}
-	// Capsule identity is the value returned by validateOperationAuthority.
-	// Ambient ABCP_CONTEXT_CAPSULE_* values are deliberately not inherited and
-	// cannot override this verified authority binding.
 	environment = append(environment,
 		"ABCP_CONTEXT_CAPSULE_PATH="+capsule.Path,
 		"ABCP_CONTEXT_CAPSULE_SHA256="+capsule.SHA256,
