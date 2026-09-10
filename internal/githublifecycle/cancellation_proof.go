@@ -68,6 +68,14 @@ func NewCancellationSubmissionProofV1(input CancellationSubmissionProofV1Input, 
 			input.RequestBytes != 0 || input.SubmissionState != ReconciliationNotApplied || input.NotAppliedProof != nil {
 			return CancellationSubmissionProofV1{}, errors.New("zero-byte proof does not bind exactly one admitted unsubmitted attempt")
 		}
+	case CancellationProofSealedZeroRequestBytes:
+		if !hasAttempt || !validSHA256(input.AdmissionSHA256) || !validSHA256(input.SealSHA256) || !validSHA256(input.CommitmentSHA256) ||
+			input.RequestBytes != 0 || input.SubmissionState != ReconciliationNotApplied || input.NotAppliedProof == nil ||
+			!input.NotAppliedProof.valid() || requireLimitsSHA(limits, input.NotAppliedProof.limitsSHA) != nil || input.NotAppliedProof.input.Kind != NotAppliedZeroRequestBytes ||
+			input.NotAppliedProof.CommitmentSHA256() != input.CommitmentSHA256 || input.NotAppliedProof.input.RequestBytes != 0 ||
+			input.NotAppliedProof.input.EvidenceRef != input.EvidenceRef {
+			return CancellationSubmissionProofV1{}, errors.New("sealed zero-byte proof does not bind the exact committed unsubmitted attempt")
+		}
 	case CancellationProofUnresolvedSubmission:
 		if !hasAttempt || !validSHA256(input.AdmissionSHA256) || !validSHA256(input.SealSHA256) || !validSHA256(input.CommitmentSHA256) ||
 			input.RequestBytes <= 0 || input.SubmissionState != ReconciliationUnknown || input.NotAppliedProof != nil {
@@ -76,7 +84,7 @@ func NewCancellationSubmissionProofV1(input CancellationSubmissionProofV1Input, 
 	case CancellationProofAuthenticatedNotApplied:
 		if !hasAttempt || !validSHA256(input.AdmissionSHA256) || !validSHA256(input.SealSHA256) || !validSHA256(input.CommitmentSHA256) ||
 			input.RequestBytes <= 0 || input.SubmissionState != ReconciliationNotApplied || input.NotAppliedProof == nil ||
-			!input.NotAppliedProof.valid() || input.NotAppliedProof.CommitmentSHA256() != input.CommitmentSHA256 ||
+			!input.NotAppliedProof.valid() || requireLimitsSHA(limits, input.NotAppliedProof.limitsSHA) != nil || input.NotAppliedProof.CommitmentSHA256() != input.CommitmentSHA256 ||
 			input.NotAppliedProof.input.RequestBytes != input.RequestBytes || input.NotAppliedProof.input.EvidenceRef != input.EvidenceRef {
 			return CancellationSubmissionProofV1{}, errors.New("authenticated NOT_APPLIED proof does not bind the exact sealed submitted attempt")
 		}
@@ -188,7 +196,7 @@ func parseUnboundNotAppliedProof(data []byte, limits Limits) (NotAppliedProofV1,
 	}
 	input := NotAppliedProofV1Input{
 		Kind: wire.Kind, RequestID: wire.RequestID, RequestBodySHA256: wire.RequestBodySHA256, RequestBytes: wire.RequestBytes,
-		Response: response, HTTPStatus: wire.HTTPStatus, ResponseBodySHA256: wire.ResponseBodySHA256, EvidenceRef: wire.EvidenceRef,
+		Response: response, HTTPStatus: wire.HTTPStatus, ResponseBodySHA256: wire.ResponseBodySHA256, ResponseBody: wire.ResponseBody, EvidenceRef: wire.EvidenceRef,
 	}
 	return NotAppliedProofV1{input: input, canonical: append([]byte(nil), data...), digest: digestBytes(data), limitsSHA: wire.LimitsSHA256}, nil
 }

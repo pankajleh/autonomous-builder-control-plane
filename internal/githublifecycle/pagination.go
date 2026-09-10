@@ -14,8 +14,11 @@ import (
 )
 
 const (
-	PaginationClosureSchemaV1 = "pagination-closure-v1"
-	GitHubAPIVersionV1        = "2026-03-10"
+	PaginationClosureSchemaV1              = "pagination-closure-v1"
+	GitHubAPIVersionV1                     = "2026-03-10"
+	GitHubPaginationBodyEvidenceKindV1     = "github-response-body"
+	GitHubPaginationEnvelopeEvidenceKindV1 = "github-pagination-response-envelope"
+	GitHubPaginationEnvelopeSchemaV1       = "github-pagination-response-envelope-v1"
 )
 
 type PaginationSourceKind string
@@ -132,6 +135,7 @@ type PaginationPageV1Input struct {
 	Response           SnapshotIdentity
 	RawBodySHA256      string
 	ResponseEvidence   ledger.EvidenceRef
+	EnvelopeEvidence   ledger.EvidenceRef
 	Items              []CanonicalPaginationItemV1
 	RESTLinkHeader     string
 	RESTLinkObserved   bool
@@ -145,12 +149,32 @@ type PaginationPageV1 struct {
 	digest   string
 }
 
+func NewPaginationEnvelopeEvidenceV1(uri string, input PaginationPageV1Input, limits Limits) (ledger.EvidenceRef, error) {
+	input = clonePaginationPageInput(input)
+	if err := limits.Validate(); err != nil {
+		return ledger.EvidenceRef{}, err
+	}
+	if !validText(uri, limits.MaxTextBytes, false) || !input.Response.valid() || input.Response.Provider() != "github" ||
+		!validSHA256(input.RawBodySHA256) || !validEvidenceRef(input.ResponseEvidence) ||
+		input.ResponseEvidence.Kind != GitHubPaginationBodyEvidenceKindV1 || input.ResponseEvidence.SHA256 != input.RawBodySHA256 {
+		return ledger.EvidenceRef{}, errors.New("pagination response envelope evidence identity is invalid")
+	}
+	canonical, _, err := canonicalJSON(paginationResponseEnvelopeWire(input))
+	if err != nil || len(canonical) > limits.MaxPaginationClosureBytes {
+		return ledger.EvidenceRef{}, errors.New("pagination response envelope evidence is invalid or unbounded")
+	}
+	return ledger.EvidenceRef{URI: uri, Kind: GitHubPaginationEnvelopeEvidenceKindV1, SHA256: digestBytes(canonical)}, nil
+}
+
 func NewPaginationPageV1(input PaginationPageV1Input, limits Limits) (PaginationPageV1, error) {
 	input = clonePaginationPageInput(input)
 	if err := limits.Validate(); err != nil {
 		return PaginationPageV1{}, err
 	}
-	if input.Ordinal < 0 || !input.Response.valid() || !validSHA256(input.RawBodySHA256) || !validEvidenceRef(input.ResponseEvidence) || input.ResponseEvidence.SHA256 != input.RawBodySHA256 || len(input.Items) > limits.MaxItemsPerPage {
+	if input.Ordinal < 0 || !input.Response.valid() || input.Response.Provider() != "github" || !validSHA256(input.RawBodySHA256) ||
+		!validEvidenceRef(input.ResponseEvidence) || input.ResponseEvidence.Kind != GitHubPaginationBodyEvidenceKindV1 ||
+		input.ResponseEvidence.SHA256 != input.RawBodySHA256 || !validEvidenceRef(input.EnvelopeEvidence) ||
+		input.EnvelopeEvidence.Kind != GitHubPaginationEnvelopeEvidenceKindV1 || len(input.Items) > limits.MaxItemsPerPage {
 		return PaginationPageV1{}, errors.New("pagination page identity or bounds are invalid")
 	}
 	seen := map[string]struct{}{}
@@ -171,6 +195,10 @@ func NewPaginationPageV1(input PaginationPageV1Input, limits Limits) (Pagination
 	}
 	if !input.RESTLinkObserved && input.RESTLinkHeader != "" {
 		return PaginationPageV1{}, errors.New("unobserved REST Link header cannot contain pagination state")
+	}
+	responseEnvelope, _, err := canonicalJSON(paginationResponseEnvelopeWire(input))
+	if err != nil || input.EnvelopeEvidence.SHA256 != digestBytes(responseEnvelope) {
+		return PaginationPageV1{}, errors.New("pagination response envelope evidence does not bind the exact response fields")
 	}
 	envelope, digest, err := canonicalJSON(paginationPageWire(input))
 	if err != nil {
@@ -195,6 +223,7 @@ type paginationPageWireV1 struct {
 	Response           identityWire                `json:"response"`
 	RawBodySHA256      string                      `json:"raw_body_sha256"`
 	ResponseEvidence   ledger.EvidenceRef          `json:"response_evidence"`
+	EnvelopeEvidence   ledger.EvidenceRef          `json:"response_envelope_evidence"`
 	Items              []CanonicalPaginationItemV1 `json:"items"`
 	ItemSetSHA256      string                      `json:"item_set_sha256"`
 	RESTLinkHeader     string                      `json:"rest_link_header"`
@@ -205,7 +234,22 @@ type paginationPageWireV1 struct {
 
 func paginationPageWire(i PaginationPageV1Input) paginationPageWireV1 {
 	items, _, _ := canonicalJSON(i.Items)
-	return paginationPageWireV1{i.Ordinal, i.RequestedPage, i.RequestedCursor, snapshotWire(i.Response), i.RawBodySHA256, i.ResponseEvidence, i.Items, digestBytes(items), i.RESTLinkHeader, i.RESTLinkObserved, i.GraphQLHasNextPage, i.GraphQLEndCursor}
+	return paginationPageWireV1{i.Ordinal, i.RequestedPage, i.RequestedCursor, snapshotWire(i.Response), i.RawBodySHA256, i.ResponseEvidence, i.EnvelopeEvidence, i.Items, digestBytes(items), i.RESTLinkHeader, i.RESTLinkObserved, i.GraphQLHasNextPage, i.GraphQLEndCursor}
+}
+
+type paginationResponseEnvelopeWireV1 struct {
+	Schema             string                      `json:"schema"`
+	Response           identityWire                `json:"response"`
+	RawBodySHA256      string                      `json:"raw_body_sha256"`
+	Items              []CanonicalPaginationItemV1 `json:"items"`
+	RESTLinkHeader     string                      `json:"rest_link_header"`
+	RESTLinkObserved   bool                        `json:"rest_link_observed"`
+	GraphQLHasNextPage *bool                       `json:"graphql_has_next_page,omitempty"`
+	GraphQLEndCursor   string                      `json:"graphql_end_cursor,omitempty"`
+}
+
+func paginationResponseEnvelopeWire(i PaginationPageV1Input) paginationResponseEnvelopeWireV1 {
+	return paginationResponseEnvelopeWireV1{GitHubPaginationEnvelopeSchemaV1, snapshotWire(i.Response), i.RawBodySHA256, i.Items, i.RESTLinkHeader, i.RESTLinkObserved, i.GraphQLHasNextPage, i.GraphQLEndCursor}
 }
 
 type PaginationClosureV1Input struct {
@@ -231,7 +275,7 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 	}
 	all := map[string]struct{}{}
 	requests := map[string]struct{}{}
-	responseEvidence := make([]ledger.EvidenceRef, 0, len(input.Pages))
+	responseEvidence := make([]ledger.EvidenceRef, 0, len(input.Pages)*2)
 	total := 0
 	for index, page := range input.Pages {
 		if !page.valid() {
@@ -247,6 +291,7 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 		}
 		requests[p.Response.RequestID()] = struct{}{}
 		responseEvidence = append(responseEvidence, p.ResponseEvidence)
+		responseEvidence = append(responseEvidence, p.EnvelopeEvidence)
 		if p.Ordinal != index {
 			return PaginationClosureV1{}, errors.New("pagination page ordinal is missing, repeated, or reordered")
 		}
@@ -265,7 +310,7 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 			if p.RequestedPage != index+1 || p.RequestedCursor != "" || p.GraphQLHasNextPage != nil || !p.RESTLinkObserved {
 				return PaginationClosureV1{}, errors.New("REST page chain is inconsistent")
 			}
-			next, hasNext, err := parseRESTNext(p.RESTLinkHeader, input.Query)
+			next, hasNext, err := parseRESTLinks(p.RESTLinkHeader, input.Query, p.RequestedPage)
 			if err != nil {
 				return PaginationClosureV1{}, err
 			}
@@ -406,7 +451,8 @@ func ParseCanonicalPaginationClosureV1(data []byte, limits Limits) (PaginationCl
 		page, err := NewPaginationPageV1(PaginationPageV1Input{
 			Ordinal: pw.Ordinal, RequestedPage: pw.RequestedPage, RequestedCursor: pw.RequestedCursor,
 			Response: response, RawBodySHA256: pw.RawBodySHA256, ResponseEvidence: pw.ResponseEvidence,
-			Items: pw.Items, RESTLinkHeader: pw.RESTLinkHeader, RESTLinkObserved: pw.RESTLinkObserved,
+			EnvelopeEvidence: pw.EnvelopeEvidence,
+			Items:            pw.Items, RESTLinkHeader: pw.RESTLinkHeader, RESTLinkObserved: pw.RESTLinkObserved,
 			GraphQLHasNextPage: pw.GraphQLHasNextPage, GraphQLEndCursor: pw.GraphQLEndCursor,
 		}, limits)
 		if err != nil {
@@ -434,7 +480,7 @@ func ParseCanonicalPaginationClosureV1(data []byte, limits Limits) (PaginationCl
 	return value, nil
 }
 
-func parseRESTNext(header string, q PaginationQueryV1) (int, bool, error) {
+func parseRESTLinks(header string, q PaginationQueryV1, requestedPage int) (int, bool, error) {
 	if len(header) == 0 {
 		return 0, false, nil
 	}
@@ -458,33 +504,48 @@ func parseRESTNext(header string, q PaginationQueryV1) (int, bool, error) {
 		}
 		relations[name] = pieces[0][1 : len(pieces[0])-1]
 	}
-	raw, ok := relations["next"]
-	if !ok {
-		return 0, false, nil
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host != "api.github.com" || u.Path != q.PathOrDocumentSHA256 {
-		return 0, false, errors.New("REST next link changed endpoint identity")
-	}
-	values := u.Query()
-	page, err := strconv.Atoi(values.Get("page"))
-	if err != nil || page <= 0 {
-		return 0, false, errors.New("REST next link page is invalid")
-	}
-	perPage, err := strconv.Atoi(values.Get("per_page"))
-	if err != nil || perPage != q.PerPage {
-		return 0, false, errors.New("REST next link per_page changed")
-	}
-	if len(values) != len(q.Variables)+2 {
-		return 0, false, errors.New("REST next link variables changed")
-	}
-	for key, expected := range q.Variables {
-		actual, ok := values[key]
-		if !ok || len(actual) != 1 || actual[0] != expected {
-			return 0, false, errors.New("REST next link query identity changed")
+	pages := make(map[string]int, len(relations))
+	for relation, raw := range relations {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "https" || u.Host != "api.github.com" || u.User != nil || u.Fragment != "" ||
+			u.Path != q.PathOrDocumentSHA256 || u.EscapedPath() != q.PathOrDocumentSHA256 {
+			return 0, false, errors.New("REST Link relation changed endpoint identity")
 		}
+		values := u.Query()
+		pageValues, perPageValues := values["page"], values["per_page"]
+		if len(pageValues) != 1 || len(perPageValues) != 1 {
+			return 0, false, errors.New("REST Link relation query identity changed")
+		}
+		page, err := strconv.Atoi(pageValues[0])
+		if err != nil || page <= 0 {
+			return 0, false, errors.New("REST Link relation page is invalid")
+		}
+		perPage, err := strconv.Atoi(perPageValues[0])
+		if err != nil || perPage != q.PerPage || len(values) != len(q.Variables)+2 {
+			return 0, false, errors.New("REST Link relation query identity changed")
+		}
+		for key, expected := range q.Variables {
+			actual, ok := values[key]
+			if !ok || len(actual) != 1 || actual[0] != expected {
+				return 0, false, errors.New("REST Link relation query identity changed")
+			}
+		}
+		pages[relation] = page
 	}
-	return page, true, nil
+	if page, ok := pages["first"]; ok && page != 1 {
+		return 0, false, errors.New("REST first relation is contradictory")
+	}
+	if page, ok := pages["prev"]; ok && (requestedPage <= 1 || page != requestedPage-1) {
+		return 0, false, errors.New("REST prev relation is contradictory")
+	}
+	next, hasNext := pages["next"]
+	if hasNext && next != requestedPage+1 {
+		return 0, false, errors.New("REST next relation is contradictory")
+	}
+	if last, ok := pages["last"]; ok && ((!hasNext && last != requestedPage) || (hasNext && last <= requestedPage)) {
+		return 0, false, errors.New("REST last relation is contradictory")
+	}
+	return next, hasNext, nil
 }
 func validateStringMap(values map[string]string, l Limits) error {
 	if len(values) > l.MaxMetadataItems {

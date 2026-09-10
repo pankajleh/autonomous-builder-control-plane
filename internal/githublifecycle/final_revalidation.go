@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	CurrentReadyProofSchemaV1 = "current-ready-proof-v1"
-	FinalRevalidationSchemaV1 = "final-revalidation-v1"
+	CurrentReadyProofSchemaV1        = "current-ready-proof-v1"
+	CurrentReadyLedgerEvidenceKindV1 = "current-ready-ledger-observation"
+	FinalRevalidationSchemaV1        = "final-revalidation-v1"
 )
 
 type CurrentReadyProofV1Input struct {
@@ -22,6 +23,7 @@ type CurrentReadyProofV1Input struct {
 	ObservedBoundPrefixSHA256 string
 	ObservedLedgerLength      int64
 	ObservedLedgerSHA256      string
+	ObservedLedgerJSONL       []byte
 	NoLaterTransition         bool
 	EvidenceRefs              []ledger.EvidenceRef
 }
@@ -44,6 +46,7 @@ type currentReadyProofWireV1 struct {
 	BoundPrefixSHA256       string               `json:"bound_prefix_sha256"`
 	ObservedLedgerLength    int64                `json:"observed_ledger_length"`
 	ObservedLedgerSHA256    string               `json:"observed_ledger_sha256"`
+	ObservedLedgerJSONL     []byte               `json:"observed_ledger_jsonl"`
 	CurrentEventID          string               `json:"current_event_id"`
 	CurrentEventSHA256      string               `json:"current_event_sha256"`
 	CurrentRunStateSequence int64                `json:"current_run_state_sequence"`
@@ -55,6 +58,7 @@ type currentReadyProofWireV1 struct {
 
 func NewCurrentReadyProofV1(input CurrentReadyProofV1Input, limits Limits) (CurrentReadyProofV1, error) {
 	input.ReadyBinding = cloneReadyBinding(input.ReadyBinding)
+	input.ObservedLedgerJSONL = append([]byte(nil), input.ObservedLedgerJSONL...)
 	input.EvidenceRefs = append([]ledger.EvidenceRef(nil), input.EvidenceRefs...)
 	limitsSHA, err := limits.SHA256()
 	if err != nil {
@@ -70,12 +74,11 @@ func NewCurrentReadyProofV1(input CurrentReadyProofV1Input, limits Limits) (Curr
 	ready := input.ReadyBinding.input
 	if input.ControllerSequence <= 0 || input.ObservedUnixNano < ready.ReadyEventUnixNano ||
 		input.ObservedBoundPrefixSHA256 != ready.LedgerPrefixSHA256 ||
-		input.ObservedLedgerLength < ready.LedgerPrefixLength || !validSHA256(input.ObservedLedgerSHA256) ||
 		!input.NoLaterTransition || len(input.EvidenceRefs) == 0 || canonicalizeEvidence(&input.EvidenceRefs, limits) != nil {
 		return CurrentReadyProofV1{}, errors.New("current READY proof is incomplete, stale, or unbounded")
 	}
-	if input.ObservedLedgerLength == ready.LedgerPrefixLength && input.ObservedLedgerSHA256 != ready.LedgerPrefixSHA256 {
-		return CurrentReadyProofV1{}, errors.New("current READY proof changed the exact bound ledger prefix")
+	if err := validateCurrentReadyLedger(input, limits); err != nil {
+		return CurrentReadyProofV1{}, err
 	}
 	wire := currentReadyProofWire(input, limitsSHA)
 	canonical, digest, err := canonicalJSON(wire)
@@ -90,7 +93,7 @@ func currentReadyProofWire(input CurrentReadyProofV1Input, limitsSHA string) cur
 	return currentReadyProofWireV1{
 		CurrentReadyProofSchemaV1, input.ReadyBinding.CanonicalJSON(), input.ReadyBinding.SHA256(), input.ControllerSequence,
 		input.ObservedUnixNano, ready.LedgerIdentity, ready.LedgerPrefixLength, ready.LedgerPrefixSHA256,
-		input.ObservedLedgerLength, input.ObservedLedgerSHA256, ready.ReadyEventID, ready.ReadyEventSHA256,
+		input.ObservedLedgerLength, input.ObservedLedgerSHA256, input.ObservedLedgerJSONL, ready.ReadyEventID, ready.ReadyEventSHA256,
 		ready.ReadyRunStateSequence, domain.StateReadyForMerge, input.NoLaterTransition, input.EvidenceRefs, limitsSHA,
 	}
 }
@@ -98,6 +101,7 @@ func currentReadyProofWire(input CurrentReadyProofV1Input, limitsSHA string) cur
 func (p CurrentReadyProofV1) Input() CurrentReadyProofV1Input {
 	i := p.input
 	i.ReadyBinding = cloneReadyBinding(i.ReadyBinding)
+	i.ObservedLedgerJSONL = append([]byte(nil), i.ObservedLedgerJSONL...)
 	i.EvidenceRefs = append([]ledger.EvidenceRef(nil), i.EvidenceRefs...)
 	return i
 }
@@ -123,7 +127,8 @@ func ParseCanonicalCurrentReadyProofV1(data []byte, limits Limits) (CurrentReady
 		ReadyBinding: ready, ControllerSequence: wire.ControllerSequence, ObservedUnixNano: wire.ObservedUnixNano,
 		ObservedBoundPrefixSHA256: wire.BoundPrefixSHA256,
 		ObservedLedgerLength:      wire.ObservedLedgerLength, ObservedLedgerSHA256: wire.ObservedLedgerSHA256,
-		NoLaterTransition: wire.NoLaterTransition, EvidenceRefs: wire.EvidenceRefs,
+		ObservedLedgerJSONL: wire.ObservedLedgerJSONL,
+		NoLaterTransition:   wire.NoLaterTransition, EvidenceRefs: wire.EvidenceRefs,
 	}, limits)
 	if err != nil {
 		return CurrentReadyProofV1{}, err
@@ -140,6 +145,54 @@ func ParseCanonicalCurrentReadyProofV1(data []byte, limits Limits) (CurrentReady
 		return CurrentReadyProofV1{}, err
 	}
 	return value, nil
+}
+
+func validateCurrentReadyLedger(input CurrentReadyProofV1Input, limits Limits) error {
+	ready := input.ReadyBinding.input
+	ledgerBytes := input.ObservedLedgerJSONL
+	if len(ledgerBytes) == 0 || len(ledgerBytes) > limits.MaxPaginationClosureBytes ||
+		input.ObservedLedgerLength != int64(len(ledgerBytes)) || input.ObservedLedgerLength < ready.LedgerPrefixLength ||
+		input.ObservedLedgerSHA256 != digestBytes(ledgerBytes) || !containsEvidenceDigest(input.EvidenceRefs, CurrentReadyLedgerEvidenceKindV1, input.ObservedLedgerSHA256) {
+		return errors.New("current READY proof lacks exact bounded ledger bytes and retained evidence")
+	}
+	if ready.LedgerPrefixLength > int64(len(ledgerBytes)) || digestBytes(ledgerBytes[:ready.LedgerPrefixLength]) != ready.LedgerPrefixSHA256 {
+		return errors.New("current READY proof changed the exact bound ledger prefix")
+	}
+	eventEnd := ready.ReadyEventByteOffset + int64(len(ready.ReadyEventJSON))
+	if eventEnd+1 != ready.LedgerPrefixLength || eventEnd >= int64(len(ledgerBytes)) || ledgerBytes[eventEnd] != '\n' ||
+		!bytes.Equal(ledgerBytes[ready.ReadyEventByteOffset:eventEnd], ready.ReadyEventJSON) {
+		return errors.New("current READY proof does not contain the bound READY event at its exact offset")
+	}
+	rest := ledgerBytes[ready.LedgerPrefixLength:]
+	for len(rest) > 0 {
+		newline := bytes.IndexByte(rest, '\n')
+		if newline < 0 || newline == 0 {
+			return errors.New("current READY ledger suffix is not complete JSONL")
+		}
+		line := rest[:newline]
+		var event ledger.Event
+		if err := strictDecode(line, &event); err != nil || event.Validate() != nil {
+			return errors.New("current READY ledger suffix contains an invalid event")
+		}
+		canonical, _ := json.Marshal(event)
+		if !bytes.Equal(canonical, line) {
+			return errors.New("current READY ledger suffix contains non-canonical event bytes")
+		}
+		if event.RunID == ready.RunID && event.StateFrom != "" {
+			return errors.New("current READY proof contains a later transition for the bound run")
+		}
+		rest = rest[newline+1:]
+	}
+	return nil
+}
+
+func containsEvidenceDigest(refs []ledger.EvidenceRef, kind, digest string) bool {
+	for _, ref := range refs {
+		if ref.Kind == kind && ref.SHA256 == digest {
+			return true
+		}
+	}
+	return false
 }
 
 type FinalRevalidationV1Input struct {
@@ -229,7 +282,7 @@ func NewFinalRevalidationV1(input FinalRevalidationV1Input, limits Limits) (Fina
 	if err := EvaluateMergePolicyV1(input.MergeInput.authority, input.PullRequest, input.Checks, input.CheckRunsClosure, input.CommitStatusesClosure, limits); err != nil {
 		return FinalRevalidationV1{}, err
 	}
-	sort.Slice(input.Checks, func(i, j int) bool { return input.Checks[i].NodeID < input.Checks[j].NodeID })
+	sort.Slice(input.Checks, func(i, j int) bool { return checkKey(input.Checks[i]) < checkKey(input.Checks[j]) })
 	if !input.Capability.valid() || input.Capability.SHA256() != input.MergeInput.capability.SHA256() ||
 		!input.Recipe.valid() || input.Recipe.SHA256() != input.MergeInput.recipe.SHA256() || !input.Counters.valid() ||
 		!input.NoTargetRequestAttempted || len(input.EvidenceRefs) == 0 || canonicalizeEvidence(&input.EvidenceRefs, limits) != nil {
@@ -395,12 +448,10 @@ func ParseCanonicalFinalRevalidationV1(data []byte, input MergeInput, limits Lim
 	if err != nil {
 		return FinalRevalidationV1{}, err
 	}
-	rebuilt := finalRevalidationWire(value.input, value.decisionSHA256, value.limitsSHA)
 	if wire.MergeInputSHA256 != input.SHA256() || wire.CurrentReadyProofSHA256 != readyProof.SHA256() ||
 		wire.PullRequestSHA256 != pr.SHA256() || wire.CheckRunsClosureSHA256 != checkRuns.SHA256() ||
 		wire.CommitStatusesClosureSHA256 != statuses.SHA256() || wire.CapabilitySHA256 != capability.SHA256() ||
-		wire.RecipeSHA256 != recipe.SHA256() || wire.FinalDecisionSHA256 != value.decisionSHA256 || wire.LimitsSHA256 != value.limitsSHA ||
-		!bytes.Equal(mustJSON(rebuilt), mustJSON(wire)) {
+		wire.RecipeSHA256 != recipe.SHA256() || wire.FinalDecisionSHA256 != value.decisionSHA256 || wire.LimitsSHA256 != value.limitsSHA {
 		return FinalRevalidationV1{}, errors.New("final revalidation nested or derived digest disagrees")
 	}
 	if err := requireCanonical(data, value.canonical); err != nil {
@@ -419,11 +470,6 @@ func checksFromWire(wire []checkWire) ([]Check, error) {
 		checks[index] = Check{item.NodeID, item.Name, item.Identity, item.Status, item.Conclusion, head, append([]ledger.EvidenceRef(nil), item.EvidenceRefs...)}
 	}
 	return checks, nil
-}
-
-func mustJSON(value any) []byte {
-	data, _ := json.Marshal(value)
-	return data
 }
 
 func cloneCurrentReadyProof(p CurrentReadyProofV1) CurrentReadyProofV1 {

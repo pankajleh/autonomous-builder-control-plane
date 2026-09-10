@@ -11,7 +11,12 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
 
-const AuthoritativePullRequestSnapshotSchemaV1 = "authoritative-pull-request-snapshot-v1"
+const (
+	AuthoritativePullRequestSnapshotSchemaV1 = "authoritative-pull-request-snapshot-v1"
+	GitHubPullRequestResponseEvidenceKindV1  = "github-pull-request-response-body"
+	GitHubPullRequestEnvelopeEvidenceKindV1  = "github-pull-request-response-envelope"
+	GitHubPullRequestEnvelopeSchemaV1        = "github-pull-request-response-envelope-v1"
+)
 
 type AuthoritativePullRequestSnapshotV1Input struct {
 	Snapshot              SnapshotIdentity
@@ -43,13 +48,58 @@ type AuthoritativePullRequestSnapshotV1 struct {
 	limitsSHA string
 }
 
+func NewPullRequestEnvelopeEvidenceV1(uri string, input AuthoritativePullRequestSnapshotV1Input, limits Limits) (ledger.EvidenceRef, error) {
+	if err := limits.Validate(); err != nil {
+		return ledger.EvidenceRef{}, err
+	}
+	if !validText(uri, limits.MaxTextBytes, false) || !input.Snapshot.valid() || input.Snapshot.Provider() != "github" ||
+		!validSHA256(input.ResponseBodySHA256) || !input.RepositoryBinding.valid() || !input.PullRequest.valid() ||
+		!input.BaseOID.valid() || !input.HeadOID.valid() {
+		return ledger.EvidenceRef{}, errors.New("authoritative PR response envelope identity is invalid")
+	}
+	canonical, _, err := canonicalJSON(pullRequestResponseEnvelopeWire(input))
+	if err != nil {
+		return ledger.EvidenceRef{}, err
+	}
+	return ledger.EvidenceRef{URI: uri, Kind: GitHubPullRequestEnvelopeEvidenceKindV1, SHA256: digestBytes(canonical)}, nil
+}
+
+type pullRequestResponseEnvelopeWireV1 struct {
+	Schema                  string            `json:"schema"`
+	Snapshot                identityWire      `json:"snapshot"`
+	ResponseBodySHA256      string            `json:"response_body_sha256"`
+	APIVersion              string            `json:"api_version"`
+	RepositoryBindingSHA256 string            `json:"repository_binding_sha256"`
+	PullRequest             prIdentityWire    `json:"pull_request"`
+	PullRequestDatabaseID   int64             `json:"pull_request_database_id"`
+	BaseRepositoryNodeID    string            `json:"base_repository_node_id"`
+	BaseRef                 string            `json:"base_ref"`
+	BaseOID                 string            `json:"base_oid"`
+	HeadRepositoryNodeID    string            `json:"head_repository_node_id"`
+	HeadRef                 string            `json:"head_ref"`
+	HeadOID                 string            `json:"head_oid"`
+	State                   *PullRequestState `json:"state"`
+	IsDraft                 *bool             `json:"is_draft"`
+	Merged                  *bool             `json:"merged"`
+	MergedAtUnixNano        *int64            `json:"merged_at_unix_nano"`
+}
+
+func pullRequestResponseEnvelopeWire(input AuthoritativePullRequestSnapshotV1Input) pullRequestResponseEnvelopeWireV1 {
+	return pullRequestResponseEnvelopeWireV1{
+		GitHubPullRequestEnvelopeSchemaV1, snapshotWire(input.Snapshot), input.ResponseBodySHA256, input.APIVersion, input.RepositoryBinding.SHA256(),
+		pullRequestWire(input.PullRequest), input.PullRequestDatabaseID, input.BaseRepositoryNodeID, input.BaseRef,
+		input.BaseOID.String(), input.HeadRepositoryNodeID, input.HeadRef, input.HeadOID.String(), input.State,
+		input.IsDraft, input.Merged, input.MergedAtUnixNano,
+	}
+}
+
 func NewAuthoritativePullRequestSnapshotV1(input AuthoritativePullRequestSnapshotV1Input, limits Limits) (AuthoritativePullRequestSnapshotV1, error) {
 	input = cloneAuthoritativePRInput(input)
 	limitsSHA, err := limits.SHA256()
 	if err != nil {
 		return AuthoritativePullRequestSnapshotV1{}, err
 	}
-	if !input.Snapshot.valid() || !validSHA256(input.ResponseBodySHA256) || !validText(input.APIVersion, limits.MaxTextBytes, false) ||
+	if !input.Snapshot.valid() || input.Snapshot.Provider() != "github" || !validSHA256(input.ResponseBodySHA256) || !validText(input.APIVersion, limits.MaxTextBytes, false) ||
 		!input.RepositoryBinding.valid() || !input.PullRequest.valid() || input.PullRequestDatabaseID <= 0 || !input.Actor.valid() || !input.BaseOID.valid() || !input.HeadOID.valid() {
 		return AuthoritativePullRequestSnapshotV1{}, errors.New("authoritative PR snapshot identity is invalid")
 	}
@@ -109,6 +159,13 @@ func NewAuthoritativePullRequestSnapshotV1(input AuthoritativePullRequestSnapsho
 	}
 	if len(input.EvidenceRefs) == 0 || canonicalizeEvidence(&input.EvidenceRefs, limits) != nil {
 		return AuthoritativePullRequestSnapshotV1{}, errors.New("authoritative PR evidence is invalid")
+	}
+	if !containsEvidenceDigest(input.EvidenceRefs, GitHubPullRequestResponseEvidenceKindV1, input.ResponseBodySHA256) {
+		return AuthoritativePullRequestSnapshotV1{}, errors.New("authoritative PR evidence does not retain the exact GitHub response body")
+	}
+	responseEnvelope, _, err := canonicalJSON(pullRequestResponseEnvelopeWire(input))
+	if err != nil || !containsEvidenceDigest(input.EvidenceRefs, GitHubPullRequestEnvelopeEvidenceKindV1, digestBytes(responseEnvelope)) {
+		return AuthoritativePullRequestSnapshotV1{}, errors.New("authoritative PR evidence does not bind the GitHub request, body, and decoded response fields")
 	}
 	canonical, digest, err := canonicalJSON(authoritativePRWire(input, limitsSHA))
 	if err != nil {

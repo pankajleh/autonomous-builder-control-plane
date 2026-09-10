@@ -45,9 +45,10 @@ its newline), and its run-state sequence must equal its transition ordinal.
 The closure must contain the event evidence, repository-mapping evidence, and
 every accepted source's acceptance evidence. A source for the integrated head
 must be present. `CurrentReadyProofV1` independently re-parses the READY
-binding, proves the observed bound-prefix digest is unchanged, binds a bounded
-ledger observation, and asserts that the same READY event remains current with
-no later run transition.
+binding, retains the exact bounded ledger JSONL bytes and matching evidence,
+recomputes the bound-prefix and full-observation digests, verifies the READY
+event at its exact byte offset, and rejects any later transition for the same
+run. A caller-provided no-later-transition summary is never sufficient.
 
 `RepositoryBindingV1` binds Phase-3 repository identity/path/canonical remote/
 start SHA to exact GitHub owner/name and stable repository node/database IDs,
@@ -77,8 +78,9 @@ disagreement, and invalid constructor inputs fail closed.
 `isDraft=false`, `merged=false`, and absent `mergedAt` observations together
 with stable repository and PR node/database identities, exact same-repository
 full base/head refs and OIDs, API version, authenticated acting principal,
-provider request identity, response digest, evidence, limits, and independently
-validated reviews closure. Closed, draft, merged, contradictory, missing,
+provider request identity, response digest, body evidence, and retained response-
+envelope evidence binding that request/body pair to the decoded PR fields, limits,
+and independently validated reviews closure. Closed, draft, merged, contradictory, missing,
 synthetic/deleted-ref, or fork-head observations are invalid.
 
 Every `Check` has a `TrustedCheckIdentityV1`: exact context, source kind
@@ -104,8 +106,11 @@ filters, and page size are independently produced by
 Each closure binds its exact derived source/query/filters, ordered page or
 cursor requests, unique provider request/body identities, canonical response
 envelopes, stable item keys/digests, closure-wide set digest, evidence, and
-limits. Every page binds a retained response evidence ref whose digest equals
-the raw body digest, and the closure evidence contains every page ref. REST
+limits. Every page requires a GitHub response identity, binds a retained body
+evidence ref whose digest equals the raw-body digest, and binds a second
+retained response-envelope evidence ref covering the response identity,
+decoded items, and exact REST/GraphQL pagination fields. The closure evidence
+contains both refs for every page. REST
 termination comes only from an explicitly observed valid final `Link`
 relation set (including an explicitly observed absent header) without
 `next`; an empty default string is not observation. GraphQL termination comes
@@ -195,7 +200,11 @@ all-or-nothing base/head before-OID rejection. The proof derives and binds the
 repository/node identity, both ordered ref updates and OIDs, rejected
 predicate, capability, seal/commitment/write/mutation identities,
 request/response identity and bodies, raw evidence digest/ref, and the fixed
-all-or-nothing disposition. Its evidence must also be in reconciliation
+all-or-nothing disposition. Atomic rejection proof construction requires the
+response request ID to match the submitted request, retains and strict-parses
+the bounded canonical response body, derives the rejected ref-update index
+from its frozen machine-readable error code, and requires the raw evidence
+digest to equal the response-body digest. Its evidence must also be in reconciliation
 closure. `UNKNOWN`
 contains no result or non-application claim. Absent/open PR, old/unrelated
 target, missing expected object, truncation, or generic provider assertions
@@ -211,7 +220,8 @@ their independently bounded rules.
 
 `CancellationAuthorityV1` is immutable strict-canonical controller authority.
 It binds project/plan/run, repository and Phase-3 authority, exact READY event/
-digest/sequence and ledger prefix, current-READY proof, a closed requested-at
+digest/sequence and ledger prefix, the full independently revalidated canonical
+current-READY proof rather than a caller digest, a closed requested-at
 boundary and controller receipt ordering, every reached admission/attempt/
 write/seal/commitment identity, stable authenticated requester, controller
 cancellation policy/source/grant/allow decision, unique source request,
@@ -226,7 +236,8 @@ and evidence, ingress ordering, and evidence closure.
 
 Boundary construction enforces exact absence/presence for `PRE_ADMISSION`,
 `ADMITTED_PRE_TARGET_SUBMISSION`, `TARGET_SUBMISSION_UNKNOWN`, and
-`TARGET_NOT_APPLIED`. Independent validation receives expected READY, policy,
+`TARGET_NOT_APPLIED`, including a sealed zero-request-byte form for a published
+seal/commitment whose transport provably wrote no request bytes. Independent validation receives expected READY, policy,
 principal, boundary, attempt/write/seal/commitment, source/ingress ordering,
 and proof identities.
 
@@ -239,7 +250,9 @@ bytes/digest. Replay identity is independently reconstructed before
 `CANCELLED` selection. Only this prior durable form may
 authorize `CANCELLED`; submitted boundaries also need exact typed
 `NOT_APPLIED` proof; `TARGET_NOT_APPLIED` must contain that byte-identical
-proof in its submission record. `APPLIED` always defeats cancellation.
+proof in its submission record. Pre-submit selection requires its bound
+no-admission/zero-byte `NOT_APPLIED` disposition; `UNKNOWN` never selects a
+terminal state. `APPLIED` always defeats cancellation.
 
 ## Post-merge result and containment
 

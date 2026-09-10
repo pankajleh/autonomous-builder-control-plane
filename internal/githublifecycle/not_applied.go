@@ -20,6 +20,8 @@ const (
 
 const NotAppliedAllOrNothingDispositionV1 = "all_or_nothing_not_applied"
 
+const NotAppliedBeforeOIDMismatchCodeV1 = "UPDATE_REFS_BEFORE_OID_MISMATCH"
+
 const (
 	NotAppliedZeroByteEvidenceKindV1        = "not-applied-zero-byte-proof"
 	NotAppliedAtomicRejectionEvidenceKindV1 = "github-update-refs-atomic-rejection"
@@ -33,6 +35,7 @@ type NotAppliedProofV1Input struct {
 	Response           *SnapshotIdentity
 	HTTPStatus         int
 	ResponseBodySHA256 string
+	ResponseBody       []byte
 	EvidenceRef        ledger.EvidenceRef
 }
 
@@ -62,6 +65,7 @@ type notAppliedProofWireV1 struct {
 	Response                *identityWire         `json:"response,omitempty"`
 	HTTPStatus              int                   `json:"http_status,omitempty"`
 	ResponseBodySHA256      string                `json:"response_body_sha256,omitempty"`
+	ResponseBody            json.RawMessage       `json:"response_body,omitempty"`
 	RawEvidenceSHA256       string                `json:"raw_evidence_sha256"`
 	EvidenceRef             ledger.EvidenceRef    `json:"evidence_ref"`
 	AllOrNothing            bool                  `json:"all_or_nothing"`
@@ -86,14 +90,22 @@ func NewNotAppliedProofV1(input NotAppliedProofV1Input, sealed SealedMergeAuthor
 	}
 	switch input.Kind {
 	case NotAppliedZeroRequestBytes:
-		if input.EvidenceRef.Kind != NotAppliedZeroByteEvidenceKindV1 || input.RequestBytes != 0 || input.RequestBodySHA256 != "" || input.Response != nil || input.HTTPStatus != 0 || input.ResponseBodySHA256 != "" {
+		if input.EvidenceRef.Kind != NotAppliedZeroByteEvidenceKindV1 || input.RequestBytes != 0 || input.RequestBodySHA256 != "" || input.Response != nil || input.HTTPStatus != 0 || input.ResponseBodySHA256 != "" || len(input.ResponseBody) != 0 {
 			return NotAppliedProofV1{}, errors.New("zero-byte NOT_APPLIED proof contains submitted request or response state")
 		}
 	case NotAppliedAtomicBaseRejected, NotAppliedAtomicHeadRejected:
 		if input.EvidenceRef.Kind != NotAppliedAtomicRejectionEvidenceKindV1 || input.RequestBytes <= 0 ||
 			input.RequestBodySHA256 != sealed.input.Commitment.SHA256() || input.Response == nil || !input.Response.valid() ||
-			input.Response.Provider() != "github" || input.HTTPStatus != 200 || !validSHA256(input.ResponseBodySHA256) {
+			input.Response.Provider() != "github" || input.Response.RequestID() != input.RequestID ||
+			input.Response.ObservedUnixNano() < sealed.input.Seal.input.FinalRevalidation.input.CompletedUnixNano ||
+			input.HTTPStatus != 200 || len(input.ResponseBody) == 0 || len(input.ResponseBody) > limits.MaxPaginationClosureBytes ||
+			!validSHA256(input.ResponseBodySHA256) || input.ResponseBodySHA256 != digestBytes(input.ResponseBody) ||
+			input.EvidenceRef.SHA256 != input.ResponseBodySHA256 {
 			return NotAppliedProofV1{}, errors.New("atomic rejection proof lacks authenticated request/response evidence")
+		}
+		kind, err := parseAtomicRejectionResponse(input.ResponseBody)
+		if err != nil || kind != input.Kind {
+			return NotAppliedProofV1{}, errors.New("atomic rejection response does not prove the claimed before-OID predicate")
 		}
 	default:
 		return NotAppliedProofV1{}, errors.New("unsupported NOT_APPLIED proof kind")
@@ -125,7 +137,7 @@ func notAppliedProofWire(input NotAppliedProofV1Input, sealed SealedMergeAuthori
 		updates, predicate, sealed.input.MergeInput.capability.CanonicalJSON(), sealed.input.MergeInput.capability.SHA256(),
 		sealed.input.Seal.SHA256(), commitment.SHA256(), sealed.input.MergeInput.attempt.WriteID(), commitment.clientMutationID,
 		input.RequestID, input.RequestBodySHA256, input.RequestBytes, response, input.HTTPStatus, input.ResponseBodySHA256,
-		input.EvidenceRef.SHA256, input.EvidenceRef, true, NotAppliedAllOrNothingDispositionV1, limitsSHA,
+		input.ResponseBody, input.EvidenceRef.SHA256, input.EvidenceRef, true, NotAppliedAllOrNothingDispositionV1, limitsSHA,
 	}
 }
 
@@ -173,13 +185,12 @@ func ParseCanonicalNotAppliedProofV1(data []byte, sealed SealedMergeAuthorizatio
 	}
 	value, err := NewNotAppliedProofV1(NotAppliedProofV1Input{
 		Kind: wire.Kind, RequestID: wire.RequestID, RequestBodySHA256: wire.RequestBodySHA256, RequestBytes: wire.RequestBytes,
-		Response: response, HTTPStatus: wire.HTTPStatus, ResponseBodySHA256: wire.ResponseBodySHA256, EvidenceRef: wire.EvidenceRef,
+		Response: response, HTTPStatus: wire.HTTPStatus, ResponseBodySHA256: wire.ResponseBodySHA256, ResponseBody: wire.ResponseBody, EvidenceRef: wire.EvidenceRef,
 	}, sealed, limits)
 	if err != nil {
 		return NotAppliedProofV1{}, err
 	}
-	rebuilt := notAppliedProofWire(value.input, sealed, value.limitsSHA)
-	if wire.RawEvidenceSHA256 != wire.EvidenceRef.SHA256 || !bytes.Equal(mustJSON(rebuilt), mustJSON(wire)) {
+	if wire.RawEvidenceSHA256 != wire.EvidenceRef.SHA256 {
 		return NotAppliedProofV1{}, errors.New("NOT_APPLIED proof derived repository, refs, predicate, capability, or disposition disagrees")
 	}
 	if err := requireCanonical(data, value.canonical); err != nil {
@@ -193,7 +204,56 @@ func cloneNotAppliedInput(input NotAppliedProofV1Input) NotAppliedProofV1Input {
 		value := *input.Response
 		input.Response = &value
 	}
+	input.ResponseBody = append([]byte(nil), input.ResponseBody...)
 	return input
+}
+
+type atomicRejectionResponseV1 struct {
+	Data struct {
+		UpdateRefs json.RawMessage `json:"updateRefs"`
+	} `json:"data"`
+	Errors []struct {
+		Type       string   `json:"type"`
+		Path       []string `json:"path"`
+		Extensions struct {
+			Code           string `json:"code"`
+			RefUpdateIndex int    `json:"ref_update_index"`
+		} `json:"extensions"`
+	} `json:"errors"`
+}
+
+func parseAtomicRejectionResponse(data []byte) (NotAppliedProofKindV1, error) {
+	var response atomicRejectionResponseV1
+	if err := strictDecode(data, &response); err != nil || len(response.Errors) != 1 ||
+		!bytes.Equal(response.Data.UpdateRefs, []byte("null")) || response.Errors[0].Type != "FAILED_PRECONDITION" ||
+		response.Errors[0].Extensions.Code != NotAppliedBeforeOIDMismatchCodeV1 ||
+		!equalStrings(response.Errors[0].Path, []string{"updateRefs", "refUpdates", "beforeOid"}) {
+		return "", errors.New("atomic rejection response is malformed or unsupported")
+	}
+	canonical, _ := json.Marshal(response)
+	if !bytes.Equal(canonical, data) {
+		return "", errors.New("atomic rejection response is not canonical")
+	}
+	switch response.Errors[0].Extensions.RefUpdateIndex {
+	case 0:
+		return NotAppliedAtomicBaseRejected, nil
+	case 1:
+		return NotAppliedAtomicHeadRejected, nil
+	default:
+		return "", errors.New("atomic rejection response names an unknown ref update")
+	}
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func cloneNotAppliedProof(proof NotAppliedProofV1) NotAppliedProofV1 {

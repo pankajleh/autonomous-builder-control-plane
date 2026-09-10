@@ -132,15 +132,25 @@ func TestTrustedChecksAndIndependentPaginationBoundaries(t *testing.T) {
 	evidence1 := ledger.EvidenceRef{URI: "evidence/page-1", Kind: "github-response-body", SHA256: strings.Repeat("3", 64)}
 	evidence2 := ledger.EvidenceRef{URI: "evidence/page-2", Kind: "github-response-body", SHA256: strings.Repeat("4", 64)}
 	link := "<https://api.github.com/repos/octo-org/control-plane/commits/" + f.headSHA.String() + "/check-runs?filter=all&page=2&per_page=1>; rel=\"next\""
-	p1, err := NewPaginationPageV1(PaginationPageV1Input{Ordinal: 0, RequestedPage: 1, Response: response1, RawBodySHA256: evidence1.SHA256, ResponseEvidence: evidence1, Items: []CanonicalPaginationItemV1{item1}, RESTLinkHeader: link, RESTLinkObserved: true}, limits)
+	p1Input := PaginationPageV1Input{Ordinal: 0, RequestedPage: 1, Response: response1, RawBodySHA256: evidence1.SHA256, ResponseEvidence: evidence1, Items: []CanonicalPaginationItemV1{item1}, RESTLinkHeader: link, RESTLinkObserved: true}
+	p1Input.EnvelopeEvidence, err = NewPaginationEnvelopeEvidenceV1("evidence/page-envelope-1", p1Input, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p2, err := NewPaginationPageV1(PaginationPageV1Input{Ordinal: 1, RequestedPage: 2, Response: response2, RawBodySHA256: evidence2.SHA256, ResponseEvidence: evidence2, Items: []CanonicalPaginationItemV1{item2}, RESTLinkObserved: true}, limits)
+	p1, err := NewPaginationPageV1(p1Input, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence := []ledger.EvidenceRef{evidence1, evidence2}
+	p2Input := PaginationPageV1Input{Ordinal: 1, RequestedPage: 2, Response: response2, RawBodySHA256: evidence2.SHA256, ResponseEvidence: evidence2, Items: []CanonicalPaginationItemV1{item2}, RESTLinkObserved: true}
+	p2Input.EnvelopeEvidence, err = NewPaginationEnvelopeEvidenceV1("evidence/page-envelope-2", p2Input, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := NewPaginationPageV1(p2Input, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := []ledger.EvidenceRef{evidence1, p1Input.EnvelopeEvidence, evidence2, p2Input.EnvelopeEvidence}
 	closure, err := NewPaginationClosureV1(PaginationClosureV1Input{query, []PaginationPageV1{p1, p2}, evidence}, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -153,7 +163,14 @@ func TestTrustedChecksAndIndependentPaginationBoundaries(t *testing.T) {
 	}
 	duplicate := p2.Input()
 	duplicate.Items = []CanonicalPaginationItemV1{item1}
-	p2dup, _ := NewPaginationPageV1(duplicate, limits)
+	duplicate.EnvelopeEvidence, err = NewPaginationEnvelopeEvidenceV1("evidence/page-envelope-2-duplicate", duplicate, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2dup, err := NewPaginationPageV1(duplicate, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := NewPaginationClosureV1(PaginationClosureV1Input{query, []PaginationPageV1{p1, p2dup}, evidence}, limits); err == nil {
 		t.Fatal("cross-page duplicate accepted")
 	}
@@ -227,10 +244,11 @@ func TestCancellationAuthorityStrictDurableAndAppliedPrecedence(t *testing.T) {
 	authRef := ledger.EvidenceRef{URI: "evidence/cancel-authn", Kind: "authentication", SHA256: strings.Repeat("1", 64)}
 	policyRef := ledger.EvidenceRef{URI: "evidence/cancel-policy", Kind: "cancellation-policy", SHA256: strings.Repeat("2", 64)}
 	requestRef := ledger.EvidenceRef{URI: "evidence/cancel-request", Kind: "cancellation-request", SHA256: strings.Repeat("3", 64)}
-	proofRef := ledger.EvidenceRef{URI: "evidence/not-applied", Kind: NotAppliedAtomicRejectionEvidenceKindV1, SHA256: strings.Repeat("b", 64)}
 	attempt := f.mergeWrite.Attempt()
-	response, _ := NewSnapshotIdentity("github", "request-not-applied", 1700000004000000000)
-	notApplied, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicHeadRejected, RequestID: "target-attempt-1", RequestBodySHA256: f.sealed.Commitment().SHA256(), RequestBytes: 100, Response: &response, HTTPStatus: 200, ResponseBodySHA256: strings.Repeat("5", 64), EvidenceRef: proofRef}, f.sealed, f.limits)
+	response, _ := NewSnapshotIdentity("github", "target-attempt-1", 1700000004000000000)
+	responseBody := atomicRejectionResponseBody(t, 1)
+	proofRef := ledger.EvidenceRef{URI: "evidence/not-applied", Kind: NotAppliedAtomicRejectionEvidenceKindV1, SHA256: digestBytes(responseBody)}
+	notApplied, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicHeadRejected, RequestID: "target-attempt-1", RequestBodySHA256: f.sealed.Commitment().SHA256(), RequestBytes: 100, Response: &response, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: proofRef}, f.sealed, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +259,9 @@ func TestCancellationAuthorityStrictDurableAndAppliedPrecedence(t *testing.T) {
 	if _, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofAuthenticatedNotApplied, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), RequestBytes: 101, SubmissionState: ReconciliationNotApplied, NotAppliedProof: &notApplied, EvidenceRef: proofRef}, f.limits); err == nil {
 		t.Fatal("cancellation submission proof accepted a byte count different from its exact NOT_APPLIED proof")
 	}
-	input := CancellationAuthorityV1Input{ProjectID: ready.input.ProjectID, PlanID: ready.input.PlanID, RunID: ready.input.RunID, RepositoryBindingSHA256: ready.RepositoryBinding().SHA256(), Phase3AuthoritySHA256: ready.input.Phase3AuthoritySHA256, ReadyEventSHA256: ready.input.ReadyEventSHA256, ReadyEventID: ready.input.ReadyEventID, ReadyRunStateSequence: ready.input.ReadyRunStateSequence, ReadyBindingSHA256: ready.SHA256(), LedgerPrefixSHA256: ready.input.LedgerPrefixSHA256, LedgerPrefixLength: ready.input.LedgerPrefixLength, CurrentReadyProofSHA256: strings.Repeat("4", 64), Boundary: CancellationTargetNotApplied, ReceiptUnixNano: 1700000001, IngressSequence: 7, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), SubmissionProof: submissionProof, Requester: StablePrincipalV1{Kind: "user", Identity: StableIdentityV1{DatabaseID: 7, NodeID: "U_cancel"}}, AuthenticationEvidence: authRef, CancellationPolicyVersion: "cancel-v1", CancellationPolicySource: policyRef, CancellationPolicySHA256: strings.Repeat("6", 64), ScopedGrantSHA256: strings.Repeat("7", 64), AllowDecisionSHA256: strings.Repeat("8", 64), SourceRequestID: "cancel-request-1", SourceKind: "api", RequestEvidence: requestRef, IngressID: "ingress-1", EvidenceRefs: []ledger.EvidenceRef{authRef, policyRef, requestRef, proofRef}}
+	cancellationEvidence := []ledger.EvidenceRef{authRef, policyRef, requestRef, proofRef}
+	cancellationEvidence = append(cancellationEvidence, f.readyProof.input.EvidenceRefs...)
+	input := CancellationAuthorityV1Input{ProjectID: ready.input.ProjectID, PlanID: ready.input.PlanID, RunID: ready.input.RunID, RepositoryBindingSHA256: ready.RepositoryBinding().SHA256(), Phase3AuthoritySHA256: ready.input.Phase3AuthoritySHA256, ReadyEventSHA256: ready.input.ReadyEventSHA256, ReadyEventID: ready.input.ReadyEventID, ReadyRunStateSequence: ready.input.ReadyRunStateSequence, ReadyBindingSHA256: ready.SHA256(), LedgerPrefixSHA256: ready.input.LedgerPrefixSHA256, LedgerPrefixLength: ready.input.LedgerPrefixLength, CurrentReadyProof: f.readyProof, Boundary: CancellationTargetNotApplied, ReceiptUnixNano: 1700000005000000000, IngressSequence: 12, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), SubmissionProof: submissionProof, Requester: StablePrincipalV1{Kind: "user", Identity: StableIdentityV1{DatabaseID: 7, NodeID: "U_cancel"}}, AuthenticationEvidence: authRef, CancellationPolicyVersion: "cancel-v1", CancellationPolicySource: policyRef, CancellationPolicySHA256: strings.Repeat("6", 64), ScopedGrantSHA256: strings.Repeat("7", 64), AllowDecisionSHA256: strings.Repeat("8", 64), SourceRequestID: "cancel-request-1", SourceKind: "api", RequestEvidence: requestRef, IngressID: "ingress-1", EvidenceRefs: cancellationEvidence}
 	authority, err := NewCancellationAuthorityV1(input, f.limits)
 	if err != nil {
 		t.Fatal(err)
@@ -250,12 +270,12 @@ func TestCancellationAuthorityStrictDurableAndAppliedPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := CancellationAuthorityExpectationV1{ProjectID: input.ProjectID, PlanID: input.PlanID, RunID: input.RunID, ReadyBinding: ready, CurrentReadyProofSHA256: input.CurrentReadyProofSHA256, AdmissionSHA256: input.AdmissionSHA256, Requester: input.Requester, AuthenticationEvidence: input.AuthenticationEvidence, CancellationPolicyVersion: input.CancellationPolicyVersion, CancellationPolicySource: input.CancellationPolicySource, CancellationPolicySHA256: input.CancellationPolicySHA256, ScopedGrantSHA256: input.ScopedGrantSHA256, AllowDecisionSHA256: input.AllowDecisionSHA256, Boundary: input.Boundary, Attempt: &attempt, SealSHA256: input.SealSHA256, CommitmentSHA256: input.CommitmentSHA256, SealedAuthorization: f.sealed, SubmissionProof: input.SubmissionProof, SourceRequestID: input.SourceRequestID, SourceKind: input.SourceKind, RequestEvidence: input.RequestEvidence, IngressID: input.IngressID, ReceiptUnixNano: input.ReceiptUnixNano, IngressSequence: input.IngressSequence, EvidenceRefs: input.EvidenceRefs}
+	expected := CancellationAuthorityExpectationV1{ProjectID: input.ProjectID, PlanID: input.PlanID, RunID: input.RunID, ReadyBinding: ready, CurrentReadyProof: input.CurrentReadyProof, AdmissionSHA256: input.AdmissionSHA256, Requester: input.Requester, AuthenticationEvidence: input.AuthenticationEvidence, CancellationPolicyVersion: input.CancellationPolicyVersion, CancellationPolicySource: input.CancellationPolicySource, CancellationPolicySHA256: input.CancellationPolicySHA256, ScopedGrantSHA256: input.ScopedGrantSHA256, AllowDecisionSHA256: input.AllowDecisionSHA256, Boundary: input.Boundary, Attempt: &attempt, SealSHA256: input.SealSHA256, CommitmentSHA256: input.CommitmentSHA256, SealedAuthorization: f.sealed, SubmissionProof: input.SubmissionProof, SourceRequestID: input.SourceRequestID, SourceKind: input.SourceKind, RequestEvidence: input.RequestEvidence, IngressID: input.IngressID, ReceiptUnixNano: input.ReceiptUnixNano, IngressSequence: input.IngressSequence, EvidenceRefs: input.EvidenceRefs}
 	if err := ValidateCancellationAuthorityV1(recovered, expected, f.limits); err != nil {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*CancellationAuthorityExpectationV1){
-		"current READY proof": func(v *CancellationAuthorityExpectationV1) { v.CurrentReadyProofSHA256 = strings.Repeat("0", 64) },
+		"current READY proof": func(v *CancellationAuthorityExpectationV1) { v.CurrentReadyProof.digest = strings.Repeat("0", 64) },
 		"authentication":      func(v *CancellationAuthorityExpectationV1) { v.AuthenticationEvidence = requestRef },
 		"policy version":      func(v *CancellationAuthorityExpectationV1) { v.CancellationPolicyVersion = "other" },
 		"grant":               func(v *CancellationAuthorityExpectationV1) { v.ScopedGrantSHA256 = strings.Repeat("0", 64) },
@@ -355,12 +375,21 @@ func paginationClosureWithItems(t *testing.T, f fixture, source PaginationSource
 	if err != nil {
 		t.Fatal(err)
 	}
-	bodyEvidence := ledger.EvidenceRef{URI: "evidence/items-body-" + string(source), Kind: "github-response-body", SHA256: strings.Repeat("7", 64)}
-	page, err := NewPaginationPageV1(PaginationPageV1Input{Ordinal: 0, RequestedPage: 1, Response: f.snapshot, RawBodySHA256: bodyEvidence.SHA256, ResponseEvidence: bodyEvidence, Items: items, RESTLinkObserved: true}, f.limits)
+	response, err := NewSnapshotIdentity("github", "pagination-items-"+string(source), f.snapshot.ObservedUnixNano())
 	if err != nil {
 		t.Fatal(err)
 	}
-	closure, err := NewPaginationClosureV1(PaginationClosureV1Input{query, []PaginationPageV1{page}, []ledger.EvidenceRef{bodyEvidence}}, f.limits)
+	bodyEvidence := ledger.EvidenceRef{URI: "evidence/items-body-" + string(source), Kind: GitHubPaginationBodyEvidenceKindV1, SHA256: strings.Repeat("7", 64)}
+	pageInput := PaginationPageV1Input{Ordinal: 0, RequestedPage: 1, Response: response, RawBodySHA256: bodyEvidence.SHA256, ResponseEvidence: bodyEvidence, Items: items, RESTLinkObserved: true}
+	pageInput.EnvelopeEvidence, err = NewPaginationEnvelopeEvidenceV1("evidence/items-envelope-"+string(source), pageInput, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := NewPaginationPageV1(pageInput, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure, err := NewPaginationClosureV1(PaginationClosureV1Input{query, []PaginationPageV1{page}, []ledger.EvidenceRef{bodyEvidence, pageInput.EnvelopeEvidence}}, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}

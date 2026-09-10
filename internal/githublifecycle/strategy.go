@@ -137,7 +137,7 @@ func NewGenericStrategyPostMergeV1(input GenericStrategyPostMergeV1Input, limits
 		return GenericStrategyPostMergeV1{}, errors.New("generic strategy result fails independent validation")
 	}
 	result, proof := input.Result.input, input.ContainmentProof.input
-	if proof.Repository != result.Repository || proof.TargetRef != "refs/heads/"+result.BaseBranch.String() ||
+	if proof.Snapshot != input.Snapshot || proof.Repository != result.Repository || proof.TargetRef != "refs/heads/"+result.BaseBranch.String() ||
 		proof.ResultSHA != result.ResultSHA || proof.ObservedTargetTipSHA != input.ObservedTargetTipSHA {
 		return GenericStrategyPostMergeV1{}, errors.New("generic containment proof changed repository, target, or result")
 	}

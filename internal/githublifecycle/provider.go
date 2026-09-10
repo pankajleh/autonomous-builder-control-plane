@@ -243,7 +243,7 @@ func NewMergeInput(input MergeAuthorizationInputV1, writeID string, limits Limit
 	if err := addUniqueRequestIDs(map[string]struct{}{}, input.InitialPullRequest, input.CheckRunsClosure, input.CommitStatusesClosure); err != nil {
 		return MergeInput{}, err
 	}
-	sort.Slice(input.Checks, func(i, j int) bool { return input.Checks[i].NodeID < input.Checks[j].NodeID })
+	sort.Slice(input.Checks, func(i, j int) bool { return checkKey(input.Checks[i]) < checkKey(input.Checks[j]) })
 	authoritySHA, _ := authority.SHA256()
 	readySHA := authority.ReadyBinding().SHA256()
 	policySHA := authority.MergePolicy().SHA256()
