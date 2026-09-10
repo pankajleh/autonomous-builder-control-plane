@@ -46,6 +46,28 @@ type CommandRunner interface {
 	Run(context.Context, supervisor.Command) (supervisor.Result, error)
 }
 
+// ContainedCommandRunner is the mandatory V3 Linux handoff. Implementations
+// must create the scope before spawn, place every descendant in it, and prove
+// the scope empty before returning.
+type ContainedCommandRunner interface {
+	RunContained(context.Context, supervisor.Command, ContainmentRequestV1) (supervisor.Result, ContainmentEvidenceV1, error)
+}
+
+// ContainmentRequestV1 is the controller-selected, non-reusable scope request.
+type ContainmentRequestV1 struct {
+	Identity         string `json:"identity"`
+	WallClockTimeout string `json:"wall_clock_timeout"`
+}
+
+// ContainmentEvidenceV1 proves membership and verified empty-scope teardown.
+type ContainmentEvidenceV1 struct {
+	Kind               string `json:"kind"`
+	ScopeIdentity      string `json:"scope_identity"`
+	Primitive          string `json:"primitive"`
+	MembershipVerified bool   `json:"membership_verified"`
+	EmptyScopeVerified bool   `json:"empty_scope_verified"`
+}
+
 // Result is the terminal EP-002 conclusion and its controller-owned evidence.
 type Result struct {
 	State                 domain.State
@@ -91,6 +113,19 @@ func New(governed authority.Authority, events EventAppender, artifacts superviso
 	capsule, err := validateOperationAuthority(governed)
 	if err != nil {
 		return nil, err
+	}
+	capsuleData, err := os.ReadFile(capsule.Path)
+	if err != nil {
+		return nil, fmt.Errorf("read admitted context capsule: %w", err)
+	}
+	parsedCapsule, err := contextcapsule.Parse(capsuleData)
+	if err != nil {
+		return nil, fmt.Errorf("parse admitted context capsule: %w", err)
+	}
+	if parsedCapsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
+		if _, ok := processes.(ContainedCommandRunner); !ok {
+			return nil, errors.New("EXECUTION_BOUNDS_INVALID: Linux containment handoff is unavailable")
+		}
 	}
 	return &Runner{governed: governed, capsule: capsule, events: events, artifacts: artifacts, processes: processes}, nil
 }
@@ -166,23 +201,44 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	}
 	result.State = domain.StateImplementing
 
-	process, processErr := r.processes.Run(ctx, supervisor.Command{
+	command := supervisor.Command{
 		Argv:    argv,
 		Cwd:     r.governed.Repository().Path,
 		Env:     ralphexEnvironment(r.governed.Executor().Executor, r.capsule),
 		Timeout: ralphexTimeout,
 		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stdout.log", Kind: "ralphex-stdout"},
 		Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stderr.log", Kind: "ralphex-stderr"},
-	})
+	}
+	var process supervisor.Result
+	var processErr error
+	var containment *ContainmentEvidenceV1
+	if invocation.Bounds != nil {
+		contained, ok := r.processes.(ContainedCommandRunner)
+		if !ok {
+			return r.fail(result, domain.StateImplementing, "ralphex-adapter", errors.New("EXECUTION_BOUNDS_INVALID: Linux containment handoff is unavailable"), nil)
+		}
+		evidence, containedErr := ContainmentEvidenceV1{}, error(nil)
+		process, evidence, containedErr = contained.RunContained(ctx, command, ContainmentRequestV1{
+			Identity: r.governed.RunID(), WallClockTimeout: invocation.Bounds.WallClockTimeout,
+		})
+		processErr = containedErr
+		containment = &evidence
+		if processErr == nil && (evidence.Kind != "ContainmentEvidenceV1" || evidence.ScopeIdentity == "" || evidence.Primitive != "cgroup-v2" || !evidence.MembershipVerified || !evidence.EmptyScopeVerified) {
+			processErr = errors.New("EXECUTION_BOUNDS_INVALID: containment membership or empty-scope proof is invalid")
+		}
+	} else {
+		process, processErr = r.processes.Run(ctx, command)
+	}
 	result.Ralphex = process
 	if processErr != nil {
 		return r.fail(result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
 	}
 	metadataRef, err := r.writeJSON("ralphex-process.json", "ralphex-process-metadata", struct {
-		Process           supervisor.Result    `json:"process"`
-		EnvironmentPolicy string               `json:"environment_policy"`
-		EvidenceRefs      []ledger.EvidenceRef `json:"evidence_refs"`
-	}{Process: process, EnvironmentPolicy: ralphexEnvironmentPolicy, EvidenceRefs: processRefs(process)})
+		Process           supervisor.Result      `json:"process"`
+		EnvironmentPolicy string                 `json:"environment_policy"`
+		EvidenceRefs      []ledger.EvidenceRef   `json:"evidence_refs"`
+		Containment       *ContainmentEvidenceV1 `json:"containment,omitempty"`
+	}{Process: process, EnvironmentPolicy: ralphexEnvironmentPolicy, EvidenceRefs: processRefs(process), Containment: containment})
 	if err != nil {
 		return r.fail(result, domain.StateImplementing, "ralphex-adapter", err, processRefs(process))
 	}
@@ -287,7 +343,7 @@ func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
 	if executor != "" && executor != "claude" && executor != "codex" {
 		return ralphex.Invocation{}, fmt.Errorf("unsupported executor %q", executor)
 	}
-	return ralphex.Invocation{
+	invocation := ralphex.Invocation{
 		BinaryPath:   r.governed.Ralphex().BinaryPath,
 		PlanPath:     r.governed.Plan().Path,
 		ConfigDir:    configDir,
@@ -300,7 +356,27 @@ func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
 		ReviewModel:  policy.ReviewModel,
 		ReviewEffort: policy.ReviewEffort,
 		WaitOnLimit:  r.governed.Ralphex().WaitOnLimit,
-	}, nil
+	}
+	data, err := os.ReadFile(r.capsule.Path)
+	if err != nil {
+		return ralphex.Invocation{}, fmt.Errorf("read context capsule for invocation: %w", err)
+	}
+	capsule, err := contextcapsule.Parse(data)
+	if err != nil {
+		return ralphex.Invocation{}, fmt.Errorf("parse context capsule for invocation: %w", err)
+	}
+	if capsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
+		if capsule.PhaseAuthority == nil || capsule.PhaseAuthority.ExecutionBounds == nil {
+			return ralphex.Invocation{}, errors.New("EXECUTION_BOUNDS_INVALID: B V3 execution bounds are absent")
+		}
+		runtime := r.governed.Ralphex()
+		invocation.BaseRef = capsule.BaseSHA
+		invocation.Bounds = capsule.PhaseAuthority.ExecutionBounds
+		invocation.Capability = runtime.Capability
+		invocation.BinarySHA256 = runtime.BinarySHA256
+		invocation.SourceSHA = runtime.SourceSHA
+	}
+	return invocation, nil
 }
 
 func (r *Runner) appendCreated(authorityRef ledger.EvidenceRef) error {
@@ -424,7 +500,7 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	if validation.ContextCapsuleSHA256 != capsule.SHA256 {
 		return validation, errors.New("context capsule SHA256 changed after authority validation")
 	}
-	if verified.PolicyVersion != contextcapsule.PolicyVersionV2 {
+	if verified.PolicyVersion != contextcapsule.PolicyVersionV2 && verified.PolicyVersion != contextcapsule.PolicyVersionV3 {
 		return validation, fmt.Errorf("context capsule policy version changed to %q after authority validation", verified.PolicyVersion)
 	}
 	repositoryRoot, err := gitOutput(ctx, repository.Path, "rev-parse", "--show-toplevel")
@@ -585,24 +661,33 @@ func ralphexEnvironment(executor string, capsule authority.ContextCapsuleManifes
 func validateOperationAuthority(governed authority.Authority) (authority.ContextCapsuleManifest, error) {
 	capsule, present := governed.ContextCapsule()
 	if !present {
-		return authority.ContextCapsuleManifest{}, errors.New("verified v2 context capsule is required for governed execution")
+		return authority.ContextCapsuleManifest{}, errors.New("verified v2 context capsule is required for legacy execution; V3 successor is required after activation")
 	}
 	verified, err := contextcapsule.VerifyFile(governed.Repository().Path, capsule.Path)
 	if err != nil {
-		return authority.ContextCapsuleManifest{}, fmt.Errorf("verify v2 operation context capsule: %w", err)
+		return authority.ContextCapsuleManifest{}, fmt.Errorf("verify operation context capsule: %w", err)
 	}
 	if verified.SHA256 != capsule.SHA256 {
 		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule SHA256 mismatch: authority binds %s, verified exact bytes are %s", capsule.SHA256, verified.SHA256)
-	}
-	if verified.PolicyVersion != contextcapsule.PolicyVersionV2 {
-		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule policy version %q cannot authorize new governed execution; %s is required", verified.PolicyVersion, contextcapsule.PolicyVersionV2)
 	}
 	if verified.BaseSHA != governed.Repository().StartSHA {
 		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule base SHA %s does not match governed start SHA %s", verified.BaseSHA, governed.Repository().StartSHA)
 	}
 	mode := governed.Ralphex().Mode
-	if err := validateOperationMode(verified.OperationKind, mode); err != nil {
-		return authority.ContextCapsuleManifest{}, err
+	if verified.PolicyVersion == contextcapsule.PolicyVersionV2 {
+		if err := validateOperationMode(verified.OperationKind, mode); err != nil {
+			return authority.ContextCapsuleManifest{}, err
+		}
+	} else if verified.PolicyVersion == contextcapsule.PolicyVersionV3 {
+		admission, present := governed.Governance()
+		if !present {
+			return authority.ContextCapsuleManifest{}, errors.New("CAPSULE_USAGE_INVALID: V3 governance admission is required")
+		}
+		if err := validateOperationMode(admission.Operation, mode); err != nil {
+			return authority.ContextCapsuleManifest{}, err
+		}
+	} else {
+		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule policy version %q cannot authorize governed execution; %s or activated %s is required", verified.PolicyVersion, contextcapsule.PolicyVersionV2, contextcapsule.PolicyVersionV3)
 	}
 	policy := governed.Executor()
 	if strings.EqualFold(strings.TrimSpace(policy.Executor), "codex") {

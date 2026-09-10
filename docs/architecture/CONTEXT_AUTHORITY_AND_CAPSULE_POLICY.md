@@ -1,81 +1,53 @@
-# Context Authority and Task Capsule Policy
+# Context Authority and Capsule Policy
 
-## Purpose
+## Status and authority
 
-Fresh coding/review sessions must be able to execute correctly without ChatGPT history or a long-lived agent conversation. Project context is durable in the repository; model context is disposable.
+`context-capsule-v3` is the product contract for the A/B/C autonomous-development workflow after a committed `GovernanceActivationV1`. The earlier universal-v2 and one-capsule-per-commit operating prose is superseded for that workflow by this document and `AUTONOMOUS_EXECUTION_GOVERNANCE.md`.
 
-The original capsule policy became effective for EP-004. Historical artifacts are not retroactively represented as having stronger authority than they had when created.
+V1 and V2 bytes retain their historical parse and verification meaning. V2 remains the separately governed format for deployment, recovery, and maintenance until an explicit migration. No activation record retroactively strengthens old evidence.
 
-The universal rule for new work is: no governed autonomous operation may start without a purpose-specific, verified `context-capsule-v2`. Verification binds the exact capsule bytes, repository, operation base SHA, and source bytes. A base or source change invalidates that authority and requires a newly authorized capsule; an executor must never carry a capsule across a commit/HEAD boundary into a fresh operation.
+## Durable authority hierarchy
 
-## Authority hierarchy
+Fresh sessions are stateless. They read, in order, architecture and ADRs, roadmap/current state, the active execution pack and task plan, the active capsule/checkpoint tip, and exact controller evidence. Chat history, model memory, shell wrappers, and reviewer prose are navigation aids only.
 
-Context is selected from canonical sources in this order:
+The autonomous-development workflow has exactly three immutable capsules:
 
-1. architecture and ADRs;
-2. implementation roadmap;
-3. current progress/state;
-4. the active execution pack;
-5. the active Ralphex task plan;
-6. exact repository/base SHA and prior accepted task outputs.
+`A_DESIGN -> B_IMPLEMENTATION -> C_ACCEPTANCE_MERGE`
 
-A task must not invent missing architecture. Missing required authority becomes a blocker or `HUMAN_DECISION_REQUIRED`.
+- A permits design planning and read-only design review. Its mutation paths are limited to the named design documents.
+- B permits implementation and implementation review. Review-driven mutation additionally requires a controller-issued, one-use mutation lease.
+- C permits acceptance, read-only exact-head final review, PR publication, merge authorization, and post-merge acceptance. Repository content is read-only throughout C.
 
-## Context layers
+Exact candidate commits remain checkpoint evidence rather than mutable capsule fields.
 
-Every fresh operation receives a compact context capsule made of three layers:
+## V3 phase authority
 
-- **Global guardrails** — project purpose, authority hierarchy, state/security invariants, completion rules, and non-negotiable boundaries.
-- **Execution-pack context** — roadmap phase, parent goal, in-scope deliverables, explicit non-goals, relevant components, and expected end state.
-- **Operation context** — exact objective and operation kind, owned scope, blocking criteria, relevant files/contracts, predecessor outputs, edge cases, and acceptance criteria.
+Every V3 capsule binds the existing project, plan, task, repository, base, source, invariant, non-goal, and predecessor fields plus `phase_authority`. Phase authority fixes the canonical stage and operation set; parent checkpoint and grant; immutable semantic registry digest; observation, blocking, and mutation rule IDs; authorized invariant/finding IDs; exact paths or concrete `dir/**` prefixes; review profile; and, for B, execution bounds.
 
-The default is relevant context, not the entire architecture corpus.
+All arrays are sorted and unique. Blocking is a subset of observation; mutation is a subset of blocking. Absolute paths, traversal, regex/glob syntax other than `dir/**`, symlink-derived paths, and broad-root patterns fail closed.
 
-## Capsule requirements
+A child cannot establish lineage by naming a predecessor commit. A `PhaseCheckpointV1` and `NextStageGrantV1` establish it. B and C must equal or narrow grant maxima and retain every required blocker, invariant, operation, and final-review floor. B-to-C derivation also proves those floors were preserved transitively.
 
-Every v2 capsule must record:
+## Source and candidate verification
 
-- project/plan/task identity;
-- one recognized operation kind: `design-planning`, `design-review`, `implementation`, `implementation-review`, `acceptance`, `merge-authorization`, `deployment`, `recovery`, or `maintenance`;
-- explicit owned scope and blocking criteria;
-- exact base SHA;
-- roadmap phase and execution-pack ID;
-- selected source paths plus SHA256 hashes;
-- relevant prior task outcome summaries and commit SHAs;
-- explicit non-goals;
-- context policy version;
-- capsule SHA256.
+V1/V2 verification remains checkout-bound exactly as before: repository HEAD equals capsule base and live source bytes match the recorded hashes.
 
-`context-capsule-v2` adds operation context without changing the canonical representation or verification rules for `context-capsule-v1`. Historical v1 capsules and authorities remain parseable and evidence-readable, but a v1 capsule cannot authorize a new governed execution.
+V3 verification disables Git replacement objects, resolves the exact base commit, reads regular-file blobs from that immutable commit tree, and hashes those bytes. A later clean candidate HEAD therefore does not invalidate the capsule's immutable source proof.
 
-New run authority must bind `context_capsule.path` and `context_capsule.sha256`. The controller verifies the bound exact bytes, internal canonical hash, repository/base SHA, and every source hash both when authority is constructed and immediately before execution. The capsule base must equal the governed start SHA. A missing binding, wrong byte hash, wrong version, base drift, or source drift fails closed before subprocess launch. Optional bindings remain parseable only so pre-policy authority evidence retains its historical shape.
+Candidate verification is separate. It proves exact lowercase commit identity, base ancestry, a clean index/worktree/untracked/submodule state, the exact `base...candidate` path digest and diff bounds, and stage path authority. C requires the exact converged base HEAD with no repository-content change.
 
-For Codex-governed execution, both `task_effort` and `review_effort` must be exactly `xhigh`. Missing or lower effort fails closed before launch.
+## Semantic authority and review convergence
 
-## Token-efficiency rules
+`OBSERVE != BLOCK != MUTATE`.
 
-- Do not replay prior agent transcripts as context.
-- Prefer compact task-outcome records over conversation history.
-- Read deeper canonical documents on demand only when the task requires them.
-- Use a deterministic component/dependency map as the primary selector; semantic retrieval may supplement but cannot override canonical authority.
-- Keep repeated global guardrails small and stable so provider prompt caching can help where available, but correctness must not depend on caching.
+The A-reviewed `SemanticAuthorityRegistryV1` fixes each rule, predicate, evidence class, correction relation, owner/path family, deterministic validator identity, and whether model-only observation is permitted. A reviewer cannot mint or redefine a rule.
 
-## Fresh-task startup contract
+For `INITIAL_IMPLEMENTATION`, report zero establishes a bounded active-finding set. Later reports may retain or remove IDs but never add one. For `CORRECTION`, every blocker is already named by B and the same monotonic rule applies. An unmapped or newly blocking concern returns `SCOPE_EXPANSION_REQUIRED`; a `DESIGN_GAP` returns to a new A lineage.
 
-Before any governed autonomous operation, every fresh executor must read its capsule, verify the environment-provided capsule path and SHA256 against exact bytes, independently run `abcp context-verify` against the governed repository/base, and inspect the operation's relevant source files. If the binding is missing or any base/source/hash check fails, execution stops for re-authorization rather than silently using newer context.
+`ReviewScopeReportV1` records one non-forkable report tip. Deferred observations never block and never justify mutation. A validated blocking report is still read-only: the controller deterministically intersects B paths with registry correction paths and issues a single-use `MutationLeaseV1`. The lease must CAS from `ISSUED` to `CONSUMING` before edits. An independently validated `MutationReceiptV1` advances the receipt tip and marks it `CONSUMED`. Replay, fork, crash ambiguity, path escape, dirty exit, or diff-bound violation blocks convergence.
 
-The controller supplies `ABCP_CONTEXT_CAPSULE_PATH` and `ABCP_CONTEXT_CAPSULE_SHA256` to Ralphex/Codex only from its validated immutable authority. Ambient variables with those names cannot create a binding and cannot override the governed values.
+## Activation and startup
 
-The intended invariant is: **durable external project memory + small fresh agent sessions**, not one indefinitely growing model conversation.
+V3 becomes mandatory only when `GovernanceActivationV1` is committed/merged and durably recorded. The record binds policy digest, activation commit/sequence/time, and a finite sorted list of V2 authority digests issued before activation. Only exact listed digests are grandfathered. A caller's “in flight” assertion is not evidence.
 
-## Immediate operating rule
-
-Every executable Ralphex plan must point fresh operations to the context capsule path and SHA256 bound by governed run authority. Before any operation work begins, each fresh executor must read that capsule and run independent capsule verification against the governed repository. A missing binding, failed verification, or drift is a blocker; work must not continue with unverified context.
-
-Every task section must include that startup instruction before its implementation steps. Ralphex `full` and `tasks-only` modes are implementation-capable and require an `implementation` operation capsule; `review` mode requires a `design-review` or `implementation-review` capsule. All other operation-kind/mode combinations fail closed before launch. Every implementation-capable plan may contain at most one incomplete executable `### Task N:` or `### Iteration N:` section. Completing that section changes the commit/HEAD boundary, so any next section is a fresh operation requiring fresh authority and a capsule built at the accepted predecessor HEAD. Fenced-code exclusions use Markdown fence indentation, marker, and length rules; malformed or unterminated fence structure cannot hide executable sections from this restriction.
-
-For `design-review` and `implementation-review`, only Critical or Major findings that apply to the capsule's current owned scope and blocking criteria block the current operation. Valid concerns for future work or outside the owned scope are recorded as deferred observations. They cannot be promoted into current blockers without new authority that brings them into scope.
-
-The capsule supplies compact invariants, non-goals, predecessor outcomes, and hashed source references; the executor may open those referenced documents on demand, but entire documents are not pasted into the capsule.
-
-Capsules are built from structured specs with `abcp context-build --repository <path> --spec <path> --output <path>` and independently checked with `abcp context-verify --repository <path> --capsule <path>`. Source selection remains explicit and deterministic; no semantic retrieval is performed.
+The controller supplies capsule path and exact file SHA through its validated environment. Fresh executors verify those bytes and the repository evidence before work. CLI diagnostics (`context-build`, `context-verify`, and `governance-*-validate`) invoke the same library validators; they are not weaker alternate authority paths.

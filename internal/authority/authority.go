@@ -16,6 +16,7 @@ import (
 	"time"
 
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
+	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
@@ -26,6 +27,7 @@ type Manifest struct {
 	Plan           PlanManifest            `json:"plan"`
 	ContextCapsule *ContextCapsuleManifest `json:"context_capsule,omitempty"`
 	MergeReview    *ReviewPolicy           `json:"merge_review,omitempty"`
+	Governance     *GovernanceManifest     `json:"governance,omitempty"`
 	Ralphex        RalphexManifest         `json:"ralphex"`
 	Executor       ExecutorPolicy          `json:"executor"`
 	Worktree       WorktreePolicy          `json:"worktree"`
@@ -74,12 +76,24 @@ type ContextCapsuleManifest struct {
 
 // RalphexManifest pins the executable, its source metadata, and invocation mode.
 type RalphexManifest struct {
-	BinaryPath   string       `json:"binary_path"`
-	BinarySHA256 string       `json:"binary_sha256"`
-	SourceSHA    string       `json:"source_sha,omitempty"`
-	Mode         ralphex.Mode `json:"mode"`
-	Timeout      string       `json:"timeout"`
-	WaitOnLimit  string       `json:"wait_on_limit"`
+	BinaryPath     string                    `json:"binary_path"`
+	BinarySHA256   string                    `json:"binary_sha256"`
+	SourceSHA      string                    `json:"source_sha,omitempty"`
+	Mode           ralphex.Mode              `json:"mode"`
+	Timeout        string                    `json:"timeout"`
+	WaitOnLimit    string                    `json:"wait_on_limit"`
+	Capability     *ralphex.CapabilityV1     `json:"capability,omitempty"`
+	ExecutionState *ralphex.ExecutionStateV1 `json:"execution_state,omitempty"`
+}
+
+// GovernanceManifest selects one V3 operation and binds activation evidence
+// when the durable A/B/C cutover has occurred.
+type GovernanceManifest struct {
+	Operation      contextcapsule.OperationKind         `json:"operation"`
+	Mutation       bool                                 `json:"mutation"`
+	LeaseSHA256    string                               `json:"lease_sha256,omitempty"`
+	IssuedSequence uint64                               `json:"issued_sequence,omitempty"`
+	Activation     *governancev3.GovernanceActivationV1 `json:"activation,omitempty"`
 }
 
 // ExecutorPolicy records the selected executor and model/effort settings.
@@ -185,6 +199,9 @@ func New(input Manifest) (Authority, error) {
 	for index := range manifest.Acceptance {
 		manifest.Acceptance[index].Timeout = canonicalDuration(manifest.Acceptance[index].Timeout)
 	}
+	if err := validateGovernanceAdmission(manifest); err != nil {
+		return Authority{}, err
+	}
 
 	canonicalJSON, err := json.Marshal(manifest)
 	if err != nil {
@@ -245,6 +262,15 @@ func (a Authority) MergeReviewPolicy() (ReviewPolicy, bool) {
 	return cloneReviewPolicy(*a.manifest.MergeReview), true
 }
 
+// Governance returns the optional V3 operation/activation admission record.
+func (a Authority) Governance() (GovernanceManifest, bool) {
+	if a.manifest.Governance == nil {
+		return GovernanceManifest{}, false
+	}
+	copy := cloneManifest(Manifest{Governance: a.manifest.Governance})
+	return *copy.Governance, true
+}
+
 // Ralphex returns the canonical Ralphex identity and mode.
 func (a Authority) Ralphex() RalphexManifest {
 	return a.manifest.Ralphex
@@ -268,6 +294,78 @@ func (a Authority) Acceptance() []AcceptanceCommand {
 // PolicyVersion returns the authority policy version.
 func (a Authority) PolicyVersion() string {
 	return a.manifest.PolicyVersion
+}
+
+func validateGovernanceAdmission(manifest Manifest) error {
+	if manifest.ContextCapsule == nil {
+		if manifest.Governance != nil {
+			return errors.New("CAPSULE_USAGE_INVALID: governance admission requires a context capsule")
+		}
+		return nil
+	}
+	data, err := os.ReadFile(manifest.ContextCapsule.Path)
+	if err != nil {
+		return fmt.Errorf("read governance context capsule: %w", err)
+	}
+	capsule, err := contextcapsule.Parse(data)
+	if err != nil {
+		return fmt.Errorf("parse governance context capsule: %w", err)
+	}
+	if manifest.Governance != nil && manifest.Governance.Activation != nil {
+		if err := governancev3.ValidateActivatedWorkflowPolicyV1(capsule.PolicyVersion, manifest.ContextCapsule.SHA256, manifest.Governance.IssuedSequence, *manifest.Governance.Activation); err != nil {
+			return err
+		}
+	}
+	if capsule.PolicyVersion != contextcapsule.PolicyVersionV3 {
+		if manifest.Governance != nil && manifest.Governance.Activation == nil {
+			return errors.New("CAPSULE_LINEAGE_INVALID: V2 cannot assert A/B/C governance without activation/grandfather evidence")
+		}
+		return nil
+	}
+	if manifest.Governance == nil {
+		return errors.New("CAPSULE_USAGE_INVALID: V3 requires explicit governance operation admission")
+	}
+	if err := governancev3.ValidateCapsuleUsageV3(capsule, manifest.Governance.Operation, manifest.Governance.Mutation, manifest.Governance.LeaseSHA256); err != nil {
+		return err
+	}
+	if capsule.PhaseAuthority == nil || capsule.PhaseAuthority.Stage != contextcapsule.StageBImplementation {
+		return errors.New("CAPSULE_STAGE_INVALID: Ralphex execution is authorized only by B_IMPLEMENTATION")
+	}
+	if manifest.Governance.Operation != contextcapsule.OperationImplementation && manifest.Governance.Operation != contextcapsule.OperationImplementationReview {
+		return errors.New("CAPSULE_USAGE_INVALID: Ralphex B admission requires implementation or implementation-review")
+	}
+	bounds := capsule.PhaseAuthority.ExecutionBounds
+	if bounds == nil || manifest.Ralphex.Capability == nil || manifest.Ralphex.ExecutionState == nil {
+		return errors.New("EXECUTION_BOUNDS_INVALID: V3 requires execution bounds, capability, and durable counters")
+	}
+	if err := ralphex.ValidateCapabilityV1(*manifest.Ralphex.Capability, manifest.Ralphex.BinarySHA256, manifest.Ralphex.SourceSHA, manifest.Ralphex.Mode); err != nil {
+		return err
+	}
+	if err := ralphex.ValidateExecutionStateV1(*bounds, *manifest.Ralphex.ExecutionState); err != nil {
+		return err
+	}
+	if manifest.Executor.Executor != "codex" || manifest.Executor.TaskEffort != "xhigh" || manifest.Executor.ReviewEffort != "xhigh" {
+		return errors.New("EXECUTION_BOUNDS_INVALID: V3 requires Codex task and review effort exactly xhigh")
+	}
+	wall, _ := time.ParseDuration(bounds.WallClockTimeout)
+	manifestTimeout, _ := time.ParseDuration(manifest.Ralphex.Timeout)
+	if manifestTimeout != wall {
+		return errors.New("EXECUTION_BOUNDS_INVALID: Ralphex timeout must equal V3 wall_clock_timeout")
+	}
+	wait, _ := time.ParseDuration(manifest.Ralphex.WaitOnLimit)
+	aggregate, _ := time.ParseDuration(bounds.AggregateWallClockTimeout)
+	elapsed, _ := time.ParseDuration(manifest.Ralphex.ExecutionState.AggregateElapsed)
+	if wait < 0 || elapsed+wall+wait > aggregate {
+		return errors.New("EXECUTION_BOUNDS_INVALID: rate-limit wait exceeds aggregate wall clock")
+	}
+	plan, err := os.ReadFile(manifest.Plan.Path)
+	if err != nil {
+		return fmt.Errorf("read governed plan for execution bounds: %w", err)
+	}
+	if err := ralphex.ValidateSingleIncompleteTaskV1(plan); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validateRequired(manifest Manifest) error {
@@ -608,6 +706,23 @@ func cloneManifest(input Manifest) Manifest {
 	if input.MergeReview != nil {
 		policy := cloneReviewPolicy(*input.MergeReview)
 		clone.MergeReview = &policy
+	}
+	if input.Governance != nil {
+		governance := *input.Governance
+		if input.Governance.Activation != nil {
+			activation := *input.Governance.Activation
+			activation.GrandfatheredV2Digests = append([]string(nil), input.Governance.Activation.GrandfatheredV2Digests...)
+			governance.Activation = &activation
+		}
+		clone.Governance = &governance
+	}
+	if input.Ralphex.Capability != nil {
+		capability := *input.Ralphex.Capability
+		clone.Ralphex.Capability = &capability
+	}
+	if input.Ralphex.ExecutionState != nil {
+		state := *input.Ralphex.ExecutionState
+		clone.Ralphex.ExecutionState = &state
 	}
 	clone.Acceptance = cloneAcceptance(input.Acceptance)
 	return clone

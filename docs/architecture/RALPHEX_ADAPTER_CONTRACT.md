@@ -1,62 +1,38 @@
 # Ralphex Adapter Contract
 
-## 1. Purpose
+## Purpose
 
-The adapter isolates all assumptions about Ralphex invocation and observed result mapping from the rest of the control plane.
+The adapter is the structural process boundary between controller authority and a pinned Ralphex binary. For activated A/B/C autonomous development, only a B V3 capsule can admit Ralphex. Earlier prose allowing V2 to authorize that workflow is superseded. Historical V1/V2 evidence and separately governed deployment/recovery/maintenance behavior are unchanged.
 
-## 2. Inputs
+## Pinned inputs and capability
 
-A governed invocation includes:
+A governed invocation binds the exact binary hash and source identity, repository and plan, mode, executor/model/effort, isolated config, candidate/base ref, rate-limit policy, per-invocation bounds, cumulative B counters, and Linux containment capability.
 
-- binary path;
-- expected binary hash (optional but recommended for pinned production runs);
-- expected source SHA metadata;
-- repository path;
-- plan path;
-- mode;
-- executor (`codex` or default Claude);
-- worktree flag;
-- explicit candidate branch override for worktree runs;
-- controller-owned isolated config directory;
-- task/review model + effort policy;
-- timeout;
-- `wait_on_limit` policy;
-- correlation/run identifiers.
+`RalphexCapabilityV1` must prove exact support for:
 
-## 3. Command construction
+- `--max-iterations`, `--session-timeout`, `--idle-timeout`, `--skip-finalize`, and `--base-ref`;
+- selected executor/model/effort flags and an isolated config directory;
+- a controller-visible tasks-only, review-only, or stop-before-each-fix handoff boundary;
+- the Linux cgroup-v2 containment handoff.
 
-Arguments are built as structured `[]string`. Never concatenate user-controlled plan paths into a shell command string.
-Governed runs reject repository-local `.ralphex` configuration so it cannot
-override authority after the isolated directory is selected.
+An asserted feature, repository-local `.ralphex` override, or success string is not capability evidence. Any missing proof returns `EXECUTION_BOUNDS_INVALID` before spawn.
 
-Examples:
+## Structured invocation and bounds
 
-```text
-ralphex --config-dir <dir> --codex --worktree docs/plans/feature.md
-ralphex --config-dir <dir> --review docs/plans/completed/feature.md
-```
+Arguments are emitted as a structured string array; no shell concatenation is permitted. A B invocation includes all native per-process controls and always emits `--skip-finalize`. Codex task and review effort are exactly `xhigh`.
 
-## 4. Result mapping
+The initial hard ceilings are 10 iterations, 90 minutes per session, 45 minutes idle, three hours per invocation wall clock, `finalize=false`, and exactly one incomplete executable Task/Iteration section. Each capsule can tighten them.
 
-The adapter records:
+B also carries finite positive maxima for Ralphex invocations, review reports, mutation leases, total fix batches, aggregate wall clock, changed files, and changed bytes. Counters and elapsed time are durable workflow state. Starting another process never resets them; reaching a ceiling is bounded non-success.
 
-- process PID/process-group identity;
-- start/end timestamps;
-- exit code/signal;
-- stdout/stderr artifact refs;
-- progress log path;
-- detected branch/worktree/plan paths when available;
-- final Git SHA;
-- coarse Ralphex outcome.
+Native full review/fix is admitted only when Ralphex stops before every fix so the controller can validate the report and issue a one-use lease. Otherwise the controller uses separate bounded review and fix invocations. Tasks-only cannot silently enter review/fix.
 
-The adapter does **not** map Ralphex success directly to `READY_FOR_MERGE` or `COMPLETED`.
+## Linux containment
 
-Successful full/tasks execution maps at most to `IMPLEMENTATION_COMPLETED` pending controller acceptance.
+V3 execution requires a controller-created cgroup-v2 scope, or a separately proven equivalent primitive. Process-group isolation alone is insufficient. The contained runner proves the scope identity, verifies child membership, gracefully terminates on expiry, applies a bounded forced scope kill if needed, and proves `cgroup.procs` empty before returning. Creation, membership, teardown, or evidence failure is `EXECUTION_BOUNDS_INVALID`.
 
-## 5. Recovery-safe ownership
+The supervisor wall-clock timeout bounds one invocation. Aggregate wall time includes every B invocation, controller handoff, and rate-limit wait.
 
-Before deleting a stale worktree, the supervisor must establish that the owning execution is no longer alive and must snapshot uncommitted changes.
+## Results
 
-## 6. Notifications and dashboard
-
-Ralphex notifications and dashboard are supplemental. Their status never overrides control-plane ledger state.
+The adapter records structured argv, pinned identities, scope/process identity, timestamps, exit/signal, stdout/stderr refs, effective bounds, and verified containment teardown. Ralphex completion maps at most to implementation completion pending controller validation. Model or Ralphex success text never creates checkpoint, acceptance, publication, or merge authority.

@@ -15,6 +15,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
+	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
@@ -181,6 +182,50 @@ func TestContextCommandsRequireStructuredPathArguments(t *testing.T) {
 	stderr.Reset()
 	if code := runCLI([]string{"context-verify", "capsule.json"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("context-verify accepted positional input with exit %d", code)
+	}
+}
+
+func TestGovernanceActivationDiagnosticUsesProductValidator(t *testing.T) {
+	activation, err := governancev3.SealGovernanceActivationV1(governancev3.GovernanceActivationV1{
+		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3,
+		PolicySHA256: strings.Repeat("a", 64), ActivationRepositoryCommit: strings.Repeat("b", 40),
+		ActivationSequence: 12, ActivationTime: "2026-09-10T00:00:00Z", GrandfatheredV2Digests: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "activation.json")
+	writeCLIFile(t, path, data, 0o600)
+	var stdout, stderr bytes.Buffer
+	if code := runCLI([]string{"governance-activation-validate", "--input", path}, &stdout, &stderr); code != 0 {
+		t.Fatalf("activation diagnostic exited %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"valid": true`) {
+		t.Fatalf("activation output = %q", stdout.String())
+	}
+	activation.PolicySHA256 = strings.Repeat("c", 64)
+	data, err = json.Marshal(activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCLIFile(t, path, data, 0o600)
+	stdout.Reset()
+	stderr.Reset()
+	if code := runCLI([]string{"governance-activation-validate", "--input", path}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "CAPSULE_LINEAGE_INVALID") {
+		t.Fatalf("tampered activation diagnostic exited %d: %s", code, stderr.String())
+	}
+}
+
+func TestGovernanceDiagnosticRejectsNonCanonicalJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoint.json")
+	writeCLIFile(t, path, []byte("{\n  \"kind\": \"DESIGN_ACCEPTED\"\n}\n"), 0o600)
+	var stdout, stderr bytes.Buffer
+	if code := runCLI([]string{"governance-checkpoint-validate", "--input", path}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "strict canonical") {
+		t.Fatalf("noncanonical diagnostic exited %d: %s", code, stderr.String())
 	}
 }
 

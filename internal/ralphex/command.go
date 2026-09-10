@@ -1,8 +1,14 @@
 package ralphex
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
+
+	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 )
 
 type Mode string
@@ -26,6 +32,47 @@ type Invocation struct {
 	ReviewModel  string
 	ReviewEffort string
 	WaitOnLimit  string
+	BaseRef      string
+	Bounds       *contextcapsule.ExecutionBoundsV1
+	Capability   *CapabilityV1
+	BinarySHA256 string
+	SourceSHA    string
+}
+
+// HandoffMode identifies the controller-visible review->lease->fix boundary.
+type HandoffMode string
+
+const (
+	HandoffTasksOnly          HandoffMode = "TASKS_ONLY"
+	HandoffReviewOnly         HandoffMode = "REVIEW_ONLY"
+	HandoffStopBeforeFixBatch HandoffMode = "CONTROLLER_STOP_BEFORE_FIX_BATCH"
+)
+
+// CapabilityV1 is pinned evidence that one Ralphex binary supports every
+// structural execution control required by a B V3 invocation.
+type CapabilityV1 struct {
+	Kind                     string      `json:"kind"`
+	BinarySHA256             string      `json:"binary_sha256"`
+	SourceSHA                string      `json:"source_sha"`
+	MaxIterationsFlag        bool        `json:"max_iterations_flag"`
+	SessionTimeoutFlag       bool        `json:"session_timeout_flag"`
+	IdleTimeoutFlag          bool        `json:"idle_timeout_flag"`
+	SkipFinalizeFlag         bool        `json:"skip_finalize_flag"`
+	BaseRefFlag              bool        `json:"base_ref_flag"`
+	ExecutorModelEffortFlags bool        `json:"executor_model_effort_flags"`
+	IsolatedConfig           bool        `json:"isolated_config"`
+	GovernedHandoff          HandoffMode `json:"governed_handoff"`
+	LinuxContainment         bool        `json:"linux_containment"`
+}
+
+// ExecutionStateV1 contains durable B-wide counters which process restarts do
+// not reset.
+type ExecutionStateV1 struct {
+	RalphexInvocations int    `json:"ralphex_invocations"`
+	ReviewReports      int    `json:"review_reports"`
+	MutationLeases     int    `json:"mutation_leases"`
+	TotalFixBatches    int    `json:"total_fix_batches"`
+	AggregateElapsed   string `json:"aggregate_elapsed"`
 }
 
 func (i Invocation) Argv() ([]string, error) {
@@ -50,6 +97,23 @@ func (i Invocation) Argv() ([]string, error) {
 	if i.Branch != "" && !i.Worktree {
 		return nil, fmt.Errorf("branch override requires worktree invocation")
 	}
+	if i.Bounds != nil {
+		if i.Capability == nil {
+			return nil, fmt.Errorf("EXECUTION_BOUNDS_INVALID: pinned Ralphex capability is required")
+		}
+		if err := ValidateCapabilityV1(*i.Capability, i.BinarySHA256, i.SourceSHA, i.Mode); err != nil {
+			return nil, err
+		}
+		if err := contextcapsule.ValidateExecutionBoundsV1(*i.Bounds); err != nil {
+			return nil, err
+		}
+		if i.BaseRef == "" {
+			return nil, fmt.Errorf("EXECUTION_BOUNDS_INVALID: base-ref is required")
+		}
+		if i.TaskEffort != "xhigh" || i.ReviewEffort != "xhigh" {
+			return nil, fmt.Errorf("EXECUTION_BOUNDS_INVALID: Codex task and review effort must be xhigh")
+		}
+	}
 
 	argv := []string{i.BinaryPath}
 	if i.ConfigDir != "" {
@@ -60,6 +124,15 @@ func (i Invocation) Argv() ([]string, error) {
 	}
 	if i.WaitOnLimit != "" {
 		argv = append(argv, "--wait", i.WaitOnLimit)
+	}
+	if i.Bounds != nil {
+		argv = append(argv,
+			"--max-iterations", strconv.Itoa(i.Bounds.MaxIterations),
+			"--session-timeout", i.Bounds.SessionTimeout,
+			"--idle-timeout", i.Bounds.IdleTimeout,
+			"--skip-finalize",
+			"--base-ref", i.BaseRef,
+		)
 	}
 	taskModel, err := modelSpec(i.TaskModel, i.TaskEffort)
 	if err != nil {
@@ -87,6 +160,192 @@ func (i Invocation) Argv() ([]string, error) {
 	}
 	argv = append(argv, i.PlanPath)
 	return argv, nil
+}
+
+// ValidateCapabilityV1 fails admission unless every selected bound and
+// handoff property is proven by the pinned binary/source identity.
+func ValidateCapabilityV1(capability CapabilityV1, binarySHA256, sourceSHA string, mode Mode) error {
+	if capability.Kind != "RalphexCapabilityV1" || capability.BinarySHA256 == "" || capability.BinarySHA256 != binarySHA256 || capability.SourceSHA == "" || capability.SourceSHA != sourceSHA {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: Ralphex capability identity does not match pinned binary/source")
+	}
+	if !capability.MaxIterationsFlag || !capability.SessionTimeoutFlag || !capability.IdleTimeoutFlag || !capability.SkipFinalizeFlag || !capability.BaseRefFlag || !capability.ExecutorModelEffortFlags || !capability.IsolatedConfig || !capability.LinuxContainment {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: Ralphex capability does not prove every structural bound and Linux containment")
+	}
+	switch mode {
+	case ModeTasksOnly:
+		if capability.GovernedHandoff != HandoffTasksOnly {
+			return fmt.Errorf("EXECUTION_BOUNDS_INVALID: tasks-only invocation requires TASKS_ONLY handoff capability")
+		}
+	case ModeReview:
+		if capability.GovernedHandoff != HandoffReviewOnly {
+			return fmt.Errorf("EXECUTION_BOUNDS_INVALID: review invocation must stop before mutation")
+		}
+	case ModeFull:
+		if capability.GovernedHandoff != HandoffStopBeforeFixBatch {
+			return fmt.Errorf("EXECUTION_BOUNDS_INVALID: native review/fix lacks controller stop-before-fix handoff")
+		}
+	default:
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: unsupported Ralphex mode %q", mode)
+	}
+	return nil
+}
+
+// ValidateExecutionStateV1 enforces B-wide cumulative ceilings without reset.
+func ValidateExecutionStateV1(bounds contextcapsule.ExecutionBoundsV1, state ExecutionStateV1) error {
+	if err := contextcapsule.ValidateExecutionBoundsV1(bounds); err != nil {
+		return err
+	}
+	elapsed, err := time.ParseDuration(state.AggregateElapsed)
+	maximum, maxErr := time.ParseDuration(bounds.AggregateWallClockTimeout)
+	wall, wallErr := time.ParseDuration(bounds.WallClockTimeout)
+	if err != nil || maxErr != nil || wallErr != nil || elapsed < 0 || elapsed.String() != state.AggregateElapsed || elapsed >= maximum || elapsed+wall > maximum {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: aggregate elapsed time is invalid or exhausted")
+	}
+	if state.RalphexInvocations < 0 || state.RalphexInvocations >= bounds.MaxRalphexInvocations || state.ReviewReports < 0 || state.ReviewReports > bounds.MaxReviewReports || state.MutationLeases < 0 || state.MutationLeases > bounds.MaxMutationLeases || state.TotalFixBatches < 0 || state.TotalFixBatches > bounds.MaxTotalFixBatches {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: a durable cumulative counter is invalid or exhausted")
+	}
+	return nil
+}
+
+// ValidateSingleIncompleteTaskV1 proves that a plan exposes exactly one
+// executable Task/Iteration section with unchecked items.
+func ValidateSingleIncompleteTaskV1(plan []byte) error {
+	if len(plan) == 0 || len(plan) > 4<<20 {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: plan is empty or oversized")
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(plan)))
+	scanner.Buffer(make([]byte, 64<<10), 4<<20)
+	inSection, sectionIncomplete, inFence := false, false, false
+	incompleteSections, fenceLength := 0, 0
+	var fenceMarker byte
+	flush := func() {
+		if inSection && sectionIncomplete {
+			incompleteSections++
+		}
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if inFence {
+			if closesFence(line, fenceMarker, fenceLength) {
+				inFence = false
+			}
+			continue
+		}
+		if marker, length, opens := opensFence(line); opens {
+			inFence, fenceMarker, fenceLength = true, marker, length
+			continue
+		}
+		level := headingLevel(line)
+		if level == 3 && taskHeading(line) {
+			flush()
+			inSection, sectionIncomplete = true, false
+			continue
+		}
+		if level > 0 && level <= 3 {
+			flush()
+			inSection, sectionIncomplete = false, false
+			continue
+		}
+		trimmed := strings.TrimLeft(line, " \t")
+		if inSection && (strings.HasPrefix(trimmed, "- [ ]") || strings.HasPrefix(trimmed, "* [ ]") || strings.HasPrefix(trimmed, "+ [ ]")) {
+			sectionIncomplete = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: scan plan: %w", err)
+	}
+	if inFence {
+		return errors.New("EXECUTION_BOUNDS_INVALID: unterminated Markdown fence")
+	}
+	flush()
+	if incompleteSections != 1 {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: plan has %d incomplete executable sections; exactly 1 is required", incompleteSections)
+	}
+	return nil
+}
+
+func opensFence(line string) (byte, int, bool) {
+	content, ok := fenceContent(line)
+	if !ok || len(content) < 3 || content[0] != '`' && content[0] != '~' {
+		return 0, 0, false
+	}
+	marker, count := content[0], 0
+	for count < len(content) && content[count] == marker {
+		count++
+	}
+	if count < 3 || marker == '`' && strings.ContainsRune(content[count:], '`') {
+		return 0, 0, false
+	}
+	return marker, count, true
+}
+
+func closesFence(line string, marker byte, openingLength int) bool {
+	content, ok := fenceContent(line)
+	if !ok || len(content) < openingLength || content[0] != marker {
+		return false
+	}
+	count := 0
+	for count < len(content) && content[count] == marker {
+		count++
+	}
+	return count >= openingLength && strings.Trim(content[count:], " \t") == ""
+}
+
+func fenceContent(line string) (string, bool) {
+	column := 0
+	for index := 0; index < len(line); index++ {
+		switch line[index] {
+		case ' ':
+			column++
+		case '\t':
+			column += 4 - column%4
+		default:
+			return line[index:], column <= 3
+		}
+		if column > 3 {
+			return "", false
+		}
+	}
+	return "", false
+}
+
+func headingLevel(line string) int {
+	spaces := 0
+	for spaces < len(line) && line[spaces] == ' ' {
+		spaces++
+	}
+	if spaces > 3 {
+		return 0
+	}
+	line = line[spaces:]
+	level := 0
+	for level < len(line) && line[level] == '#' {
+		level++
+	}
+	if level == 0 || level > 6 || level == len(line) || line[level] != ' ' && line[level] != '\t' {
+		return 0
+	}
+	return level
+}
+
+func taskHeading(line string) bool {
+	spaces := 0
+	for spaces < len(line) && line[spaces] == ' ' {
+		spaces++
+	}
+	title := strings.TrimSpace(line[spaces+3:])
+	for _, prefix := range []string{"Task ", "Iteration "} {
+		if !strings.HasPrefix(title, prefix) {
+			continue
+		}
+		remainder := title[len(prefix):]
+		digits := 0
+		for digits < len(remainder) && remainder[digits] >= '0' && remainder[digits] <= '9' {
+			digits++
+		}
+		return digits > 0 && digits < len(remainder) && remainder[digits] == ':'
+	}
+	return false
 }
 
 func modelSpec(model, effort string) (string, error) {

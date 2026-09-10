@@ -391,6 +391,98 @@ func TestNewRejectsInvalidMergeReviewPolicy(t *testing.T) {
 	}
 }
 
+func TestNewAdmitsV3BOnlyWithStructuralCapabilityAndCounters(t *testing.T) {
+	manifest := v3BoundManifest(t)
+	governed, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, present := governed.Governance()
+	if !present || admission.Operation != contextcapsule.OperationImplementation {
+		t.Fatalf("V3 governance admission = %#v, present=%t", admission, present)
+	}
+	invalid := cloneManifest(manifest)
+	invalid.Ralphex.Capability.IdleTimeoutFlag = false
+	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "EXECUTION_BOUNDS_INVALID") {
+		t.Fatalf("unsupported V3 capability was admitted: %v", err)
+	}
+	invalid = cloneManifest(manifest)
+	invalid.Ralphex.ExecutionState.RalphexInvocations = 2
+	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "exhausted") {
+		t.Fatalf("exhausted cumulative bound was reset: %v", err)
+	}
+}
+
+func TestNewRejectsV2ABCGovernanceAssertionWithoutActivation(t *testing.T) {
+	manifest := boundCapsuleManifest(t)
+	head := manifest.Repository.StartSHA
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersionV2, Project: "ABCP", Plan: "legacy", RoadmapPhase: "test", ExecutionPack: "test",
+		Task: "Task 1", Repository: manifest.Repository.Identity, BaseSHA: head,
+		OperationContext: &contextcapsule.OperationContext{Kind: contextcapsule.OperationImplementation, OwnedScope: []string{"task"}, BlockingCriteria: []string{"major"}},
+		Invariants:       []string{"Fail closed."}, NonGoals: []string{"No network."}, PredecessorOutcomes: []contextcapsule.Outcome{}, Sources: []string{"source.md"},
+	}
+	_, data, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, manifest.ContextCapsule.Path, data, 0o600)
+	manifest.ContextCapsule.SHA256 = fileHash(t, manifest.ContextCapsule.Path)
+	manifest.Governance = &GovernanceManifest{Operation: contextcapsule.OperationImplementation}
+	if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "cannot assert A/B/C") {
+		t.Fatalf("V2 governance assertion was admitted: %v", err)
+	}
+}
+
+func v3BoundManifest(t *testing.T) Manifest {
+	t.Helper()
+	manifest := boundCapsuleManifest(t)
+	planPath := filepath.Join(manifest.Repository.Path, manifest.Plan.Path)
+	writeFile(t, planPath, []byte("### Task 1: bounded\n\n- [ ] implement\n"), 0o600)
+	gitAuthorityCommand(t, manifest.Repository.Path, "add", "plan.md")
+	gitAuthorityCommand(t, manifest.Repository.Path, "commit", "-m", "bounded plan")
+	head := gitAuthorityCommand(t, manifest.Repository.Path, "rev-parse", "HEAD")
+	manifest.Repository.StartSHA = head
+	manifest.Plan.SHA256 = fileHash(t, planPath)
+	bounds := &contextcapsule.ExecutionBoundsV1{
+		MaxIterations: 3, SessionTimeout: "30m0s", IdleTimeout: "10m0s", WallClockTimeout: "1h0m0s", AggregateWallClockTimeout: "2h0m0s",
+		MaxIncompleteTasks: 1, MaxInitialActiveFindings: 3, MaxRalphexInvocations: 2, MaxReviewReports: 3,
+		MaxMutationLeases: 2, MaxTotalFixBatches: 2, MaxChangedFiles: 10, MaxChangedBytes: 1000,
+	}
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersionV3, Project: "ABCP", Plan: "v3", RoadmapPhase: "test", ExecutionPack: "test",
+		Task: "Task 1", Repository: manifest.Repository.Identity, BaseSHA: head, Invariants: []string{"Fail closed."},
+		NonGoals: []string{"No network."}, PredecessorOutcomes: []contextcapsule.Outcome{}, Sources: []string{"source.md"},
+		PhaseAuthority: &contextcapsule.PhaseAuthorityV3{
+			Stage: contextcapsule.StageBImplementation, AllowedOperations: []contextcapsule.OperationKind{contextcapsule.OperationImplementation, contextcapsule.OperationImplementationReview},
+			Parent:                 &contextcapsule.PhaseParentV1{CapsuleFileSHA256: strings.Repeat("a", 64), CapsuleSHA256: strings.Repeat("b", 64), Stage: contextcapsule.StageADesign, CheckpointSHA256: strings.Repeat("c", 64), CandidateSHA: head, GrantSHA256: strings.Repeat("d", 64)},
+			SemanticRegistrySHA256: strings.Repeat("e", 64), ObservationScopeIDs: []string{"rule.one"}, BlockingScopeIDs: []string{"rule.one"}, MutationScopeIDs: []string{"rule.one"},
+			AuthorizedFindingIDs: []string{}, AuthorizedInvariantIDs: []string{"rule.one"}, AllowedPaths: []string{"source.md"}, ReviewProfile: contextcapsule.ReviewProfileInitialImplementation, ExecutionBounds: bounds,
+		},
+	}
+	_, data, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, manifest.ContextCapsule.Path, data, 0o600)
+	manifest.ContextCapsule.SHA256 = fileHash(t, manifest.ContextCapsule.Path)
+	manifest.Ralphex.Mode = ralphex.ModeTasksOnly
+	manifest.Ralphex.Timeout = bounds.WallClockTimeout
+	manifest.Ralphex.WaitOnLimit = "0s"
+	manifest.Executor.Executor = "codex"
+	manifest.Executor.TaskEffort = "xhigh"
+	manifest.Executor.ReviewEffort = "xhigh"
+	manifest.Worktree = WorktreePolicy{}
+	manifest.Ralphex.Capability = &ralphex.CapabilityV1{
+		Kind: "RalphexCapabilityV1", BinarySHA256: manifest.Ralphex.BinarySHA256, SourceSHA: manifest.Ralphex.SourceSHA,
+		MaxIterationsFlag: true, SessionTimeoutFlag: true, IdleTimeoutFlag: true, SkipFinalizeFlag: true, BaseRefFlag: true,
+		ExecutorModelEffortFlags: true, IsolatedConfig: true, GovernedHandoff: ralphex.HandoffTasksOnly, LinuxContainment: true,
+	}
+	manifest.Ralphex.ExecutionState = &ralphex.ExecutionStateV1{AggregateElapsed: "0s"}
+	manifest.Governance = &GovernanceManifest{Operation: contextcapsule.OperationImplementation}
+	return manifest
+}
+
 func boundCapsuleManifest(t *testing.T) Manifest {
 	t.Helper()
 	manifest := fixtureManifest(t)
