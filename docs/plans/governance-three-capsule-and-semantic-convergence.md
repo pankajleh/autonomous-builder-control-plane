@@ -111,11 +111,11 @@ B `parent` binds all of:
 - exact accepted design HEAD;
 - exact B grant digest.
 
-B base SHA must equal the accepted design HEAD. Every B field must equal or narrow the B grant by deterministic set inclusion/numeric tightening. No natural-language “does not contradict” test is used.
+B base SHA must equal the accepted design HEAD. Every B field must equal or narrow the B grant by deterministic set inclusion/numeric tightening. The grant also carries mandatory floors: `required_blocking_scope_ids`, `required_invariant_ids`, `required_operations`, and `required_final_review_ids`; a child may not remove or weaken those floors. B must preserve every mandatory A-reviewed obligation needed for implementation correctness. No natural-language “does not contradict” test is used.
 
 ### B -> C grant
 
-`IMPLEMENTATION_CONVERGED` similarly binds B, the exact converged implementation HEAD, final validated review-scope chain tip, and a `NextStageGrantV1` for C. C parent binds B capsule digests, B checkpoint digest, converged HEAD, and C grant digest. C base SHA equals that converged HEAD and C fields must equal/narrow the C grant.
+`IMPLEMENTATION_CONVERGED` similarly binds B, the exact converged implementation HEAD, final validated review-scope chain tip, and a `NextStageGrantV1` for C. That C grant is controller-derived from the B grant plus the exact validated convergence outcome: it may tighten maxima but must carry forward every mandatory final-review/invariant floor inherited from A/B. C parent binds B capsule digests, B checkpoint digest, converged HEAD, and C grant digest. C base SHA equals that converged HEAD and C fields must equal/narrow maxima while containing all mandatory floors. A B->C grant that drops a required A/B obligation fails `CAPSULE_LINEAGE_INVALID`.
 
 This produces a cryptographically and controller-evidence-bound A -> DESIGN_ACCEPTED/grant -> B -> IMPLEMENTATION_CONVERGED/grant -> C chain.
 
@@ -162,9 +162,9 @@ A `DESIGN_GAP` never acquires mutation authority under B. It stops convergence a
 
 ABCP persists one controller-owned review-tip record and accepts only a report extending that exact tip. Fork, replay with changed bytes, missing sequence, candidate mismatch, active-set growth, unauthorized blocker, or unregistered semantic mapping fails closed.
 
-A valid blocking report does not itself authorize editing. ABCP issues a one-use `MutationLeaseV1` binding report digest, B capsule digest, exact pre-fix HEAD, exact blocker/mutation IDs, exact allowed paths, and conservative changed-file/byte ceilings. Ralphex/Codex receives only this lease for that fix batch.
+A valid blocking report does not itself authorize editing. ABCP derives a one-use `MutationLeaseV1` from the exact validated report and registry: lease blocker/mutation IDs must be members of the report active set and B mutation scope; lease `allowed_paths` is the deterministic intersection of B `allowed_paths` and every selected registry rule's permitted correction/path family; changed-file/byte ceilings may only tighten B limits. The controller persists lease state `ISSUED` under the same workflow lock and records its digest as the only consumable lease tip. Ralphex/Codex receives only this lease for that fix batch.
 
-After mutation, ABCP validates a `MutationReceiptV1` binding lease digest, exact resulting commit, exact diff/path digest and counts. It independently checks ancestry and changed paths. Unleased mutation, mutation for deferred/new findings, path escape, diff limit violation, dirty exit, or mismatched result HEAD fails the phase and cannot produce `IMPLEMENTATION_CONVERGED`.
+Lease consumption is atomic and non-forkable. Before any repository mutation ABCP CAS-transitions the exact lease digest from `ISSUED` to `CONSUMING`; a second consumer/replay fails. After mutation, ABCP validates a strict-canonical `MutationReceiptV1` binding lease digest, report digest, exact pre-fix HEAD, exact resulting commit, exact diff/path digest and counts, and predecessor receipt-tip digest. Under the workflow lock it independently checks ancestry/paths/diff, atomically appends the receipt, advances the receipt tip, and marks the lease `CONSUMED`. A crash after `CONSUMING` is recovery-blocking until deterministic reconciliation proves one result or escalates; the lease is never reissued. Unleased mutation, competing receipt, mutation for deferred/new findings, path escape, diff limit violation, dirty exit, or mismatched result HEAD fails the phase and cannot produce `IMPLEMENTATION_CONVERGED`.
 
 Ralphex or model success text is never acceptance evidence.
 
@@ -182,11 +182,13 @@ Initial ceiling profile is:
 - exactly one incomplete executable Task/Iteration section;
 - Codex task and review effort exactly `xhigh`.
 
-`RalphexCapabilityV1` binds the pinned source/binary identity and exact support for `--max-iterations`, `--session-timeout`, `--idle-timeout`, `--skip-finalize`, `--base-ref`, selected executor/model/effort flags, and isolated config. If the selected binary capability does not prove every requested bound, admission fails `EXECUTION_BOUNDS_INVALID` before spawn.
+`RalphexCapabilityV1` binds the pinned source/binary identity and exact support for `--max-iterations`, `--session-timeout`, `--idle-timeout`, `--skip-finalize`, `--base-ref`, selected executor/model/effort flags, isolated config, and the governed review/fix handoff mode described below. If the selected binary/adapter capability does not prove every requested bound or handoff property, admission fails `EXECUTION_BOUNDS_INVALID` before spawn. Native Ralphex review/fix is not admitted merely because it can review and mutate; it must expose a controller-enforced stop boundary before each fix batch, or ABCP must run review and fix as separate bounded invocations so report validation and lease issuance happen before mutation.
 
-The adapter emits all controls structurally as argv. `wall_clock_timeout` is enforced by the ABCP process supervisor from spawn until the Ralphex process group and governed descendants terminate; expiry sends the configured graceful termination then bounded forced kill and records timeout evidence. `session_timeout` and `idle_timeout` use the pinned Ralphex capability semantics. `max_iterations` is the native Ralphex loop ceiling. `finalize=false` always emits `--skip-finalize` and isolated config cannot re-enable it. Rate-limit wait is separately bounded policy and does not reset the ABCP wall clock.
+`ExecutionBoundsV1` also carries B-wide cumulative ceilings: `max_ralphex_invocations`, `max_review_reports`, `max_mutation_leases`, `max_total_fix_batches`, and `aggregate_wall_clock_timeout`. Each is finite, positive, controller-owned, and may only tighten from the accepted design grant. Counters and aggregate elapsed time are durable workflow state and never reset by starting another process. Hitting any ceiling ends B with a bounded non-success outcome; it does not mint fresh authority or reset counters.
 
-These are safety ceilings, not target durations. Semantic review convergence rules above remain mandatory.
+The adapter emits all per-invocation controls structurally as argv. `wall_clock_timeout` is enforced by the ABCP process supervisor for one invocation; `aggregate_wall_clock_timeout` is measured across all B-governed invocations including review/fix handoffs and rate-limit waits. On Linux, governed execution must run inside a controller-created cgroup v2 scope (or an equivalently proven containment primitive) whose identity is bound in evidence; all spawned descendants must remain in that scope. Expiry first requests graceful termination, then bounded forced kill of the scope, and ABCP verifies the scope is empty before recording termination. If containment creation, membership verification, or empty-scope proof is unavailable, admission fails `EXECUTION_BOUNDS_INVALID`. `session_timeout` and `idle_timeout` use the pinned Ralphex capability semantics. `max_iterations` is the native per-invocation loop ceiling. `finalize=false` always emits `--skip-finalize` and isolated config cannot re-enable it. Rate-limit wait is separately bounded and consumes aggregate wall clock.
+
+These are safety ceilings, not target durations. Semantic review convergence rules above remain mandatory. No controller path may loop by issuing a fresh B for the same unresolved active finding set without a new accepted design/checkpoint lineage.
 
 ## 10. C exact-head acceptance and merge chain
 
@@ -256,7 +258,9 @@ The two `dev_agent_automation_platform` entry documents must link the ABCP gover
 
 ## 15. Review findings closed by this revision
 
-This revision closes Codex M-01 through M-09 and ChatGPT M-01 through M-04 by: selecting canonical wire enums/golden vectors; using accepted checkpoint grants rather than self-selected child scope; defining controller-authenticated checkpoint ordering; binding semantic IDs to an immutable reviewed registry; making review reports non-forkable; specifying V3 immutable-base-tree verification plus clean candidate validation; composing C with the existing exact target/provider merge authority; defining activation/grandfathering without stranding non-workflow V2 operations; and specifying exact Ralphex capability/clock/argv enforcement.
+The first revision closed Codex M-01 through M-09 and ChatGPT M-01 through M-04. The exact-head bounded re-review then identified only six closure defects in those mechanisms; this revision is intentionally limited to those six: mandatory review floors and transitive A/B/C obligation preservation; atomic one-use mutation-lease consumption; controller-visible review->lease->fix handoff before mutation; B-wide cumulative execution ceilings; descendant containment/verified teardown; and deterministic lease-path intersection with semantic correction authority.
+
+The next design re-review is a closure-only review. It may verify these six defects against the previously reviewed design and Capsule-A authority. It must not reopen unrelated architecture, search for new optimization opportunities, or promote a newly observed independent concern into this correction cycle. Any independent concern is `DEFERRED` and requires separate authority.
 
 ## 16. Bounded implementation task
 
