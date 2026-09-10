@@ -74,11 +74,12 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	outputRoot := t.TempDir()
 	ledgerPath := filepath.Join(outputRoot, "ledger", "events.jsonl")
 	evidenceRoot := filepath.Join(outputRoot, "evidence")
+	governanceState := filepath.Join(outputRoot, "controller", "governance.json")
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	code := runCLI([]string{
-		"run", "--manifest", manifestPath, "--ledger", ledgerPath, "--evidence-root", evidenceRoot,
+		"run", "--manifest", manifestPath, "--ledger", ledgerPath, "--evidence-root", evidenceRoot, "--governance-state", governanceState,
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("run CLI exited %d: %s", code, stderr.String())

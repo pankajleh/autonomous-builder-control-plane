@@ -21,6 +21,7 @@ import (
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
+	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
@@ -77,6 +78,99 @@ func TestRunnerSuccessReachesBranchAcceptedWithOrderedEvidence(t *testing.T) {
 	}
 	if len(events[len(events)-1].EvidenceRefs) < 8 {
 		t.Fatalf("BRANCH_ACCEPTED lacks complete acceptance evidence: %#v", events[len(events)-1].EvidenceRefs)
+	}
+}
+
+func TestV3BReusesCapsuleAtDescendantAndStopsBeforeCAcceptance(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	repository := manifest.Repository.Path
+	base := manifest.Repository.StartSHA
+	writeTestFile(t, manifest.Plan.Path, []byte("### Task 1: bounded\n\n- [ ] implement\n"), 0o600)
+	runGit(t, repository, "add", "plan.md")
+	runGit(t, repository, "commit", "-m", "authorized descendant plan")
+	start := runGit(t, repository, "rev-parse", "HEAD")
+	if start == base {
+		t.Fatal("test did not create a descendant candidate")
+	}
+	manifest.Repository.StartSHA = start
+	manifest.Plan.SHA256 = testHash(t, manifest.Plan.Path)
+	probe := "{\"kind\":\"RalphexCapabilityProbeV1\",\"source_sha\":\"source-test\",\"max_iterations_flag\":true,\"session_timeout_flag\":true,\"idle_timeout_flag\":true,\"skip_finalize_flag\":true,\"base_ref_flag\":true,\"executor_model_effort_flags\":true,\"isolated_config\":true,\"governed_handoff\":\"TASKS_ONLY\",\"linux_containment\":true}"
+	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"--abcp-governance-capability-v1\" ]; then printf '%%s\\n' '%s'; exit 0; fi\nprintf candidate > candidate.txt\ngit add candidate.txt || exit 90\ngit commit -qm candidate || exit 91\n", probe)
+	writeTestFile(t, manifest.Ralphex.BinaryPath, []byte(script), 0o700)
+	manifest.Ralphex.BinarySHA256 = testHash(t, manifest.Ralphex.BinaryPath)
+	bounds := &contextcapsule.ExecutionBoundsV1{
+		MaxIterations: 2, SessionTimeout: "5s", IdleTimeout: "5s", WallClockTimeout: "5s", AggregateWallClockTimeout: "20s",
+		MaxIncompleteTasks: 1, MaxInitialActiveFindings: 2, MaxRalphexInvocations: 2, MaxReviewReports: 2, MaxMutationLeases: 1,
+		MaxTotalFixBatches: 1, MaxChangedFiles: 4, MaxChangedBytes: 10000,
+	}
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersionV3, Project: "ABCP", Plan: "v3", RoadmapPhase: "test", ExecutionPack: "test", Task: "Task 1",
+		Repository: manifest.Repository.Identity, BaseSHA: base, Invariants: []string{"Fail closed."}, NonGoals: []string{"No C authority."},
+		PredecessorOutcomes: []contextcapsule.Outcome{}, Sources: []string{"context.md"},
+		PhaseAuthority: &contextcapsule.PhaseAuthorityV3{
+			Stage: contextcapsule.StageBImplementation, AllowedOperations: []contextcapsule.OperationKind{contextcapsule.OperationImplementation, contextcapsule.OperationImplementationReview},
+			Parent:                 &contextcapsule.PhaseParentV1{CapsuleFileSHA256: strings.Repeat("a", 64), CapsuleSHA256: strings.Repeat("b", 64), Stage: contextcapsule.StageADesign, CheckpointSHA256: strings.Repeat("c", 64), CandidateSHA: base, GrantSHA256: strings.Repeat("d", 64)},
+			SemanticRegistrySHA256: strings.Repeat("e", 64), ObservationScopeIDs: []string{"rule.one"}, BlockingScopeIDs: []string{"rule.one"}, MutationScopeIDs: []string{"rule.one"},
+			AuthorizedFindingIDs: []string{}, AuthorizedInvariantIDs: []string{"rule.one"}, AllowedPaths: []string{"candidate.txt", "plan.md"},
+			ReviewProfile: contextcapsule.ReviewProfileInitialImplementation, ExecutionBounds: bounds,
+		},
+	}
+	_, capsuleBytes, err := contextcapsule.Build(repository, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, manifest.ContextCapsule.Path, capsuleBytes, 0o600)
+	manifest.ContextCapsule.SHA256 = testHash(t, manifest.ContextCapsule.Path)
+	manifest.Ralphex.Mode = ralphex.ModeTasksOnly
+	manifest.Ralphex.Timeout = bounds.WallClockTimeout
+	manifest.Ralphex.WaitOnLimit = "0s"
+	manifest.Ralphex.ExecutionState = nil
+	manifest.Ralphex.Capability = &ralphex.CapabilityV1{
+		Kind: "RalphexCapabilityV1", BinarySHA256: manifest.Ralphex.BinarySHA256, SourceSHA: manifest.Ralphex.SourceSHA,
+		MaxIterationsFlag: true, SessionTimeoutFlag: true, IdleTimeoutFlag: true, SkipFinalizeFlag: true, BaseRefFlag: true,
+		ExecutorModelEffortFlags: true, IsolatedConfig: true, GovernedHandoff: ralphex.HandoffTasksOnly, LinuxContainment: true,
+	}
+	manifest.Governance = &authority.GovernanceManifest{Operation: contextcapsule.OperationImplementation, Mutation: true}
+	controller, err := governancev3.OpenControllerV1(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	governed, err := authority.NewWithGovernanceController(manifest, controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := ledger.NewJSONLLedger(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := evidence.NewStore(fixture.evidence, governed.RunID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	processes := &testContainedRunner{inner: supervisor.New()}
+	runner, err := NewWithController(governed, events, artifacts, processes, controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.StateImplementationCompleted || result.Accepted() || len(result.Acceptance.Commands()) != 0 {
+		t.Fatalf("B crossed into C-only acceptance: %#v", result)
+	}
+	for _, state := range eventStates(readEvents(t, fixture.ledgerPath)) {
+		if state == domain.StateBranchAcceptancePending || state == domain.StateBranchAccepted {
+			t.Fatalf("B emitted C-only state %s", state)
+		}
+	}
+	snapshot, err := controller.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ExecutionState.RalphexInvocations != 1 || snapshot.ExecutionState.TotalFixBatches != 0 {
+		t.Fatalf("B counters = %#v", snapshot.ExecutionState)
 	}
 }
 
@@ -271,6 +365,18 @@ func TestNewEnforcesOperationKindAndRalphexModeMapping(t *testing.T) {
 				t.Fatalf("operation kind %q with mode %q rejected: %v", test.kind, test.mode, err)
 			}
 		})
+	}
+}
+
+func TestV3ReviewFixRequiresSeparateLeasedTasksOnlyBoundary(t *testing.T) {
+	if err := validateOperationMode(contextcapsule.OperationImplementationReview, ralphex.ModeTasksOnly, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOperationMode(contextcapsule.OperationImplementationReview, ralphex.ModeReview, true); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("mutating review invocation was admitted: %v", err)
+	}
+	if err := validateOperationMode(contextcapsule.OperationImplementation, ralphex.ModeFull, true); err == nil || !strings.Contains(err.Error(), "review-to-lease-to-fix") {
+		t.Fatalf("uninterrupted native fix invocation was admitted: %v", err)
 	}
 }
 
@@ -801,6 +907,20 @@ type runFixture struct {
 
 type recordingEventAppender struct {
 	events []ledger.Event
+}
+
+type testContainedRunner struct {
+	inner CommandRunner
+}
+
+func (r *testContainedRunner) Run(ctx context.Context, command supervisor.Command) (supervisor.Result, error) {
+	return r.inner.Run(ctx, command)
+}
+
+func (r *testContainedRunner) RunContained(ctx context.Context, command supervisor.Command, request ContainmentRequestV1) (supervisor.Result, ContainmentEvidenceV1, error) {
+	result, err := r.inner.Run(ctx, command)
+	evidence := ContainmentEvidenceV1{Kind: "ContainmentEvidenceV1", ScopeIdentity: "test/" + request.Identity, Primitive: "cgroup-v2", MembershipVerified: true, EmptyScopeVerified: true}
+	return result, evidence, err
 }
 
 func (a *recordingEventAppender) Append(event ledger.Event) error {

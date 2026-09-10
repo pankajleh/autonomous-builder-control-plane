@@ -32,6 +32,7 @@ func TestCgroupV2EvidenceFailsClosedOnMembershipAndTeardown(t *testing.T) {
 		t.Fatalf("expected non-empty teardown rejection, got %v", err)
 	}
 	writeCgroupTestFile(t, filepath.Join(scope, "cgroup.procs"), "")
+	writeCgroupTestFile(t, filepath.Join(scope, "cgroup.events"), "populated 0\n")
 	if err := VerifyCgroupEmptyV1(scope); err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +56,12 @@ func TestCgroupV2ScopeRejectsRootAndSymlink(t *testing.T) {
 	writeCgroupTestFile(t, filepath.Join(scope, "cgroup.kill"), "")
 	if err := ValidateCgroupV2ScopeV1(root, scope); err == nil || !strings.Contains(err.Error(), "non-symlink") {
 		t.Fatalf("expected symlink control rejection, got %v", err)
+	}
+}
+
+func TestLinuxContainedRunnerFailsClosedWhenCgroupV2Unavailable(t *testing.T) {
+	if _, err := NewLinuxContainedCommandRunner(&testContainedRunner{}, t.TempDir()); err == nil || !strings.Contains(err.Error(), "cgroup v2 is unavailable") {
+		t.Fatalf("missing containment primitive was admitted: %v", err)
 	}
 }
 

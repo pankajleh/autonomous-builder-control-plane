@@ -123,13 +123,34 @@ type AcceptanceCommand struct {
 // Authority is an immutable, validated value. Its internals are deliberately
 // private; accessors return copies for fields containing mutable Go values.
 type Authority struct {
-	manifest      Manifest
-	canonicalJSON []byte
-	sha256        string
+	manifest           Manifest
+	canonicalJSON      []byte
+	sha256             string
+	controllerAdmitted bool
+}
+
+// WorkflowAdmissionController is the controller-owned durable activation
+// boundary. Manifests cannot substitute caller-provided activation state.
+type WorkflowAdmissionController interface {
+	AdmitWorkflowAuthority(policyVersion, authorityDigest string) error
+	ValidateCapsuleUsageV3(contextcapsule.Capsule, contextcapsule.OperationKind, bool, string) error
 }
 
 // New validates, canonicalizes, and freezes a run manifest.
 func New(input Manifest) (Authority, error) {
+	return newAuthority(input, nil)
+}
+
+// NewWithGovernanceController validates and durably admits an A/B/C workflow
+// authority against the controller activation tip.
+func NewWithGovernanceController(input Manifest, controller WorkflowAdmissionController) (Authority, error) {
+	if controller == nil {
+		return Authority{}, errors.New("CAPSULE_LINEAGE_INVALID: durable governance controller is required")
+	}
+	return newAuthority(input, controller)
+}
+
+func newAuthority(input Manifest, controller WorkflowAdmissionController) (Authority, error) {
 	manifest := cloneManifest(input)
 	if manifest.MergeReview != nil {
 		sort.Slice(manifest.MergeReview.Required, func(i, j int) bool {
@@ -199,7 +220,7 @@ func New(input Manifest) (Authority, error) {
 	for index := range manifest.Acceptance {
 		manifest.Acceptance[index].Timeout = canonicalDuration(manifest.Acceptance[index].Timeout)
 	}
-	if err := validateGovernanceAdmission(manifest); err != nil {
+	if err := validateGovernanceAdmission(manifest, controller); err != nil {
 		return Authority{}, err
 	}
 
@@ -209,11 +230,24 @@ func New(input Manifest) (Authority, error) {
 	}
 	digest := sha256.Sum256(canonicalJSON)
 
-	return Authority{
+	authority := Authority{
 		manifest:      manifest,
 		canonicalJSON: canonicalJSON,
 		sha256:        hex.EncodeToString(digest[:]),
-	}, nil
+	}
+	if controller != nil {
+		workflow, policyVersion, err := autonomousWorkflowPolicy(manifest)
+		if err != nil {
+			return Authority{}, err
+		}
+		if workflow {
+			if err := controller.AdmitWorkflowAuthority(policyVersion, authority.sha256); err != nil {
+				return Authority{}, err
+			}
+		}
+		authority.controllerAdmitted = true
+	}
+	return authority, nil
 }
 
 // Manifest returns a deep copy of the canonical validated manifest.
@@ -296,7 +330,16 @@ func (a Authority) PolicyVersion() string {
 	return a.manifest.PolicyVersion
 }
 
-func validateGovernanceAdmission(manifest Manifest) error {
+// ControllerAdmitted reports whether durable activation policy admitted this
+// authority. V3 execution paths require this bit.
+func (a Authority) ControllerAdmitted() bool {
+	return a.controllerAdmitted
+}
+
+func validateGovernanceAdmission(manifest Manifest, controller WorkflowAdmissionController) error {
+	if manifest.Governance != nil && (manifest.Governance.Activation != nil || manifest.Governance.IssuedSequence != 0) {
+		return errors.New("CAPSULE_LINEAGE_INVALID: activation and issuance state are controller-owned, not manifest assertions")
+	}
 	if manifest.ContextCapsule == nil {
 		if manifest.Governance != nil {
 			return errors.New("CAPSULE_USAGE_INVALID: governance admission requires a context capsule")
@@ -311,13 +354,8 @@ func validateGovernanceAdmission(manifest Manifest) error {
 	if err != nil {
 		return fmt.Errorf("parse governance context capsule: %w", err)
 	}
-	if manifest.Governance != nil && manifest.Governance.Activation != nil {
-		if err := governancev3.ValidateActivatedWorkflowPolicyV1(capsule.PolicyVersion, manifest.ContextCapsule.SHA256, manifest.Governance.IssuedSequence, *manifest.Governance.Activation); err != nil {
-			return err
-		}
-	}
 	if capsule.PolicyVersion != contextcapsule.PolicyVersionV3 {
-		if manifest.Governance != nil && manifest.Governance.Activation == nil {
+		if manifest.Governance != nil {
 			return errors.New("CAPSULE_LINEAGE_INVALID: V2 cannot assert A/B/C governance without activation/grandfather evidence")
 		}
 		return nil
@@ -325,7 +363,11 @@ func validateGovernanceAdmission(manifest Manifest) error {
 	if manifest.Governance == nil {
 		return errors.New("CAPSULE_USAGE_INVALID: V3 requires explicit governance operation admission")
 	}
-	if err := governancev3.ValidateCapsuleUsageV3(capsule, manifest.Governance.Operation, manifest.Governance.Mutation, manifest.Governance.LeaseSHA256); err != nil {
+	if controller == nil {
+		if err := governancev3.ValidateCapsuleUsageV3(capsule, manifest.Governance.Operation, manifest.Governance.Mutation, manifest.Governance.LeaseSHA256); err != nil {
+			return err
+		}
+	} else if err := controller.ValidateCapsuleUsageV3(capsule, manifest.Governance.Operation, manifest.Governance.Mutation, manifest.Governance.LeaseSHA256); err != nil {
 		return err
 	}
 	if capsule.PhaseAuthority == nil || capsule.PhaseAuthority.Stage != contextcapsule.StageBImplementation {
@@ -335,13 +377,13 @@ func validateGovernanceAdmission(manifest Manifest) error {
 		return errors.New("CAPSULE_USAGE_INVALID: Ralphex B admission requires implementation or implementation-review")
 	}
 	bounds := capsule.PhaseAuthority.ExecutionBounds
-	if bounds == nil || manifest.Ralphex.Capability == nil || manifest.Ralphex.ExecutionState == nil {
-		return errors.New("EXECUTION_BOUNDS_INVALID: V3 requires execution bounds, capability, and durable counters")
+	if bounds == nil || manifest.Ralphex.Capability == nil {
+		return errors.New("EXECUTION_BOUNDS_INVALID: V3 requires execution bounds and pinned capability")
 	}
-	if err := ralphex.ValidateCapabilityV1(*manifest.Ralphex.Capability, manifest.Ralphex.BinarySHA256, manifest.Ralphex.SourceSHA, manifest.Ralphex.Mode); err != nil {
-		return err
+	if manifest.Ralphex.ExecutionState != nil {
+		return errors.New("EXECUTION_BOUNDS_INVALID: cumulative execution state is controller-owned, not manifest input")
 	}
-	if err := ralphex.ValidateExecutionStateV1(*bounds, *manifest.Ralphex.ExecutionState); err != nil {
+	if err := ralphex.VerifyBinaryCapabilityV1(manifest.Ralphex.BinaryPath, *manifest.Ralphex.Capability, manifest.Ralphex.BinarySHA256, manifest.Ralphex.SourceSHA, manifest.Ralphex.Mode); err != nil {
 		return err
 	}
 	if manifest.Executor.Executor != "codex" || manifest.Executor.TaskEffort != "xhigh" || manifest.Executor.ReviewEffort != "xhigh" {
@@ -354,8 +396,7 @@ func validateGovernanceAdmission(manifest Manifest) error {
 	}
 	wait, _ := time.ParseDuration(manifest.Ralphex.WaitOnLimit)
 	aggregate, _ := time.ParseDuration(bounds.AggregateWallClockTimeout)
-	elapsed, _ := time.ParseDuration(manifest.Ralphex.ExecutionState.AggregateElapsed)
-	if wait < 0 || elapsed+wall+wait > aggregate {
+	if wait < 0 || wall+wait > aggregate {
 		return errors.New("EXECUTION_BOUNDS_INVALID: rate-limit wait exceeds aggregate wall clock")
 	}
 	plan, err := os.ReadFile(manifest.Plan.Path)
@@ -366,6 +407,36 @@ func validateGovernanceAdmission(manifest Manifest) error {
 		return err
 	}
 	return nil
+}
+
+func autonomousWorkflowPolicy(manifest Manifest) (bool, string, error) {
+	if manifest.ContextCapsule == nil {
+		return false, "", nil
+	}
+	data, err := os.ReadFile(manifest.ContextCapsule.Path)
+	if err != nil {
+		return false, "", fmt.Errorf("read governance context capsule: %w", err)
+	}
+	capsule, err := contextcapsule.Parse(data)
+	if err != nil {
+		return false, "", fmt.Errorf("parse governance context capsule: %w", err)
+	}
+	if capsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
+		return true, capsule.PolicyVersion, nil
+	}
+	if capsule.PolicyVersion != contextcapsule.PolicyVersionV2 || capsule.OperationContext == nil {
+		return false, capsule.PolicyVersion, nil
+	}
+	switch capsule.OperationContext.Kind {
+	case contextcapsule.OperationDesignPlanning, contextcapsule.OperationDesignReview,
+		contextcapsule.OperationImplementation, contextcapsule.OperationImplementationReview,
+		contextcapsule.OperationAcceptance, contextcapsule.OperationFinalReview,
+		contextcapsule.OperationPRPublication, contextcapsule.OperationMergeAuthorization,
+		contextcapsule.OperationPostMergeAcceptance:
+		return true, capsule.PolicyVersion, nil
+	default:
+		return false, capsule.PolicyVersion, nil
+	}
 }
 
 func validateRequired(manifest Manifest) error {

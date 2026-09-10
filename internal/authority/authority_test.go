@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
+	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
@@ -407,9 +408,23 @@ func TestNewAdmitsV3BOnlyWithStructuralCapabilityAndCounters(t *testing.T) {
 		t.Fatalf("unsupported V3 capability was admitted: %v", err)
 	}
 	invalid = cloneManifest(manifest)
-	invalid.Ralphex.ExecutionState.RalphexInvocations = 2
-	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "exhausted") {
-		t.Fatalf("exhausted cumulative bound was reset: %v", err)
+	binary, err := os.ReadFile(invalid.Ralphex.BinaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary = []byte(strings.Replace(string(binary), "\"idle_timeout_flag\":true", "\"idle_timeout_flag\":false", 1))
+	writeFile(t, invalid.Ralphex.BinaryPath, binary, 0o700)
+	invalid.Ralphex.BinarySHA256 = fileHash(t, invalid.Ralphex.BinaryPath)
+	invalid.Ralphex.Capability.BinarySHA256 = invalid.Ralphex.BinarySHA256
+	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "differs from the pinned binary probe") {
+		t.Fatalf("caller-asserted capability overrode binary probe: %v", err)
+	}
+	// Restore the shared fixture binary before testing independent state input.
+	manifest = v3BoundManifest(t)
+	invalid = cloneManifest(manifest)
+	invalid.Ralphex.ExecutionState = &ralphex.ExecutionStateV1{AggregateElapsed: "0s"}
+	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "controller-owned") {
+		t.Fatalf("caller-owned cumulative state was admitted: %v", err)
 	}
 }
 
@@ -434,9 +449,56 @@ func TestNewRejectsV2ABCGovernanceAssertionWithoutActivation(t *testing.T) {
 	}
 }
 
+func TestControllerAdmissionRejectsPostActivationV2WhenGovernanceIsOmitted(t *testing.T) {
+	manifest := boundCapsuleManifest(t)
+	head := manifest.Repository.StartSHA
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersionV2, Project: "ABCP", Plan: "legacy", RoadmapPhase: "test", ExecutionPack: "test",
+		Task: "Task 1", Repository: manifest.Repository.Identity, BaseSHA: head,
+		OperationContext: &contextcapsule.OperationContext{Kind: contextcapsule.OperationImplementation, OwnedScope: []string{"task"}, BlockingCriteria: []string{"major"}},
+		Invariants:       []string{"Fail closed."}, NonGoals: []string{"No network."}, PredecessorOutcomes: []contextcapsule.Outcome{}, Sources: []string{"source.md"},
+	}
+	_, data, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, manifest.ContextCapsule.Path, data, 0o600)
+	manifest.ContextCapsule.SHA256 = fileHash(t, manifest.ContextCapsule.Path)
+	legacy, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := governancev3.OpenControllerV1(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.AdmitWorkflowAuthority(contextcapsule.PolicyVersionV2, legacy.SHA256()); err != nil {
+		t.Fatal(err)
+	}
+	activation, err := governancev3.SealGovernanceActivationV1(governancev3.GovernanceActivationV1{
+		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3, PolicySHA256: strings.Repeat("a", 64),
+		ActivationRepositoryCommit: strings.Repeat("b", 40), ActivationSequence: 2, ActivationTime: "1970-01-01T00:00:00Z", GrandfatheredV2Digests: []string{legacy.SHA256()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.InstallActivationV1(activation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewWithGovernanceController(manifest, controller); err != nil {
+		t.Fatalf("exact grandfathered authority was rejected: %v", err)
+	}
+	manifest.RunID = "post-activation-copy"
+	if _, err := NewWithGovernanceController(manifest, controller); governancev3.ClassOf(err) != governancev3.CapsuleLineageInvalid {
+		t.Fatalf("omitted governance bypass class = %q, err=%v", governancev3.ClassOf(err), err)
+	}
+}
+
 func v3BoundManifest(t *testing.T) Manifest {
 	t.Helper()
 	manifest := boundCapsuleManifest(t)
+	writeFile(t, manifest.Ralphex.BinaryPath, []byte("#!/bin/sh\nif [ \"$1\" = \"--abcp-governance-capability-v1\" ]; then printf '%s\\n' '{\"kind\":\"RalphexCapabilityProbeV1\",\"source_sha\":\"abcdef0123456789\",\"max_iterations_flag\":true,\"session_timeout_flag\":true,\"idle_timeout_flag\":true,\"skip_finalize_flag\":true,\"base_ref_flag\":true,\"executor_model_effort_flags\":true,\"isolated_config\":true,\"governed_handoff\":\"TASKS_ONLY\",\"linux_containment\":true}'; exit 0; fi\nexit 0\n"), 0o700)
+	manifest.Ralphex.BinarySHA256 = fileHash(t, manifest.Ralphex.BinaryPath)
 	planPath := filepath.Join(manifest.Repository.Path, manifest.Plan.Path)
 	writeFile(t, planPath, []byte("### Task 1: bounded\n\n- [ ] implement\n"), 0o600)
 	gitAuthorityCommand(t, manifest.Repository.Path, "add", "plan.md")
@@ -478,8 +540,8 @@ func v3BoundManifest(t *testing.T) Manifest {
 		MaxIterationsFlag: true, SessionTimeoutFlag: true, IdleTimeoutFlag: true, SkipFinalizeFlag: true, BaseRefFlag: true,
 		ExecutorModelEffortFlags: true, IsolatedConfig: true, GovernedHandoff: ralphex.HandoffTasksOnly, LinuxContainment: true,
 	}
-	manifest.Ralphex.ExecutionState = &ralphex.ExecutionStateV1{AggregateElapsed: "0s"}
-	manifest.Governance = &GovernanceManifest{Operation: contextcapsule.OperationImplementation}
+	manifest.Ralphex.ExecutionState = nil
+	manifest.Governance = &GovernanceManifest{Operation: contextcapsule.OperationImplementation, Mutation: true}
 	return manifest
 }
 

@@ -2,8 +2,16 @@ package ralphex
 
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -53,6 +61,23 @@ const (
 type CapabilityV1 struct {
 	Kind                     string      `json:"kind"`
 	BinarySHA256             string      `json:"binary_sha256"`
+	SourceSHA                string      `json:"source_sha"`
+	MaxIterationsFlag        bool        `json:"max_iterations_flag"`
+	SessionTimeoutFlag       bool        `json:"session_timeout_flag"`
+	IdleTimeoutFlag          bool        `json:"idle_timeout_flag"`
+	SkipFinalizeFlag         bool        `json:"skip_finalize_flag"`
+	BaseRefFlag              bool        `json:"base_ref_flag"`
+	ExecutorModelEffortFlags bool        `json:"executor_model_effort_flags"`
+	IsolatedConfig           bool        `json:"isolated_config"`
+	GovernedHandoff          HandoffMode `json:"governed_handoff"`
+	LinuxContainment         bool        `json:"linux_containment"`
+}
+
+// CapabilityProbeV1 is emitted by the exact selected binary when invoked with
+// --abcp-governance-capability-v1. The controller supplies the binary digest,
+// so probe output cannot redirect attestation to a different executable.
+type CapabilityProbeV1 struct {
+	Kind                     string      `json:"kind"`
 	SourceSHA                string      `json:"source_sha"`
 	MaxIterationsFlag        bool        `json:"max_iterations_flag"`
 	SessionTimeoutFlag       bool        `json:"session_timeout_flag"`
@@ -188,6 +213,62 @@ func ValidateCapabilityV1(capability CapabilityV1, binarySHA256, sourceSHA strin
 		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: unsupported Ralphex mode %q", mode)
 	}
 	return nil
+}
+
+// VerifyBinaryCapabilityV1 queries the already hash-pinned executable and
+// requires its strict-canonical response to equal the requested capability.
+// Caller-set booleans alone are never sufficient for V3 admission.
+func VerifyBinaryCapabilityV1(binaryPath string, expected CapabilityV1, binarySHA256, sourceSHA string, mode Mode) error {
+	file, err := os.Open(binaryPath)
+	if err != nil {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: open pinned Ralphex binary: %w", err)
+	}
+	hasher := sha256.New()
+	_, copyErr := io.Copy(hasher, io.LimitReader(file, 1<<30))
+	closeErr := file.Close()
+	if copyErr != nil || closeErr != nil || hex.EncodeToString(hasher.Sum(nil)) != binarySHA256 {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: selected Ralphex binary does not match its pinned digest")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, binaryPath, "--abcp-governance-capability-v1").Output()
+	if err != nil {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: pinned Ralphex capability probe failed: %w", err)
+	}
+	if len(output) == 0 || len(output) > 64<<10 {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: pinned Ralphex capability probe output is empty or oversized")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	probe := CapabilityProbeV1{}
+	if err := decoder.Decode(&probe); err != nil {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: decode pinned Ralphex capability probe: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: capability probe contains trailing JSON")
+	}
+	canonical, err := json.Marshal(probe)
+	if err != nil || !bytes.Equal(bytes.TrimSpace(output), canonical) {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: capability probe is not strict canonical JSON")
+	}
+	if probe.Kind != "RalphexCapabilityProbeV1" {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: capability probe kind is invalid")
+	}
+	actual := CapabilityV1{
+		Kind: "RalphexCapabilityV1", BinarySHA256: binarySHA256, SourceSHA: probe.SourceSHA,
+		MaxIterationsFlag: probe.MaxIterationsFlag, SessionTimeoutFlag: probe.SessionTimeoutFlag,
+		IdleTimeoutFlag: probe.IdleTimeoutFlag, SkipFinalizeFlag: probe.SkipFinalizeFlag,
+		BaseRefFlag: probe.BaseRefFlag, ExecutorModelEffortFlags: probe.ExecutorModelEffortFlags,
+		IsolatedConfig: probe.IsolatedConfig, GovernedHandoff: probe.GovernedHandoff,
+		LinuxContainment: probe.LinuxContainment,
+	}
+	actualJSON, actualErr := json.Marshal(actual)
+	expectedJSON, expectedErr := json.Marshal(expected)
+	if actualErr != nil || expectedErr != nil || !bytes.Equal(actualJSON, expectedJSON) {
+		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: manifest capability differs from the pinned binary probe")
+	}
+	return ValidateCapabilityV1(actual, binarySHA256, sourceSHA, mode)
 }
 
 // ValidateExecutionStateV1 enforces B-wide cumulative ceilings without reset.
