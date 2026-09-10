@@ -24,7 +24,10 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	gitCommand(t, "", "init", "-b", "main", repository)
 	gitCommand(t, repository, "config", "user.email", "cli@example.test")
 	gitCommand(t, repository, "config", "user.name", "CLI Test")
-	gitCommand(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
+	remoteDigest := sha256.Sum256([]byte(repository))
+	repositoryIdentity := "example/project-" + hex.EncodeToString(remoteDigest[:8])
+	remoteURL := "https://example.test/" + repositoryIdentity + ".git"
+	gitCommand(t, repository, "remote", "add", "origin", remoteURL)
 	planPath := filepath.Join(repository, "plan.md")
 	writeCLIFile(t, planPath, []byte("# CLI plan\n"), 0o600)
 	gitCommand(t, repository, "add", "plan.md")
@@ -40,7 +43,7 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	manifest := authority.Manifest{
 		RunID: "cli-run",
 		Repository: authority.RepositoryManifest{
-			Path: repository, Identity: "example/project", Remotes: map[string]string{"origin": "https://example.test/example/project.git"}, DefaultBranch: "main", StartSHA: startSHA,
+			Path: repository, Identity: repositoryIdentity, Remotes: map[string]string{"origin": remoteURL}, DefaultBranch: "main", StartSHA: startSHA,
 		},
 		Plan:          authority.PlanManifest{Path: planPath, SHA256: cliFileHash(t, planPath)},
 		Ralphex:       authority.RalphexManifest{BinaryPath: binaryPath, BinarySHA256: cliFileHash(t, binaryPath), Mode: ralphex.ModeFull, Timeout: "5s", WaitOnLimit: "0s"},
@@ -50,7 +53,7 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	capsuleSpec := contextcapsule.Spec{
 		PolicyVersion: contextcapsule.PolicyVersionV2,
 		Project:       "ABCP", Plan: "CLI plan", RoadmapPhase: "test", ExecutionPack: "test",
-		Task: "Task 1", Repository: "example/project", BaseSHA: startSHA,
+		Task: "Task 1", Repository: repositoryIdentity, BaseSHA: startSHA,
 		OperationContext: &contextcapsule.OperationContext{
 			Kind: contextcapsule.OperationImplementation, OwnedScope: []string{"CLI plan"},
 			BlockingCriteria: []string{"Current owned-scope Critical or Major findings."},

@@ -3,6 +3,7 @@ package governance
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -156,7 +157,9 @@ func TestCandidateProofRejectsPathEscapeAndCMutation(t *testing.T) {
 	gitTest(t, "", "init", "-b", "main", repository)
 	gitTest(t, repository, "config", "user.email", "governance@example.test")
 	gitTest(t, repository, "config", "user.name", "Governance Test")
-	gitTest(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
+	remoteDigest := sha256.Sum256([]byte(repository))
+	remoteURL := "https://" + hex.EncodeToString(remoteDigest[:8]) + ".example.test/example/project.git"
+	gitTest(t, repository, "remote", "add", "origin", remoteURL)
 	if err := os.MkdirAll(filepath.Join(repository, "internal", "governance"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -205,13 +208,13 @@ func TestActivationGrandfathersOnlyExactPreActivationDigest(t *testing.T) {
 }
 
 func TestControllerActivationCannotBeBypassedByOmittedCallerState(t *testing.T) {
-	repository, _ := governanceRepository(t)
+	repository, _, identity := governanceRepository(t)
 	controller, err := OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
 	}
 	grandfathered := hashChar("3")
-	if err := controller.AdmitWorkflowAuthority(repository, "example/project", contextcapsule.PolicyVersionV2, grandfathered); err != nil {
+	if err := controller.AdmitWorkflowAuthority(repository, identity, contextcapsule.PolicyVersionV2, grandfathered); err != nil {
 		t.Fatal(err)
 	}
 	activation, err := SealGovernanceActivationV1(GovernanceActivationV1{
@@ -222,41 +225,50 @@ func TestControllerActivationCannotBeBypassedByOmittedCallerState(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.InstallActivationV1(repository, "example/project", activation); err != nil {
+	if err := controller.InstallActivationV1(repository, identity, activation); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenControllerV1(repository)
+	freshClone := filepath.Join(t.TempDir(), "fresh-clone")
+	gitTest(t, "", "clone", "--quiet", repository, freshClone)
+	gitTest(t, freshClone, "remote", "set-url", "origin", "https://mirror.example.test/"+identity+".git")
+	reopened, err := OpenControllerV1(freshClone)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.AdmitWorkflowAuthority(repository, "example/project", contextcapsule.PolicyVersionV2, grandfathered); err != nil {
+	if reopened.ControllerIdentity() != controller.ControllerIdentity() {
+		t.Fatal("fresh clone did not resolve the durable repository controller identity")
+	}
+	if err := reopened.AdmitWorkflowAuthority(freshClone, identity, contextcapsule.PolicyVersionV2, grandfathered); err != nil {
 		t.Fatalf("durably grandfathered authority was rejected: %v", err)
 	}
-	if err := reopened.AdmitWorkflowAuthority(repository, "example/project", contextcapsule.PolicyVersionV2, hashChar("4")); ClassOf(err) != CapsuleLineageInvalid {
+	if err := reopened.AdmitWorkflowAuthority(freshClone, identity, contextcapsule.PolicyVersionV2, hashChar("4")); ClassOf(err) != CapsuleLineageInvalid {
 		t.Fatalf("post-activation omitted-state bypass class = %q, err=%v", ClassOf(err), err)
 	}
-	if err := reopened.AdmitWorkflowAuthority(repository, "example/project", contextcapsule.PolicyVersionV3, hashChar("5")); err != nil {
+	if err := reopened.AdmitWorkflowAuthority(freshClone, identity, contextcapsule.PolicyVersionV3, hashChar("5")); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestControllerCountersAndInFlightReservationAreDurable(t *testing.T) {
-	repository, base := governanceRepository(t)
+	repository, base, identity := governanceRepository(t)
 	capsule := fixtureCapsule(contextcapsule.StageBImplementation, hashChar("a"))
 	capsule.BaseSHA = base
+	capsule.Repository = identity
 	capsule.PhaseAuthority.ExecutionBounds.MaxRalphexInvocations = 1
 	first, err := OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
 	}
-	linkedWorktree := filepath.Join(t.TempDir(), "linked-worktree")
-	gitTest(t, repository, "worktree", "add", "--detach", linkedWorktree, base)
-	second, err := OpenControllerV1(linkedWorktree)
+	remote := gitTest(t, repository, "remote", "get-url", "origin")
+	freshClone := filepath.Join(t.TempDir(), "fresh-clone")
+	gitTest(t, "", "clone", "--quiet", repository, freshClone)
+	gitTest(t, freshClone, "remote", "set-url", "origin", remote)
+	second, err := OpenControllerV1(freshClone)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first.ControllerIdentity() != second.ControllerIdentity() {
-		t.Fatal("linked worktree did not share the repository controller identity")
+		t.Fatal("fresh clone did not share the repository controller identity")
 	}
 	reservation, err := first.ReserveRalphexInvocationV1(capsule, contextcapsule.OperationImplementation, true, "")
 	if err != nil {
@@ -284,19 +296,19 @@ func TestControllerCountersAndInFlightReservationAreDurable(t *testing.T) {
 }
 
 func TestRepositoryControllerRejectsAlternatePathsAndCopiedState(t *testing.T) {
-	repository, _ := governanceRepository(t)
+	repository, _, identity := governanceRepository(t)
 	controller, err := OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.AdmitWorkflowAuthority(repository, "example/project", contextcapsule.PolicyVersionV2, hashChar("1")); err != nil {
+	if err := controller.AdmitWorkflowAuthority(repository, identity, contextcapsule.PolicyVersionV2, hashChar("1")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := OpenControllerV1(filepath.Join(repository, "caller-selected-state.json")); ClassOf(err) != ExecutionBoundsInvalid {
 		t.Fatalf("caller-selected state path class = %q, err=%v", ClassOf(err), err)
 	}
 
-	otherRepository, _ := governanceRepository(t)
+	otherRepository, _, _ := governanceRepository(t)
 	other, err := OpenControllerV1(otherRepository)
 	if err != nil {
 		t.Fatal(err)
@@ -314,10 +326,11 @@ func TestRepositoryControllerRejectsAlternatePathsAndCopiedState(t *testing.T) {
 }
 
 func TestControllerLeaseCASAndReceiptUseIndependentRepositoryProof(t *testing.T) {
-	repository, base := governanceRepository(t)
+	repository, base, identity := governanceRepository(t)
 	registry := fixtureRegistry(t)
 	capsule := fixtureCapsule(contextcapsule.StageBImplementation, registry.RegistrySHA256)
 	capsule.BaseSHA = base
+	capsule.Repository = identity
 	capsuleFile := hashChar("a")
 	report := sealReport(t, capsule, capsuleFile, registry, nil, ReviewScopeReportV1{
 		Kind: "ReviewScopeReportV1", CapsuleFileSHA256: capsuleFile, CapsuleSHA256: capsule.CapsuleSHA256,
@@ -344,15 +357,37 @@ func TestControllerLeaseCASAndReceiptUseIndependentRepositoryProof(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.BeginMutationLeaseV1(lease.LeaseSHA256); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenControllerV1(repository)
+	remote := gitTest(t, repository, "remote", "get-url", "origin")
+	freshClone := filepath.Join(t.TempDir(), "fresh-clone")
+	gitTest(t, "", "clone", "--quiet", repository, freshClone)
+	gitTest(t, freshClone, "remote", "set-url", "origin", remote)
+	reopened, err := OpenControllerV1(freshClone)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.BeginMutationLeaseV1(lease.LeaseSHA256); ClassOf(err) != MutationScopeViolation {
-		t.Fatalf("lease replay class = %q, err=%v", ClassOf(err), err)
+	begin := make(chan struct{})
+	results := make(chan error, 2)
+	for _, contender := range []*ControllerV1{controller, reopened} {
+		go func(contender *ControllerV1) {
+			<-begin
+			results <- contender.BeginMutationLeaseV1(lease.LeaseSHA256)
+		}(contender)
+	}
+	close(begin)
+	successes := 0
+	rejections := 0
+	for range 2 {
+		err := <-results
+		if err == nil {
+			successes++
+		} else if ClassOf(err) == MutationScopeViolation {
+			rejections++
+		} else {
+			t.Fatalf("parallel lease CAS error = %v", err)
+		}
+	}
+	if successes != 1 || rejections != 1 {
+		t.Fatalf("parallel lease CAS successes=%d rejections=%d", successes, rejections)
 	}
 	reservation, err := reopened.ReserveRalphexInvocationV1(capsule, contextcapsule.OperationImplementationReview, true, lease.LeaseSHA256)
 	if err != nil {
@@ -436,6 +471,51 @@ func TestActiveFindingMustMatchRegistryEvidenceContract(t *testing.T) {
 	}
 }
 
+func TestControllerResolvesFindingEvidenceAndRunsRegisteredValidator(t *testing.T) {
+	repository, base, identity := governanceRepository(t)
+	registry := fixtureRegistry(t)
+	capsule := fixtureCapsule(contextcapsule.StageBImplementation, registry.RegistrySHA256)
+	capsule.BaseSHA = base
+	capsule.Repository = identity
+	artifact := []byte("deterministic validator output")
+	resolver := &testFindingEvidenceResolver{artifacts: map[string][]byte{"review/resolved": artifact}}
+	controller, err := OpenControllerWithFindingEvidenceV1(repository, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := controller.RecordFindingEvidenceV1(repository, capsule, registry, FindingEvidenceRequestV1{
+		Ref: "review/resolved", CandidateSHA: base, FindingID: "finding.one", RuleID: "rule.invariant",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(artifact)
+	if evidence.ArtifactSHA256 != hex.EncodeToString(digest[:]) || evidence.RegisteredKind != RegistryInvariant || evidence.EvidenceClass != "TEST" || evidence.ValidatorIdentity != "governance-test" || evidence.ModelJudgmentUsed || evidence.Outcome != "VIOLATION_CONFIRMED" {
+		t.Fatalf("controller-derived evidence metadata = %#v", evidence)
+	}
+	if len(resolver.validated) != 1 || resolver.validated[0] != "governance-test" {
+		t.Fatalf("registered validator calls = %v", resolver.validated)
+	}
+
+	resolver.artifacts["review/rejected"] = []byte("caller-asserted passing output")
+	resolver.err = errors.New("violation not confirmed")
+	if _, err := controller.RecordFindingEvidenceV1(repository, capsule, registry, FindingEvidenceRequestV1{
+		Ref: "review/rejected", CandidateSHA: base, FindingID: "finding.two", RuleID: "rule.invariant",
+	}); ClassOf(err) != ReviewChainInvalid {
+		t.Fatalf("unconfirmed deterministic evidence class = %q, err=%v", ClassOf(err), err)
+	}
+
+	withoutResolver, err := OpenControllerV1(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := withoutResolver.RecordFindingEvidenceV1(repository, capsule, registry, FindingEvidenceRequestV1{
+		Ref: "review/unresolved", CandidateSHA: base, FindingID: "finding.three", RuleID: "rule.invariant",
+	}); ClassOf(err) != ReviewChainInvalid {
+		t.Fatalf("caller-only evidence class = %q, err=%v", ClassOf(err), err)
+	}
+}
+
 func TestGrantDigestBindsParentCheckpoint(t *testing.T) {
 	grant := fixtureGrant(hashChar("a"))
 	grant.ParentCheckpointSHA256 = hashChar("b")
@@ -513,7 +593,7 @@ func TestCleanCheckpointsBindValidatedTipZeroVerdictAndFinalFloors(t *testing.T)
 }
 
 func TestControllerCheckpointGateConsumesOnlyDurableCleanReviewTips(t *testing.T) {
-	repository, base := governanceRepository(t)
+	repository, base, identity := governanceRepository(t)
 	registry := fixtureRegistry(t)
 	controller, err := OpenControllerV1(repository)
 	if err != nil {
@@ -522,6 +602,7 @@ func TestControllerCheckpointGateConsumesOnlyDurableCleanReviewTips(t *testing.T
 
 	aCapsule := fixtureCapsule(contextcapsule.StageADesign, registry.RegistrySHA256)
 	aCapsule.BaseSHA = base
+	aCapsule.Repository = identity
 	aCapsule.CapsuleSHA256 = hashChar("6")
 	aFile := hashChar("a")
 	design := PhaseCheckpointV1{
@@ -542,6 +623,7 @@ func TestControllerCheckpointGateConsumesOnlyDurableCleanReviewTips(t *testing.T
 
 	bCapsule := fixtureCapsule(contextcapsule.StageBImplementation, registry.RegistrySHA256)
 	bCapsule.BaseSHA = base
+	bCapsule.Repository = identity
 	bCapsule.CapsuleSHA256 = hashChar("7")
 	bCapsule.PhaseAuthority.Parent = &contextcapsule.PhaseParentV1{CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256, Stage: contextcapsule.StageADesign, CheckpointSHA256: design.CheckpointSHA256, CandidateSHA: base, GrantSHA256: bGrant.GrantSHA256}
 	bFile := hashChar("b")
@@ -590,6 +672,7 @@ func TestControllerCheckpointGateConsumesOnlyDurableCleanReviewTips(t *testing.T
 
 	cCapsule := fixtureCapsule(contextcapsule.StageCAcceptanceMerge, registry.RegistrySHA256)
 	cCapsule.BaseSHA = base
+	cCapsule.Repository = identity
 	cCapsule.CapsuleSHA256 = hashChar("8")
 	cCapsule.PhaseAuthority.Parent = &contextcapsule.PhaseParentV1{CapsuleFileSHA256: bFile, CapsuleSHA256: bCapsule.CapsuleSHA256, Stage: contextcapsule.StageBImplementation, CheckpointSHA256: converged.CheckpointSHA256, CandidateSHA: base, GrantSHA256: cGrant.GrantSHA256}
 	cFile := hashChar("c")
@@ -739,11 +822,33 @@ func sealReport(t *testing.T, capsule contextcapsule.Capsule, file string, regis
 
 func fixtureFindingEvidence(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, finding ActiveFindingV1, ref string) FindingEvidenceV1 {
 	rule := registryMap(registry)[finding.RuleID]
+	artifactDigest := sha256.Sum256(findingArtifact(ref))
 	return FindingEvidenceV1{
 		Kind: "FindingEvidenceV1", Ref: ref, CapsuleSHA256: capsule.CapsuleSHA256, SemanticRegistrySHA256: registry.RegistrySHA256,
 		CandidateSHA: capsule.BaseSHA, FindingID: finding.FindingID, RuleID: finding.RuleID, RegisteredKind: rule.Kind,
-		EvidenceClass: rule.EvidenceClass, ValidatorIdentity: rule.ValidatorIdentity, Outcome: "VIOLATION_CONFIRMED", ArtifactSHA256: hashChar("9"),
+		EvidenceClass: rule.EvidenceClass, ValidatorIdentity: rule.ValidatorIdentity, Outcome: "VIOLATION_CONFIRMED", ArtifactSHA256: hex.EncodeToString(artifactDigest[:]),
 	}
+}
+
+func findingArtifact(ref string) []byte { return []byte("controller artifact for " + ref) }
+
+type testFindingEvidenceResolver struct {
+	artifacts map[string][]byte
+	validated []string
+	err       error
+}
+
+func (r *testFindingEvidenceResolver) ResolveArtifactV1(_, _, ref string) ([]byte, error) {
+	artifact, ok := r.artifacts[ref]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return append([]byte(nil), artifact...), nil
+}
+
+func (r *testFindingEvidenceResolver) ConfirmViolationV1(_ string, _ string, rule SemanticRuleV1, _ []byte) error {
+	r.validated = append(r.validated, rule.ValidatorIdentity)
+	return r.err
 }
 
 func findingEvidenceForReport(t *testing.T, capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, report ReviewScopeReportV1) []FindingEvidenceV1 {
@@ -781,9 +886,18 @@ func bindReportEvidence(t *testing.T, capsule contextcapsule.Capsule, registry S
 
 func recordReportEvidence(t *testing.T, controller *ControllerV1, repository string, capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, report ReviewScopeReportV1) {
 	t.Helper()
+	resolver := &testFindingEvidenceResolver{artifacts: make(map[string][]byte)}
+	controller.findingEvidenceResolver = resolver
 	for _, record := range findingEvidenceForReport(t, capsule, registry, report) {
-		if err := controller.RecordFindingEvidenceV1(repository, capsule, registry, record); err != nil {
+		resolver.artifacts[record.Ref] = findingArtifact(record.Ref)
+		resolved, err := controller.RecordFindingEvidenceV1(repository, capsule, registry, FindingEvidenceRequestV1{
+			Ref: record.Ref, CandidateSHA: record.CandidateSHA, FindingID: record.FindingID, RuleID: record.RuleID,
+		})
+		if err != nil {
 			t.Fatal(err)
+		}
+		if resolved.EvidenceSHA256 != record.EvidenceSHA256 {
+			t.Fatalf("controller-resolved evidence digest = %s, want %s", resolved.EvidenceSHA256, record.EvidenceSHA256)
 		}
 	}
 }
@@ -801,13 +915,16 @@ func gitTest(t *testing.T, directory string, arguments ...string) string {
 	return strings.TrimSpace(string(output))
 }
 
-func governanceRepository(t *testing.T) (string, string) {
+func governanceRepository(t *testing.T) (string, string, string) {
 	t.Helper()
 	repository := filepath.Join(t.TempDir(), "repository")
 	gitTest(t, "", "init", "-b", "main", repository)
 	gitTest(t, repository, "config", "user.email", "governance@example.test")
 	gitTest(t, repository, "config", "user.name", "Governance Test")
-	gitTest(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
+	remoteDigest := sha256.Sum256([]byte(repository))
+	identity := "example/project-" + hex.EncodeToString(remoteDigest[:8])
+	remoteURL := "https://example.test/" + identity + ".git"
+	gitTest(t, repository, "remote", "add", "origin", remoteURL)
 	if err := os.MkdirAll(filepath.Join(repository, "internal", "governance"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -816,5 +933,5 @@ func governanceRepository(t *testing.T) (string, string) {
 	}
 	gitTest(t, repository, "add", ".")
 	gitTest(t, repository, "commit", "-m", "base")
-	return repository, gitTest(t, repository, "rev-parse", "HEAD")
+	return repository, gitTest(t, repository, "rev-parse", "HEAD"), identity
 }

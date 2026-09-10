@@ -575,7 +575,11 @@ func boundCapsuleManifest(t *testing.T) Manifest {
 	gitAuthorityCommand(t, manifest.Repository.Path, "init", "-b", "main")
 	gitAuthorityCommand(t, manifest.Repository.Path, "config", "user.email", "authority@example.test")
 	gitAuthorityCommand(t, manifest.Repository.Path, "config", "user.name", "Authority Test")
-	gitAuthorityCommand(t, manifest.Repository.Path, "remote", "add", "origin", "https://example.test/example/project.git")
+	remoteDigest := sha256.Sum256([]byte(manifest.Repository.Path))
+	manifest.Repository.Identity = "example/project-" + hex.EncodeToString(remoteDigest[:8])
+	remoteURL := "https://example.test/" + manifest.Repository.Identity + ".git"
+	gitAuthorityCommand(t, manifest.Repository.Path, "remote", "add", "origin", remoteURL)
+	manifest.Repository.Remotes = map[string]string{"origin": remoteURL}
 	gitAuthorityCommand(t, manifest.Repository.Path, "add", "plan.md", "source.md")
 	gitAuthorityCommand(t, manifest.Repository.Path, "commit", "-m", "governed inputs")
 	head := gitAuthorityCommand(t, manifest.Repository.Path, "rev-parse", "HEAD")
@@ -583,7 +587,7 @@ func boundCapsuleManifest(t *testing.T) Manifest {
 	spec := contextcapsule.Spec{
 		PolicyVersion: contextcapsule.PolicyVersionV1,
 		Project:       "ABCP", Plan: "EP-004", RoadmapPhase: "Phase 3", ExecutionPack: "EP-004",
-		Task: "Task 1", Repository: "example/project", BaseSHA: head,
+		Task: "Task 1", Repository: manifest.Repository.Identity, BaseSHA: head,
 		Invariants: []string{"Fail closed."}, NonGoals: []string{"No retrieval."}, Sources: []string{"source.md"},
 	}
 	_, data, err := contextcapsule.Build(manifest.Repository.Path, spec)

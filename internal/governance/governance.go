@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -877,6 +878,26 @@ type FindingEvidenceV1 struct {
 	EvidenceSHA256         string       `json:"evidence_sha256"`
 }
 
+// FindingEvidenceRequestV1 is the complete untrusted input accepted by the
+// durable controller. Artifact hashes and registry/validator metadata are
+// deliberately absent: the controller derives them after resolving Ref.
+type FindingEvidenceRequestV1 struct {
+	Ref          string `json:"ref"`
+	CandidateSHA string `json:"candidate_sha"`
+	FindingID    string `json:"finding_id"`
+	RuleID       string `json:"rule_id"`
+}
+
+// FindingEvidenceResolverV1 is installed by the controller composition, not
+// selected by a review report. ResolveArtifactV1 must return the exact bounded
+// immutable artifact bytes for ref. ConfirmViolationV1 must run the named
+// registry validator against the exact repository candidate and return nil
+// only when that deterministic validator confirms a violation.
+type FindingEvidenceResolverV1 interface {
+	ResolveArtifactV1(repository, candidateSHA, ref string) ([]byte, error)
+	ConfirmViolationV1(repository, candidateSHA string, rule SemanticRuleV1, artifact []byte) error
+}
+
 // SealFindingEvidenceV1 binds one exact violation record to the immutable
 // capsule, registry rule, candidate, and underlying artifact digest.
 func SealFindingEvidenceV1(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, evidence FindingEvidenceV1) (FindingEvidenceV1, error) {
@@ -1589,57 +1610,73 @@ type ControllerStateV1 struct {
 	NextStageGrant        *NextStageGrantV1        `json:"next_stage_grant,omitempty"`
 }
 
-// ControllerV1 owns the one strict-canonical state file derived from a Git
-// common directory. Callers cannot select a parallel state location.
+// ControllerV1 owns the one strict-canonical state file derived from durable
+// repository identity. Callers cannot select a parallel state location.
 type ControllerV1 struct {
-	repository string
-	commonDir  string
-	identity   string
-	path       string
+	repository              string
+	repositoryIdentity      string
+	repositoryControllerKey string
+	identity                string
+	path                    string
+	findingEvidenceResolver FindingEvidenceResolverV1
 }
 
-// OpenControllerV1 derives the controller identity and state location from the
-// canonical repository Git common directory. Linked worktrees share the same
-// controller; copying the state into another repository fails identity checks.
+// OpenControllerV1 derives the controller identity from the canonical origin
+// identity and stores state outside clone-local Git data. Fresh clones and
+// linked worktrees of the same origin therefore share one controller CAS tip.
 func OpenControllerV1(repository string) (*ControllerV1, error) {
+	return openControllerV1(repository, nil)
+}
+
+// OpenControllerWithFindingEvidenceV1 installs the trusted artifact resolver
+// and deterministic validator used by controller finding ingestion. The
+// resolver belongs to controller composition and is never read from a report.
+func OpenControllerWithFindingEvidenceV1(repository string, resolver FindingEvidenceResolverV1) (*ControllerV1, error) {
+	if resolver == nil {
+		return nil, fail(ReviewChainInvalid, "controller finding evidence resolver is required")
+	}
+	return openControllerV1(repository, resolver)
+}
+
+func openControllerV1(repository string, resolver FindingEvidenceResolverV1) (*ControllerV1, error) {
 	root, err := canonicalRepository(repository)
 	if err != nil {
 		return nil, fail(ExecutionBoundsInvalid, "resolve controller repository: %v", err)
 	}
-	commonDir, err := gitText(root, "rev-parse", "--git-common-dir")
-	if err != nil || commonDir == "" {
-		return nil, fail(ExecutionBoundsInvalid, "resolve repository Git common directory")
-	}
-	if !filepath.IsAbs(commonDir) {
-		commonDir = filepath.Join(root, commonDir)
-	}
-	commonDir, err = filepath.EvalSymlinks(commonDir)
+	repositoryIdentity, err := repositoryControllerIdentity(root)
 	if err != nil {
-		return nil, fail(ExecutionBoundsInvalid, "canonicalize repository Git common directory: %v", err)
+		return nil, fail(ExecutionBoundsInvalid, "derive durable repository identity: %v", err)
 	}
-	info, err := os.Stat(commonDir)
-	if err != nil || !info.IsDir() {
-		return nil, fail(ExecutionBoundsInvalid, "repository Git common directory is unavailable")
+	repositoryKey, err := repositoryControllerKey(repositoryIdentity)
+	if err != nil {
+		return nil, fail(ExecutionBoundsInvalid, "derive durable repository key: %v", err)
 	}
 	identity, err := digestJSON(struct {
-		Kind      string `json:"kind"`
-		CommonDir string `json:"git_common_dir"`
-	}{Kind: "GovernanceControllerIdentityV1", CommonDir: filepath.Clean(commonDir)})
+		Kind          string `json:"kind"`
+		RepositoryKey string `json:"repository_key"`
+	}{Kind: "GovernanceControllerIdentityV1", RepositoryKey: repositoryKey})
 	if err != nil {
 		return nil, fail(ExecutionBoundsInvalid, "derive controller identity: %v", err)
 	}
-	directory := filepath.Join(commonDir, "abcp-governance")
+	stateRoot, err := durableControllerRoot()
+	if err != nil {
+		return nil, fail(ExecutionBoundsInvalid, "resolve durable controller root: %v", err)
+	}
+	directory := filepath.Join(stateRoot, identity)
 	if err := os.Mkdir(directory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return nil, fail(ExecutionBoundsInvalid, "create repository controller directory: %v", err)
+		return nil, fail(ExecutionBoundsInvalid, "create durable repository controller directory: %v", err)
 	}
 	directoryInfo, err := os.Lstat(directory)
 	if err != nil || directoryInfo.Mode()&os.ModeSymlink != 0 || !directoryInfo.IsDir() || directoryInfo.Mode().Perm()&0o077 != 0 {
-		return nil, fail(ExecutionBoundsInvalid, "repository controller directory is not private and canonical")
+		return nil, fail(ExecutionBoundsInvalid, "durable repository controller directory is not private and canonical")
 	}
-	return &ControllerV1{repository: root, commonDir: filepath.Clean(commonDir), identity: identity, path: filepath.Join(directory, "workflow-state-v1.json")}, nil
+	return &ControllerV1{
+		repository: root, repositoryIdentity: repositoryIdentity, repositoryControllerKey: repositoryKey, identity: identity,
+		path: filepath.Join(directory, "workflow-state-v1.json"), findingEvidenceResolver: resolver,
+	}, nil
 }
 
-// ControllerIdentity returns the repository-owned physical controller identity.
+// ControllerIdentity returns the stable repository-owned controller identity.
 func (c *ControllerV1) ControllerIdentity() string {
 	if c == nil {
 		return ""
@@ -1663,32 +1700,78 @@ func (c *ControllerV1) Snapshot() (ControllerStateV1, error) {
 	return result, err
 }
 
-// RecordFindingEvidenceV1 persists one immutable, registry-resolved evidence
-// record before a report may use its ref as blocking evidence.
-func (c *ControllerV1) RecordFindingEvidenceV1(repository string, capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, evidence FindingEvidenceV1) error {
+// RecordFindingEvidenceV1 resolves artifact bytes and deterministic validator
+// results through controller-owned dependencies, derives all registry metadata,
+// and persists the resulting immutable record before a report can name it.
+func (c *ControllerV1) RecordFindingEvidenceV1(repository string, capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, request FindingEvidenceRequestV1) (FindingEvidenceV1, error) {
+	var recorded FindingEvidenceV1
 	if err := c.validateRepository(repository, capsule.Repository); err != nil {
-		return err
+		return recorded, err
 	}
-	if err := ValidateFindingEvidenceV1(capsule, registry, evidence); err != nil {
-		return err
+	if c.findingEvidenceResolver == nil {
+		return recorded, fail(ReviewChainInvalid, "controller finding evidence resolver is unavailable")
 	}
-	if _, err := ValidateCandidateV1(repository, capsule, evidence.CandidateSHA); err != nil {
-		return err
+	if err := ValidateSemanticAuthorityRegistryV1(registry); err != nil {
+		return recorded, err
 	}
-	head, err := gitText(repository, "rev-parse", "--verify", "HEAD^{commit}")
-	if err != nil || head != evidence.CandidateSHA {
-		return fail(ReviewChainInvalid, "finding evidence is not for the controller's exact current candidate")
+	if capsule.PolicyVersion != contextcapsule.PolicyVersionV3 || capsule.PhaseAuthority == nil || registry.RegistrySHA256 != capsule.PhaseAuthority.SemanticRegistrySHA256 {
+		return recorded, fail(ReviewChainInvalid, "finding evidence request is outside the exact V3 registry authority")
 	}
-	return c.withState(func(state *ControllerStateV1) (bool, error) {
+	if !validText(request.Ref, 2048) || !validOID(request.CandidateSHA) || !validID(request.FindingID) || !validID(request.RuleID) {
+		return recorded, fail(ReviewChainInvalid, "finding evidence request identity is invalid")
+	}
+	rule, ok := registryMap(registry)[request.RuleID]
+	if !ok || rule.Kind != RegistryInvariant && rule.Kind != RegistryKnownFinding {
+		return recorded, fail(ScopeExpansionRequired, "finding evidence has no blocking registry mapping")
+	}
+	if !stringSubset([]string{request.RuleID}, capsule.PhaseAuthority.BlockingScopeIDs) || !stringSubset([]string{request.RuleID}, capsule.PhaseAuthority.AuthorizedInvariantIDs) {
+		return recorded, fail(ScopeExpansionRequired, "finding evidence is outside blocker or invariant authority")
+	}
+	if _, err := ValidateCandidateV1(repository, capsule, request.CandidateSHA); err != nil {
+		return recorded, err
+	}
+	artifact, err := c.findingEvidenceResolver.ResolveArtifactV1(repository, request.CandidateSHA, request.Ref)
+	if err != nil {
+		return recorded, fail(ReviewChainInvalid, "resolve controller finding artifact: %v", err)
+	}
+	if len(artifact) == 0 || len(artifact) > 16<<20 {
+		return recorded, fail(ReviewChainInvalid, "controller finding artifact is empty or exceeds the bounded limit")
+	}
+	modelJudgment := rule.ValidatorIdentity == ""
+	if modelJudgment {
+		if !rule.ModelJudgmentMayObserve {
+			return recorded, fail(ReviewChainInvalid, "registry rule has no deterministic validator and forbids model judgment")
+		}
+	} else if err := c.findingEvidenceResolver.ConfirmViolationV1(repository, request.CandidateSHA, rule, append([]byte(nil), artifact...)); err != nil {
+		return recorded, fail(ReviewChainInvalid, "registered deterministic validator did not confirm violation: %v", err)
+	}
+	artifactDigest := sha256.Sum256(artifact)
+	evidence, err := SealFindingEvidenceV1(capsule, registry, FindingEvidenceV1{
+		Kind: "FindingEvidenceV1", Ref: request.Ref, CapsuleSHA256: capsule.CapsuleSHA256,
+		SemanticRegistrySHA256: registry.RegistrySHA256, CandidateSHA: request.CandidateSHA,
+		FindingID: request.FindingID, RuleID: request.RuleID, RegisteredKind: rule.Kind,
+		EvidenceClass: rule.EvidenceClass, ValidatorIdentity: rule.ValidatorIdentity,
+		ModelJudgmentUsed: modelJudgment, Outcome: "VIOLATION_CONFIRMED",
+		ArtifactSHA256: hex.EncodeToString(artifactDigest[:]),
+	})
+	if err != nil {
+		return recorded, err
+	}
+	err = c.withState(func(state *ControllerStateV1) (bool, error) {
 		bound, err := c.bindCapsuleRepository(state, capsule)
 		if err != nil {
 			return false, err
+		}
+		head, err := gitText(repository, "rev-parse", "--verify", "HEAD^{commit}")
+		if err != nil || head != evidence.CandidateSHA {
+			return false, fail(ReviewChainInvalid, "finding evidence is not for the controller's exact current candidate")
 		}
 		for _, existing := range state.FindingEvidence {
 			if existing.Ref != evidence.Ref {
 				continue
 			}
 			if existing.EvidenceSHA256 == evidence.EvidenceSHA256 {
+				recorded = existing
 				return bound, nil
 			}
 			return false, fail(ReviewChainInvalid, "a competing controller evidence record already uses ref %q", evidence.Ref)
@@ -1698,8 +1781,10 @@ func (c *ControllerV1) RecordFindingEvidenceV1(repository string, capsule contex
 		}
 		state.FindingEvidence = append(state.FindingEvidence, evidence)
 		sort.Slice(state.FindingEvidence, func(i, j int) bool { return state.FindingEvidence[i].Ref < state.FindingEvidence[j].Ref })
+		recorded = evidence
 		return true, nil
 	})
+	return recorded, err
 }
 
 // AdvanceCheckpointV1 validates and atomically advances the sole durable
@@ -1844,23 +1929,20 @@ func (c *ControllerV1) AdmitWorkflowAuthority(repository, repositoryIdentity, po
 }
 
 func (c *ControllerV1) validateRepository(repository, identity string) error {
-	if c == nil || c.identity == "" || !validText(identity, 512) {
+	if c == nil || c.identity == "" || c.repositoryIdentity == "" || c.repositoryControllerKey == "" || !validText(identity, 512) {
 		return fail(CapsuleLineageInvalid, "repository controller identity is invalid")
 	}
 	root, err := canonicalRepository(repository)
 	if err != nil || !repositoryIdentityMatches(root, identity) {
 		return fail(CapsuleLineageInvalid, "repository identity is not controller-owned")
 	}
-	commonDir, err := gitText(root, "rev-parse", "--git-common-dir")
-	if err != nil || commonDir == "" {
-		return fail(CapsuleLineageInvalid, "repository Git common directory is unavailable")
+	repositoryIdentity, err := repositoryControllerIdentity(root)
+	if err != nil || repositoryIdentity != identity || repositoryIdentity != c.repositoryIdentity {
+		return fail(CapsuleLineageInvalid, "repository origin identity differs from durable controller identity")
 	}
-	if !filepath.IsAbs(commonDir) {
-		commonDir = filepath.Join(root, commonDir)
-	}
-	commonDir, err = filepath.EvalSymlinks(commonDir)
-	if err != nil || filepath.Clean(commonDir) != c.commonDir {
-		return fail(CapsuleLineageInvalid, "repository belongs to a different governance controller")
+	repositoryKey, err := repositoryControllerKey(repositoryIdentity)
+	if err != nil || repositoryKey != c.repositoryControllerKey {
+		return fail(CapsuleLineageInvalid, "repository origin belongs to a different governance controller")
 	}
 	return nil
 }
@@ -2235,7 +2317,7 @@ func (c *ControllerV1) CompleteMutationReceiptV1(repository string, capsule cont
 }
 
 func (c *ControllerV1) withState(update func(*ControllerStateV1) (bool, error)) error {
-	if c == nil || c.path == "" || c.identity == "" || c.repository == "" || c.commonDir == "" {
+	if c == nil || c.path == "" || c.identity == "" || c.repository == "" || c.repositoryIdentity == "" || c.repositoryControllerKey == "" {
 		return fail(ExecutionBoundsInvalid, "durable governance controller is required")
 	}
 	lockPath := c.path + ".lock"
@@ -2515,6 +2597,109 @@ func canonicalRepository(repository string) (string, error) {
 		return "", errors.New("repository must be the canonical Git root")
 	}
 	return root, nil
+}
+
+func durableControllerRoot() (string, error) {
+	current, err := user.Current()
+	if err != nil || current.HomeDir == "" || !filepath.IsAbs(current.HomeDir) {
+		return "", errors.New("controller operating-system home is unavailable")
+	}
+	root := filepath.Join(current.HomeDir, ".local", "state", "autonomous-builder-control-plane", "governance-v1")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", err
+	}
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	if filepath.Clean(canonical) != filepath.Clean(root) {
+		return "", errors.New("controller state root must not traverse symlinks")
+	}
+	info, err := os.Lstat(canonical)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return "", errors.New("controller state root is not a private canonical directory")
+	}
+	return filepath.Clean(canonical), nil
+}
+
+func repositoryControllerIdentity(repository string) (string, error) {
+	remoteURLs, err := gitText(repository, "remote", "get-url", "--all", "origin")
+	if err != nil || remoteURLs == "" {
+		return "", errors.New("canonical origin remote is required")
+	}
+	identities := make([]string, 0, 2)
+	seen := make(map[string]struct{})
+	for _, remoteURL := range strings.Split(remoteURLs, "\n") {
+		identity, err := controllerRemoteRepositoryIdentity(repository, remoteURL)
+		if err != nil {
+			return "", err
+		}
+		if _, duplicate := seen[identity]; duplicate {
+			continue
+		}
+		seen[identity] = struct{}{}
+		identities = append(identities, identity)
+	}
+	if len(identities) == 0 {
+		return "", errors.New("canonical origin remote is empty")
+	}
+	sort.Strings(identities)
+	if len(identities) != 1 {
+		return "", errors.New("origin remote URLs do not resolve to one repository identity")
+	}
+	return identities[0], nil
+}
+
+func repositoryControllerKey(repositoryIdentity string) (string, error) {
+	if !validText(repositoryIdentity, 512) {
+		return "", errors.New("repository controller identity is invalid")
+	}
+	return digestJSON(struct {
+		Kind               string `json:"kind"`
+		RepositoryIdentity string `json:"repository_identity"`
+	}{Kind: "RepositoryControllerKeyV1", RepositoryIdentity: repositoryIdentity})
+}
+
+func controllerRemoteRepositoryIdentity(repository, remote string) (string, error) {
+	remote = strings.TrimSpace(remote)
+	if remote == "" || strings.ContainsAny(remote, "\r\n") {
+		return "", errors.New("origin remote identity is invalid")
+	}
+	if parsed, err := url.Parse(remote); err == nil && parsed.Scheme != "" {
+		if parsed.Path == "" {
+			return "", errors.New("origin remote URL is incomplete")
+		}
+		identity := strings.Trim(strings.ReplaceAll(parsed.Path, "\\", "/"), "/")
+		identity = strings.TrimSuffix(identity, ".git")
+		if identity == "" {
+			return "", errors.New("origin remote repository identity is empty")
+		}
+		return identity, nil
+	}
+	if colon := strings.IndexByte(remote, ':'); colon > 0 && !strings.Contains(remote[:colon], "/") {
+		identity := strings.Trim(strings.ReplaceAll(remote[colon+1:], "\\", "/"), "/")
+		identity = strings.TrimSuffix(identity, ".git")
+		if identity == "" {
+			return "", errors.New("origin scp-style remote is incomplete")
+		}
+		return identity, nil
+	}
+	if !filepath.IsAbs(remote) {
+		remote = filepath.Join(repository, remote)
+	}
+	absolute, err := filepath.Abs(remote)
+	if err != nil {
+		return "", err
+	}
+	if canonical, evalErr := filepath.EvalSymlinks(absolute); evalErr == nil {
+		absolute = canonical
+	}
+	identity := strings.Trim(filepath.ToSlash(filepath.Clean(absolute)), "/")
+	identity = strings.TrimSuffix(identity, ".git")
+	if identity == "" {
+		return "", errors.New("origin file repository identity is empty")
+	}
+	return identity, nil
 }
 
 func repositoryIdentityMatches(repository, identity string) bool {

@@ -259,7 +259,7 @@ func TestRunnerReverifiesBoundContextCapsuleBeforeRalphexLaunch(t *testing.T) {
 	spec := contextcapsule.Spec{
 		PolicyVersion: contextcapsule.PolicyVersionV2,
 		Project:       "ABCP", Plan: "EP-004", RoadmapPhase: "Phase 3", ExecutionPack: "EP-004",
-		Task: "Task 1", Repository: "example/project", BaseSHA: manifest.Repository.StartSHA,
+		Task: "Task 1", Repository: manifest.Repository.Identity, BaseSHA: manifest.Repository.StartSHA,
 		OperationContext: &contextcapsule.OperationContext{
 			Kind: contextcapsule.OperationImplementation, OwnedScope: []string{"Task 1"},
 			BlockingCriteria: []string{"Current owned-scope Critical or Major findings."},
@@ -964,7 +964,10 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 	runGit(t, "", "init", "-b", "main", repository)
 	runGit(t, repository, "config", "user.email", "controller@example.test")
 	runGit(t, repository, "config", "user.name", "Controller Test")
-	runGit(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
+	remoteDigest := sha256.Sum256([]byte(repository))
+	repositoryIdentity := "example/project-" + hex.EncodeToString(remoteDigest[:8])
+	remoteURL := "https://example.test/" + repositoryIdentity + ".git"
+	runGit(t, repository, "remote", "add", "origin", remoteURL)
 	planPath := filepath.Join(repository, "plan.md")
 	writeTestFile(t, planPath, []byte("# governed plan\n"), 0o600)
 	writeTestFile(t, filepath.Join(repository, "context.md"), []byte("governed operation context\n"), 0o600)
@@ -979,8 +982,8 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 		RunID: "run-fixture",
 		Repository: authority.RepositoryManifest{
 			Path:          repository,
-			Identity:      "example/project",
-			Remotes:       map[string]string{"origin": "https://example.test/example/project.git"},
+			Identity:      repositoryIdentity,
+			Remotes:       map[string]string{"origin": remoteURL},
 			DefaultBranch: "main",
 			StartSHA:      startSHA,
 		},
