@@ -29,8 +29,6 @@ const (
 
 type NotAppliedProofV1Input struct {
 	Kind               NotAppliedProofKindV1
-	RequestID          string
-	RequestBodySHA256  string
 	RequestBytes       int64
 	Response           *SnapshotIdentity
 	HTTPStatus         int
@@ -40,10 +38,11 @@ type NotAppliedProofV1Input struct {
 }
 
 type NotAppliedProofV1 struct {
-	input     NotAppliedProofV1Input
-	canonical []byte
-	digest    string
-	limitsSHA string
+	input      NotAppliedProofV1Input
+	submission TargetSubmissionV1
+	canonical  []byte
+	digest     string
+	limitsSHA  string
 }
 
 type notAppliedProofWireV1 struct {
@@ -59,8 +58,8 @@ type notAppliedProofWireV1 struct {
 	CommitmentSHA256        string                `json:"commitment_sha256"`
 	WriteID                 string                `json:"write_id"`
 	ClientMutationID        string                `json:"client_mutation_id"`
-	RequestID               string                `json:"request_id"`
-	RequestBodySHA256       string                `json:"request_body_sha256,omitempty"`
+	TargetSubmission        json.RawMessage       `json:"target_submission"`
+	TargetSubmissionSHA256  string                `json:"target_submission_sha256"`
 	RequestBytes            int64                 `json:"request_bytes"`
 	Response                *identityWire         `json:"response,omitempty"`
 	HTTPStatus              int                   `json:"http_status,omitempty"`
@@ -73,8 +72,9 @@ type notAppliedProofWireV1 struct {
 	LimitsSHA256            string                `json:"limits_sha256"`
 }
 
-func NewNotAppliedProofV1(input NotAppliedProofV1Input, sealed SealedMergeAuthorizationV1, limits Limits) (NotAppliedProofV1, error) {
+func NewNotAppliedProofV1(input NotAppliedProofV1Input, sealed SealedMergeAuthorizationV1, submission TargetSubmissionV1, limits Limits) (NotAppliedProofV1, error) {
 	input = cloneNotAppliedInput(input)
+	submission = cloneTargetSubmission(submission)
 	limitsSHA, err := limits.SHA256()
 	if err != nil {
 		return NotAppliedProofV1{}, err
@@ -85,18 +85,17 @@ func NewNotAppliedProofV1(input NotAppliedProofV1Input, sealed SealedMergeAuthor
 	if _, err := ParseCanonicalSealedMergeAuthorizationV1(sealed.CanonicalJSON(), limits); err != nil {
 		return NotAppliedProofV1{}, errors.New("NOT_APPLIED proof sealed authorization fails independent validation")
 	}
-	if !validOpaqueID(input.RequestID, limits.MaxTextBytes) || !validEvidenceRef(input.EvidenceRef) {
+	if ValidateTargetSubmissionV1(sealed, submission, limits) != nil || !validEvidenceRef(input.EvidenceRef) {
 		return NotAppliedProofV1{}, errors.New("NOT_APPLIED request or raw evidence identity is invalid")
 	}
 	switch input.Kind {
 	case NotAppliedZeroRequestBytes:
-		if input.EvidenceRef.Kind != NotAppliedZeroByteEvidenceKindV1 || input.RequestBytes != 0 || input.RequestBodySHA256 != "" || input.Response != nil || input.HTTPStatus != 0 || input.ResponseBodySHA256 != "" || len(input.ResponseBody) != 0 {
+		if input.EvidenceRef.Kind != NotAppliedZeroByteEvidenceKindV1 || input.RequestBytes != 0 || input.Response != nil || input.HTTPStatus != 0 || input.ResponseBodySHA256 != "" || len(input.ResponseBody) != 0 {
 			return NotAppliedProofV1{}, errors.New("zero-byte NOT_APPLIED proof contains submitted request or response state")
 		}
 	case NotAppliedAtomicBaseRejected, NotAppliedAtomicHeadRejected:
-		if input.EvidenceRef.Kind != NotAppliedAtomicRejectionEvidenceKindV1 || input.RequestBytes <= 0 ||
-			input.RequestBodySHA256 != sealed.input.Commitment.SHA256() || input.Response == nil || !input.Response.valid() ||
-			input.Response.Provider() != "github" || input.Response.RequestID() != input.RequestID ||
+		if input.EvidenceRef.Kind != NotAppliedAtomicRejectionEvidenceKindV1 || input.RequestBytes <= 0 || input.RequestBytes > int64(limits.MaxPaginationClosureBytes) || input.Response == nil || !input.Response.valid() ||
+			input.Response.Provider() != "github" || input.Response.RequestID() != submission.requestID ||
 			input.Response.ObservedUnixNano() < sealed.input.Seal.input.FinalRevalidation.input.CompletedUnixNano ||
 			input.HTTPStatus != 200 || len(input.ResponseBody) == 0 || len(input.ResponseBody) > limits.MaxPaginationClosureBytes ||
 			!validSHA256(input.ResponseBodySHA256) || input.ResponseBodySHA256 != digestBytes(input.ResponseBody) ||
@@ -110,15 +109,15 @@ func NewNotAppliedProofV1(input NotAppliedProofV1Input, sealed SealedMergeAuthor
 	default:
 		return NotAppliedProofV1{}, errors.New("unsupported NOT_APPLIED proof kind")
 	}
-	wire := notAppliedProofWire(input, sealed, limitsSHA)
+	wire := notAppliedProofWire(input, sealed, submission, limitsSHA)
 	canonical, digest, err := canonicalJSON(wire)
 	if err != nil {
 		return NotAppliedProofV1{}, err
 	}
-	return NotAppliedProofV1{input, canonical, digest, limitsSHA}, nil
+	return NotAppliedProofV1{input, submission, canonical, digest, limitsSHA}, nil
 }
 
-func notAppliedProofWire(input NotAppliedProofV1Input, sealed SealedMergeAuthorizationV1, limitsSHA string) notAppliedProofWireV1 {
+func notAppliedProofWire(input NotAppliedProofV1Input, sealed SealedMergeAuthorizationV1, submission TargetSubmissionV1, limitsSHA string) notAppliedProofWireV1 {
 	commitment := sealed.input.Commitment
 	updates := []refUpdateWireV1{refUpdateWire(commitment.updates[0]), refUpdateWire(commitment.updates[1])}
 	predicate := "request_bytes_equal_zero"
@@ -136,7 +135,7 @@ func notAppliedProofWire(input NotAppliedProofV1Input, sealed SealedMergeAuthori
 		NotAppliedProofSchemaV1, input.Kind, repositoryWire(sealed.input.MergeInput.authority.Repository()), commitment.repositoryNodeID,
 		updates, predicate, sealed.input.MergeInput.capability.CanonicalJSON(), sealed.input.MergeInput.capability.SHA256(),
 		sealed.input.Seal.SHA256(), commitment.SHA256(), sealed.input.MergeInput.attempt.WriteID(), commitment.clientMutationID,
-		input.RequestID, input.RequestBodySHA256, input.RequestBytes, response, input.HTTPStatus, input.ResponseBodySHA256,
+		submission.CanonicalJSON(), submission.SHA256(), input.RequestBytes, response, input.HTTPStatus, input.ResponseBodySHA256,
 		input.ResponseBody, input.EvidenceRef.SHA256, input.EvidenceRef, true, NotAppliedAllOrNothingDispositionV1, limitsSHA,
 	}
 }
@@ -144,6 +143,9 @@ func notAppliedProofWire(input NotAppliedProofV1Input, sealed SealedMergeAuthori
 func (p NotAppliedProofV1) Input() NotAppliedProofV1Input { return cloneNotAppliedInput(p.input) }
 func (p NotAppliedProofV1) CanonicalJSON() []byte         { return append([]byte(nil), p.canonical...) }
 func (p NotAppliedProofV1) SHA256() string                { return p.digest }
+func (p NotAppliedProofV1) TargetSubmission() TargetSubmissionV1 {
+	return cloneTargetSubmission(p.submission)
+}
 func (p NotAppliedProofV1) CommitmentSHA256() string {
 	if !p.valid() {
 		return ""
@@ -156,18 +158,21 @@ func (p NotAppliedProofV1) valid() bool {
 	return len(p.canonical) > 0 && validSHA256(p.digest) && digestBytes(p.canonical) == p.digest && validSHA256(p.limitsSHA)
 }
 
-func ValidateNotAppliedProofV1(sealed SealedMergeAuthorizationV1, proof NotAppliedProofV1, limits Limits) error {
+func ValidateNotAppliedProofV1(sealed SealedMergeAuthorizationV1, submission TargetSubmissionV1, proof NotAppliedProofV1, limits Limits) error {
 	if !proof.valid() || requireLimitsSHA(limits, proof.limitsSHA) != nil {
 		return errors.New("NOT_APPLIED proof is incomplete or uses different limits")
 	}
-	rebuilt, err := NewNotAppliedProofV1(proof.input, sealed, limits)
+	if proof.submission.SHA256() != submission.SHA256() || !bytes.Equal(proof.submission.CanonicalJSON(), submission.CanonicalJSON()) {
+		return errors.New("NOT_APPLIED proof does not match the independently supplied target submission")
+	}
+	rebuilt, err := NewNotAppliedProofV1(proof.input, sealed, submission, limits)
 	if err != nil || rebuilt.digest != proof.digest || !bytes.Equal(rebuilt.canonical, proof.canonical) {
 		return errors.New("NOT_APPLIED proof fails independent sealed-input validation")
 	}
 	return nil
 }
 
-func ParseCanonicalNotAppliedProofV1(data []byte, sealed SealedMergeAuthorizationV1, limits Limits) (NotAppliedProofV1, error) {
+func ParseCanonicalNotAppliedProofV1(data []byte, sealed SealedMergeAuthorizationV1, submission TargetSubmissionV1, limits Limits) (NotAppliedProofV1, error) {
 	var wire notAppliedProofWireV1
 	if err := strictDecode(data, &wire); err != nil {
 		return NotAppliedProofV1{}, err
@@ -183,10 +188,15 @@ func ParseCanonicalNotAppliedProofV1(data []byte, sealed SealedMergeAuthorizatio
 		}
 		response = &value
 	}
+	parsedSubmission, err := ParseCanonicalTargetSubmissionV1(wire.TargetSubmission, sealed, limits)
+	if err != nil || parsedSubmission.SHA256() != wire.TargetSubmissionSHA256 || parsedSubmission.SHA256() != submission.SHA256() ||
+		!bytes.Equal(parsedSubmission.CanonicalJSON(), submission.CanonicalJSON()) {
+		return NotAppliedProofV1{}, errors.New("NOT_APPLIED proof target submission identity disagrees")
+	}
 	value, err := NewNotAppliedProofV1(NotAppliedProofV1Input{
-		Kind: wire.Kind, RequestID: wire.RequestID, RequestBodySHA256: wire.RequestBodySHA256, RequestBytes: wire.RequestBytes,
+		Kind: wire.Kind, RequestBytes: wire.RequestBytes,
 		Response: response, HTTPStatus: wire.HTTPStatus, ResponseBodySHA256: wire.ResponseBodySHA256, ResponseBody: wire.ResponseBody, EvidenceRef: wire.EvidenceRef,
-	}, sealed, limits)
+	}, sealed, submission, limits)
 	if err != nil {
 		return NotAppliedProofV1{}, err
 	}
@@ -258,6 +268,7 @@ func equalStrings(left, right []string) bool {
 
 func cloneNotAppliedProof(proof NotAppliedProofV1) NotAppliedProofV1 {
 	proof.input = cloneNotAppliedInput(proof.input)
+	proof.submission = cloneTargetSubmission(proof.submission)
 	proof.canonical = append([]byte(nil), proof.canonical...)
 	return proof
 }

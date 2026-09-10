@@ -79,7 +79,8 @@ disagreement, and invalid constructor inputs fail closed.
 with stable repository and PR node/database identities, exact same-repository
 full base/head refs and OIDs, API version, authenticated acting principal,
 provider request identity, response digest, body evidence, and retained response-
-envelope evidence binding that request/body pair to the decoded PR fields, limits,
+envelope evidence binding that request/body pair to the authenticated acting
+principal and decoded PR fields, limits,
 and independently validated reviews closure. Closed, draft, merged, contradictory, missing,
 synthetic/deleted-ref, or fork-head observations are invalid.
 
@@ -115,7 +116,10 @@ termination comes only from an explicitly observed valid final `Link`
 relation set (including an explicitly observed absent header) without
 `next`; an empty default string is not observation. GraphQL termination comes
 only from final `hasNextPage=false`. Missing, skipped, repeated, reordered, duplicate,
-conflicting, altered, invented-terminal, or truncated chains fail.
+conflicting, altered, invented-terminal, or truncated chains fail. Nonterminal
+pages must contain the frozen page size, GraphQL cursors must advance without
+reuse, and every observed REST `last` relation must remain consistent with the
+actual terminal page.
 `ValidatePaginationClosureV1` reconstructs the chain and exact canonical item
 set against the authority-derived query rather than trusting collector
 summaries. Review/check sets are canonicalized only after this closure
@@ -194,7 +198,13 @@ nested canonical bytes and digests.
 
 Merge reconciliation owns the full `SealedMergeAuthorizationV1`, not an
 attempt alone. `APPLIED` requires the identical materialized and validated
-`MergeResult`. `NOT_APPLIED` requires strict-canonical
+`MergeResult`. Every disposition also binds the strict-canonical
+`TargetSubmissionV1` published for the one transport invocation: the exact
+sealed authorization, seal, commitment, write/mutation identity, request ID,
+canonical request body/digest/length, and limits. The reconciliation or
+cancellation submission proof separately binds the transport-observed request-
+byte count to that exact submission record.
+`NOT_APPLIED` requires strict-canonical
 `NotAppliedProofV1`: either exact zero-request-byte evidence or authenticated
 all-or-nothing base/head before-OID rejection. The proof derives and binds the
 repository/node identity, both ordered ref updates and OIDs, rejected
@@ -211,7 +221,7 @@ target, missing expected object, truncation, or generic provider assertions
 remain `UNKNOWN`.
 
 `ValidateReconciliationResult` checks the full input, seal, commitment,
-attempt, result/proof, evidence, and limits. Merge mutations have no implicit
+target submission, attempt, result/proof, evidence, and limits. Merge mutations have no implicit
 retry right even after `NOT_APPLIED`; future retry authority requires a
 separately versioned controller contract. Existing non-merge retries retain
 their independently bounded rules.
@@ -231,7 +241,8 @@ The submission proof is the full canonical typed
 `CancellationSubmissionProofV1`, not a caller kind/digest pair. Independent
 expectations cover every authority-bearing field: current READY and admission,
 principal/authentication, policy version/source/digest, grant/allow decision,
-boundary/attempt/seal/commitment, exact submission proof, source kind/request
+boundary/attempt/seal/commitment, the exact `TargetSubmissionV1` for submitted
+boundaries, exact submission proof, source kind/request
 and evidence, ingress ordering, and evidence closure.
 
 Boundary construction enforces exact absence/presence for `PRE_ADMISSION`,

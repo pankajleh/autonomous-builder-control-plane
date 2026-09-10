@@ -340,8 +340,11 @@ func validateCancellationSubmissionExpectationV1(expected CancellationAuthorityE
 		proof.SealSHA256 != sealed.input.Seal.SHA256() || proof.CommitmentSHA256 != sealed.input.Commitment.SHA256() {
 		return errors.New("submitted cancellation expectation changed its sealed admission, attempt, seal, or commitment")
 	}
+	if proof.TargetSubmission == nil || ValidateTargetSubmissionV1(sealed, *proof.TargetSubmission, limits) != nil {
+		return errors.New("submitted cancellation expectation lacks the exact target submission record")
+	}
 	if expected.Boundary == CancellationTargetNotApplied {
-		if proof.NotAppliedProof == nil || ValidateNotAppliedProofV1(sealed, *proof.NotAppliedProof, limits) != nil {
+		if proof.NotAppliedProof == nil || ValidateNotAppliedProofV1(sealed, *proof.TargetSubmission, *proof.NotAppliedProof, limits) != nil {
 			return errors.New("submitted cancellation expectation lacks the exact sealed NOT_APPLIED proof")
 		}
 	}
@@ -444,15 +447,17 @@ func AuthorizeCancelledV1(durable DurableCancellationAuthorityV1, expected Cance
 		return errors.New("APPLIED always defeats cancellation")
 	}
 	if boundary == CancellationTargetSubmissionUnknown || boundary == CancellationTargetNotApplied {
+		boundSubmission := durable.authority.input.SubmissionProof.input.TargetSubmission
 		if disposition != ReconciliationNotApplied || len(notAppliedProof) != 1 || !expected.SealedAuthorization.valid() ||
+			boundSubmission == nil || ValidateTargetSubmissionV1(expected.SealedAuthorization, *boundSubmission, limits) != nil ||
 			expected.SealedAuthorization.Seal().SHA256() != durable.authority.input.SealSHA256 ||
 			expected.SealedAuthorization.Commitment().SHA256() != durable.authority.input.CommitmentSHA256 ||
-			ValidateNotAppliedProofV1(expected.SealedAuthorization, notAppliedProof[0], limits) != nil ||
+			ValidateNotAppliedProofV1(expected.SealedAuthorization, *boundSubmission, notAppliedProof[0], limits) != nil ||
 			notAppliedProof[0].CommitmentSHA256() != durable.authority.input.CommitmentSHA256 {
 			return errors.New("submitted cancellation requires exact typed NOT_APPLIED proof")
 		}
 		if boundary == CancellationTargetSubmissionUnknown && notAppliedProof[0].input.RequestBytes != durable.authority.input.SubmissionProof.input.RequestBytes {
-			return errors.New("unknown-submission cancellation changed the reconciled target request")
+			return errors.New("unknown-submission cancellation changed the reconciled target request byte count")
 		}
 		if boundary == CancellationTargetNotApplied {
 			bound := durable.authority.input.SubmissionProof.input.NotAppliedProof

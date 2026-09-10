@@ -275,7 +275,10 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 	}
 	all := map[string]struct{}{}
 	requests := map[string]struct{}{}
+	graphqlCursors := map[string]struct{}{}
 	responseEvidence := make([]ledger.EvidenceRef, 0, len(input.Pages)*2)
+	restLastPage := 0
+	restLastObserved := false
 	total := 0
 	for index, page := range input.Pages {
 		if !page.valid() {
@@ -306,19 +309,31 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 			all[item.Key] = struct{}{}
 		}
 		terminal := index == len(input.Pages)-1
+		if !terminal && len(p.Items) != input.Query.PerPage {
+			return PaginationClosureV1{}, errors.New("pagination nonterminal page is short or empty")
+		}
 		if input.Query.Protocol == PaginationREST {
 			if p.RequestedPage != index+1 || p.RequestedCursor != "" || p.GraphQLHasNextPage != nil || !p.RESTLinkObserved {
 				return PaginationClosureV1{}, errors.New("REST page chain is inconsistent")
 			}
-			next, hasNext, err := parseRESTLinks(p.RESTLinkHeader, input.Query, p.RequestedPage)
+			links, err := parseRESTLinks(p.RESTLinkHeader, input.Query, p.RequestedPage)
 			if err != nil {
 				return PaginationClosureV1{}, err
 			}
-			if terminal && hasNext {
+			if links.hasLast {
+				if restLastObserved && restLastPage != links.last {
+					return PaginationClosureV1{}, errors.New("REST last relation changed across the page chain")
+				}
+				restLastPage, restLastObserved = links.last, true
+			}
+			if terminal && links.hasNext {
 				return PaginationClosureV1{}, errors.New("REST terminal page still advertises next")
 			}
-			if !terminal && (!hasNext || next != index+2) {
+			if !terminal && (!links.hasNext || links.next != index+2) {
 				return PaginationClosureV1{}, errors.New("REST page chain skips or invents a page")
+			}
+			if terminal && restLastObserved && restLastPage != p.RequestedPage {
+				return PaginationClosureV1{}, errors.New("REST page chain terminated before its advertised last page")
 			}
 		}
 		if input.Query.Protocol == PaginationGraphQL {
@@ -332,11 +347,23 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 			if p.RequestedCursor != expected {
 				return PaginationClosureV1{}, errors.New("GraphQL cursor chain skips, repeats, or reorders a page")
 			}
+			if _, repeated := graphqlCursors[p.RequestedCursor]; repeated {
+				return PaginationClosureV1{}, errors.New("GraphQL requested cursor is repeated")
+			}
+			graphqlCursors[p.RequestedCursor] = struct{}{}
 			if terminal && *p.GraphQLHasNextPage {
 				return PaginationClosureV1{}, errors.New("GraphQL terminal page still has next page")
 			}
 			if !terminal && (!*p.GraphQLHasNextPage || p.GraphQLEndCursor == "") {
 				return PaginationClosureV1{}, errors.New("GraphQL nonterminal page lacks a next cursor")
+			}
+			if !terminal {
+				if p.GraphQLEndCursor == p.RequestedCursor {
+					return PaginationClosureV1{}, errors.New("GraphQL nonterminal page did not advance its cursor")
+				}
+				if _, repeated := graphqlCursors[p.GraphQLEndCursor]; repeated {
+					return PaginationClosureV1{}, errors.New("GraphQL end cursor repeats an earlier cursor")
+				}
 			}
 		}
 	}
@@ -480,27 +507,34 @@ func ParseCanonicalPaginationClosureV1(data []byte, limits Limits) (PaginationCl
 	return value, nil
 }
 
-func parseRESTLinks(header string, q PaginationQueryV1, requestedPage int) (int, bool, error) {
+type restPaginationLinks struct {
+	next    int
+	hasNext bool
+	last    int
+	hasLast bool
+}
+
+func parseRESTLinks(header string, q PaginationQueryV1, requestedPage int) (restPaginationLinks, error) {
 	if len(header) == 0 {
-		return 0, false, nil
+		return restPaginationLinks{}, nil
 	}
 	relations := map[string]string{}
 	for _, part := range strings.Split(header, ",") {
 		part = strings.TrimSpace(part)
 		pieces := strings.Split(part, ";")
 		if len(pieces) != 2 || len(pieces[0]) < 3 || pieces[0][0] != '<' || pieces[0][len(pieces[0])-1] != '>' {
-			return 0, false, errors.New("REST Link header is malformed or ambiguous")
+			return restPaginationLinks{}, errors.New("REST Link header is malformed or ambiguous")
 		}
 		rel := strings.TrimSpace(pieces[1])
 		if !strings.HasPrefix(rel, "rel=\"") || !strings.HasSuffix(rel, "\"") {
-			return 0, false, errors.New("REST Link relation is malformed")
+			return restPaginationLinks{}, errors.New("REST Link relation is malformed")
 		}
 		name := strings.TrimSuffix(strings.TrimPrefix(rel, "rel=\""), "\"")
 		if name != "next" && name != "prev" && name != "first" && name != "last" {
-			return 0, false, errors.New("REST Link relation is unsupported")
+			return restPaginationLinks{}, errors.New("REST Link relation is unsupported")
 		}
 		if _, ok := relations[name]; ok {
-			return 0, false, errors.New("REST Link relation is duplicated")
+			return restPaginationLinks{}, errors.New("REST Link relation is duplicated")
 		}
 		relations[name] = pieces[0][1 : len(pieces[0])-1]
 	}
@@ -509,43 +543,44 @@ func parseRESTLinks(header string, q PaginationQueryV1, requestedPage int) (int,
 		u, err := url.Parse(raw)
 		if err != nil || u.Scheme != "https" || u.Host != "api.github.com" || u.User != nil || u.Fragment != "" ||
 			u.Path != q.PathOrDocumentSHA256 || u.EscapedPath() != q.PathOrDocumentSHA256 {
-			return 0, false, errors.New("REST Link relation changed endpoint identity")
+			return restPaginationLinks{}, errors.New("REST Link relation changed endpoint identity")
 		}
 		values := u.Query()
 		pageValues, perPageValues := values["page"], values["per_page"]
 		if len(pageValues) != 1 || len(perPageValues) != 1 {
-			return 0, false, errors.New("REST Link relation query identity changed")
+			return restPaginationLinks{}, errors.New("REST Link relation query identity changed")
 		}
 		page, err := strconv.Atoi(pageValues[0])
 		if err != nil || page <= 0 {
-			return 0, false, errors.New("REST Link relation page is invalid")
+			return restPaginationLinks{}, errors.New("REST Link relation page is invalid")
 		}
 		perPage, err := strconv.Atoi(perPageValues[0])
 		if err != nil || perPage != q.PerPage || len(values) != len(q.Variables)+2 {
-			return 0, false, errors.New("REST Link relation query identity changed")
+			return restPaginationLinks{}, errors.New("REST Link relation query identity changed")
 		}
 		for key, expected := range q.Variables {
 			actual, ok := values[key]
 			if !ok || len(actual) != 1 || actual[0] != expected {
-				return 0, false, errors.New("REST Link relation query identity changed")
+				return restPaginationLinks{}, errors.New("REST Link relation query identity changed")
 			}
 		}
 		pages[relation] = page
 	}
 	if page, ok := pages["first"]; ok && page != 1 {
-		return 0, false, errors.New("REST first relation is contradictory")
+		return restPaginationLinks{}, errors.New("REST first relation is contradictory")
 	}
 	if page, ok := pages["prev"]; ok && (requestedPage <= 1 || page != requestedPage-1) {
-		return 0, false, errors.New("REST prev relation is contradictory")
+		return restPaginationLinks{}, errors.New("REST prev relation is contradictory")
 	}
 	next, hasNext := pages["next"]
 	if hasNext && next != requestedPage+1 {
-		return 0, false, errors.New("REST next relation is contradictory")
+		return restPaginationLinks{}, errors.New("REST next relation is contradictory")
 	}
 	if last, ok := pages["last"]; ok && ((!hasNext && last != requestedPage) || (hasNext && last <= requestedPage)) {
-		return 0, false, errors.New("REST last relation is contradictory")
+		return restPaginationLinks{}, errors.New("REST last relation is contradictory")
 	}
-	return next, hasNext, nil
+	last, hasLast := pages["last"]
+	return restPaginationLinks{next: next, hasNext: hasNext, last: last, hasLast: hasLast}, nil
 }
 func validateStringMap(values map[string]string, l Limits) error {
 	if len(values) > l.MaxMetadataItems {

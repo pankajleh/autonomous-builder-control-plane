@@ -3,6 +3,7 @@ package githublifecycle
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -79,6 +80,9 @@ func TestAuthoritativePRRequiresExactGitHubResponseEvidence(t *testing.T) {
 		},
 		"unbound response fields": func(input *AuthoritativePullRequestSnapshotV1Input) {
 			input.PullRequestDatabaseID++
+		},
+		"unbound actor": func(input *AuthoritativePullRequestSnapshotV1Input) {
+			input.Actor, _ = NewUserIdentity("different-authenticated-principal")
 		},
 		"wrong provider": func(input *AuthoritativePullRequestSnapshotV1Input) {
 			input.Snapshot, _ = NewSnapshotIdentity("cache", input.Snapshot.RequestID(), input.Snapshot.ObservedUnixNano())
@@ -247,6 +251,77 @@ func TestPaginationRejectsSelfCertifiedSourcePathAndAmbiguousTerminal(t *testing
 	}
 }
 
+func TestPaginationRejectsCrossPageLastShortAndRepeatedCursor(t *testing.T) {
+	f := newFixture(t, MergeMethodMerge)
+	limits := f.limits
+	limits.MaxPages = 3
+	limits.MaxItemsPerPage = 1
+	limits.MaxTotalItems = 3
+	scope := PaginationQueryScopeV1{Source: PaginationCheckRuns, Repository: f.repository, RepositoryNodeID: "R_repo", HeadSHA: f.headSHA}
+	query, err := DerivePaginationQueryV1(scope, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := []CanonicalPaginationItemV1{
+		{Key: "one", SHA256: strings.Repeat("1", 64)},
+		{Key: "two", SHA256: strings.Repeat("2", 64)},
+		{Key: "three", SHA256: strings.Repeat("3", 64)},
+	}
+	restPage := func(ordinal int, link string, pageItems []CanonicalPaginationItemV1) (PaginationPageV1, []ledger.EvidenceRef) {
+		t.Helper()
+		response, _ := NewSnapshotIdentity("github", fmt.Sprintf("cross-page-rest-%d", ordinal), 1700000004000000000+int64(ordinal))
+		body := ledger.EvidenceRef{URI: fmt.Sprintf("evidence/cross-page-rest-body-%d", ordinal), Kind: GitHubPaginationBodyEvidenceKindV1, SHA256: strings.Repeat(fmt.Sprint(ordinal+4), 64)}
+		input := PaginationPageV1Input{Ordinal: ordinal, RequestedPage: ordinal + 1, Response: response, RawBodySHA256: body.SHA256, ResponseEvidence: body, Items: pageItems, RESTLinkHeader: link, RESTLinkObserved: true}
+		input.EnvelopeEvidence, err = NewPaginationEnvelopeEvidenceV1(fmt.Sprintf("evidence/cross-page-rest-envelope-%d", ordinal), input, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		page, err := NewPaginationPageV1(input, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return page, []ledger.EvidenceRef{body, input.EnvelopeEvidence}
+	}
+	baseURL := "https://api.github.com" + query.PathOrDocumentSHA256 + "?filter=all&per_page=1&page="
+	first, firstEvidence := restPage(0, "<"+baseURL+"2>; rel=\"next\", <"+baseURL+"99>; rel=\"last\"", items[:1])
+	second, secondEvidence := restPage(1, "", items[1:2])
+	if _, err := NewPaginationClosureV1(PaginationClosureV1Input{Query: query, Pages: []PaginationPageV1{first, second}, EvidenceRefs: append(firstEvidence, secondEvidence...)}, limits); err == nil {
+		t.Fatal("REST pagination terminated before an earlier advertised last page")
+	}
+
+	short, shortEvidence := restPage(0, "<"+baseURL+"2>; rel=\"next\"", nil)
+	if _, err := NewPaginationClosureV1(PaginationClosureV1Input{Query: query, Pages: []PaginationPageV1{short, second}, EvidenceRefs: append(shortEvidence, secondEvidence...)}, limits); err == nil {
+		t.Fatal("short or empty REST nonterminal page accepted")
+	}
+
+	graphqlQuery := clonePaginationQuery(query)
+	graphqlQuery.Protocol = PaginationGraphQL
+	graphqlQuery.Method = "POST"
+	graphqlQuery.PathOrDocumentSHA256 = strings.Repeat("a", 64)
+	graphqlPage := func(ordinal int, requested, end string, hasNext bool) (PaginationPageV1, []ledger.EvidenceRef) {
+		t.Helper()
+		response, _ := NewSnapshotIdentity("github", fmt.Sprintf("repeated-cursor-graphql-%d", ordinal), 1700000005000000000+int64(ordinal))
+		body := ledger.EvidenceRef{URI: fmt.Sprintf("evidence/repeated-cursor-body-%d", ordinal), Kind: GitHubPaginationBodyEvidenceKindV1, SHA256: strings.Repeat(fmt.Sprint(ordinal+7), 64)}
+		input := PaginationPageV1Input{Ordinal: ordinal, RequestedCursor: requested, Response: response, RawBodySHA256: body.SHA256, ResponseEvidence: body, Items: items[ordinal : ordinal+1], GraphQLHasNextPage: &hasNext, GraphQLEndCursor: end}
+		input.EnvelopeEvidence, err = NewPaginationEnvelopeEvidenceV1(fmt.Sprintf("evidence/repeated-cursor-envelope-%d", ordinal), input, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		page, err := NewPaginationPageV1(input, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return page, []ledger.EvidenceRef{body, input.EnvelopeEvidence}
+	}
+	g1, g1Evidence := graphqlPage(0, "", "cursor-1", true)
+	g2, g2Evidence := graphqlPage(1, "cursor-1", "cursor-1", true)
+	g3, g3Evidence := graphqlPage(2, "cursor-1", "cursor-2", false)
+	graphEvidence := append(append(g1Evidence, g2Evidence...), g3Evidence...)
+	if _, err := NewPaginationClosureV1(PaginationClosureV1Input{Query: graphqlQuery, Pages: []PaginationPageV1{g1, g2, g3}, EvidenceRefs: graphEvidence}, limits); err == nil {
+		t.Fatal("GraphQL pagination accepted a repeated nonterminal cursor")
+	}
+}
+
 func replaceEvidenceKind(refs []ledger.EvidenceRef, kind string, replacement ledger.EvidenceRef) []ledger.EvidenceRef {
 	result := make([]ledger.EvidenceRef, 0, len(refs)+1)
 	for _, ref := range refs {
@@ -404,15 +479,31 @@ func TestNotAppliedProofRejectsForgedBindingAndAmbiguousZeroBytes(t *testing.T) 
 	response, _ := NewSnapshotIdentity("github", "target-request-1", 1700000007000000000)
 	responseBody := atomicRejectionResponseBody(t, 0)
 	evidence := ledger.EvidenceRef{URI: "evidence/atomic-rejection", Kind: NotAppliedAtomicRejectionEvidenceKindV1, SHA256: digestBytes(responseBody)}
+	targetSubmission := newTargetSubmission(t, f, "target-request-1")
 	proof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{
-		Kind: NotAppliedAtomicBaseRejected, RequestID: "target-request-1", RequestBodySHA256: f.sealed.Commitment().SHA256(),
-		RequestBytes: 200, Response: &response, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: evidence,
-	}, f.sealed, f.limits)
+		Kind: NotAppliedAtomicBaseRejected, RequestBytes: 200, Response: &response, HTTPStatus: 200,
+		ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: evidence,
+	}, f.sealed, targetSubmission, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ParseCanonicalNotAppliedProofV1(proof.CanonicalJSON(), f.sealed, f.limits); err != nil {
+	if _, err := ParseCanonicalNotAppliedProofV1(proof.CanonicalJSON(), f.sealed, targetSubmission, f.limits); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := ParseCanonicalTargetSubmissionV1(targetSubmission.CanonicalJSON(), f.sealed, f.limits); err != nil {
+		t.Fatal(err)
+	}
+	duplicateSubmission := newTargetSubmission(t, f, "target-request-duplicate")
+	duplicateResponse, _ := NewSnapshotIdentity("github", duplicateSubmission.RequestID(), response.ObservedUnixNano()+1)
+	duplicateProof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{
+		Kind: NotAppliedAtomicBaseRejected, RequestBytes: 200, Response: &duplicateResponse, HTTPStatus: 200,
+		ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: evidence,
+	}, f.sealed, duplicateSubmission, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateNotAppliedProofV1(f.sealed, targetSubmission, duplicateProof, f.limits); err == nil {
+		t.Fatal("rejection from a duplicate request accepted for the original target submission")
 	}
 	for name, forged := range map[string][]byte{
 		"repository":  bytes.Replace(proof.CanonicalJSON(), []byte("octo-org"), []byte("evil-org"), 1),
@@ -420,7 +511,7 @@ func TestNotAppliedProofRejectsForgedBindingAndAmbiguousZeroBytes(t *testing.T) 
 		"disposition": bytes.Replace(proof.CanonicalJSON(), []byte(NotAppliedAllOrNothingDispositionV1), []byte("collector_says_not_applied"), 1),
 		"raw digest":  bytes.Replace(proof.CanonicalJSON(), []byte(evidence.SHA256), []byte(strings.Repeat("c", 64)), 1),
 	} {
-		if _, err := ParseCanonicalNotAppliedProofV1(forged, f.sealed, f.limits); err == nil {
+		if _, err := ParseCanonicalNotAppliedProofV1(forged, f.sealed, targetSubmission, f.limits); err == nil {
 			t.Fatalf("forged NOT_APPLIED %s accepted", name)
 		}
 	}
@@ -440,17 +531,18 @@ func TestNotAppliedProofRejectsForgedBindingAndAmbiguousZeroBytes(t *testing.T) 
 		t.Run(name, func(t *testing.T) {
 			input := proof.Input()
 			mutate(&input)
-			if _, err := NewNotAppliedProofV1(input, f.sealed, f.limits); err == nil {
+			if _, err := NewNotAppliedProofV1(input, f.sealed, targetSubmission, f.limits); err == nil {
 				t.Fatal("NOT_APPLIED accepted an unrelated or self-certified rejection response")
 			}
 		})
 	}
 
 	zeroEvidence := ledger.EvidenceRef{URI: "evidence/zero-bytes", Kind: NotAppliedZeroByteEvidenceKindV1, SHA256: strings.Repeat("d", 64)}
-	if _, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedZeroRequestBytes, RequestID: "target-request-zero", RequestBytes: 0, Response: &response, EvidenceRef: zeroEvidence}, f.sealed, f.limits); err == nil {
+	zeroSubmission := newTargetSubmission(t, f, "target-request-zero")
+	if _, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedZeroRequestBytes, Response: &response, EvidenceRef: zeroEvidence}, f.sealed, zeroSubmission, f.limits); err == nil {
 		t.Fatal("zero-byte proof accepted a provider response")
 	}
-	if _, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedZeroRequestBytes, RequestID: "target-request-zero", RequestBytes: 0, EvidenceRef: zeroEvidence}, f.sealed, f.limits); err != nil {
+	if _, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedZeroRequestBytes, EvidenceRef: zeroEvidence}, f.sealed, zeroSubmission, f.limits); err != nil {
 		t.Fatalf("strict zero-byte proof rejected: %v", err)
 	}
 }
@@ -576,7 +668,8 @@ func TestCancellationBoundaryMatrixAndSealedZeroByteProof(t *testing.T) {
 	}
 
 	unknownEvidence := ledger.EvidenceRef{URI: "evidence/unresolved", Kind: "unresolved-submission", SHA256: strings.Repeat("d", 64)}
-	unknownProof, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofUnresolvedSubmission, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), RequestBytes: 100, SubmissionState: ReconciliationUnknown, EvidenceRef: unknownEvidence}, f.limits)
+	unknownSubmission := newTargetSubmission(t, f, "unknown-target-request")
+	unknownProof, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofUnresolvedSubmission, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), TargetSubmission: &unknownSubmission, RequestBytes: 100, SubmissionState: ReconciliationUnknown, EvidenceRef: unknownEvidence}, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -587,20 +680,30 @@ func TestCancellationBoundaryMatrixAndSealedZeroByteProof(t *testing.T) {
 	responseBody := atomicRejectionResponseBody(t, 0)
 	response, _ := NewSnapshotIdentity("github", "unknown-target-request", f.sealed.input.Seal.input.FinalRevalidation.input.CompletedUnixNano+1)
 	atomicEvidence := ledger.EvidenceRef{URI: "evidence/unknown-reconciled", Kind: NotAppliedAtomicRejectionEvidenceKindV1, SHA256: digestBytes(responseBody)}
-	atomicProof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicBaseRejected, RequestID: "unknown-target-request", RequestBodySHA256: f.sealed.Commitment().SHA256(), RequestBytes: 100, Response: &response, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: atomicEvidence}, f.sealed, f.limits)
+	atomicProof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicBaseRejected, RequestBytes: 100, Response: &response, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: atomicEvidence}, f.sealed, unknownSubmission, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := AuthorizeCancelledV1(unknown.durable, unknown.expected, ReconciliationNotApplied, f.limits, atomicProof); err != nil {
 		t.Fatal(err)
 	}
-
-	zeroEvidence := ledger.EvidenceRef{URI: "evidence/sealed-zero", Kind: NotAppliedZeroByteEvidenceKindV1, SHA256: strings.Repeat("e", 64)}
-	zeroProof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedZeroRequestBytes, RequestID: "sealed-zero-target", EvidenceRef: zeroEvidence}, f.sealed, f.limits)
+	otherSubmission := newTargetSubmission(t, f, "other-target-request")
+	otherResponse, _ := NewSnapshotIdentity("github", otherSubmission.RequestID(), response.ObservedUnixNano()+1)
+	otherProof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicBaseRejected, RequestBytes: 100, Response: &otherResponse, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: atomicEvidence}, f.sealed, otherSubmission, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealedZeroProof, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofSealedZeroRequestBytes, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), SubmissionState: ReconciliationNotApplied, NotAppliedProof: &zeroProof, EvidenceRef: zeroEvidence}, f.limits)
+	if err := AuthorizeCancelledV1(unknown.durable, unknown.expected, ReconciliationNotApplied, f.limits, otherProof); err == nil {
+		t.Fatal("unknown-submission cancellation accepted NOT_APPLIED proof from a different request")
+	}
+
+	zeroEvidence := ledger.EvidenceRef{URI: "evidence/sealed-zero", Kind: NotAppliedZeroByteEvidenceKindV1, SHA256: strings.Repeat("e", 64)}
+	zeroSubmission := newTargetSubmission(t, f, "sealed-zero-target")
+	zeroProof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedZeroRequestBytes, EvidenceRef: zeroEvidence}, f.sealed, zeroSubmission, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealedZeroProof, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofSealedZeroRequestBytes, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), TargetSubmission: &zeroSubmission, SubmissionState: ReconciliationNotApplied, NotAppliedProof: &zeroProof, EvidenceRef: zeroEvidence}, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -610,7 +713,7 @@ func TestCancellationBoundaryMatrixAndSealedZeroByteProof(t *testing.T) {
 	}
 	wrongLimitsProof := cloneNotAppliedProof(zeroProof)
 	wrongLimitsProof.limitsSHA = strings.Repeat("0", 64)
-	if _, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofSealedZeroRequestBytes, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), SubmissionState: ReconciliationNotApplied, NotAppliedProof: &wrongLimitsProof, EvidenceRef: zeroEvidence}, f.limits); err == nil {
+	if _, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofSealedZeroRequestBytes, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), TargetSubmission: &zeroSubmission, SubmissionState: ReconciliationNotApplied, NotAppliedProof: &wrongLimitsProof, EvidenceRef: zeroEvidence}, f.limits); err == nil {
 		t.Fatal("sealed zero-byte cancellation accepted a nested proof from a different limits policy")
 	}
 }

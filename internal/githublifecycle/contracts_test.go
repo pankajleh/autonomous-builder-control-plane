@@ -134,6 +134,15 @@ func newFixture(t *testing.T, method MergeMethod) fixture {
 	return f
 }
 
+func newTargetSubmission(t *testing.T, f fixture, requestID string) TargetSubmissionV1 {
+	t.Helper()
+	submission, err := NewTargetSubmissionV1(requestID, f.sealed, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return submission
+}
+
 func emptyPaginationClosure(t *testing.T, f fixture, source PaginationSourceKind, pr *PullRequestIdentity, requestID string, observedUnixNano int64) PaginationClosureV1 {
 	t.Helper()
 	query, err := DerivePaginationQueryV1(PaginationQueryScopeV1{Source: source, Repository: f.repository, RepositoryNodeID: "R_repo", PullRequest: pr, HeadSHA: f.headSHA}, f.limits)
@@ -425,12 +434,13 @@ func TestSubmittedCancellationAndDeadlineAreAmbiguousAndNotRetried(t *testing.T)
 	response, _ := NewSnapshotIdentity("github", "target-attempt-2", 1700000004000000000)
 	responseBody := atomicRejectionResponseBody(t, 0)
 	proofEvidence := ledger.EvidenceRef{URI: "evidence/not-applied.json", Kind: NotAppliedAtomicRejectionEvidenceKindV1, SHA256: digestBytes(responseBody)}
-	proof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicBaseRejected, RequestID: "target-attempt-2", RequestBodySHA256: f.sealed.Commitment().SHA256(), RequestBytes: 50, Response: &response, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: proofEvidence}, f.sealed, f.limits)
+	targetSubmission := newTargetSubmission(t, f, "target-attempt-2")
+	proof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicBaseRejected, RequestBytes: 50, Response: &response, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: proofEvidence}, f.sealed, targetSubmission, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
 	evidence = append(evidence, proofEvidence)
-	reconciled, err := NewMergeReconciliationResult(f.sealed, ReconciliationNotApplied, nil, &proof, evidence, f.limits)
+	reconciled, err := NewMergeReconciliationResult(f.sealed, targetSubmission, ReconciliationNotApplied, nil, &proof, evidence, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,7 +448,7 @@ func TestSubmittedCancellationAndDeadlineAreAmbiguousAndNotRetried(t *testing.T)
 	if CanRetry(failure, 0, f.limits, &attempt, &reconciled) {
 		t.Fatal("merge reconciliation improperly granted mutation retry authority")
 	}
-	unknown, err := NewMergeReconciliationResult(f.sealed, ReconciliationUnknown, nil, nil, evidence, f.limits)
+	unknown, err := NewMergeReconciliationResult(f.sealed, targetSubmission, ReconciliationUnknown, nil, nil, evidence, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}

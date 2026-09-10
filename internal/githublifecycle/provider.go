@@ -333,6 +333,7 @@ func (i ObservePostMergeInput) LimitsSHA256() string  { return i.limitsSHA }
 type ReconcileWriteInput struct {
 	attempt             WriteAttempt
 	sealed              SealedMergeAuthorizationV1
+	targetSubmission    TargetSubmissionV1
 	observationIdentity string
 	observationEvidence []ledger.EvidenceRef
 	limitsSHA           string
@@ -363,8 +364,8 @@ func NewReconcileWriteInput(value any, limits Limits) (ReconcileWriteInput, erro
 	return ReconcileWriteInput{attempt: attempt, sealed: sealed, observationIdentity: identity, limitsSHA: digest}, nil
 }
 
-func NewMergeReconcileWriteInput(sealed SealedMergeAuthorizationV1, observationEvidence []ledger.EvidenceRef, limits Limits) (ReconcileWriteInput, error) {
-	if !sealed.valid() {
+func NewMergeReconcileWriteInput(sealed SealedMergeAuthorizationV1, submission TargetSubmissionV1, observationEvidence []ledger.EvidenceRef, limits Limits) (ReconcileWriteInput, error) {
+	if !sealed.valid() || ValidateTargetSubmissionV1(sealed, submission, limits) != nil {
 		return ReconcileWriteInput{}, errors.New("sealed merge authorization is invalid")
 	}
 	evidence := append([]ledger.EvidenceRef(nil), observationEvidence...)
@@ -375,12 +376,15 @@ func NewMergeReconcileWriteInput(sealed SealedMergeAuthorizationV1, observationE
 	if err != nil {
 		return ReconcileWriteInput{}, err
 	}
-	return ReconcileWriteInput{attempt: sealed.input.MergeInput.attempt, sealed: cloneSealedAuthorization(sealed), observationIdentity: sealed.input.Commitment.SHA256(), observationEvidence: evidence, limitsSHA: digest}, nil
+	return ReconcileWriteInput{attempt: sealed.input.MergeInput.attempt, sealed: cloneSealedAuthorization(sealed), targetSubmission: cloneTargetSubmission(submission), observationIdentity: submission.SHA256(), observationEvidence: evidence, limitsSHA: digest}, nil
 }
 
 func (i ReconcileWriteInput) Attempt() WriteAttempt { return i.attempt }
 func (i ReconcileWriteInput) SealedAuthorization() (SealedMergeAuthorizationV1, bool) {
 	return cloneSealedAuthorization(i.sealed), i.sealed.valid()
+}
+func (i ReconcileWriteInput) TargetSubmission() (TargetSubmissionV1, bool) {
+	return cloneTargetSubmission(i.targetSubmission), i.targetSubmission.valid()
 }
 func (i ReconcileWriteInput) ObservationEvidence() []ledger.EvidenceRef {
 	return append([]ledger.EvidenceRef(nil), i.observationEvidence...)
@@ -455,13 +459,14 @@ const (
 )
 
 type ReconciliationResult struct {
-	attempt         WriteAttempt
-	sealed          SealedMergeAuthorizationV1
-	disposition     ReconciliationDisposition
-	mergeResult     *MergeResult
-	notAppliedProof *NotAppliedProofV1
-	evidence        []ledger.EvidenceRef
-	limitsSHA       string
+	attempt          WriteAttempt
+	sealed           SealedMergeAuthorizationV1
+	targetSubmission TargetSubmissionV1
+	disposition      ReconciliationDisposition
+	mergeResult      *MergeResult
+	notAppliedProof  *NotAppliedProofV1
+	evidence         []ledger.EvidenceRef
+	limitsSHA        string
 }
 
 func NewReconciliationResult(attempt WriteAttempt, disposition ReconciliationDisposition, evidenceRefs []ledger.EvidenceRef, limits Limits) (ReconciliationResult, error) {
@@ -482,6 +487,9 @@ func NewReconciliationResult(attempt WriteAttempt, disposition ReconciliationDis
 func (r ReconciliationResult) Attempt() WriteAttempt                  { return r.attempt }
 func (r ReconciliationResult) Disposition() ReconciliationDisposition { return r.disposition }
 func (r ReconciliationResult) LimitsSHA256() string                   { return r.limitsSHA }
+func (r ReconciliationResult) TargetSubmission() (TargetSubmissionV1, bool) {
+	return cloneTargetSubmission(r.targetSubmission), r.targetSubmission.valid()
+}
 func (r ReconciliationResult) Evidence() []ledger.EvidenceRef {
 	return append([]ledger.EvidenceRef(nil), r.evidence...)
 }
@@ -492,15 +500,15 @@ func (r ReconciliationResult) MergeResult() (MergeResult, bool) {
 	return *r.mergeResult, true
 }
 
-func NewMergeReconciliationResult(sealed SealedMergeAuthorizationV1, disposition ReconciliationDisposition, mergeResult *MergeResult, notAppliedProof *NotAppliedProofV1, evidenceRefs []ledger.EvidenceRef, limits Limits) (ReconciliationResult, error) {
-	if !sealed.valid() || (disposition != ReconciliationApplied && disposition != ReconciliationNotApplied && disposition != ReconciliationUnknown) {
+func NewMergeReconciliationResult(sealed SealedMergeAuthorizationV1, submission TargetSubmissionV1, disposition ReconciliationDisposition, mergeResult *MergeResult, notAppliedProof *NotAppliedProofV1, evidenceRefs []ledger.EvidenceRef, limits Limits) (ReconciliationResult, error) {
+	if !sealed.valid() || ValidateTargetSubmissionV1(sealed, submission, limits) != nil || (disposition != ReconciliationApplied && disposition != ReconciliationNotApplied && disposition != ReconciliationUnknown) {
 		return ReconciliationResult{}, errors.New("merge reconciliation input or disposition is invalid")
 	}
 	evidence := append([]ledger.EvidenceRef(nil), evidenceRefs...)
 	if len(evidence) == 0 || canonicalizeEvidence(&evidence, limits) != nil {
 		return ReconciliationResult{}, errors.New("merge reconciliation evidence is invalid")
 	}
-	result := ReconciliationResult{attempt: sealed.input.MergeInput.attempt, sealed: cloneSealedAuthorization(sealed), disposition: disposition, evidence: evidence}
+	result := ReconciliationResult{attempt: sealed.input.MergeInput.attempt, sealed: cloneSealedAuthorization(sealed), targetSubmission: cloneTargetSubmission(submission), disposition: disposition, evidence: evidence}
 	switch disposition {
 	case ReconciliationApplied:
 		if mergeResult == nil || notAppliedProof != nil {
@@ -512,7 +520,7 @@ func NewMergeReconciliationResult(sealed SealedMergeAuthorizationV1, disposition
 		copy := *mergeResult
 		result.mergeResult = &copy
 	case ReconciliationNotApplied:
-		if mergeResult != nil || notAppliedProof == nil || ValidateNotAppliedProofV1(sealed, *notAppliedProof, limits) != nil ||
+		if mergeResult != nil || notAppliedProof == nil || ValidateNotAppliedProofV1(sealed, submission, *notAppliedProof, limits) != nil ||
 			!containsEvidence(evidence, notAppliedProof.input.EvidenceRef) {
 			return ReconciliationResult{}, errors.New("NOT_APPLIED reconciliation requires exact typed authenticated proof")
 		}
@@ -527,11 +535,13 @@ func NewMergeReconciliationResult(sealed SealedMergeAuthorizationV1, disposition
 	return result, nil
 }
 
-func ValidateReconciliationResult(sealed SealedMergeAuthorizationV1, result ReconciliationResult, limits Limits) error {
-	if !sealed.valid() || result.sealed.SHA256() != sealed.SHA256() || result.attempt != sealed.input.MergeInput.attempt {
+func ValidateReconciliationResult(sealed SealedMergeAuthorizationV1, submission TargetSubmissionV1, result ReconciliationResult, limits Limits) error {
+	if !sealed.valid() || ValidateTargetSubmissionV1(sealed, submission, limits) != nil || result.sealed.SHA256() != sealed.SHA256() ||
+		result.targetSubmission.SHA256() != submission.SHA256() || !bytes.Equal(result.targetSubmission.CanonicalJSON(), submission.CanonicalJSON()) ||
+		result.attempt != sealed.input.MergeInput.attempt {
 		return errors.New("reconciliation result does not bind the full sealed input")
 	}
-	rebuilt, err := NewMergeReconciliationResult(sealed, result.disposition, result.mergeResult, result.notAppliedProof, result.evidence, limits)
+	rebuilt, err := NewMergeReconciliationResult(sealed, submission, result.disposition, result.mergeResult, result.notAppliedProof, result.evidence, limits)
 	if err != nil {
 		return err
 	}

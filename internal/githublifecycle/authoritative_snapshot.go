@@ -54,7 +54,7 @@ func NewPullRequestEnvelopeEvidenceV1(uri string, input AuthoritativePullRequest
 	}
 	if !validText(uri, limits.MaxTextBytes, false) || !input.Snapshot.valid() || input.Snapshot.Provider() != "github" ||
 		!validSHA256(input.ResponseBodySHA256) || !input.RepositoryBinding.valid() || !input.PullRequest.valid() ||
-		!input.BaseOID.valid() || !input.HeadOID.valid() {
+		!input.BaseOID.valid() || !input.HeadOID.valid() || !input.Actor.valid() {
 		return ledger.EvidenceRef{}, errors.New("authoritative PR response envelope identity is invalid")
 	}
 	canonical, _, err := canonicalJSON(pullRequestResponseEnvelopeWire(input))
@@ -82,6 +82,7 @@ type pullRequestResponseEnvelopeWireV1 struct {
 	IsDraft                 *bool             `json:"is_draft"`
 	Merged                  *bool             `json:"merged"`
 	MergedAtUnixNano        *int64            `json:"merged_at_unix_nano"`
+	Actor                   actorWire         `json:"actor"`
 }
 
 func pullRequestResponseEnvelopeWire(input AuthoritativePullRequestSnapshotV1Input) pullRequestResponseEnvelopeWireV1 {
@@ -89,7 +90,7 @@ func pullRequestResponseEnvelopeWire(input AuthoritativePullRequestSnapshotV1Inp
 		GitHubPullRequestEnvelopeSchemaV1, snapshotWire(input.Snapshot), input.ResponseBodySHA256, input.APIVersion, input.RepositoryBinding.SHA256(),
 		pullRequestWire(input.PullRequest), input.PullRequestDatabaseID, input.BaseRepositoryNodeID, input.BaseRef,
 		input.BaseOID.String(), input.HeadRepositoryNodeID, input.HeadRef, input.HeadOID.String(), input.State,
-		input.IsDraft, input.Merged, input.MergedAtUnixNano,
+		input.IsDraft, input.Merged, input.MergedAtUnixNano, actingWire(input.Actor),
 	}
 }
 

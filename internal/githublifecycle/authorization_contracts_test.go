@@ -215,26 +215,36 @@ func TestDeterministicRecipeCapabilityCommitmentAndReconciliation(t *testing.T) 
 		t.Fatal("attempt-only merge reconciliation input accepted")
 	}
 	reconcileEvidence := []ledger.EvidenceRef{{URI: "evidence/reconcile-observation", Kind: "reconciliation-observation", SHA256: strings.Repeat("c", 64)}}
-	reconcileInput, err := NewMergeReconcileWriteInput(f.sealed, reconcileEvidence, f.limits)
+	submission := newTargetSubmission(t, f, "target-attempt-reconcile")
+	reconcileInput, err := NewMergeReconcileWriteInput(f.sealed, submission, reconcileEvidence, f.limits)
 	if err != nil || reconcileInput.Attempt() != f.mergeWrite.Attempt() || len(reconcileInput.ObservationEvidence()) != 1 {
 		t.Fatalf("full merge reconciliation input: %v", err)
 	}
+	boundSubmission, ok := reconcileInput.TargetSubmission()
+	if !ok || boundSubmission.SHA256() != submission.SHA256() || !bytes.Equal(boundSubmission.RequestBody(), commitment.CanonicalJSON()) ||
+		boundSubmission.RequestBodyBytes() != int64(len(commitment.CanonicalJSON())) {
+		t.Fatal("merge reconciliation input did not retain the exact canonical target submission")
+	}
 
 	result := f.validMergeResult(t)
-	applied, err := NewMergeReconciliationResult(f.sealed, ReconciliationApplied, &result, nil, []ledger.EvidenceRef{{URI: "evidence/reconcile", Kind: "reconciliation", SHA256: strings.Repeat("a", 64)}}, f.limits)
+	applied, err := NewMergeReconciliationResult(f.sealed, submission, ReconciliationApplied, &result, nil, []ledger.EvidenceRef{{URI: "evidence/reconcile", Kind: "reconciliation", SHA256: strings.Repeat("a", 64)}}, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateReconciliationResult(f.sealed, applied, f.limits); err != nil {
+	if err := ValidateReconciliationResult(f.sealed, submission, applied, f.limits); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewMergeReconciliationResult(f.sealed, ReconciliationApplied, nil, nil, applied.Evidence(), f.limits); err == nil {
+	if _, err := NewMergeReconciliationResult(f.sealed, submission, ReconciliationApplied, nil, nil, applied.Evidence(), f.limits); err == nil {
 		t.Fatal("APPLIED reconciliation without materialized MergeResult accepted")
 	}
 	other := f.sealed
 	other.digest = strings.Repeat("b", 64)
-	if err := ValidateReconciliationResult(other, applied, f.limits); err == nil {
+	if err := ValidateReconciliationResult(other, submission, applied, f.limits); err == nil {
 		t.Fatal("reconciliation accepted a different sealed input")
+	}
+	otherSubmission := newTargetSubmission(t, f, "different-target-attempt")
+	if err := ValidateReconciliationResult(f.sealed, otherSubmission, applied, f.limits); err == nil {
+		t.Fatal("reconciliation accepted a different target submission")
 	}
 }
 
@@ -248,15 +258,16 @@ func TestCancellationAuthorityStrictDurableAndAppliedPrecedence(t *testing.T) {
 	response, _ := NewSnapshotIdentity("github", "target-attempt-1", 1700000004000000000)
 	responseBody := atomicRejectionResponseBody(t, 1)
 	proofRef := ledger.EvidenceRef{URI: "evidence/not-applied", Kind: NotAppliedAtomicRejectionEvidenceKindV1, SHA256: digestBytes(responseBody)}
-	notApplied, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicHeadRejected, RequestID: "target-attempt-1", RequestBodySHA256: f.sealed.Commitment().SHA256(), RequestBytes: 100, Response: &response, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: proofRef}, f.sealed, f.limits)
+	targetSubmission := newTargetSubmission(t, f, "target-attempt-1")
+	notApplied, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicHeadRejected, RequestBytes: 100, Response: &response, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: proofRef}, f.sealed, targetSubmission, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	submissionProof, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofAuthenticatedNotApplied, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), RequestBytes: 100, SubmissionState: ReconciliationNotApplied, NotAppliedProof: &notApplied, EvidenceRef: proofRef}, f.limits)
+	submissionProof, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofAuthenticatedNotApplied, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), TargetSubmission: &targetSubmission, RequestBytes: 100, SubmissionState: ReconciliationNotApplied, NotAppliedProof: &notApplied, EvidenceRef: proofRef}, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofAuthenticatedNotApplied, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), RequestBytes: 101, SubmissionState: ReconciliationNotApplied, NotAppliedProof: &notApplied, EvidenceRef: proofRef}, f.limits); err == nil {
+	if _, err := NewCancellationSubmissionProofV1(CancellationSubmissionProofV1Input{Kind: CancellationProofAuthenticatedNotApplied, AdmissionSHA256: f.mergeWrite.SHA256(), Attempt: &attempt, SealSHA256: f.sealed.Seal().SHA256(), CommitmentSHA256: f.sealed.Commitment().SHA256(), TargetSubmission: &targetSubmission, RequestBytes: 101, SubmissionState: ReconciliationNotApplied, NotAppliedProof: &notApplied, EvidenceRef: proofRef}, f.limits); err == nil {
 		t.Fatal("cancellation submission proof accepted a byte count different from its exact NOT_APPLIED proof")
 	}
 	cancellationEvidence := []ledger.EvidenceRef{authRef, policyRef, requestRef, proofRef}
