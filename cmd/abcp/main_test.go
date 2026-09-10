@@ -19,7 +19,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
-func TestRunCLIEndToEnd(t *testing.T) {
+func TestRunCLIRejectsAutonomousWorkflowWithoutAuthorityBackend(t *testing.T) {
 	repository := filepath.Join(t.TempDir(), "repository")
 	gitCommand(t, "", "init", "-b", "main", repository)
 	gitCommand(t, repository, "config", "user.email", "cli@example.test")
@@ -83,17 +83,20 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	code := runCLI([]string{
 		"run", "--manifest", manifestPath, "--ledger", ledgerPath, "--evidence-root", evidenceRoot,
 	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("run CLI exited %d: %s", code, stderr.String())
+	if code != 1 {
+		t.Fatalf("run CLI without authority backend exited %d: %s", code, stderr.String())
 	}
-	if strings.TrimSpace(stdout.String()) != "BRANCH_ACCEPTED" {
+	if !strings.Contains(stderr.String(), "workflow-wide authority backend is required") {
+		t.Fatalf("missing fail-closed backend error: %q", stderr.String())
+	}
+	if stdout.Len() != 0 {
 		t.Fatalf("unexpected CLI output %q", stdout.String())
 	}
-	if _, err := os.Stat(ledgerPath); err != nil {
-		t.Fatalf("ledger was not created: %v", err)
+	if _, err := os.Stat(ledgerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backendless admission created a ledger: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(evidenceRoot, "cli-run", "authority.json")); err != nil {
-		t.Fatalf("authority evidence was not created: %v", err)
+	if _, err := os.Stat(filepath.Join(evidenceRoot, "cli-run", "authority.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backendless admission created authority evidence: %v", err)
 	}
 }
 

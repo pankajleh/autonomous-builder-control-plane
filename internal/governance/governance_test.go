@@ -3,15 +3,18 @@ package governance
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
 func TestCheckpointChainRejectsForkAndCHeadChange(t *testing.T) {
@@ -209,10 +212,19 @@ func TestActivationGrandfathersOnlyExactPreActivationDigest(t *testing.T) {
 
 func TestControllerActivationCannotBeBypassedByOmittedCallerState(t *testing.T) {
 	repository, _, identity := governanceRepository(t)
-	controller, err := OpenControllerV1(repository)
+	localOnly, err := OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := localOnly.AdmitWorkflowAuthority(repository, identity, contextcapsule.PolicyVersionV2, hashChar("0")); ClassOf(err) != ExecutionBoundsInvalid {
+		t.Fatalf("implicit host-local authority class = %q, err=%v", ClassOf(err), err)
+	}
+	backend := newTestWorkflowAuthorityStoreV1()
+	controller, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a/user-a/home-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.seed(t, controller, identity)
 	grandfathered := hashChar("3")
 	if err := controller.AdmitWorkflowAuthority(repository, identity, contextcapsule.PolicyVersionV2, grandfathered); err != nil {
 		t.Fatal(err)
@@ -231,7 +243,7 @@ func TestControllerActivationCannotBeBypassedByOmittedCallerState(t *testing.T) 
 	freshClone := filepath.Join(t.TempDir(), "fresh-clone")
 	gitTest(t, "", "clone", "--quiet", repository, freshClone)
 	gitTest(t, freshClone, "remote", "set-url", "origin", "https://mirror.example.test/"+identity+".git")
-	reopened, err := OpenControllerV1(freshClone)
+	reopened, err := OpenControllerWithAuthorityBackendV1(freshClone, backend.client("host-b/user-b/home-b"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,6 +259,18 @@ func TestControllerActivationCannotBeBypassedByOmittedCallerState(t *testing.T) 
 	if err := reopened.AdmitWorkflowAuthority(freshClone, identity, contextcapsule.PolicyVersionV3, hashChar("5")); err != nil {
 		t.Fatal(err)
 	}
+
+	missingUniverse := newTestWorkflowAuthorityStoreV1WithDomain(backend.domain)
+	isolated, err := OpenControllerWithAuthorityBackendV1(freshClone, missingUniverse.client("host-c/user-c/home-c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := isolated.AdmitWorkflowAuthority(freshClone, identity, contextcapsule.PolicyVersionV2, hashChar("4")); ClassOf(err) != ExecutionBoundsInvalid {
+		t.Fatalf("missing authority universe class = %q, err=%v", ClassOf(err), err)
+	}
+	if _, err := isolated.Snapshot(); ClassOf(err) != ExecutionBoundsInvalid {
+		t.Fatalf("missing state initialized a zero universe: class=%q err=%v", ClassOf(err), err)
+	}
 }
 
 func TestControllerCountersAndInFlightReservationAreDurable(t *testing.T) {
@@ -255,15 +279,17 @@ func TestControllerCountersAndInFlightReservationAreDurable(t *testing.T) {
 	capsule.BaseSHA = base
 	capsule.Repository = identity
 	capsule.PhaseAuthority.ExecutionBounds.MaxRalphexInvocations = 1
-	first, err := OpenControllerV1(repository)
+	backend := newTestWorkflowAuthorityStoreV1()
+	first, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a/user-a/home-a"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend.seed(t, first, identity)
 	remote := gitTest(t, repository, "remote", "get-url", "origin")
 	freshClone := filepath.Join(t.TempDir(), "fresh-clone")
 	gitTest(t, "", "clone", "--quiet", repository, freshClone)
 	gitTest(t, freshClone, "remote", "set-url", "origin", remote)
-	second, err := OpenControllerV1(freshClone)
+	second, err := OpenControllerWithAuthorityBackendV1(freshClone, backend.client("host-b/user-b/home-b"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,6 +309,14 @@ func TestControllerCountersAndInFlightReservationAreDurable(t *testing.T) {
 	if _, err := first.ReserveRalphexInvocationV1(capsule, contextcapsule.OperationImplementation, true, ""); ClassOf(err) != ExecutionBoundsInvalid {
 		t.Fatalf("counter reset class = %q, err=%v", ClassOf(err), err)
 	}
+	missingUniverse := newTestWorkflowAuthorityStoreV1WithDomain(backend.domain)
+	isolated, err := OpenControllerWithAuthorityBackendV1(freshClone, missingUniverse.client("host-c/user-c/home-c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := isolated.ReserveRalphexInvocationV1(capsule, contextcapsule.OperationImplementation, true, ""); ClassOf(err) != ExecutionBoundsInvalid {
+		t.Fatalf("missing authority backend reset counters: class=%q err=%v", ClassOf(err), err)
+	}
 	snapshot, err := second.Snapshot()
 	if err != nil {
 		t.Fatal(err)
@@ -297,29 +331,25 @@ func TestControllerCountersAndInFlightReservationAreDurable(t *testing.T) {
 
 func TestRepositoryControllerRejectsAlternatePathsAndCopiedState(t *testing.T) {
 	repository, _, identity := governanceRepository(t)
-	controller, err := OpenControllerV1(repository)
+	backend := newTestWorkflowAuthorityStoreV1()
+	controller, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend.seed(t, controller, identity)
 	if err := controller.AdmitWorkflowAuthority(repository, identity, contextcapsule.PolicyVersionV2, hashChar("1")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenControllerV1(filepath.Join(repository, "caller-selected-state.json")); ClassOf(err) != ExecutionBoundsInvalid {
+	if _, err := OpenControllerWithAuthorityBackendV1(filepath.Join(repository, "caller-selected-state.json"), backend.client("host-a")); ClassOf(err) != ExecutionBoundsInvalid {
 		t.Fatalf("caller-selected state path class = %q, err=%v", ClassOf(err), err)
 	}
 
 	otherRepository, _, _ := governanceRepository(t)
-	other, err := OpenControllerV1(otherRepository)
+	other, err := OpenControllerWithAuthorityBackendV1(otherRepository, backend.client("host-b"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(controller.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(other.path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	backend.copyRecord(t, controller.identity, other.identity)
 	if _, err := other.Snapshot(); ClassOf(err) != ExecutionBoundsInvalid {
 		t.Fatalf("copied controller state class = %q, err=%v", ClassOf(err), err)
 	}
@@ -339,10 +369,12 @@ func TestControllerLeaseCASAndReceiptUseIndependentRepositoryProof(t *testing.T)
 		RequestedMutationIDs: []string{"finding.one"}, DeferredObservations: []DeferredObservationV1{},
 		ReviewerIdentity: "reviewer", ProviderIdentity: "provider", ReviewEvidenceSHA256: hashChar("2"),
 	})
-	controller, err := OpenControllerV1(repository)
+	backend := newTestWorkflowAuthorityStoreV1()
+	controller, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a/user-a/home-a"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend.seed(t, controller, identity)
 	if err := controller.AdvanceReviewTipV1(repository, capsule, capsuleFile, registry, report); ClassOf(err) != ReviewChainInvalid {
 		t.Fatalf("opaque report evidence class = %q, err=%v", ClassOf(err), err)
 	}
@@ -361,7 +393,7 @@ func TestControllerLeaseCASAndReceiptUseIndependentRepositoryProof(t *testing.T)
 	freshClone := filepath.Join(t.TempDir(), "fresh-clone")
 	gitTest(t, "", "clone", "--quiet", repository, freshClone)
 	gitTest(t, freshClone, "remote", "set-url", "origin", remote)
-	reopened, err := OpenControllerV1(freshClone)
+	reopened, err := OpenControllerWithAuthorityBackendV1(freshClone, backend.client("host-b/user-b/home-b"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,6 +420,14 @@ func TestControllerLeaseCASAndReceiptUseIndependentRepositoryProof(t *testing.T)
 	}
 	if successes != 1 || rejections != 1 {
 		t.Fatalf("parallel lease CAS successes=%d rejections=%d", successes, rejections)
+	}
+	missingUniverse := newTestWorkflowAuthorityStoreV1WithDomain(backend.domain)
+	isolated, err := OpenControllerWithAuthorityBackendV1(freshClone, missingUniverse.client("host-c/user-c/home-c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := isolated.BeginMutationLeaseV1(lease.LeaseSHA256); ClassOf(err) != ExecutionBoundsInvalid {
+		t.Fatalf("missing authority backend independently consumed lease: class=%q err=%v", ClassOf(err), err)
 	}
 	reservation, err := reopened.ReserveRalphexInvocationV1(capsule, contextcapsule.OperationImplementationReview, true, lease.LeaseSHA256)
 	if err != nil {
@@ -479,10 +519,12 @@ func TestControllerResolvesFindingEvidenceAndRunsRegisteredValidator(t *testing.
 	capsule.Repository = identity
 	artifact := []byte("deterministic validator output")
 	resolver := &testFindingEvidenceResolver{artifacts: map[string][]byte{"review/resolved": artifact}}
-	controller, err := OpenControllerWithFindingEvidenceV1(repository, resolver)
+	backend := newTestWorkflowAuthorityStoreV1()
+	controller, err := OpenControllerWithAuthorityBackendAndFindingEvidenceV1(repository, backend.client("host-a"), resolver)
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend.seed(t, controller, identity)
 	evidence, err := controller.RecordFindingEvidenceV1(repository, capsule, registry, FindingEvidenceRequestV1{
 		Ref: "review/resolved", CandidateSHA: base, FindingID: "finding.one", RuleID: "rule.invariant",
 	})
@@ -505,7 +547,7 @@ func TestControllerResolvesFindingEvidenceAndRunsRegisteredValidator(t *testing.
 		t.Fatalf("unconfirmed deterministic evidence class = %q, err=%v", ClassOf(err), err)
 	}
 
-	withoutResolver, err := OpenControllerV1(repository)
+	withoutResolver, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-b"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,10 +637,12 @@ func TestCleanCheckpointsBindValidatedTipZeroVerdictAndFinalFloors(t *testing.T)
 func TestControllerCheckpointGateConsumesOnlyDurableCleanReviewTips(t *testing.T) {
 	repository, base, identity := governanceRepository(t)
 	registry := fixtureRegistry(t)
-	controller, err := OpenControllerV1(repository)
+	backend := newTestWorkflowAuthorityStoreV1()
+	controller, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend.seed(t, controller, identity)
 
 	aCapsule := fixtureCapsule(contextcapsule.StageADesign, registry.RegistrySHA256)
 	aCapsule.BaseSHA = base
@@ -901,6 +945,99 @@ func recordReportEvidence(t *testing.T, controller *ControllerV1, repository str
 		}
 	}
 }
+
+type testWorkflowAuthorityRecordV1 struct {
+	canonicalState []byte
+	revision       uint64
+}
+
+type testWorkflowAuthorityStoreV1 struct {
+	mu      sync.Mutex
+	domain  string
+	records map[string]testWorkflowAuthorityRecordV1
+}
+
+type testWorkflowAuthorityClientV1 struct {
+	store       *testWorkflowAuthorityStoreV1
+	environment string
+}
+
+func newTestWorkflowAuthorityStoreV1() *testWorkflowAuthorityStoreV1 {
+	return newTestWorkflowAuthorityStoreV1WithDomain(hashChar("f"))
+}
+
+func newTestWorkflowAuthorityStoreV1WithDomain(domain string) *testWorkflowAuthorityStoreV1 {
+	return &testWorkflowAuthorityStoreV1{domain: domain, records: make(map[string]testWorkflowAuthorityRecordV1)}
+}
+
+func (s *testWorkflowAuthorityStoreV1) client(environment string) *testWorkflowAuthorityClientV1 {
+	return &testWorkflowAuthorityClientV1{store: s, environment: environment}
+}
+
+func (c *testWorkflowAuthorityClientV1) AuthorityDomainV1() (string, error) {
+	if c == nil || c.store == nil || c.environment == "" {
+		return "", errors.New("test authority client unavailable")
+	}
+	return c.store.domain, nil
+}
+
+func (c *testWorkflowAuthorityClientV1) LoadWorkflowStateV1(controllerIdentity string) ([]byte, uint64, error) {
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	record, ok := c.store.records[controllerIdentity]
+	if !ok {
+		return nil, 0, errors.New("authoritative workflow state is not initialized")
+	}
+	return append([]byte(nil), record.canonicalState...), record.revision, nil
+}
+
+func (c *testWorkflowAuthorityClientV1) CompareAndSwapWorkflowStateV1(controllerIdentity string, expectedRevision uint64, canonicalState []byte) (bool, error) {
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	record, ok := c.store.records[controllerIdentity]
+	if !ok {
+		return false, errors.New("authoritative workflow state is not initialized")
+	}
+	if record.revision != expectedRevision {
+		return false, nil
+	}
+	var state ControllerStateV1
+	if err := ParseCanonical(canonicalState, &state); err != nil {
+		return false, err
+	}
+	c.store.records[controllerIdentity] = testWorkflowAuthorityRecordV1{canonicalState: append([]byte(nil), canonicalState...), revision: state.Revision}
+	return true, nil
+}
+
+func (s *testWorkflowAuthorityStoreV1) seed(t *testing.T, controller *ControllerV1, repositoryIdentity string) {
+	t.Helper()
+	state := ControllerStateV1{
+		Kind: "GovernanceControllerStateV1", ControllerIdentity: controller.identity, RepositoryIdentity: repositoryIdentity, Revision: 1,
+		IssuedV2Authorities: []IssuedAuthorityV1{}, ExecutionState: ralphex.ExecutionStateV1{AggregateElapsed: "0s"}, FindingEvidence: []FindingEvidenceV1{},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.records[controller.identity]; exists {
+		t.Fatal("test authority state already initialized")
+	}
+	s.records[controller.identity] = testWorkflowAuthorityRecordV1{canonicalState: data, revision: state.Revision}
+}
+
+func (s *testWorkflowAuthorityStoreV1) copyRecord(t *testing.T, sourceIdentity, targetIdentity string) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.records[sourceIdentity]
+	if !ok {
+		t.Fatal("source authority record is absent")
+	}
+	s.records[targetIdentity] = testWorkflowAuthorityRecordV1{canonicalState: append([]byte(nil), record.canonicalState...), revision: record.revision}
+}
+
 func hashChar(character string) string { return strings.Repeat(character, 64) }
 func oidChar(character string) string  { return strings.Repeat(character, 40) }
 

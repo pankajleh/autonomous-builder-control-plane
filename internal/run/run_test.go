@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -166,10 +167,7 @@ func TestV3BReusesCapsuleAtDescendantAndStopsBeforeCAcceptance(t *testing.T) {
 		ExecutorModelEffortFlags: true, IsolatedConfig: true, GovernedHandoff: ralphex.HandoffTasksOnly, LinuxContainment: true,
 	}
 	manifest.Governance = &authority.GovernanceManifest{Operation: contextcapsule.OperationImplementation, Mutation: true}
-	controller, err := governancev3.OpenControllerV1(repository)
-	if err != nil {
-		t.Fatal(err)
-	}
+	controller := newRunTestController(t, repository, manifest.Repository.Identity)
 	governed, err := authority.NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		t.Fatal(err)
@@ -930,6 +928,67 @@ type testContainedRunner struct {
 	inner CommandRunner
 }
 
+type runTestBackendRecord struct {
+	data     []byte
+	revision uint64
+}
+
+type runTestBackend struct {
+	mu      sync.Mutex
+	records map[string]runTestBackendRecord
+}
+
+func (b *runTestBackend) AuthorityDomainV1() (string, error) {
+	return strings.Repeat("f", 64), nil
+}
+
+func (b *runTestBackend) LoadWorkflowStateV1(controllerIdentity string) ([]byte, uint64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	record, ok := b.records[controllerIdentity]
+	if !ok {
+		return nil, 0, errors.New("authority state is not initialized")
+	}
+	return append([]byte(nil), record.data...), record.revision, nil
+}
+
+func (b *runTestBackend) CompareAndSwapWorkflowStateV1(controllerIdentity string, expectedRevision uint64, data []byte) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	record, ok := b.records[controllerIdentity]
+	if !ok {
+		return false, errors.New("authority state is not initialized")
+	}
+	if record.revision != expectedRevision {
+		return false, nil
+	}
+	var state governancev3.ControllerStateV1
+	if err := governancev3.ParseCanonical(data, &state); err != nil {
+		return false, err
+	}
+	b.records[controllerIdentity] = runTestBackendRecord{data: append([]byte(nil), data...), revision: state.Revision}
+	return true, nil
+}
+
+func newRunTestController(t *testing.T, repository, repositoryIdentity string) *governancev3.ControllerV1 {
+	t.Helper()
+	backend := &runTestBackend{records: make(map[string]runTestBackendRecord)}
+	controller, err := governancev3.OpenControllerWithAuthorityBackendV1(repository, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := governancev3.ControllerStateV1{
+		Kind: "GovernanceControllerStateV1", ControllerIdentity: controller.ControllerIdentity(), RepositoryIdentity: repositoryIdentity, Revision: 1,
+		IssuedV2Authorities: []governancev3.IssuedAuthorityV1{}, ExecutionState: ralphex.ExecutionStateV1{AggregateElapsed: "0s"}, FindingEvidence: []governancev3.FindingEvidenceV1{},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.records[controller.ControllerIdentity()] = runTestBackendRecord{data: data, revision: state.Revision}
+	return controller
+}
+
 func (r *testContainedRunner) Run(ctx context.Context, command supervisor.Command) (supervisor.Result, error) {
 	return r.inner.Run(ctx, command)
 }
@@ -1002,10 +1061,7 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 		PolicyVersion: "branch-test-v1",
 	}
 	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
-	controller, err := governancev3.OpenControllerV1(repository)
-	if err != nil {
-		t.Fatal(err)
-	}
+	controller := newRunTestController(t, repository, repositoryIdentity)
 	governed, err := authority.NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		t.Fatal(err)

@@ -3,10 +3,13 @@ package authority
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
@@ -397,10 +400,7 @@ func TestNewAdmitsV3BOnlyWithStructuralCapabilityAndCounters(t *testing.T) {
 	if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "repository governance controller") {
 		t.Fatalf("controllerless V3 authority was admitted: %v", err)
 	}
-	controller, err := governancev3.OpenControllerV1(manifest.Repository.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	controller := newAuthorityTestController(t, manifest.Repository.Path, manifest.Repository.Identity)
 	governed, err := NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		t.Fatal(err)
@@ -428,10 +428,7 @@ func TestNewAdmitsV3BOnlyWithStructuralCapabilityAndCounters(t *testing.T) {
 	}
 	// Restore the shared fixture binary before testing independent state input.
 	manifest = v3BoundManifest(t)
-	controller, err = governancev3.OpenControllerV1(manifest.Repository.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	controller = newAuthorityTestController(t, manifest.Repository.Path, manifest.Repository.Identity)
 	invalid = cloneManifest(manifest)
 	invalid.Ralphex.ExecutionState = &ralphex.ExecutionStateV1{AggregateElapsed: "0s"}
 	if _, err := NewWithGovernanceController(invalid, controller); err == nil || !strings.Contains(err.Error(), "controller-owned") {
@@ -490,10 +487,7 @@ func TestControllerAdmissionRejectsPostActivationV2WhenGovernanceIsOmitted(t *te
 	}
 	writeFile(t, manifest.ContextCapsule.Path, data, 0o600)
 	manifest.ContextCapsule.SHA256 = fileHash(t, manifest.ContextCapsule.Path)
-	controller, err := governancev3.OpenControllerV1(manifest.Repository.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	controller := newAuthorityTestController(t, manifest.Repository.Path, manifest.Repository.Identity)
 	legacy, err := NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		t.Fatal(err)
@@ -598,6 +592,67 @@ func boundCapsuleManifest(t *testing.T) Manifest {
 	writeFile(t, capsulePath, data, 0o600)
 	manifest.ContextCapsule = &ContextCapsuleManifest{Path: capsulePath, SHA256: fileHash(t, capsulePath)}
 	return manifest
+}
+
+type authorityTestBackendRecord struct {
+	data     []byte
+	revision uint64
+}
+
+type authorityTestBackend struct {
+	mu      sync.Mutex
+	records map[string]authorityTestBackendRecord
+}
+
+func (b *authorityTestBackend) AuthorityDomainV1() (string, error) {
+	return strings.Repeat("f", 64), nil
+}
+
+func (b *authorityTestBackend) LoadWorkflowStateV1(controllerIdentity string) ([]byte, uint64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	record, ok := b.records[controllerIdentity]
+	if !ok {
+		return nil, 0, errors.New("authority state is not initialized")
+	}
+	return append([]byte(nil), record.data...), record.revision, nil
+}
+
+func (b *authorityTestBackend) CompareAndSwapWorkflowStateV1(controllerIdentity string, expectedRevision uint64, data []byte) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	record, ok := b.records[controllerIdentity]
+	if !ok {
+		return false, errors.New("authority state is not initialized")
+	}
+	if record.revision != expectedRevision {
+		return false, nil
+	}
+	var state governancev3.ControllerStateV1
+	if err := governancev3.ParseCanonical(data, &state); err != nil {
+		return false, err
+	}
+	b.records[controllerIdentity] = authorityTestBackendRecord{data: append([]byte(nil), data...), revision: state.Revision}
+	return true, nil
+}
+
+func newAuthorityTestController(t *testing.T, repository, repositoryIdentity string) *governancev3.ControllerV1 {
+	t.Helper()
+	backend := &authorityTestBackend{records: make(map[string]authorityTestBackendRecord)}
+	controller, err := governancev3.OpenControllerWithAuthorityBackendV1(repository, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := governancev3.ControllerStateV1{
+		Kind: "GovernanceControllerStateV1", ControllerIdentity: controller.ControllerIdentity(), RepositoryIdentity: repositoryIdentity, Revision: 1,
+		IssuedV2Authorities: []governancev3.IssuedAuthorityV1{}, ExecutionState: ralphex.ExecutionStateV1{AggregateElapsed: "0s"}, FindingEvidence: []governancev3.FindingEvidenceV1{},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.records[controller.ControllerIdentity()] = authorityTestBackendRecord{data: data, revision: state.Revision}
+	return controller
 }
 
 func gitAuthorityCommand(t *testing.T, directory string, args ...string) string {

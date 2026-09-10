@@ -11,14 +11,11 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
@@ -1587,7 +1584,7 @@ type InvocationReservationV1 struct {
 }
 
 // ControllerStateV1 is the single non-forkable durable tip for one workflow.
-// It is always read and replaced while holding the adjacent controller lock.
+// It is always advanced through the workflow-wide authority backend CAS.
 type ControllerStateV1 struct {
 	Kind                  string                   `json:"kind"`
 	ControllerIdentity    string                   `json:"controller_identity"`
@@ -1610,35 +1607,72 @@ type ControllerStateV1 struct {
 	NextStageGrant        *NextStageGrantV1        `json:"next_stage_grant,omitempty"`
 }
 
-// ControllerV1 owns the one strict-canonical state file derived from durable
-// repository identity. Callers cannot select a parallel state location.
+// WorkflowAuthorityBackendV1 is the controller-owned, workflow-wide CAS
+// authority. Implementations must provide one durable, linearizable revision
+// stream for an authority domain across every controller host and user. A
+// host-local file, process-local mutex, or per-host flock does not satisfy this
+// contract.
+//
+// LoadWorkflowStateV1 must fail when the authoritative record is unavailable
+// or has not been explicitly initialized by the control plane. It must never
+// synthesize an empty pre-activation state. CompareAndSwapWorkflowStateV1 must
+// atomically replace exactly expectedRevision and return swapped=false when a
+// competing controller advanced the record first.
+type WorkflowAuthorityBackendV1 interface {
+	AuthorityDomainV1() (string, error)
+	LoadWorkflowStateV1(controllerIdentity string) (canonicalState []byte, revision uint64, err error)
+	CompareAndSwapWorkflowStateV1(controllerIdentity string, expectedRevision uint64, canonicalState []byte) (swapped bool, err error)
+}
+
+// ControllerV1 owns the one strict-canonical state record derived from the
+// durable repository identity and controller-owned authority domain.
 type ControllerV1 struct {
 	repository              string
 	repositoryIdentity      string
 	repositoryControllerKey string
+	authorityDomain         string
 	identity                string
-	path                    string
+	backend                 WorkflowAuthorityBackendV1
 	findingEvidenceResolver FindingEvidenceResolverV1
 }
 
-// OpenControllerV1 derives the controller identity from the canonical origin
-// identity and stores state outside clone-local Git data. Fresh clones and
-// linked worktrees of the same origin therefore share one controller CAS tip.
+// OpenControllerV1 preserves the legacy constructor shape but deliberately
+// has no implicit storage fallback. Durable operations fail closed until
+// controller composition supplies a workflow-wide authority backend.
 func OpenControllerV1(repository string) (*ControllerV1, error) {
-	return openControllerV1(repository, nil)
+	return openControllerV1(repository, nil, nil)
 }
 
 // OpenControllerWithFindingEvidenceV1 installs the trusted artifact resolver
 // and deterministic validator used by controller finding ingestion. The
 // resolver belongs to controller composition and is never read from a report.
+// Like OpenControllerV1, this legacy constructor has no implicit authority
+// backend and therefore cannot perform durable operations.
 func OpenControllerWithFindingEvidenceV1(repository string, resolver FindingEvidenceResolverV1) (*ControllerV1, error) {
 	if resolver == nil {
 		return nil, fail(ReviewChainInvalid, "controller finding evidence resolver is required")
 	}
-	return openControllerV1(repository, resolver)
+	return openControllerV1(repository, nil, resolver)
 }
 
-func openControllerV1(repository string, resolver FindingEvidenceResolverV1) (*ControllerV1, error) {
+// OpenControllerWithAuthorityBackendV1 binds a repository controller to the
+// explicit workflow-wide CAS authority selected by trusted controller
+// composition. The backend, not a manifest or repository path, owns the
+// authority-domain selection.
+func OpenControllerWithAuthorityBackendV1(repository string, backend WorkflowAuthorityBackendV1) (*ControllerV1, error) {
+	return openControllerV1(repository, backend, nil)
+}
+
+// OpenControllerWithAuthorityBackendAndFindingEvidenceV1 additionally binds
+// the trusted finding-evidence resolver used by B-IMPL-08 validation.
+func OpenControllerWithAuthorityBackendAndFindingEvidenceV1(repository string, backend WorkflowAuthorityBackendV1, resolver FindingEvidenceResolverV1) (*ControllerV1, error) {
+	if resolver == nil {
+		return nil, fail(ReviewChainInvalid, "controller finding evidence resolver is required")
+	}
+	return openControllerV1(repository, backend, resolver)
+}
+
+func openControllerV1(repository string, backend WorkflowAuthorityBackendV1, resolver FindingEvidenceResolverV1) (*ControllerV1, error) {
 	root, err := canonicalRepository(repository)
 	if err != nil {
 		return nil, fail(ExecutionBoundsInvalid, "resolve controller repository: %v", err)
@@ -1651,28 +1685,27 @@ func openControllerV1(repository string, resolver FindingEvidenceResolverV1) (*C
 	if err != nil {
 		return nil, fail(ExecutionBoundsInvalid, "derive durable repository key: %v", err)
 	}
+	authorityDomain := ""
+	if backend != nil {
+		authorityDomain, err = backend.AuthorityDomainV1()
+		if err != nil {
+			return nil, fail(ExecutionBoundsInvalid, "resolve workflow-wide authority domain: %v", err)
+		}
+		if !validSHA256(authorityDomain) {
+			return nil, fail(ExecutionBoundsInvalid, "workflow-wide authority domain identity is invalid")
+		}
+	}
 	identity, err := digestJSON(struct {
-		Kind          string `json:"kind"`
-		RepositoryKey string `json:"repository_key"`
-	}{Kind: "GovernanceControllerIdentityV1", RepositoryKey: repositoryKey})
+		Kind            string `json:"kind"`
+		RepositoryKey   string `json:"repository_key"`
+		AuthorityDomain string `json:"authority_domain"`
+	}{Kind: "GovernanceControllerIdentityV1", RepositoryKey: repositoryKey, AuthorityDomain: authorityDomain})
 	if err != nil {
 		return nil, fail(ExecutionBoundsInvalid, "derive controller identity: %v", err)
 	}
-	stateRoot, err := durableControllerRoot()
-	if err != nil {
-		return nil, fail(ExecutionBoundsInvalid, "resolve durable controller root: %v", err)
-	}
-	directory := filepath.Join(stateRoot, identity)
-	if err := os.Mkdir(directory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return nil, fail(ExecutionBoundsInvalid, "create durable repository controller directory: %v", err)
-	}
-	directoryInfo, err := os.Lstat(directory)
-	if err != nil || directoryInfo.Mode()&os.ModeSymlink != 0 || !directoryInfo.IsDir() || directoryInfo.Mode().Perm()&0o077 != 0 {
-		return nil, fail(ExecutionBoundsInvalid, "durable repository controller directory is not private and canonical")
-	}
 	return &ControllerV1{
 		repository: root, repositoryIdentity: repositoryIdentity, repositoryControllerKey: repositoryKey, identity: identity,
-		path: filepath.Join(directory, "workflow-state-v1.json"), findingEvidenceResolver: resolver,
+		authorityDomain: authorityDomain, backend: backend, findingEvidenceResolver: resolver,
 	}, nil
 }
 
@@ -2317,103 +2350,74 @@ func (c *ControllerV1) CompleteMutationReceiptV1(repository string, capsule cont
 }
 
 func (c *ControllerV1) withState(update func(*ControllerStateV1) (bool, error)) error {
-	if c == nil || c.path == "" || c.identity == "" || c.repository == "" || c.repositoryIdentity == "" || c.repositoryControllerKey == "" {
+	if c == nil || c.identity == "" || c.repository == "" || c.repositoryIdentity == "" || c.repositoryControllerKey == "" {
 		return fail(ExecutionBoundsInvalid, "durable governance controller is required")
 	}
-	lockPath := c.path + ".lock"
-	if info, err := os.Lstat(lockPath); err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()) {
-		return fail(ExecutionBoundsInvalid, "controller lock path is not a regular file")
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fail(ExecutionBoundsInvalid, "inspect controller lock: %v", err)
+	if c.backend == nil || c.authorityDomain == "" {
+		return fail(ExecutionBoundsInvalid, "workflow-wide authority backend is required; host-local governance state is not authoritative")
 	}
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return fail(ExecutionBoundsInvalid, "open controller lock: %v", err)
+	domain, err := c.backend.AuthorityDomainV1()
+	if err != nil || domain != c.authorityDomain {
+		return fail(ExecutionBoundsInvalid, "workflow-wide authority backend identity is unavailable or changed")
 	}
-	defer lock.Close()
-	if info, err := lock.Stat(); err != nil || info.Mode().Perm()&0o077 != 0 {
-		return fail(ExecutionBoundsInvalid, "controller lock permissions are not private")
+	for attempt := 0; attempt < 32; attempt++ {
+		state, revision, err := c.loadState()
+		if err != nil {
+			return err
+		}
+		changed, err := update(&state)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return nil
+		}
+		if revision == ^uint64(0) {
+			return fail(ExecutionBoundsInvalid, "workflow-wide authority revision is exhausted")
+		}
+		state.Revision = revision + 1
+		swapped, err := c.saveState(revision, state)
+		if err != nil {
+			return err
+		}
+		if swapped {
+			return nil
+		}
 	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-		return fail(ExecutionBoundsInvalid, "lock controller state: %v", err)
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-
-	state, err := c.loadState()
-	if err != nil {
-		return err
-	}
-	changed, err := update(&state)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return nil
-	}
-	state.Revision++
-	return c.saveState(state)
+	return fail(ExecutionBoundsInvalid, "workflow-wide authority CAS contention exceeded the bounded retry limit")
 }
 
-func (c *ControllerV1) loadState() (ControllerStateV1, error) {
-	state := ControllerStateV1{Kind: "GovernanceControllerStateV1", ControllerIdentity: c.identity, IssuedV2Authorities: []IssuedAuthorityV1{}, ExecutionState: ralphex.ExecutionStateV1{AggregateElapsed: "0s"}, FindingEvidence: []FindingEvidenceV1{}}
-	info, err := os.Lstat(c.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return state, nil
-	}
+func (c *ControllerV1) loadState() (ControllerStateV1, uint64, error) {
+	data, revision, err := c.backend.LoadWorkflowStateV1(c.identity)
 	if err != nil {
-		return ControllerStateV1{}, fail(ExecutionBoundsInvalid, "inspect controller state: %v", err)
+		return ControllerStateV1{}, 0, fail(ExecutionBoundsInvalid, "load workflow-wide authority state: %v", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > 4<<20 {
-		return ControllerStateV1{}, fail(ExecutionBoundsInvalid, "controller state is not a bounded regular file")
+	if len(data) == 0 || revision == 0 {
+		return ControllerStateV1{}, 0, fail(ExecutionBoundsInvalid, "workflow-wide authority state is missing or uninitialized")
 	}
-	data, err := os.ReadFile(c.path)
-	if err != nil {
-		return ControllerStateV1{}, fail(ExecutionBoundsInvalid, "read controller state: %v", err)
-	}
+	var state ControllerStateV1
 	if err := ParseCanonical(data, &state); err != nil {
-		return ControllerStateV1{}, fail(ExecutionBoundsInvalid, "decode controller state: %v", err)
+		return ControllerStateV1{}, 0, fail(ExecutionBoundsInvalid, "decode workflow-wide authority state: %v", err)
 	}
-	if state.Kind != "GovernanceControllerStateV1" || state.ControllerIdentity != c.identity || state.IssuedV2Authorities == nil || state.FindingEvidence == nil || state.ExecutionState.AggregateElapsed == "" {
-		return ControllerStateV1{}, fail(ExecutionBoundsInvalid, "controller state payload is invalid")
+	if state.Kind != "GovernanceControllerStateV1" || state.ControllerIdentity != c.identity || state.RepositoryIdentity != c.repositoryIdentity || state.Revision != revision || state.IssuedV2Authorities == nil || state.FindingEvidence == nil || state.ExecutionState.AggregateElapsed == "" {
+		return ControllerStateV1{}, 0, fail(ExecutionBoundsInvalid, "workflow-wide authority state payload is invalid or divergent")
 	}
-	return state, nil
+	return state, revision, nil
 }
 
-func (c *ControllerV1) saveState(state ControllerStateV1) error {
+func (c *ControllerV1) saveState(expectedRevision uint64, state ControllerStateV1) (bool, error) {
 	data, err := json.Marshal(state)
 	if err != nil {
-		return fail(ExecutionBoundsInvalid, "encode controller state: %v", err)
+		return false, fail(ExecutionBoundsInvalid, "encode workflow-wide authority state: %v", err)
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(c.path), ".governance-state-")
+	if len(data) == 0 || len(data) > 1<<20 {
+		return false, fail(ExecutionBoundsInvalid, "workflow-wide authority state exceeds the bounded canonical size")
+	}
+	swapped, err := c.backend.CompareAndSwapWorkflowStateV1(c.identity, expectedRevision, data)
 	if err != nil {
-		return fail(ExecutionBoundsInvalid, "create controller state replacement: %v", err)
+		return false, fail(ExecutionBoundsInvalid, "compare-and-swap workflow-wide authority state: %v", err)
 	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err == nil {
-		_, err = temporary.Write(data)
-	}
-	if err == nil {
-		err = temporary.Sync()
-	}
-	if closeErr := temporary.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return fail(ExecutionBoundsInvalid, "write controller state replacement: %v", err)
-	}
-	if err := os.Rename(temporaryPath, c.path); err != nil {
-		return fail(ExecutionBoundsInvalid, "replace controller state: %v", err)
-	}
-	directory, err := os.Open(filepath.Dir(c.path))
-	if err != nil {
-		return fail(ExecutionBoundsInvalid, "open controller state directory: %v", err)
-	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil {
-		return fail(ExecutionBoundsInvalid, "sync controller state directory: %v", err)
-	}
-	return nil
+	return swapped, nil
 }
 
 func validateLifecycle(kind CheckpointKind, lifecycle *LifecycleBindingV1, candidate string) error {
@@ -2597,29 +2601,6 @@ func canonicalRepository(repository string) (string, error) {
 		return "", errors.New("repository must be the canonical Git root")
 	}
 	return root, nil
-}
-
-func durableControllerRoot() (string, error) {
-	current, err := user.Current()
-	if err != nil || current.HomeDir == "" || !filepath.IsAbs(current.HomeDir) {
-		return "", errors.New("controller operating-system home is unavailable")
-	}
-	root := filepath.Join(current.HomeDir, ".local", "state", "autonomous-builder-control-plane", "governance-v1")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", err
-	}
-	canonical, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", err
-	}
-	if filepath.Clean(canonical) != filepath.Clean(root) {
-		return "", errors.New("controller state root must not traverse symlinks")
-	}
-	info, err := os.Lstat(canonical)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
-		return "", errors.New("controller state root is not a private canonical directory")
-	}
-	return filepath.Clean(canonical), nil
 }
 
 func repositoryControllerIdentity(repository string) (string, error) {
