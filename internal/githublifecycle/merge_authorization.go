@@ -1,6 +1,7 @@
 package githublifecycle
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
@@ -47,23 +48,40 @@ type MergeCommitRecipeV1 struct {
 	commitBytes []byte
 }
 
-func NewMergeCommitRecipeV1(input MergeCommitRecipeV1Input, policy MergePolicyV1, limits Limits) (MergeCommitRecipeV1, error) {
-	input.Parents = append([]GitSHA(nil), input.Parents...)
+func NewMergeCommitRecipeV1(writeID string, authority Authority, limits Limits) (MergeCommitRecipeV1, error) {
 	limitsSHA, err := limits.SHA256()
 	if err != nil {
 		return MergeCommitRecipeV1{}, err
 	}
-	if !input.Repository.valid() || !validText(input.TargetRef, limits.MaxTextBytes, false) || !strings.HasPrefix(input.TargetRef, "refs/heads/") || !input.ExpectedResultTree.valid() || len(input.Parents) != 2 || !input.Parents[0].valid() || !input.Parents[1].valid() || input.Parents[0] == input.Parents[1] || !validCommitMessage(input.Message, limits.MaxTextBytes) || strings.HasSuffix(input.Message, "\n\n") || !input.Author.valid(limits) || !input.Committer.valid(limits) || input.AuthorUnix <= 0 || input.CommitterUnix <= 0 || !validOpaqueID(input.WriteID, limits.MaxTextBytes) || !validSHA256(input.AuthoritySHA256) || !validSHA256(input.PolicySHA256) || !validSHA256(input.ReadyBindingSHA256) {
-		return MergeCommitRecipeV1{}, errors.New("merge commit recipe is invalid")
+	if err := requireAuthority(authority); err != nil {
+		return MergeCommitRecipeV1{}, err
 	}
-	if !policy.valid() || policy.input.Method != MergeMethodMerge || policy.input.Recipe.ObjectFormat != input.ObjectFormat || policy.input.Recipe.Author != input.Author || policy.input.Recipe.Committer != input.Committer || !policy.input.Recipe.OrderedParents {
+	if !validOpaqueID(writeID, limits.MaxTextBytes) {
+		return MergeCommitRecipeV1{}, errors.New("merge commit recipe write identity is invalid")
+	}
+	policy := authority.MergePolicy()
+	if !policy.valid() || policy.input.Method != MergeMethodMerge || policy.input.Recipe.TimestampDerivation != "ready-event-time" || !policy.input.Recipe.OrderedParents {
 		return MergeCommitRecipeV1{}, errors.New("merge commit recipe does not match controller policy")
 	}
-	if input.LimitsSHA256 == "" {
-		input.LimitsSHA256 = limitsSHA
+	authoritySHA, err := authority.SHA256()
+	if err != nil {
+		return MergeCommitRecipeV1{}, err
 	}
-	if input.LimitsSHA256 != limitsSHA {
-		return MergeCommitRecipeV1{}, errors.New("merge commit recipe limits identity changed")
+	ready := authority.ReadyBinding()
+	timestamp := ready.input.ReadyEventUnixNano / 1_000_000_000
+	message := policy.input.Recipe.MessageTemplate + "\n\n" + policy.input.Recipe.TrailerTemplate + ": " + writeID
+	input := MergeCommitRecipeV1Input{
+		Repository: authority.Repository(), TargetRef: "refs/heads/" + authority.BaseBranch().String(),
+		ExpectedResultTree: authority.ExpectedContent().ExpectedResultTreeSHA(),
+		Parents:            []GitSHA{authority.ExpectedBaseTipSHA(), authority.HeadSHA()},
+		Message:            message, Author: policy.input.Recipe.Author, Committer: policy.input.Recipe.Committer,
+		AuthorUnix: timestamp, CommitterUnix: timestamp, ObjectFormat: policy.input.Recipe.ObjectFormat,
+		WriteID: writeID, AuthoritySHA256: authoritySHA, PolicySHA256: policy.SHA256(),
+		ReadyBindingSHA256: ready.SHA256(), LimitsSHA256: limitsSHA,
+	}
+	if !validCommitMessage(input.Message, limits.MaxTextBytes) || strings.HasSuffix(input.Message, "\n\n") || input.AuthorUnix <= 0 ||
+		!oidsMatchObjectFormat(input.ObjectFormat, append([]GitSHA{input.ExpectedResultTree}, input.Parents...)) {
+		return MergeCommitRecipeV1{}, errors.New("policy-derived merge commit recipe is invalid or uses inconsistent object IDs")
 	}
 	commit, err := canonicalCommitBytes(input)
 	if err != nil {
@@ -77,16 +95,29 @@ func NewMergeCommitRecipeV1(input MergeCommitRecipeV1Input, policy MergePolicyV1
 	if err != nil {
 		return MergeCommitRecipeV1{}, err
 	}
-	if input.ExpectedResultSHA.String() == "" {
-		input.ExpectedResultSHA = expectedSHA
-	} else if input.ExpectedResultSHA != expectedSHA {
-		return MergeCommitRecipeV1{}, errors.New("expected result OID does not match deterministic commit bytes")
-	}
+	input.ExpectedResultSHA = expectedSHA
 	canonical, digest, err := canonicalJSON(mergeCommitRecipeWire(input))
 	if err != nil {
 		return MergeCommitRecipeV1{}, err
 	}
 	return MergeCommitRecipeV1{input, canonical, digest, commit}, nil
+}
+
+func oidsMatchObjectFormat(format string, values []GitSHA) bool {
+	want := 0
+	if format == "sha1" {
+		want = 40
+	} else if format == "sha256" {
+		want = 64
+	} else {
+		return false
+	}
+	for _, value := range values {
+		if !value.valid() || len(value.String()) != want {
+			return false
+		}
+	}
+	return true
 }
 func (r MergeCommitRecipeV1) Input() MergeCommitRecipeV1Input {
 	i := r.input
@@ -174,7 +205,7 @@ func gitObjectID(format string, body []byte) (string, error) {
 	return "", errors.New("unsupported Git object format")
 }
 
-func ParseCanonicalMergeCommitRecipeV1(data []byte, policy MergePolicyV1, limits Limits) (MergeCommitRecipeV1, error) {
+func ParseCanonicalMergeCommitRecipeV1(data []byte, authority Authority, limits Limits) (MergeCommitRecipeV1, error) {
 	var w mergeCommitRecipeWireV1
 	if err := strictDecode(data, &w); err != nil {
 		return MergeCommitRecipeV1{}, err
@@ -182,26 +213,7 @@ func ParseCanonicalMergeCommitRecipeV1(data []byte, policy MergePolicyV1, limits
 	if w.Schema != MergeCommitRecipeSchemaV1 {
 		return MergeCommitRecipeV1{}, errors.New("unsupported merge recipe schema")
 	}
-	repository, err := NewRepository(w.Repository.Owner, w.Repository.Name)
-	if err != nil {
-		return MergeCommitRecipeV1{}, err
-	}
-	tree, err := NewGitSHA(w.ExpectedResultTree)
-	if err != nil {
-		return MergeCommitRecipeV1{}, err
-	}
-	parents := make([]GitSHA, len(w.Parents))
-	for i, s := range w.Parents {
-		parents[i], err = NewGitSHA(s)
-		if err != nil {
-			return MergeCommitRecipeV1{}, err
-		}
-	}
-	result, err := NewGitSHA(w.ExpectedResultSHA)
-	if err != nil {
-		return MergeCommitRecipeV1{}, err
-	}
-	value, err := NewMergeCommitRecipeV1(MergeCommitRecipeV1Input{repository, w.TargetRef, tree, parents, w.Message, w.Author, w.Committer, w.AuthorUnix, w.CommitterUnix, w.ObjectFormat, result, w.WriteID, w.AuthoritySHA256, w.PolicySHA256, w.ReadyBindingSHA256, w.LimitsSHA256}, policy, limits)
+	value, err := NewMergeCommitRecipeV1(w.WriteID, authority, limits)
 	if err != nil {
 		return MergeCommitRecipeV1{}, err
 	}
@@ -316,19 +328,8 @@ func (c AuthorizationCountersV1) valid() bool {
 }
 
 type AuthorizationSealV1Input struct {
-	MergeInput                 MergeInput
-	FinalPullRequest           AuthoritativePullRequestSnapshotV1
-	FinalChecks                []Check
-	FinalCheckRunsClosure      PaginationClosureV1
-	FinalCommitStatusesClosure PaginationClosureV1
-	PolicyDecisionSHA256       string
-	Verdict                    string
-	PREligible                 bool
-	Capability                 ProviderCapabilityV1
-	Recipe                     MergeCommitRecipeV1
-	Counters                   AuthorizationCountersV1
-	NoTargetRequestAttempted   bool
-	EvidenceRefs               []ledger.EvidenceRef
+	MergeInput        MergeInput
+	FinalRevalidation FinalRevalidationV1
 }
 type AuthorizationSealV1 struct {
 	input     AuthorizationSealV1Input
@@ -346,11 +347,14 @@ func NewAuthorizationSealV1(input AuthorizationSealV1Input, limits Limits) (Auth
 	if err := validateMergeInput(input.MergeInput, limits); err != nil {
 		return AuthorizationSealV1{}, err
 	}
-	if err := EvaluateMergePolicyV1(input.MergeInput.authority, input.FinalPullRequest, input.FinalChecks, input.FinalCheckRunsClosure, input.FinalCommitStatusesClosure, limits); err != nil {
-		return AuthorizationSealV1{}, err
-	}
-	if input.PolicyDecisionSHA256 != input.MergeInput.policyDecisionSHA256 || input.Verdict != "authorized" || !input.PREligible || !input.NoTargetRequestAttempted || !input.Capability.valid() || input.Capability.SHA256() != input.MergeInput.capability.SHA256() || !input.Recipe.valid() || input.Recipe.SHA256() != input.MergeInput.recipe.SHA256() || !input.Counters.valid() || len(input.EvidenceRefs) == 0 || canonicalizeEvidence(&input.EvidenceRefs, limits) != nil {
+	if !input.FinalRevalidation.valid() || input.FinalRevalidation.input.MergeInput.SHA256() != input.MergeInput.SHA256() {
 		return AuthorizationSealV1{}, errors.New("authorization seal does not bind one final authorized unsubmitted attempt")
+	}
+	revalidated, err := NewFinalRevalidationV1(input.FinalRevalidation.input, limits)
+	if err != nil || revalidated.SHA256() != input.FinalRevalidation.SHA256() ||
+		revalidated.FinalDecisionSHA256() != input.FinalRevalidation.FinalDecisionSHA256() ||
+		!bytes.Equal(revalidated.CanonicalJSON(), input.FinalRevalidation.CanonicalJSON()) {
+		return AuthorizationSealV1{}, errors.New("authorization seal final revalidation fails independent validation")
 	}
 	canonical, digest, err := canonicalJSON(authorizationSealWire(input, limitsSHA))
 	if err != nil {
@@ -380,6 +384,9 @@ type authorizationSealWireV1 struct {
 	AuthoritySHA256                  string                  `json:"authority_sha256"`
 	ReadyBindingSHA256               string                  `json:"ready_binding_sha256"`
 	PolicySHA256                     string                  `json:"policy_sha256"`
+	FinalRevalidation                json.RawMessage         `json:"final_revalidation"`
+	FinalRevalidationSHA256          string                  `json:"final_revalidation_sha256"`
+	FinalDecisionSHA256              string                  `json:"final_decision_sha256"`
 	FinalPullRequest                 json.RawMessage         `json:"final_pull_request"`
 	FinalPullRequestSHA256           string                  `json:"final_pull_request_sha256"`
 	FinalChecks                      []checkWire             `json:"final_checks"`
@@ -407,8 +414,16 @@ type authorizationSealWireV1 struct {
 
 func authorizationSealWire(i AuthorizationSealV1Input, limitsSHA string) authorizationSealWireV1 {
 	authoritySHA, _ := i.MergeInput.authority.SHA256()
-	checks := checkWires(i.FinalChecks)
-	return authorizationSealWireV1{AuthorizationSealSchemaV1, i.MergeInput.SHA256(), attemptWire(i.MergeInput.attempt), authoritySHA, i.MergeInput.authority.ReadyBinding().SHA256(), i.MergeInput.authority.MergePolicy().SHA256(), i.FinalPullRequest.CanonicalJSON(), i.FinalPullRequest.SHA256(), checks, i.FinalCheckRunsClosure.CanonicalJSON(), i.FinalCheckRunsClosure.SHA256(), i.FinalCommitStatusesClosure.CanonicalJSON(), i.FinalCommitStatusesClosure.SHA256(), i.PolicyDecisionSHA256, i.Verdict, i.PREligible, i.Capability.CanonicalJSON(), i.Capability.SHA256(), i.Recipe.CanonicalJSON(), i.Recipe.SHA256(), i.Recipe.ExpectedResultSHA().String(), "refs/heads/" + i.MergeInput.authority.BaseBranch().String(), i.MergeInput.authority.ExpectedBaseTipSHA().String(), "refs/heads/" + i.MergeInput.authority.HeadBranch().String(), i.MergeInput.authority.HeadSHA().String(), i.Counters, i.NoTargetRequestAttempted, i.EvidenceRefs, limitsSHA}
+	final := i.FinalRevalidation.input
+	checks := checkWires(final.Checks)
+	return authorizationSealWireV1{AuthorizationSealSchemaV1, i.MergeInput.SHA256(), attemptWire(i.MergeInput.attempt), authoritySHA, i.MergeInput.authority.ReadyBinding().SHA256(), i.MergeInput.authority.MergePolicy().SHA256(),
+		i.FinalRevalidation.CanonicalJSON(), i.FinalRevalidation.SHA256(), i.FinalRevalidation.FinalDecisionSHA256(),
+		final.PullRequest.CanonicalJSON(), final.PullRequest.SHA256(), checks, final.CheckRunsClosure.CanonicalJSON(), final.CheckRunsClosure.SHA256(),
+		final.CommitStatusesClosure.CanonicalJSON(), final.CommitStatusesClosure.SHA256(), i.FinalRevalidation.FinalDecisionSHA256(), "authorized", true,
+		final.Capability.CanonicalJSON(), final.Capability.SHA256(), final.Recipe.CanonicalJSON(), final.Recipe.SHA256(), final.Recipe.ExpectedResultSHA().String(),
+		"refs/heads/" + i.MergeInput.authority.BaseBranch().String(), i.MergeInput.authority.ExpectedBaseTipSHA().String(),
+		"refs/heads/" + i.MergeInput.authority.HeadBranch().String(), i.MergeInput.authority.HeadSHA().String(), final.Counters,
+		final.NoTargetRequestAttempted, final.EvidenceRefs, limitsSHA}
 }
 
 func ParseCanonicalAuthorizationSealV1(data []byte, input MergeInput, limits Limits) (AuthorizationSealV1, error) {
@@ -420,6 +435,10 @@ func ParseCanonicalAuthorizationSealV1(data []byte, input MergeInput, limits Lim
 		return AuthorizationSealV1{}, errors.New("unsupported authorization seal schema")
 	}
 	if err := validateMergeInput(input, limits); err != nil {
+		return AuthorizationSealV1{}, err
+	}
+	final, err := ParseCanonicalFinalRevalidationV1(wire.FinalRevalidation, input, limits)
+	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
 	pr, err := ParseCanonicalAuthoritativePullRequestSnapshotV1(wire.FinalPullRequest, limits)
@@ -446,16 +465,27 @@ func ParseCanonicalAuthorizationSealV1(data []byte, input MergeInput, limits Lim
 	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
-	recipe, err := ParseCanonicalMergeCommitRecipeV1(wire.Recipe, input.authority.MergePolicy(), limits)
+	recipe, err := ParseCanonicalMergeCommitRecipeV1(wire.Recipe, input.authority, limits)
 	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
-	value, err := NewAuthorizationSealV1(AuthorizationSealV1Input{input, pr, checks, checkRuns, statuses, wire.PolicyDecisionSHA256, wire.Verdict, wire.PREligible, capability, recipe, wire.Counters, wire.NoTargetRequestAttempted, wire.EvidenceRefs}, limits)
+	value, err := NewAuthorizationSealV1(AuthorizationSealV1Input{input, final}, limits)
 	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
 	authoritySHA, _ := input.authority.SHA256()
-	if wire.MergeInputSHA256 != input.SHA256() || wire.Attempt != attemptWire(input.attempt) || wire.AuthoritySHA256 != authoritySHA || wire.ReadyBindingSHA256 != input.authority.ReadyBinding().SHA256() || wire.PolicySHA256 != input.authority.MergePolicy().SHA256() || wire.FinalPullRequestSHA256 != pr.SHA256() || wire.FinalCheckRunsClosureSHA256 != checkRuns.SHA256() || wire.FinalCommitStatusesClosureSHA256 != statuses.SHA256() || wire.CapabilitySHA256 != capability.SHA256() || wire.RecipeSHA256 != recipe.SHA256() || wire.ExpectedResultSHA != recipe.ExpectedResultSHA().String() || wire.LimitsSHA256 != value.limitsSHA {
+	if wire.MergeInputSHA256 != input.SHA256() || wire.Attempt != attemptWire(input.attempt) || wire.AuthoritySHA256 != authoritySHA ||
+		wire.ReadyBindingSHA256 != input.authority.ReadyBinding().SHA256() || wire.PolicySHA256 != input.authority.MergePolicy().SHA256() ||
+		wire.FinalRevalidationSHA256 != final.SHA256() || wire.FinalDecisionSHA256 != final.FinalDecisionSHA256() ||
+		wire.FinalPullRequestSHA256 != pr.SHA256() || pr.SHA256() != final.input.PullRequest.SHA256() ||
+		wire.FinalCheckRunsClosureSHA256 != checkRuns.SHA256() || checkRuns.SHA256() != final.input.CheckRunsClosure.SHA256() ||
+		wire.FinalCommitStatusesClosureSHA256 != statuses.SHA256() || statuses.SHA256() != final.input.CommitStatusesClosure.SHA256() ||
+		wire.PolicyDecisionSHA256 != final.FinalDecisionSHA256() || wire.Verdict != "authorized" || !wire.PREligible ||
+		wire.CapabilitySHA256 != capability.SHA256() || capability.SHA256() != final.input.Capability.SHA256() ||
+		wire.RecipeSHA256 != recipe.SHA256() || recipe.SHA256() != final.input.Recipe.SHA256() ||
+		wire.ExpectedResultSHA != recipe.ExpectedResultSHA().String() || wire.Counters != final.input.Counters ||
+		wire.NoTargetRequestAttempted != final.input.NoTargetRequestAttempted || !equalEvidence(wire.EvidenceRefs, final.input.EvidenceRefs) ||
+		wire.LimitsSHA256 != value.limitsSHA {
 		return AuthorizationSealV1{}, errors.New("authorization seal nested identity or digest disagrees")
 	}
 	if err := requireCanonical(data, value.canonical); err != nil {
@@ -480,13 +510,14 @@ type TargetRefCommitmentV1 struct {
 	digest           string
 }
 
-func NewTargetRefCommitmentV1(input MergeInput, seal AuthorizationSealV1, clientMutationID string, limits Limits) (TargetRefCommitmentV1, error) {
+func NewTargetRefCommitmentV1(input MergeInput, seal AuthorizationSealV1, limits Limits) (TargetRefCommitmentV1, error) {
 	if err := validateMergeInput(input, limits); err != nil {
 		return TargetRefCommitmentV1{}, err
 	}
-	if !seal.valid() || seal.input.MergeInput.SHA256() != input.SHA256() || !validOpaqueID(clientMutationID, limits.MaxTextBytes) {
+	if !seal.valid() || seal.input.MergeInput.SHA256() != input.SHA256() {
 		return TargetRefCommitmentV1{}, errors.New("target commitment does not match sealed merge input")
 	}
+	clientMutationID := input.attempt.WriteID()
 	repoNode := input.authority.ReadyBinding().input.RepositoryBinding.input.GitHubRepositoryNodeID
 	updates := [2]RefUpdateV1{{"refs/heads/" + input.authority.BaseBranch().String(), input.authority.ExpectedBaseTipSHA(), input.recipe.ExpectedResultSHA(), false}, {"refs/heads/" + input.authority.HeadBranch().String(), input.authority.HeadSHA(), input.authority.HeadSHA(), false}}
 	wire := targetRefCommitmentWireV1{TargetRefCommitmentSchemaV1, repoNode, []refUpdateWireV1{refUpdateWire(updates[0]), refUpdateWire(updates[1])}, input.capability.SHA256(), seal.SHA256(), clientMutationID}
@@ -530,9 +561,12 @@ func ParseCanonicalTargetRefCommitmentV1(data []byte, input MergeInput, seal Aut
 	if wire.Schema != TargetRefCommitmentSchemaV1 {
 		return TargetRefCommitmentV1{}, errors.New("unsupported target commitment schema")
 	}
-	value, err := NewTargetRefCommitmentV1(input, seal, wire.ClientMutationID, limits)
+	value, err := NewTargetRefCommitmentV1(input, seal, limits)
 	if err != nil {
 		return TargetRefCommitmentV1{}, err
+	}
+	if wire.ClientMutationID != input.attempt.WriteID() {
+		return TargetRefCommitmentV1{}, errors.New("target commitment mutation identity was not derived from the write attempt")
 	}
 	if err := requireCanonical(data, value.canonical); err != nil {
 		return TargetRefCommitmentV1{}, err
@@ -665,13 +699,7 @@ func cloneCapability(c ProviderCapabilityV1) ProviderCapabilityV1 {
 }
 func cloneAuthorizationSealInput(i AuthorizationSealV1Input) AuthorizationSealV1Input {
 	i.MergeInput = cloneLifecycleMergeInput(i.MergeInput)
-	i.FinalPullRequest = cloneAuthoritativePR(i.FinalPullRequest)
-	i.FinalChecks = cloneChecks(i.FinalChecks)
-	i.FinalCheckRunsClosure = clonePaginationClosure(i.FinalCheckRunsClosure)
-	i.FinalCommitStatusesClosure = clonePaginationClosure(i.FinalCommitStatusesClosure)
-	i.Capability = cloneCapability(i.Capability)
-	i.Recipe = cloneRecipe(i.Recipe)
-	i.EvidenceRefs = append([]ledger.EvidenceRef(nil), i.EvidenceRefs...)
+	i.FinalRevalidation = cloneFinalRevalidation(i.FinalRevalidation)
 	return i
 }
 func cloneAuthorizationSeal(s AuthorizationSealV1) AuthorizationSealV1 {
@@ -752,7 +780,7 @@ func ParseCanonicalMergeInput(data []byte, limits Limits) (MergeInput, error) {
 	if err != nil {
 		return MergeInput{}, err
 	}
-	recipe, err := ParseCanonicalMergeCommitRecipeV1(wire.Recipe, authority.MergePolicy(), limits)
+	recipe, err := ParseCanonicalMergeCommitRecipeV1(wire.Recipe, authority, limits)
 	if err != nil {
 		return MergeInput{}, err
 	}

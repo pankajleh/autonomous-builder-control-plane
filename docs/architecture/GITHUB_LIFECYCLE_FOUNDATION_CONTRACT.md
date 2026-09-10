@@ -34,10 +34,20 @@ replacement-ref-resistant and no-lazy-fetch settings.
 - the stable `RepositoryBindingV1`;
 - exact canonical `INTEGRATION_ACCEPTED -> READY_FOR_MERGE` ledger event bytes,
   digest, IDs, time, physical ledger identity/offset, run-state sequence, and
-  transition ordinal;
+  transition ordinal, with actor exactly `controller` and source exactly
+  `integration-gate`;
 - the bounded ledger-prefix identity and complete READY evidence closure; and
 - the integrated head, baseline, expected tree, and exact READY decision ref
   used by `ExpectedMergeContent`.
+
+The READY event must end exactly at the bound JSONL prefix boundary (including
+its newline), and its run-state sequence must equal its transition ordinal.
+The closure must contain the event evidence, repository-mapping evidence, and
+every accepted source's acceptance evidence. A source for the integrated head
+must be present. `CurrentReadyProofV1` independently re-parses the READY
+binding, proves the observed bound-prefix digest is unchanged, binds a bounded
+ledger observation, and asserts that the same READY event remains current with
+no later run transition.
 
 `RepositoryBindingV1` binds Phase-3 repository identity/path/canonical remote/
 start SHA to exact GitHub owner/name and stable repository node/database IDs,
@@ -87,15 +97,24 @@ history capability. Stale-head, commented, and ineligible reviews grant no
 approval.
 
 `PaginationClosureV1` is independent for reviews, check runs, and commit
-statuses. Each closure binds its exact source/query/filters, ordered page or
-cursor requests, provider request/body identities, canonical response
+statuses. Consumers pass only `PaginationQueryScopeV1`; the source-specific
+GET method, owner/name path, fixed API version, exact-head/PR identities,
+filters, and page size are independently produced by
+`DerivePaginationQueryV1`. Collectors cannot supply these authority fields.
+Each closure binds its exact derived source/query/filters, ordered page or
+cursor requests, unique provider request/body identities, canonical response
 envelopes, stable item keys/digests, closure-wide set digest, evidence, and
-limits. REST termination comes only from a valid final `Link` relation set
-without `next`; GraphQL termination comes only from final
-`hasNextPage=false`. Missing, skipped, repeated, reordered, duplicate,
+limits. Every page binds a retained response evidence ref whose digest equals
+the raw body digest, and the closure evidence contains every page ref. REST
+termination comes only from an explicitly observed valid final `Link`
+relation set (including an explicitly observed absent header) without
+`next`; an empty default string is not observation. GraphQL termination comes
+only from final `hasNextPage=false`. Missing, skipped, repeated, reordered, duplicate,
 conflicting, altered, invented-terminal, or truncated chains fail.
 `ValidatePaginationClosureV1` reconstructs the chain and exact canonical item
-set rather than trusting collector summaries.
+set against the authority-derived query rather than trusting collector
+summaries. Review/check sets are canonicalized only after this closure
+validation; sorting never supplies completeness or chronology.
 
 All immutable values deep-copy slices, maps, nested bytes, and optional values;
 accessors return defensive copies. Canonical set ordering never changes the
@@ -110,6 +129,13 @@ author/committer identity and timestamps, object format, write/authority/
 policy/READY/limits identities, canonical Git commit bytes, and locally
 computed result OID. Changing any recipe field cannot retain the old OID.
 
+`NewMergeCommitRecipeV1` accepts only the authority and write ID. Repository,
+ref, tree, parents, message, trailer value, author, committer, READY-derived
+timestamp, object format, and authority/policy/READY digests are all derived;
+there are no caller recipe bytes to adopt. Every tree/parent/result OID must
+have the width selected by the object format. Production-v1 admission
+additionally requires the proved SHA-1 format; SHA-256 remains contract-only.
+
 `MergeInput` owns the full authority, initial authoritative PR and policy
 decision, canonical checks, all three independently validated source closures,
 frozen provider capability, exact recipe/result OID, evidence, limits, and
@@ -118,16 +144,29 @@ addition to repository, principal, operation, write ID, authority digest,
 payload digest, and limits. `ParseCanonicalMergeInput` must reconstruct
 byte-identical input and attempt identities.
 
-Generic squash/rebase lineage remains representable by foundation strategy
-contracts. That representation and its tests do not claim production support.
+`GenericStrategyResultV1` and `GenericStrategyPostMergeV1` preserve
+network-free squash/rebase result, lineage, and containment representation
+without a production seal or recipe. Production policy, `MergeInput`, and
+sealed execution remain merge-only. Generic representation and its tests do
+not claim executable production support.
 
 ## Authorization seal and exact target commitment
 
-`AuthorizationSealV1` binds one unchanged `MergeInput` to freshly validated
-final PR/review/check observations, exact authorized verdict and PR
-eligibility, base/head refs and OIDs, recipe/result, capability, cumulative
-counters, evidence, limits, and the fact that no target request was attempted.
-It is immutable and one-use.
+`FinalRevalidationV1` is a distinct controller-ordered record created after
+a typed current-READY proof. It owns fresh PR, review, check-run, and
+commit-status request identities, rejects every admission request identity and
+cross-source duplicate, bounds all response times to its start/completion
+interval, independently evaluates policy, closes all authority-bearing
+response evidence, and recomputes `final-authorization-decision-v1` canonical
+bytes and digest. A caller decision digest is never accepted.
+
+`AuthorizationSealV1` binds one unchanged `MergeInput` to the full canonical
+`FinalRevalidationV1` bytes/digest and independently derived final decision
+digest, exact authorized verdict and PR eligibility, base/head refs and OIDs,
+recipe/result, capability, cumulative counters, evidence, limits, and the fact
+that no target request was attempted. Reusing admission observations or
+mutating an in-memory nested record while retaining its old canonical bytes
+fails independent reconstruction. The seal is immutable and one-use.
 
 `ProviderCapabilityV1` accepts only
 `github-update-refs-atomic-base-head-v1` with immutable evidence for atomic,
@@ -136,6 +175,10 @@ all-or-nothing, no-op, base-then-head ordering, and `force=false` behavior.
 
 1. base: `before=ExpectedBaseTip`, `after=ExpectedResult`, `force=false`;
 2. head: `before=AcceptedHead`, `after=AcceptedHead`, `force=false`.
+
+Its `clientMutationID` is exactly the bound `WriteAttempt.WriteID`; the
+constructor has no independent caller mutation-ID argument. Reconstructing one
+seal therefore produces byte-identical commitment and mutation identity.
 
 `SealedMergeAuthorizationV1` owns the original input, seal, and exact
 commitment. Merge execution accepts this sealed value, never an unsealed
@@ -146,8 +189,14 @@ nested canonical bytes and digests.
 
 Merge reconciliation owns the full `SealedMergeAuthorizationV1`, not an
 attempt alone. `APPLIED` requires the identical materialized and validated
-`MergeResult`. `NOT_APPLIED` requires exact typed zero-request-byte or
-authenticated all-or-nothing base/head before-OID rejection proof. `UNKNOWN`
+`MergeResult`. `NOT_APPLIED` requires strict-canonical
+`NotAppliedProofV1`: either exact zero-request-byte evidence or authenticated
+all-or-nothing base/head before-OID rejection. The proof derives and binds the
+repository/node identity, both ordered ref updates and OIDs, rejected
+predicate, capability, seal/commitment/write/mutation identities,
+request/response identity and bodies, raw evidence digest/ref, and the fixed
+all-or-nothing disposition. Its evidence must also be in reconciliation
+closure. `UNKNOWN`
 contains no result or non-application claim. Absent/open PR, old/unrelated
 target, missing expected object, truncation, or generic provider assertions
 remain `UNKNOWN`.
@@ -168,6 +217,13 @@ write/seal/commitment identity, stable authenticated requester, controller
 cancellation policy/source/grant/allow decision, unique source request,
 ingress identity, exact submission proof, evidence closure, and limits.
 
+The submission proof is the full canonical typed
+`CancellationSubmissionProofV1`, not a caller kind/digest pair. Independent
+expectations cover every authority-bearing field: current READY and admission,
+principal/authentication, policy version/source/digest, grant/allow decision,
+boundary/attempt/seal/commitment, exact submission proof, source kind/request
+and evidence, ingress ordering, and evidence closure.
+
 Boundary construction enforces exact absence/presence for `PRE_ADMISSION`,
 `ADMITTED_PRE_TARGET_SUBMISSION`, `TARGET_SUBMISSION_UNKNOWN`, and
 `TARGET_NOT_APPLIED`. Independent validation receives expected READY, policy,
@@ -176,10 +232,14 @@ and proof identities.
 
 Raw context cancellation, deadline, signal, disconnect, mutable login, caller
 boolean, or merge credential is never cancellation authority.
-`DurableCancellationAuthorityV1` additionally binds validated fsynced channel
-and single-use replay-index evidence. Only this prior durable form may
+`CancellationReplayIdentityV1` derives the replay key exclusively from
+`(source_kind, source_request_id)` and binds it to the exact authority ID and
+fsynced index evidence. `DurableCancellationAuthorityV1` owns its canonical
+bytes/digest. Replay identity is independently reconstructed before
+`CANCELLED` selection. Only this prior durable form may
 authorize `CANCELLED`; submitted boundaries also need exact typed
-`NOT_APPLIED` proof. `APPLIED` always defeats cancellation.
+`NOT_APPLIED` proof; `TARGET_NOT_APPLIED` must contain that byte-identical
+proof in its submission record. `APPLIED` always defeats cancellation.
 
 ## Post-merge result and containment
 

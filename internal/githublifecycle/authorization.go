@@ -18,6 +18,8 @@ const (
 	ReadyAuthorityBindingSchemaV1 = "ready-authority-binding-v1"
 	MergePolicySchemaV1           = "merge-policy-v1"
 	PolicyAuthoritySchemaV1       = "merge-policy-authority-v1"
+	ReadyEventControllerActorV1   = "controller"
+	ReadyEventControllerSourceV1  = "integration-gate"
 )
 
 type RepositoryBindingV1Input struct {
@@ -215,13 +217,19 @@ func NewReadyAuthorityBindingV1(input ReadyAuthorityBindingV1Input, limits Limit
 	if !bytes.Equal(eventCanonical, input.ReadyEventJSON) || digestBytes(input.ReadyEventJSON) != input.ReadyEventSHA256 ||
 		readyEvent.EventID != input.ReadyEventID || readyEvent.Timestamp.UnixNano() != input.ReadyEventUnixNano || readyEvent.ProjectID != input.ProjectID ||
 		readyEvent.PlanID != input.PlanID || readyEvent.RunID != input.RunID || readyEvent.AttemptID != input.AttemptID ||
-		readyEvent.EventType != "STATE_TRANSITION" || readyEvent.StateFrom != domain.StateIntegrationAccepted || readyEvent.StateTo != domain.StateReadyForMerge {
+		readyEvent.EventType != "STATE_TRANSITION" || readyEvent.StateFrom != domain.StateIntegrationAccepted || readyEvent.StateTo != domain.StateReadyForMerge ||
+		readyEvent.Actor != ReadyEventControllerActorV1 || readyEvent.Source != ReadyEventControllerSourceV1 {
 		return ReadyAuthorityBindingV1{}, errors.New("READY event does not prove the exact INTEGRATION_ACCEPTED to READY_FOR_MERGE transition")
+	}
+	if input.ReadyEventByteOffset+int64(len(input.ReadyEventJSON))+1 != input.LedgerPrefixLength ||
+		input.ReadyRunStateSequence != input.ReadyTransitionOrdinal {
+		return ReadyAuthorityBindingV1{}, errors.New("READY ledger offset, sequence, ordinal, and prefix are incoherent")
 	}
 	if len(input.AcceptedSources) == 0 || len(input.AcceptedSources) > limits.MaxTotalItems {
 		return ReadyAuthorityBindingV1{}, errors.New("accepted source closure is empty or excessive")
 	}
 	seenSources := map[string]struct{}{}
+	integratedHeadSource := false
 	for index := range input.AcceptedSources {
 		source := &input.AcceptedSources[index]
 		if !validText(source.ProjectID, limits.MaxTextBytes, false) || !validText(source.PlanID, limits.MaxTextBytes, false) || !validText(source.RunID, limits.MaxTextBytes, false) ||
@@ -243,6 +251,13 @@ func NewReadyAuthorityBindingV1(input ReadyAuthorityBindingV1Input, limits Limit
 			return ReadyAuthorityBindingV1{}, errors.New("accepted source identity is duplicated")
 		}
 		seenSources[key] = struct{}{}
+		if source.RepositoryIdentity == input.RepositoryBinding.input.Phase3RepositoryIdentity &&
+			source.AcceptedHeadSHA == input.IntegratedHeadSHA.String() {
+			integratedHeadSource = true
+		}
+	}
+	if !integratedHeadSource {
+		return ReadyAuthorityBindingV1{}, errors.New("accepted source closure omits the integrated head")
 	}
 	sort.Slice(input.AcceptedSources, func(i, j int) bool {
 		return acceptedSourceKey(input.AcceptedSources[i]) < acceptedSourceKey(input.AcceptedSources[j])
@@ -253,6 +268,16 @@ func NewReadyAuthorityBindingV1(input ReadyAuthorityBindingV1Input, limits Limit
 	}
 	if len(input.EvidenceClosureRefs) == 0 || canonicalizeEvidence(&input.EvidenceClosureRefs, limits) != nil || !containsEvidence(input.EvidenceClosureRefs, input.ReadyDecisionRef) {
 		return ReadyAuthorityBindingV1{}, errors.New("READY evidence closure is incomplete")
+	}
+	requiredClosure := append([]ledger.EvidenceRef(nil), input.ReadyEvidenceRefs...)
+	requiredClosure = append(requiredClosure, input.RepositoryBinding.input.ConfigurationEvidence)
+	for _, source := range input.AcceptedSources {
+		requiredClosure = append(requiredClosure, source.AcceptanceEvidence...)
+	}
+	for _, evidence := range requiredClosure {
+		if !containsEvidence(input.EvidenceClosureRefs, evidence) {
+			return ReadyAuthorityBindingV1{}, errors.New("READY evidence closure omits controller or accepted-source evidence")
+		}
 	}
 	canonical, digest, err := canonicalJSON(readyBindingWire(input))
 	if err != nil {
@@ -413,7 +438,21 @@ type MergeCommitRecipePolicyV1 struct {
 }
 
 func (p MergeCommitRecipePolicyV1) valid(l Limits) bool {
-	return validText(p.MessageTemplate, l.MaxTextBytes, false) && validText(p.TrailerTemplate, l.MaxTextBytes, false) && p.Author.valid(l) && p.Committer.valid(l) && validOpaqueID(p.TimestampDerivation, l.MaxTextBytes) && (p.ObjectFormat == "sha1" || p.ObjectFormat == "sha256") && p.OrderedParents
+	return validCommitMessage(p.MessageTemplate, l.MaxTextBytes) && !strings.Contains(p.MessageTemplate, "\n\n") && !strings.HasSuffix(p.MessageTemplate, "\n") &&
+		validTrailerName(p.TrailerTemplate, l.MaxTextBytes) && p.Author.valid(l) && p.Committer.valid(l) &&
+		p.TimestampDerivation == "ready-event-time" && (p.ObjectFormat == "sha1" || p.ObjectFormat == "sha256") && p.OrderedParents
+}
+
+func validTrailerName(value string, max int) bool {
+	if !validText(value, max, false) || strings.ContainsAny(value, ":\r\n\x00") {
+		return false
+	}
+	for _, r := range value {
+		if !(r == '-' || r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z') {
+			return false
+		}
+	}
+	return true
 }
 
 type PolicyAuthorityBindingV1Input struct {

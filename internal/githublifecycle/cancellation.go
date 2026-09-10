@@ -60,8 +60,7 @@ type CancellationAuthorityV1Input struct {
 	Attempt                   *WriteAttempt
 	SealSHA256                string
 	CommitmentSHA256          string
-	SubmissionProofKind       CancellationSubmissionProofKindV1
-	SubmissionProofSHA256     string
+	SubmissionProof           CancellationSubmissionProofV1
 	Requester                 StablePrincipalV1
 	AuthenticationEvidence    ledger.EvidenceRef
 	CancellationPolicyVersion string
@@ -90,8 +89,13 @@ func NewCancellationAuthorityV1(input CancellationAuthorityV1Input, limits Limit
 	if err != nil {
 		return CancellationAuthorityV1{}, err
 	}
-	if !validText(input.ProjectID, limits.MaxTextBytes, false) || !validText(input.PlanID, limits.MaxTextBytes, false) || !validText(input.RunID, limits.MaxTextBytes, false) || !validSHA256(input.RepositoryBindingSHA256) || !validSHA256(input.Phase3AuthoritySHA256) || !validSHA256(input.ReadyEventSHA256) || !validOpaqueID(input.ReadyEventID, limits.MaxTextBytes) || input.ReadyRunStateSequence <= 0 || !validSHA256(input.ReadyBindingSHA256) || !validSHA256(input.LedgerPrefixSHA256) || input.LedgerPrefixLength <= 0 || !validSHA256(input.CurrentReadyProofSHA256) || input.ReceiptUnixNano <= 0 || input.IngressSequence <= 0 || !input.Requester.valid(limits) || !validEvidenceRef(input.AuthenticationEvidence) || !validText(input.CancellationPolicyVersion, limits.MaxTextBytes, false) || !validEvidenceRef(input.CancellationPolicySource) || !validSHA256(input.CancellationPolicySHA256) || !validSHA256(input.ScopedGrantSHA256) || !validSHA256(input.AllowDecisionSHA256) || !validOpaqueID(input.SourceRequestID, limits.MaxTextBytes) || !validOpaqueID(input.SourceKind, limits.MaxTextBytes) || !validEvidenceRef(input.RequestEvidence) || !validOpaqueID(input.IngressID, limits.MaxTextBytes) {
+	if !validText(input.ProjectID, limits.MaxTextBytes, false) || !validText(input.PlanID, limits.MaxTextBytes, false) || !validText(input.RunID, limits.MaxTextBytes, false) || !validSHA256(input.RepositoryBindingSHA256) || !validSHA256(input.Phase3AuthoritySHA256) || !validSHA256(input.ReadyEventSHA256) || !validOpaqueID(input.ReadyEventID, limits.MaxTextBytes) || input.ReadyRunStateSequence <= 0 || !validSHA256(input.ReadyBindingSHA256) || !validSHA256(input.LedgerPrefixSHA256) || input.LedgerPrefixLength <= 0 || !validSHA256(input.CurrentReadyProofSHA256) || input.ReceiptUnixNano <= 0 || input.IngressSequence <= 0 || !input.SubmissionProof.valid() || requireLimitsSHA(limits, input.SubmissionProof.limitsSHA) != nil || !input.Requester.valid(limits) || !validEvidenceRef(input.AuthenticationEvidence) || !validText(input.CancellationPolicyVersion, limits.MaxTextBytes, false) || !validEvidenceRef(input.CancellationPolicySource) || !validSHA256(input.CancellationPolicySHA256) || !validSHA256(input.ScopedGrantSHA256) || !validSHA256(input.AllowDecisionSHA256) || !validOpaqueID(input.SourceRequestID, limits.MaxTextBytes) || !validOpaqueID(input.SourceKind, limits.MaxTextBytes) || !validEvidenceRef(input.RequestEvidence) || !validOpaqueID(input.IngressID, limits.MaxTextBytes) {
 		return CancellationAuthorityV1{}, errors.New("cancellation authority identity, principal, policy, READY, or request binding is invalid")
+	}
+	rebuiltSubmission, err := NewCancellationSubmissionProofV1(input.SubmissionProof.input, limits)
+	if err != nil || rebuiltSubmission.SHA256() != input.SubmissionProof.SHA256() ||
+		!bytes.Equal(rebuiltSubmission.CanonicalJSON(), input.SubmissionProof.CanonicalJSON()) {
+		return CancellationAuthorityV1{}, errors.New("cancellation submission proof fails independent canonical validation")
 	}
 	if len(input.EvidenceRefs) == 0 || canonicalizeEvidence(&input.EvidenceRefs, limits) != nil || !containsEvidence(input.EvidenceRefs, input.AuthenticationEvidence) || !containsEvidence(input.EvidenceRefs, input.CancellationPolicySource) || !containsEvidence(input.EvidenceRefs, input.RequestEvidence) {
 		return CancellationAuthorityV1{}, errors.New("cancellation evidence closure is incomplete")
@@ -152,6 +156,7 @@ type cancellationAuthorityWireV1 struct {
 	SealSHA256                string                            `json:"seal_sha256,omitempty"`
 	CommitmentSHA256          string                            `json:"commitment_sha256,omitempty"`
 	SubmissionProofKind       CancellationSubmissionProofKindV1 `json:"submission_proof_kind"`
+	SubmissionProof           json.RawMessage                   `json:"submission_proof"`
 	SubmissionProofSHA256     string                            `json:"submission_proof_sha256"`
 	Requester                 StablePrincipalV1                 `json:"requester"`
 	AuthenticationEvidence    ledger.EvidenceRef                `json:"authentication_evidence"`
@@ -174,7 +179,7 @@ func cancellationWire(i CancellationAuthorityV1Input, id, limitsSHA string) canc
 		wire := attemptWire(*i.Attempt)
 		attempt = &wire
 	}
-	return cancellationAuthorityWireV1{CancellationAuthoritySchemaV1, id, i.ProjectID, i.PlanID, i.RunID, i.RepositoryBindingSHA256, i.Phase3AuthoritySHA256, i.ReadyEventSHA256, i.ReadyEventID, i.ReadyRunStateSequence, i.ReadyBindingSHA256, i.LedgerPrefixSHA256, i.LedgerPrefixLength, i.CurrentReadyProofSHA256, i.Boundary, i.ReceiptUnixNano, i.IngressSequence, i.AdmissionSHA256, attempt, i.SealSHA256, i.CommitmentSHA256, i.SubmissionProofKind, i.SubmissionProofSHA256, i.Requester, i.AuthenticationEvidence, i.CancellationPolicyVersion, i.CancellationPolicySource, i.CancellationPolicySHA256, i.ScopedGrantSHA256, i.AllowDecisionSHA256, i.SourceRequestID, i.SourceKind, i.RequestEvidence, i.IngressID, i.EvidenceRefs, limitsSHA}
+	return cancellationAuthorityWireV1{CancellationAuthoritySchemaV1, id, i.ProjectID, i.PlanID, i.RunID, i.RepositoryBindingSHA256, i.Phase3AuthoritySHA256, i.ReadyEventSHA256, i.ReadyEventID, i.ReadyRunStateSequence, i.ReadyBindingSHA256, i.LedgerPrefixSHA256, i.LedgerPrefixLength, i.CurrentReadyProofSHA256, i.Boundary, i.ReceiptUnixNano, i.IngressSequence, i.AdmissionSHA256, attempt, i.SealSHA256, i.CommitmentSHA256, i.SubmissionProof.input.Kind, i.SubmissionProof.CanonicalJSON(), i.SubmissionProof.SHA256(), i.Requester, i.AuthenticationEvidence, i.CancellationPolicyVersion, i.CancellationPolicySource, i.CancellationPolicySHA256, i.ScopedGrantSHA256, i.AllowDecisionSHA256, i.SourceRequestID, i.SourceKind, i.RequestEvidence, i.IngressID, i.EvidenceRefs, limitsSHA}
 }
 
 func validateCancellationBoundary(i CancellationAuthorityV1Input, limits Limits) error {
@@ -182,24 +187,27 @@ func validateCancellationBoundary(i CancellationAuthorityV1Input, limits Limits)
 	if hasAttempt && (!i.Attempt.valid(limits) || i.Attempt.operation != OperationMerge) {
 		return errors.New("cancellation attempt is invalid")
 	}
-	if !validSHA256(i.SubmissionProofSHA256) {
-		return errors.New("cancellation boundary proof digest is invalid")
+	p := i.SubmissionProof.input
+	if p.Kind == "" || !equalOptionalAttempt(p.Attempt, i.Attempt) || p.AdmissionSHA256 != i.AdmissionSHA256 ||
+		p.SealSHA256 != i.SealSHA256 || p.CommitmentSHA256 != i.CommitmentSHA256 ||
+		!containsEvidence(i.EvidenceRefs, p.EvidenceRef) {
+		return errors.New("cancellation boundary does not match its canonical typed submission proof")
 	}
 	switch i.Boundary {
 	case CancellationPreAdmission:
-		if hasAttempt || i.AdmissionSHA256 != "" || i.SealSHA256 != "" || i.CommitmentSHA256 != "" || i.SubmissionProofKind != CancellationProofNoAdmission {
+		if hasAttempt || i.AdmissionSHA256 != "" || i.SealSHA256 != "" || i.CommitmentSHA256 != "" || p.Kind != CancellationProofNoAdmission {
 			return errors.New("pre-admission cancellation contains admitted attempt state")
 		}
 	case CancellationAdmittedPreTargetSubmission:
-		if !hasAttempt || !validSHA256(i.AdmissionSHA256) || i.CommitmentSHA256 != "" || i.SubmissionProofKind != CancellationProofZeroRequestBytes {
+		if !hasAttempt || !validSHA256(i.AdmissionSHA256) || i.CommitmentSHA256 != "" || p.Kind != CancellationProofZeroRequestBytes {
 			return errors.New("admitted pre-submit cancellation lacks exact zero-byte attempt proof")
 		}
 	case CancellationTargetSubmissionUnknown:
-		if !hasAttempt || !validSHA256(i.AdmissionSHA256) || !validSHA256(i.SealSHA256) || !validSHA256(i.CommitmentSHA256) || i.SubmissionProofKind != CancellationProofUnresolvedSubmission {
+		if !hasAttempt || !validSHA256(i.AdmissionSHA256) || !validSHA256(i.SealSHA256) || !validSHA256(i.CommitmentSHA256) || p.Kind != CancellationProofUnresolvedSubmission {
 			return errors.New("unknown-submission cancellation lacks exact sealed commitment proof")
 		}
 	case CancellationTargetNotApplied:
-		if !hasAttempt || !validSHA256(i.AdmissionSHA256) || !validSHA256(i.SealSHA256) || !validSHA256(i.CommitmentSHA256) || i.SubmissionProofKind != CancellationProofAuthenticatedNotApplied {
+		if !hasAttempt || !validSHA256(i.AdmissionSHA256) || !validSHA256(i.SealSHA256) || !validSHA256(i.CommitmentSHA256) || p.Kind != CancellationProofAuthenticatedNotApplied {
 			return errors.New("not-applied cancellation lacks authenticated all-or-nothing proof")
 		}
 	default:
@@ -209,22 +217,32 @@ func validateCancellationBoundary(i CancellationAuthorityV1Input, limits Limits)
 }
 
 type CancellationAuthorityExpectationV1 struct {
-	ProjectID             string
-	PlanID                string
-	RunID                 string
-	ReadyBinding          ReadyAuthorityBindingV1
-	PolicySHA256          string
-	Requester             StablePrincipalV1
-	Boundary              CancellationBoundaryV1
-	Attempt               *WriteAttempt
-	SealSHA256            string
-	CommitmentSHA256      string
-	SubmissionProofKind   CancellationSubmissionProofKindV1
-	SubmissionProofSHA256 string
-	SourceRequestID       string
-	IngressID             string
-	ReceiptUnixNano       int64
-	IngressSequence       int64
+	ProjectID                 string
+	PlanID                    string
+	RunID                     string
+	ReadyBinding              ReadyAuthorityBindingV1
+	CurrentReadyProofSHA256   string
+	AdmissionSHA256           string
+	Requester                 StablePrincipalV1
+	AuthenticationEvidence    ledger.EvidenceRef
+	CancellationPolicyVersion string
+	CancellationPolicySource  ledger.EvidenceRef
+	CancellationPolicySHA256  string
+	ScopedGrantSHA256         string
+	AllowDecisionSHA256       string
+	Boundary                  CancellationBoundaryV1
+	Attempt                   *WriteAttempt
+	SealSHA256                string
+	CommitmentSHA256          string
+	SealedAuthorization       SealedMergeAuthorizationV1
+	SubmissionProof           CancellationSubmissionProofV1
+	SourceRequestID           string
+	SourceKind                string
+	RequestEvidence           ledger.EvidenceRef
+	IngressID                 string
+	ReceiptUnixNano           int64
+	IngressSequence           int64
+	EvidenceRefs              []ledger.EvidenceRef
 }
 
 func ValidateCancellationAuthorityV1(authority CancellationAuthorityV1, expected CancellationAuthorityExpectationV1, limits Limits) error {
@@ -239,8 +257,59 @@ func ValidateCancellationAuthorityV1(authority CancellationAuthorityV1, expected
 		return errors.New("cancellation authority fails independent validation")
 	}
 	i := authority.input
-	if !expected.ReadyBinding.valid() || i.ProjectID != expected.ProjectID || i.PlanID != expected.PlanID || i.RunID != expected.RunID || i.RepositoryBindingSHA256 != expected.ReadyBinding.RepositoryBinding().SHA256() || i.Phase3AuthoritySHA256 != expected.ReadyBinding.input.Phase3AuthoritySHA256 || i.ReadyEventSHA256 != expected.ReadyBinding.input.ReadyEventSHA256 || i.ReadyEventID != expected.ReadyBinding.input.ReadyEventID || i.ReadyRunStateSequence != expected.ReadyBinding.input.ReadyRunStateSequence || i.ReadyBindingSHA256 != expected.ReadyBinding.SHA256() || i.LedgerPrefixSHA256 != expected.ReadyBinding.input.LedgerPrefixSHA256 || i.LedgerPrefixLength != expected.ReadyBinding.input.LedgerPrefixLength || i.CancellationPolicySHA256 != expected.PolicySHA256 || i.Requester != expected.Requester || i.Boundary != expected.Boundary || !equalOptionalAttempt(i.Attempt, expected.Attempt) || i.SealSHA256 != expected.SealSHA256 || i.CommitmentSHA256 != expected.CommitmentSHA256 || i.SubmissionProofKind != expected.SubmissionProofKind || i.SubmissionProofSHA256 != expected.SubmissionProofSHA256 || i.SourceRequestID != expected.SourceRequestID || i.IngressID != expected.IngressID || i.ReceiptUnixNano != expected.ReceiptUnixNano || i.IngressSequence != expected.IngressSequence {
+	if !expected.ReadyBinding.valid() || !expected.SubmissionProof.valid() ||
+		i.ProjectID != expected.ProjectID || i.PlanID != expected.PlanID || i.RunID != expected.RunID ||
+		i.RepositoryBindingSHA256 != expected.ReadyBinding.RepositoryBinding().SHA256() || i.Phase3AuthoritySHA256 != expected.ReadyBinding.input.Phase3AuthoritySHA256 ||
+		i.ReadyEventSHA256 != expected.ReadyBinding.input.ReadyEventSHA256 || i.ReadyEventID != expected.ReadyBinding.input.ReadyEventID ||
+		i.ReadyRunStateSequence != expected.ReadyBinding.input.ReadyRunStateSequence || i.ReadyBindingSHA256 != expected.ReadyBinding.SHA256() ||
+		i.LedgerPrefixSHA256 != expected.ReadyBinding.input.LedgerPrefixSHA256 || i.LedgerPrefixLength != expected.ReadyBinding.input.LedgerPrefixLength ||
+		i.CurrentReadyProofSHA256 != expected.CurrentReadyProofSHA256 || i.AdmissionSHA256 != expected.AdmissionSHA256 ||
+		i.Requester != expected.Requester || i.AuthenticationEvidence != expected.AuthenticationEvidence ||
+		i.CancellationPolicyVersion != expected.CancellationPolicyVersion || i.CancellationPolicySource != expected.CancellationPolicySource ||
+		i.CancellationPolicySHA256 != expected.CancellationPolicySHA256 || i.ScopedGrantSHA256 != expected.ScopedGrantSHA256 ||
+		i.AllowDecisionSHA256 != expected.AllowDecisionSHA256 || i.Boundary != expected.Boundary || !equalOptionalAttempt(i.Attempt, expected.Attempt) ||
+		i.SealSHA256 != expected.SealSHA256 || i.CommitmentSHA256 != expected.CommitmentSHA256 ||
+		i.SubmissionProof.SHA256() != expected.SubmissionProof.SHA256() || !bytes.Equal(i.SubmissionProof.CanonicalJSON(), expected.SubmissionProof.CanonicalJSON()) ||
+		i.SourceRequestID != expected.SourceRequestID || i.SourceKind != expected.SourceKind || i.RequestEvidence != expected.RequestEvidence ||
+		i.IngressID != expected.IngressID || i.ReceiptUnixNano != expected.ReceiptUnixNano || i.IngressSequence != expected.IngressSequence ||
+		!equalEvidence(i.EvidenceRefs, expected.EvidenceRefs) {
 		return errors.New("cancellation authority does not match independent READY, policy, principal, request, attempt, or boundary expectations")
+	}
+	if err := validateCancellationSubmissionExpectationV1(expected, limits); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateCancellationSubmissionExpectationV1(expected CancellationAuthorityExpectationV1, limits Limits) error {
+	rebuiltProof, err := NewCancellationSubmissionProofV1(expected.SubmissionProof.input, limits)
+	if err != nil || rebuiltProof.SHA256() != expected.SubmissionProof.SHA256() ||
+		!bytes.Equal(rebuiltProof.CanonicalJSON(), expected.SubmissionProof.CanonicalJSON()) {
+		return errors.New("expected cancellation submission proof fails independent validation")
+	}
+	if expected.Boundary != CancellationTargetSubmissionUnknown && expected.Boundary != CancellationTargetNotApplied {
+		return nil
+	}
+	sealed := expected.SealedAuthorization
+	if !sealed.valid() {
+		return errors.New("submitted cancellation expectation lacks the exact sealed authorization")
+	}
+	recovered, err := ParseCanonicalSealedMergeAuthorizationV1(sealed.CanonicalJSON(), limits)
+	if err != nil || recovered.SHA256() != sealed.SHA256() || !bytes.Equal(recovered.CanonicalJSON(), sealed.CanonicalJSON()) {
+		return errors.New("submitted cancellation expectation sealed authorization fails independent validation")
+	}
+	mergeInput := sealed.input.MergeInput
+	proof := expected.SubmissionProof.input
+	if expected.AdmissionSHA256 != mergeInput.SHA256() || !equalOptionalAttempt(expected.Attempt, &mergeInput.attempt) ||
+		expected.SealSHA256 != sealed.input.Seal.SHA256() || expected.CommitmentSHA256 != sealed.input.Commitment.SHA256() ||
+		proof.AdmissionSHA256 != mergeInput.SHA256() || !equalOptionalAttempt(proof.Attempt, &mergeInput.attempt) ||
+		proof.SealSHA256 != sealed.input.Seal.SHA256() || proof.CommitmentSHA256 != sealed.input.Commitment.SHA256() {
+		return errors.New("submitted cancellation expectation changed its sealed admission, attempt, seal, or commitment")
+	}
+	if expected.Boundary == CancellationTargetNotApplied {
+		if proof.NotAppliedProof == nil || ValidateNotAppliedProofV1(sealed, *proof.NotAppliedProof, limits) != nil {
+			return errors.New("submitted cancellation expectation lacks the exact sealed NOT_APPLIED proof")
+		}
 	}
 	return nil
 }
@@ -261,7 +330,22 @@ func ParseCanonicalCancellationAuthorityV1(data []byte, limits Limits) (Cancella
 		}
 		attempt = &value
 	}
-	input := CancellationAuthorityV1Input{w.ProjectID, w.PlanID, w.RunID, w.RepositoryBindingSHA256, w.Phase3AuthoritySHA256, w.ReadyEventSHA256, w.ReadyEventID, w.ReadyRunStateSequence, w.ReadyBindingSHA256, w.LedgerPrefixSHA256, w.LedgerPrefixLength, w.CurrentReadyProofSHA256, w.Boundary, w.ReceiptUnixNano, w.IngressSequence, w.AdmissionSHA256, attempt, w.SealSHA256, w.CommitmentSHA256, w.SubmissionProofKind, w.SubmissionProofSHA256, w.Requester, w.AuthenticationEvidence, w.CancellationPolicyVersion, w.CancellationPolicySource, w.CancellationPolicySHA256, w.ScopedGrantSHA256, w.AllowDecisionSHA256, w.SourceRequestID, w.SourceKind, w.RequestEvidence, w.IngressID, w.EvidenceRefs}
+	submissionProof, err := ParseCanonicalCancellationSubmissionProofV1(w.SubmissionProof, limits)
+	if err != nil || submissionProof.SHA256() != w.SubmissionProofSHA256 || submissionProof.input.Kind != w.SubmissionProofKind {
+		return CancellationAuthorityV1{}, errors.New("cancellation submission proof identity disagrees")
+	}
+	input := CancellationAuthorityV1Input{
+		ProjectID: w.ProjectID, PlanID: w.PlanID, RunID: w.RunID, RepositoryBindingSHA256: w.RepositoryBindingSHA256,
+		Phase3AuthoritySHA256: w.Phase3AuthoritySHA256, ReadyEventSHA256: w.ReadyEventSHA256, ReadyEventID: w.ReadyEventID,
+		ReadyRunStateSequence: w.ReadyRunStateSequence, ReadyBindingSHA256: w.ReadyBindingSHA256, LedgerPrefixSHA256: w.LedgerPrefixSHA256,
+		LedgerPrefixLength: w.LedgerPrefixLength, CurrentReadyProofSHA256: w.CurrentReadyProofSHA256, Boundary: w.Boundary,
+		ReceiptUnixNano: w.ReceiptUnixNano, IngressSequence: w.IngressSequence, AdmissionSHA256: w.AdmissionSHA256, Attempt: attempt,
+		SealSHA256: w.SealSHA256, CommitmentSHA256: w.CommitmentSHA256, SubmissionProof: submissionProof, Requester: w.Requester,
+		AuthenticationEvidence: w.AuthenticationEvidence, CancellationPolicyVersion: w.CancellationPolicyVersion,
+		CancellationPolicySource: w.CancellationPolicySource, CancellationPolicySHA256: w.CancellationPolicySHA256,
+		ScopedGrantSHA256: w.ScopedGrantSHA256, AllowDecisionSHA256: w.AllowDecisionSHA256, SourceRequestID: w.SourceRequestID,
+		SourceKind: w.SourceKind, RequestEvidence: w.RequestEvidence, IngressID: w.IngressID, EvidenceRefs: w.EvidenceRefs,
+	}
 	value, err := NewCancellationAuthorityV1(input, limits)
 	if err != nil {
 		return CancellationAuthorityV1{}, err
@@ -276,29 +360,31 @@ func ParseCanonicalCancellationAuthorityV1(data []byte, limits Limits) (Cancella
 }
 
 type DurableCancellationAuthorityV1 struct {
-	authority           CancellationAuthorityV1
-	channelEvidence     ledger.EvidenceRef
-	replayIndexEvidence ledger.EvidenceRef
-	canonical           []byte
-	digest              string
+	authority       CancellationAuthorityV1
+	channelEvidence ledger.EvidenceRef
+	replayIdentity  CancellationReplayIdentityV1
+	canonical       []byte
+	digest          string
 }
 
-func NewDurableCancellationAuthorityV1(authority CancellationAuthorityV1, channelEvidence, replayIndexEvidence ledger.EvidenceRef, limits Limits) (DurableCancellationAuthorityV1, error) {
-	if !authority.valid() || requireLimitsSHA(limits, authority.limitsSHA) != nil || !validEvidenceRef(channelEvidence) || !validEvidenceRef(replayIndexEvidence) {
+func NewDurableCancellationAuthorityV1(authority CancellationAuthorityV1, channelEvidence ledger.EvidenceRef, replayIdentity CancellationReplayIdentityV1, limits Limits) (DurableCancellationAuthorityV1, error) {
+	if !authority.valid() || requireLimitsSHA(limits, authority.limitsSHA) != nil || !validEvidenceRef(channelEvidence) ||
+		validateCancellationReplayIdentityV1(authority, replayIdentity, limits) != nil {
 		return DurableCancellationAuthorityV1{}, errors.New("durable cancellation authority requires validated fsynced channel and replay-index evidence")
 	}
 	wire := struct {
-		Schema              string             `json:"schema"`
-		Authority           json.RawMessage    `json:"authority"`
-		AuthoritySHA256     string             `json:"authority_sha256"`
-		ChannelEvidence     ledger.EvidenceRef `json:"channel_evidence"`
-		ReplayIndexEvidence ledger.EvidenceRef `json:"replay_index_evidence"`
-	}{DurableCancellationAuthoritySchemaV1, authority.CanonicalJSON(), authority.SHA256(), channelEvidence, replayIndexEvidence}
+		Schema               string             `json:"schema"`
+		Authority            json.RawMessage    `json:"authority"`
+		AuthoritySHA256      string             `json:"authority_sha256"`
+		ChannelEvidence      ledger.EvidenceRef `json:"channel_evidence"`
+		ReplayIdentity       json.RawMessage    `json:"replay_identity"`
+		ReplayIdentitySHA256 string             `json:"replay_identity_sha256"`
+	}{DurableCancellationAuthoritySchemaV1, authority.CanonicalJSON(), authority.SHA256(), channelEvidence, replayIdentity.CanonicalJSON(), replayIdentity.SHA256()}
 	canonical, digest, err := canonicalJSON(wire)
 	if err != nil {
 		return DurableCancellationAuthorityV1{}, err
 	}
-	return DurableCancellationAuthorityV1{authority, channelEvidence, replayIndexEvidence, canonical, digest}, nil
+	return DurableCancellationAuthorityV1{authority, channelEvidence, replayIdentity, canonical, digest}, nil
 }
 func (d DurableCancellationAuthorityV1) CanonicalJSON() []byte {
 	return append([]byte(nil), d.canonical...)
@@ -308,7 +394,8 @@ func (d DurableCancellationAuthorityV1) Authority() CancellationAuthorityV1 {
 	return cloneCancellationAuthority(d.authority)
 }
 func AuthorizeCancelledV1(durable DurableCancellationAuthorityV1, expected CancellationAuthorityExpectationV1, disposition ReconciliationDisposition, limits Limits, notAppliedProof ...NotAppliedProofV1) error {
-	if len(durable.canonical) == 0 || digestBytes(durable.canonical) != durable.digest || !validEvidenceRef(durable.channelEvidence) || !validEvidenceRef(durable.replayIndexEvidence) {
+	if len(durable.canonical) == 0 || digestBytes(durable.canonical) != durable.digest || !validEvidenceRef(durable.channelEvidence) ||
+		validateCancellationReplayIdentityV1(durable.authority, durable.replayIdentity, limits) != nil {
 		return errors.New("CANCELLED requires a prior durable cancellation authority")
 	}
 	if err := ValidateCancellationAuthorityV1(durable.authority, expected, limits); err != nil {
@@ -319,8 +406,18 @@ func AuthorizeCancelledV1(durable DurableCancellationAuthorityV1, expected Cance
 		return errors.New("APPLIED always defeats cancellation")
 	}
 	if boundary == CancellationTargetSubmissionUnknown || boundary == CancellationTargetNotApplied {
-		if disposition != ReconciliationNotApplied || len(notAppliedProof) != 1 || !notAppliedProof[0].valid(limits) || notAppliedProof[0].CommitmentSHA256 != durable.authority.input.CommitmentSHA256 {
+		if disposition != ReconciliationNotApplied || len(notAppliedProof) != 1 || !expected.SealedAuthorization.valid() ||
+			expected.SealedAuthorization.Seal().SHA256() != durable.authority.input.SealSHA256 ||
+			expected.SealedAuthorization.Commitment().SHA256() != durable.authority.input.CommitmentSHA256 ||
+			ValidateNotAppliedProofV1(expected.SealedAuthorization, notAppliedProof[0], limits) != nil ||
+			notAppliedProof[0].CommitmentSHA256() != durable.authority.input.CommitmentSHA256 {
 			return errors.New("submitted cancellation requires exact typed NOT_APPLIED proof")
+		}
+		if boundary == CancellationTargetNotApplied {
+			bound := durable.authority.input.SubmissionProof.input.NotAppliedProof
+			if bound == nil || bound.SHA256() != notAppliedProof[0].SHA256() || !bytes.Equal(bound.CanonicalJSON(), notAppliedProof[0].CanonicalJSON()) {
+				return errors.New("TARGET_NOT_APPLIED cancellation changed its exact typed proof")
+			}
 		}
 	} else if len(notAppliedProof) != 0 {
 		return errors.New("pre-submit cancellation cannot adopt target reconciliation proof")
@@ -356,6 +453,7 @@ func cloneCancellationInput(i CancellationAuthorityV1Input) CancellationAuthorit
 		v := *i.Attempt
 		i.Attempt = &v
 	}
+	i.SubmissionProof = cloneCancellationSubmissionProof(i.SubmissionProof)
 	i.EvidenceRefs = append([]ledger.EvidenceRef(nil), i.EvidenceRefs...)
 	return i
 }

@@ -54,7 +54,7 @@ func newFixture(t *testing.T, method MergeMethod) fixture {
 	f.resultTree = f.headTree
 	f.pr = must(NewPullRequestIdentity(17, "PR_node_17")).(PullRequestIdentity)
 	f.actor = must(NewAppInstallationIdentity("github-app:builder", 90210)).(ActingIdentity)
-	f.snapshot = must(NewSnapshotIdentity("github", "request-1", time.Now().UnixNano())).(SnapshotIdentity)
+	f.snapshot = must(NewSnapshotIdentity("github", "request-initial", time.Unix(1700000000, 100).UnixNano())).(SnapshotIdentity)
 	expected := fakeExpectedContent(t, f.headSHA, f.baseSHA, f.headTree)
 	readyRef := expected.SourceIntegrationEvidence()
 	configRef := ledger.EvidenceRef{URI: "evidence/repository.json", Kind: "repository-binding", SHA256: strings.Repeat("a", 64)}
@@ -72,7 +72,7 @@ func newFixture(t *testing.T, method MergeMethod) fixture {
 	ready := must(NewReadyAuthorityBindingV1(ReadyAuthorityBindingV1Input{
 		Phase3AuthorityJSON: phase3JSON, Phase3AuthoritySHA256: digestBytes(phase3JSON), ProjectID: "project-1", PlanID: "plan-1", RunID: "run-1", AttemptID: "attempt-1",
 		AcceptedSources:   []AcceptedSourceCandidateV1{{ProjectID: "source-project", PlanID: "source-plan", RunID: "source-run", AttemptID: "source-attempt", RepositoryIdentity: "repo-id", Branch: f.head.String(), StartSHA: f.baseSHA.String(), AcceptedHeadSHA: f.headSHA.String(), AcceptancePolicyIdentity: "accept-v1", AcceptanceEvidence: []ledger.EvidenceRef{readyRef}}},
-		RepositoryBinding: repositoryBinding, ReadyEventJSON: readyEventJSON, ReadyEventSHA256: digestBytes(readyEventJSON), ReadyEventID: readyEvent.EventID, ReadyEventUnixNano: readyEvent.Timestamp.UnixNano(), LedgerIdentity: "ledger-dev-ino", ReadyEventByteOffset: 10, ReadyRunStateSequence: 9, LedgerPrefixLength: 100, LedgerPrefixSHA256: strings.Repeat("c", 64), ReadyTransitionOrdinal: 9,
+		RepositoryBinding: repositoryBinding, ReadyEventJSON: readyEventJSON, ReadyEventSHA256: digestBytes(readyEventJSON), ReadyEventID: readyEvent.EventID, ReadyEventUnixNano: readyEvent.Timestamp.UnixNano(), LedgerIdentity: "ledger-dev-ino", ReadyEventByteOffset: 10, ReadyRunStateSequence: 9, LedgerPrefixLength: 10 + int64(len(readyEventJSON)) + 1, LedgerPrefixSHA256: strings.Repeat("c", 64), ReadyTransitionOrdinal: 9,
 		ReadyEvidenceRefs: []ledger.EvidenceRef{readyRef}, ReadyDecisionRef: readyRef, EvidenceClosureRefs: []ledger.EvidenceRef{readyRef, configRef}, IntegratedHeadSHA: f.headSHA, BaselineSHA: f.baseSHA, ExpectedTreeSHA: f.headTree,
 	}, f.limits)).(ReadyAuthorityBindingV1)
 	policySource := ledger.EvidenceRef{URI: "evidence/merge-policy.json", Kind: "merge-policy", SHA256: strings.Repeat("f", 64)}
@@ -88,34 +88,57 @@ func newFixture(t *testing.T, method MergeMethod) fixture {
 	if method != MergeMethodMerge {
 		return f
 	}
-	f.checkRuns = emptyPaginationClosure(t, f, PaginationCheckRuns, "/repos/octo-org/control-plane/commits/"+f.headSHA.String()+"/check-runs", nil)
-	f.statuses = emptyPaginationClosure(t, f, PaginationCommitStatuses, "/repos/octo-org/control-plane/commits/"+f.headSHA.String()+"/statuses", nil)
-	reviews := emptyPaginationClosure(t, f, PaginationReviews, "/repos/octo-org/control-plane/pulls/17/reviews", &f.pr)
+	f.checkRuns = emptyPaginationClosure(t, f, PaginationCheckRuns, nil, "request-checks-initial", f.snapshot.ObservedUnixNano())
+	f.statuses = emptyPaginationClosure(t, f, PaginationCommitStatuses, nil, "request-statuses-initial", f.snapshot.ObservedUnixNano())
+	reviews := emptyPaginationClosure(t, f, PaginationReviews, &f.pr, "request-reviews-initial", f.snapshot.ObservedUnixNano())
 	open, no := PullRequestOpen, false
-	f.prAuth = must(NewAuthoritativePullRequestSnapshotV1(AuthoritativePullRequestSnapshotV1Input{Snapshot: f.snapshot, ResponseBodySHA256: strings.Repeat("1", 64), APIVersion: "2026-03-10", RepositoryBinding: repositoryBinding, PullRequest: f.pr, PullRequestDatabaseID: 17, BaseRepositoryNodeID: "R_repo", BaseRef: "refs/heads/" + f.base.String(), BaseOID: f.baseSHA, HeadRepositoryNodeID: "R_repo", HeadRef: "refs/heads/" + f.head.String(), HeadOID: f.headSHA, State: &open, IsDraft: &no, Merged: &no, Actor: f.actor, Reviews: []Review{}, ReviewsClosure: reviews, EvidenceRefs: []ledger.EvidenceRef{readyRef}}, f.limits)).(AuthoritativePullRequestSnapshotV1)
+	prSnapshot := must(NewSnapshotIdentity("github", "request-pr-initial", f.snapshot.ObservedUnixNano())).(SnapshotIdentity)
+	f.prAuth = must(NewAuthoritativePullRequestSnapshotV1(AuthoritativePullRequestSnapshotV1Input{Snapshot: prSnapshot, ResponseBodySHA256: strings.Repeat("1", 64), APIVersion: GitHubAPIVersionV1, RepositoryBinding: repositoryBinding, PullRequest: f.pr, PullRequestDatabaseID: 17, BaseRepositoryNodeID: "R_repo", BaseRef: "refs/heads/" + f.base.String(), BaseOID: f.baseSHA, HeadRepositoryNodeID: "R_repo", HeadRef: "refs/heads/" + f.head.String(), HeadOID: f.headSHA, State: &open, IsDraft: &no, Merged: &no, Actor: f.actor, Reviews: []Review{}, ReviewsClosure: reviews, EvidenceRefs: []ledger.EvidenceRef{readyRef}}, f.limits)).(AuthoritativePullRequestSnapshotV1)
 	capability := must(NewProviderCapabilityV1(ProviderCapabilityV1Input{Name: GitHubAtomicBaseHeadCapabilityV1, RepositoryNodeID: "R_repo", APIVersion: "2026-03-10", Atomic: true, AllOrNothing: true, SupportsNoOp: true, BaseThenHeadOrder: true, ForceFalse: true, EvidenceRefs: []ledger.EvidenceRef{configRef}}, f.limits)).(ProviderCapabilityV1)
-	authoritySHA, _ := f.authority.SHA256()
-	f.recipe = must(NewMergeCommitRecipeV1(MergeCommitRecipeV1Input{Repository: f.repository, TargetRef: "refs/heads/" + f.base.String(), ExpectedResultTree: f.headTree, Parents: []GitSHA{f.baseSHA, f.headSHA}, Message: "Merge authorized head\n\nABCP-Write-ID: merge-write-1", Author: identity, Committer: identity, AuthorUnix: 1700000000, CommitterUnix: 1700000000, ObjectFormat: "sha1", WriteID: "merge-write-1", AuthoritySHA256: authoritySHA, PolicySHA256: policy.SHA256(), ReadyBindingSHA256: ready.SHA256()}, policy, f.limits)).(MergeCommitRecipeV1)
+	f.recipe = must(NewMergeCommitRecipeV1("merge-write-1", f.authority, f.limits)).(MergeCommitRecipeV1)
 	f.resultSHA = f.recipe.ExpectedResultSHA()
 	approval := ledger.EvidenceRef{URI: "evidence/approval", Kind: "approval", SHA256: strings.Repeat("8", 64)}
 	f.mergeWrite = must(NewMergeInput(MergeAuthorizationInputV1{f.authority, strings.Repeat("9", 64), f.prAuth, []Check{}, f.checkRuns, f.statuses, capability, f.recipe, []ledger.EvidenceRef{approval}}, "merge-write-1", f.limits)).(MergeInput)
-	seal := must(NewAuthorizationSealV1(AuthorizationSealV1Input{MergeInput: f.mergeWrite, FinalPullRequest: f.prAuth, FinalChecks: []Check{}, FinalCheckRunsClosure: f.checkRuns, FinalCommitStatusesClosure: f.statuses, PolicyDecisionSHA256: strings.Repeat("9", 64), Verdict: "authorized", PREligible: true, Capability: capability, Recipe: f.recipe, Counters: AuthorizationCountersV1{}, NoTargetRequestAttempted: true, EvidenceRefs: []ledger.EvidenceRef{approval}}, f.limits)).(AuthorizationSealV1)
-	commitment := must(NewTargetRefCommitmentV1(f.mergeWrite, seal, "mutation-1", f.limits)).(TargetRefCommitmentV1)
+	readyProof := must(NewCurrentReadyProofV1(CurrentReadyProofV1Input{ReadyBinding: ready, ControllerSequence: 10, ObservedUnixNano: 1700000001000000000, ObservedBoundPrefixSHA256: ready.input.LedgerPrefixSHA256, ObservedLedgerLength: ready.input.LedgerPrefixLength, ObservedLedgerSHA256: ready.input.LedgerPrefixSHA256, NoLaterTransition: true, EvidenceRefs: []ledger.EvidenceRef{readyRef}}, f.limits)).(CurrentReadyProofV1)
+	finalReviews := emptyPaginationClosure(t, f, PaginationReviews, &f.pr, "request-reviews-final", 1700000002200000000)
+	finalChecks := emptyPaginationClosure(t, f, PaginationCheckRuns, nil, "request-checks-final", 1700000002300000000)
+	finalStatuses := emptyPaginationClosure(t, f, PaginationCommitStatuses, nil, "request-statuses-final", 1700000002400000000)
+	finalPRInput := f.prAuth.Input()
+	finalPRInput.Snapshot = must(NewSnapshotIdentity("github", "request-pr-final", 1700000002500000000)).(SnapshotIdentity)
+	finalPRInput.ReviewsClosure = finalReviews
+	finalPR := must(NewAuthoritativePullRequestSnapshotV1(finalPRInput, f.limits)).(AuthoritativePullRequestSnapshotV1)
+	finalEvidence := []ledger.EvidenceRef{approval, readyRef}
+	finalEvidence = append(finalEvidence, finalReviews.input.EvidenceRefs...)
+	finalEvidence = append(finalEvidence, finalChecks.input.EvidenceRefs...)
+	finalEvidence = append(finalEvidence, finalStatuses.input.EvidenceRefs...)
+	final := must(NewFinalRevalidationV1(FinalRevalidationV1Input{
+		MergeInput: f.mergeWrite, ControllerSequence: 11, StartedUnixNano: 1700000002000000000, CompletedUnixNano: 1700000003000000000,
+		CurrentReadyProof: readyProof, PullRequest: finalPR, Checks: []Check{}, CheckRunsClosure: finalChecks,
+		CommitStatusesClosure: finalStatuses, Capability: capability, Recipe: f.recipe, Counters: AuthorizationCountersV1{},
+		NoTargetRequestAttempted: true, EvidenceRefs: finalEvidence,
+	}, f.limits)).(FinalRevalidationV1)
+	seal := must(NewAuthorizationSealV1(AuthorizationSealV1Input{MergeInput: f.mergeWrite, FinalRevalidation: final}, f.limits)).(AuthorizationSealV1)
+	commitment := must(NewTargetRefCommitmentV1(f.mergeWrite, seal, f.limits)).(TargetRefCommitmentV1)
 	f.sealed = must(NewSealedMergeAuthorizationV1(SealedMergeAuthorizationV1Input{f.mergeWrite, seal, commitment}, f.limits)).(SealedMergeAuthorizationV1)
 	return f
 }
 
-func emptyPaginationClosure(t *testing.T, f fixture, source PaginationSourceKind, path string, pr *PullRequestIdentity) PaginationClosureV1 {
+func emptyPaginationClosure(t *testing.T, f fixture, source PaginationSourceKind, pr *PullRequestIdentity, requestID string, observedUnixNano int64) PaginationClosureV1 {
 	t.Helper()
-	query := PaginationQueryV1{Source: source, Protocol: PaginationREST, Method: "GET", PathOrDocumentSHA256: path, APIVersion: "2026-03-10", RepositoryNodeID: "R_repo", HeadSHA: f.headSHA.String(), Variables: map[string]string{}, PerPage: f.limits.MaxItemsPerPage}
-	if pr != nil {
-		query.PullRequestNumber, query.PullRequestNodeID = pr.Number(), pr.NodeID()
-	}
-	page, err := NewPaginationPageV1(PaginationPageV1Input{Ordinal: 0, RequestedPage: 1, Response: f.snapshot, RawBodySHA256: strings.Repeat("7", 64), Items: []CanonicalPaginationItemV1{}, RESTLinkHeader: ""}, f.limits)
+	query, err := DerivePaginationQueryV1(PaginationQueryScopeV1{Source: source, Repository: f.repository, RepositoryNodeID: "R_repo", PullRequest: pr, HeadSHA: f.headSHA}, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	closure, err := NewPaginationClosureV1(PaginationClosureV1Input{Query: query, Pages: []PaginationPageV1{page}, EvidenceRefs: []ledger.EvidenceRef{{URI: "evidence/page-" + string(source), Kind: "pagination", SHA256: strings.Repeat("6", 64)}}}, f.limits)
+	response, err := NewSnapshotIdentity("github", requestID, observedUnixNano)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyEvidence := ledger.EvidenceRef{URI: "evidence/response-" + requestID, Kind: "github-response-body", SHA256: strings.Repeat("7", 64)}
+	page, err := NewPaginationPageV1(PaginationPageV1Input{Ordinal: 0, RequestedPage: 1, Response: response, RawBodySHA256: bodyEvidence.SHA256, ResponseEvidence: bodyEvidence, Items: []CanonicalPaginationItemV1{}, RESTLinkHeader: "", RESTLinkObserved: true}, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure, err := NewPaginationClosureV1(PaginationClosureV1Input{Query: query, Pages: []PaginationPageV1{page}, EvidenceRefs: []ledger.EvidenceRef{bodyEvidence}}, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +406,13 @@ func TestSubmittedCancellationAndDeadlineAreAmbiguousAndNotRetried(t *testing.T)
 	}
 
 	evidence := []ledger.EvidenceRef{{URI: "evidence/reconcile.json", Kind: "reconciliation", SHA256: strings.Repeat("a", 64)}}
-	proof := NotAppliedProofV1{Kind: NotAppliedAtomicBaseRejected, CommitmentSHA256: f.sealed.Commitment().SHA256(), ResponseRequestID: "request-2", EvidenceRef: evidence[0]}
+	response, _ := NewSnapshotIdentity("github", "request-2", 1700000004000000000)
+	proofEvidence := ledger.EvidenceRef{URI: "evidence/not-applied.json", Kind: NotAppliedAtomicRejectionEvidenceKindV1, SHA256: strings.Repeat("b", 64)}
+	proof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicBaseRejected, RequestID: "target-attempt-2", RequestBodySHA256: f.sealed.Commitment().SHA256(), RequestBytes: 50, Response: &response, HTTPStatus: 200, ResponseBodySHA256: strings.Repeat("c", 64), EvidenceRef: proofEvidence}, f.sealed, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence = append(evidence, proofEvidence)
 	reconciled, err := NewMergeReconciliationResult(f.sealed, ReconciliationNotApplied, nil, &proof, evidence, f.limits)
 	if err != nil {
 		t.Fatal(err)

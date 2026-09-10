@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -91,12 +92,20 @@ func NewAuthoritativePullRequestSnapshotV1(input AuthoritativePullRequestSnapsho
 	if !input.ReviewsClosure.valid() || input.ReviewsClosure.input.Query.Source != PaginationReviews {
 		return AuthoritativePullRequestSnapshotV1{}, errors.New("independent reviews pagination closure is required")
 	}
-	if err := ValidatePaginationClosureV1(input.ReviewsClosure.input.Query, input.ReviewsClosure, reviewItems, limits); err != nil {
+	scope := PaginationQueryScopeV1{
+		Source: PaginationReviews, Repository: input.RepositoryBinding.input.GitHubRepository,
+		RepositoryNodeID: repositoryNode, PullRequest: &input.PullRequest, HeadSHA: input.HeadOID,
+	}
+	if err := ValidatePaginationClosureV1(scope, input.ReviewsClosure, reviewItems, limits); err != nil {
 		return AuthoritativePullRequestSnapshotV1{}, err
 	}
-	query := input.ReviewsClosure.input.Query
-	if query.RepositoryNodeID != repositoryNode || query.PullRequestNumber != input.PullRequest.Number() || query.PullRequestNodeID != input.PullRequest.NodeID() || query.HeadSHA != input.HeadOID.String() {
-		return AuthoritativePullRequestSnapshotV1{}, errors.New("reviews pagination query does not match PR authority")
+	sort.Slice(input.Reviews, func(i, j int) bool {
+		left := fmt.Sprintf("%020d/%s", input.Reviews[i].DatabaseID, input.Reviews[i].NodeID)
+		right := fmt.Sprintf("%020d/%s", input.Reviews[j].DatabaseID, input.Reviews[j].NodeID)
+		return left < right
+	})
+	if input.APIVersion != GitHubAPIVersionV1 {
+		return AuthoritativePullRequestSnapshotV1{}, errors.New("authoritative PR API version is not the frozen version")
 	}
 	if len(input.EvidenceRefs) == 0 || canonicalizeEvidence(&input.EvidenceRefs, limits) != nil {
 		return AuthoritativePullRequestSnapshotV1{}, errors.New("authoritative PR evidence is invalid")
@@ -268,10 +277,17 @@ func EvaluateMergePolicyV1(authority Authority, pr AuthoritativePullRequestSnaps
 	if checkRuns.input.Query.Source != PaginationCheckRuns || commitStatuses.input.Query.Source != PaginationCommitStatuses {
 		return errors.New("both independent check source closures are required")
 	}
-	if err := ValidatePaginationClosureV1(checkRuns.input.Query, checkRuns, runItems, limits); err != nil {
+	repositoryBinding := authority.ReadyBinding().RepositoryBinding()
+	if err := ValidatePaginationClosureV1(PaginationQueryScopeV1{
+		Source: PaginationCheckRuns, Repository: authority.Repository(),
+		RepositoryNodeID: repositoryBinding.input.GitHubRepositoryNodeID, HeadSHA: authority.HeadSHA(),
+	}, checkRuns, runItems, limits); err != nil {
 		return err
 	}
-	if err := ValidatePaginationClosureV1(commitStatuses.input.Query, commitStatuses, statusItems, limits); err != nil {
+	if err := ValidatePaginationClosureV1(PaginationQueryScopeV1{
+		Source: PaginationCommitStatuses, Repository: authority.Repository(),
+		RepositoryNodeID: repositoryBinding.input.GitHubRepositoryNodeID, HeadSHA: authority.HeadSHA(),
+	}, commitStatuses, statusItems, limits); err != nil {
 		return err
 	}
 	for _, required := range policy.input.RequiredChecks {

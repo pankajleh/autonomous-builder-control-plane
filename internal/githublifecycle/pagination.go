@@ -13,7 +13,10 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
 
-const PaginationClosureSchemaV1 = "pagination-closure-v1"
+const (
+	PaginationClosureSchemaV1 = "pagination-closure-v1"
+	GitHubAPIVersionV1        = "2026-03-10"
+)
 
 type PaginationSourceKind string
 
@@ -42,6 +45,53 @@ type PaginationQueryV1 struct {
 	HeadSHA              string               `json:"head_sha"`
 	Variables            map[string]string    `json:"variables"`
 	PerPage              int                  `json:"per_page"`
+}
+
+// PaginationQueryScopeV1 contains only authority-derived identities. The
+// endpoint, method, API version, filters, and page size are frozen locally.
+type PaginationQueryScopeV1 struct {
+	Source           PaginationSourceKind
+	Repository       Repository
+	RepositoryNodeID string
+	PullRequest      *PullRequestIdentity
+	HeadSHA          GitSHA
+}
+
+func DerivePaginationQueryV1(scope PaginationQueryScopeV1, limits Limits) (PaginationQueryV1, error) {
+	if err := limits.Validate(); err != nil {
+		return PaginationQueryV1{}, err
+	}
+	if !scope.Repository.valid() || !validOpaqueID(scope.RepositoryNodeID, limits.MaxTextBytes) || !scope.HeadSHA.valid() {
+		return PaginationQueryV1{}, errors.New("pagination authority scope is invalid")
+	}
+	base := "/repos/" + scope.Repository.Owner() + "/" + scope.Repository.Name()
+	query := PaginationQueryV1{
+		Source: scope.Source, Protocol: PaginationREST, Method: "GET", APIVersion: GitHubAPIVersionV1,
+		RepositoryNodeID: scope.RepositoryNodeID, HeadSHA: scope.HeadSHA.String(), Variables: map[string]string{}, PerPage: limits.MaxItemsPerPage,
+	}
+	switch scope.Source {
+	case PaginationCheckRuns:
+		if scope.PullRequest != nil {
+			return PaginationQueryV1{}, errors.New("check-run pagination cannot carry a pull request identity")
+		}
+		query.PathOrDocumentSHA256 = base + "/commits/" + scope.HeadSHA.String() + "/check-runs"
+		query.Variables = map[string]string{"filter": "all"}
+	case PaginationCommitStatuses:
+		if scope.PullRequest != nil {
+			return PaginationQueryV1{}, errors.New("commit-status pagination cannot carry a pull request identity")
+		}
+		query.PathOrDocumentSHA256 = base + "/commits/" + scope.HeadSHA.String() + "/statuses"
+	case PaginationReviews:
+		if scope.PullRequest == nil || !scope.PullRequest.valid() {
+			return PaginationQueryV1{}, errors.New("review pagination requires the exact pull request identity")
+		}
+		query.PullRequestNumber = scope.PullRequest.Number()
+		query.PullRequestNodeID = scope.PullRequest.NodeID()
+		query.PathOrDocumentSHA256 = base + "/pulls/" + strconv.FormatInt(scope.PullRequest.Number(), 10) + "/reviews"
+	default:
+		return PaginationQueryV1{}, errors.New("unsupported pagination source")
+	}
+	return query, nil
 }
 
 func (q PaginationQueryV1) valid(limits Limits) bool {
@@ -81,8 +131,10 @@ type PaginationPageV1Input struct {
 	RequestedCursor    string
 	Response           SnapshotIdentity
 	RawBodySHA256      string
+	ResponseEvidence   ledger.EvidenceRef
 	Items              []CanonicalPaginationItemV1
 	RESTLinkHeader     string
+	RESTLinkObserved   bool
 	GraphQLHasNextPage *bool
 	GraphQLEndCursor   string
 }
@@ -98,7 +150,7 @@ func NewPaginationPageV1(input PaginationPageV1Input, limits Limits) (Pagination
 	if err := limits.Validate(); err != nil {
 		return PaginationPageV1{}, err
 	}
-	if input.Ordinal < 0 || !input.Response.valid() || !validSHA256(input.RawBodySHA256) || len(input.Items) > limits.MaxItemsPerPage {
+	if input.Ordinal < 0 || !input.Response.valid() || !validSHA256(input.RawBodySHA256) || !validEvidenceRef(input.ResponseEvidence) || input.ResponseEvidence.SHA256 != input.RawBodySHA256 || len(input.Items) > limits.MaxItemsPerPage {
 		return PaginationPageV1{}, errors.New("pagination page identity or bounds are invalid")
 	}
 	seen := map[string]struct{}{}
@@ -111,11 +163,14 @@ func NewPaginationPageV1(input PaginationPageV1Input, limits Limits) (Pagination
 		}
 		seen[item.Key] = struct{}{}
 	}
-	if input.RESTLinkHeader != "" && (len(input.RESTLinkHeader) > limits.MaxTextBytes || input.GraphQLHasNextPage != nil || input.GraphQLEndCursor != "") {
+	if len(input.RESTLinkHeader) > limits.MaxTextBytes || (input.RESTLinkObserved && (input.GraphQLHasNextPage != nil || input.GraphQLEndCursor != "")) {
 		return PaginationPageV1{}, errors.New("pagination page mixes REST and GraphQL terminal evidence")
 	}
-	if input.GraphQLHasNextPage != nil && (input.RESTLinkHeader != "" || !validText(input.GraphQLEndCursor, limits.MaxTextBytes, true)) {
+	if input.GraphQLHasNextPage != nil && (input.RESTLinkObserved || input.RESTLinkHeader != "" || !validText(input.GraphQLEndCursor, limits.MaxTextBytes, true)) {
 		return PaginationPageV1{}, errors.New("GraphQL page info is invalid")
+	}
+	if !input.RESTLinkObserved && input.RESTLinkHeader != "" {
+		return PaginationPageV1{}, errors.New("unobserved REST Link header cannot contain pagination state")
 	}
 	envelope, digest, err := canonicalJSON(paginationPageWire(input))
 	if err != nil {
@@ -139,16 +194,18 @@ type paginationPageWireV1 struct {
 	RequestedCursor    string                      `json:"requested_cursor,omitempty"`
 	Response           identityWire                `json:"response"`
 	RawBodySHA256      string                      `json:"raw_body_sha256"`
+	ResponseEvidence   ledger.EvidenceRef          `json:"response_evidence"`
 	Items              []CanonicalPaginationItemV1 `json:"items"`
 	ItemSetSHA256      string                      `json:"item_set_sha256"`
-	RESTLinkHeader     string                      `json:"rest_link_header,omitempty"`
+	RESTLinkHeader     string                      `json:"rest_link_header"`
+	RESTLinkObserved   bool                        `json:"rest_link_observed"`
 	GraphQLHasNextPage *bool                       `json:"graphql_has_next_page,omitempty"`
 	GraphQLEndCursor   string                      `json:"graphql_end_cursor,omitempty"`
 }
 
 func paginationPageWire(i PaginationPageV1Input) paginationPageWireV1 {
 	items, _, _ := canonicalJSON(i.Items)
-	return paginationPageWireV1{i.Ordinal, i.RequestedPage, i.RequestedCursor, snapshotWire(i.Response), i.RawBodySHA256, i.Items, digestBytes(items), i.RESTLinkHeader, i.GraphQLHasNextPage, i.GraphQLEndCursor}
+	return paginationPageWireV1{i.Ordinal, i.RequestedPage, i.RequestedCursor, snapshotWire(i.Response), i.RawBodySHA256, i.ResponseEvidence, i.Items, digestBytes(items), i.RESTLinkHeader, i.RESTLinkObserved, i.GraphQLHasNextPage, i.GraphQLEndCursor}
 }
 
 type PaginationClosureV1Input struct {
@@ -173,6 +230,8 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 		return PaginationClosureV1{}, errors.New("pagination query or page count is invalid")
 	}
 	all := map[string]struct{}{}
+	requests := map[string]struct{}{}
+	responseEvidence := make([]ledger.EvidenceRef, 0, len(input.Pages))
 	total := 0
 	for index, page := range input.Pages {
 		if !page.valid() {
@@ -183,6 +242,11 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 			return PaginationClosureV1{}, fmt.Errorf("pagination page %d fails independent validation", index)
 		}
 		p := page.input
+		if _, duplicated := requests[p.Response.RequestID()]; duplicated {
+			return PaginationClosureV1{}, errors.New("pagination response request identity is duplicated")
+		}
+		requests[p.Response.RequestID()] = struct{}{}
+		responseEvidence = append(responseEvidence, p.ResponseEvidence)
 		if p.Ordinal != index {
 			return PaginationClosureV1{}, errors.New("pagination page ordinal is missing, repeated, or reordered")
 		}
@@ -198,7 +262,7 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 		}
 		terminal := index == len(input.Pages)-1
 		if input.Query.Protocol == PaginationREST {
-			if p.RequestedPage != index+1 || p.RequestedCursor != "" || p.GraphQLHasNextPage != nil {
+			if p.RequestedPage != index+1 || p.RequestedCursor != "" || p.GraphQLHasNextPage != nil || !p.RESTLinkObserved {
 				return PaginationClosureV1{}, errors.New("REST page chain is inconsistent")
 			}
 			next, hasNext, err := parseRESTNext(p.RESTLinkHeader, input.Query)
@@ -213,7 +277,7 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 			}
 		}
 		if input.Query.Protocol == PaginationGraphQL {
-			if p.RequestedPage != 0 || p.RESTLinkHeader != "" || p.GraphQLHasNextPage == nil {
+			if p.RequestedPage != 0 || p.RESTLinkObserved || p.RESTLinkHeader != "" || p.GraphQLHasNextPage == nil {
 				return PaginationClosureV1{}, errors.New("GraphQL page chain is inconsistent")
 			}
 			expected := ""
@@ -233,6 +297,11 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 	}
 	if len(input.EvidenceRefs) == 0 || canonicalizeEvidence(&input.EvidenceRefs, limits) != nil {
 		return PaginationClosureV1{}, errors.New("pagination closure evidence is invalid")
+	}
+	for _, evidence := range responseEvidence {
+		if !containsEvidence(input.EvidenceRefs, evidence) {
+			return PaginationClosureV1{}, errors.New("pagination closure omits retained response evidence")
+		}
 	}
 	canonical, digest, err := canonicalJSON(paginationClosureWire(input, limitsSHA))
 	if err != nil {
@@ -280,7 +349,7 @@ func paginationClosureWire(i PaginationClosureV1Input, limitsSHA string) paginat
 	return paginationClosureWireV1{PaginationClosureSchemaV1, clonePaginationQuery(i.Query), pages, digestBytes(set), i.EvidenceRefs, limitsSHA}
 }
 
-func ValidatePaginationClosureV1(expected PaginationQueryV1, closure PaginationClosureV1, items []CanonicalPaginationItemV1, limits Limits) error {
+func ValidatePaginationClosureV1(scope PaginationQueryScopeV1, closure PaginationClosureV1, items []CanonicalPaginationItemV1, limits Limits) error {
 	if !closure.valid() {
 		return errors.New("pagination closure is incomplete")
 	}
@@ -290,6 +359,10 @@ func ValidatePaginationClosureV1(expected PaginationQueryV1, closure PaginationC
 	rebuilt, err := NewPaginationClosureV1(closure.input, limits)
 	if err != nil || rebuilt.digest != closure.digest || !bytes.Equal(rebuilt.canonical, closure.canonical) {
 		return errors.New("pagination closure fails independent validation")
+	}
+	expected, err := DerivePaginationQueryV1(scope, limits)
+	if err != nil {
+		return err
 	}
 	if !equalPaginationQuery(expected, closure.input.Query) {
 		return errors.New("pagination closure query identity changed")
@@ -330,7 +403,12 @@ func ParseCanonicalPaginationClosureV1(data []byte, limits Limits) (PaginationCl
 		if err != nil {
 			return PaginationClosureV1{}, err
 		}
-		page, err := NewPaginationPageV1(PaginationPageV1Input{pw.Ordinal, pw.RequestedPage, pw.RequestedCursor, response, pw.RawBodySHA256, pw.Items, pw.RESTLinkHeader, pw.GraphQLHasNextPage, pw.GraphQLEndCursor}, limits)
+		page, err := NewPaginationPageV1(PaginationPageV1Input{
+			Ordinal: pw.Ordinal, RequestedPage: pw.RequestedPage, RequestedCursor: pw.RequestedCursor,
+			Response: response, RawBodySHA256: pw.RawBodySHA256, ResponseEvidence: pw.ResponseEvidence,
+			Items: pw.Items, RESTLinkHeader: pw.RESTLinkHeader, RESTLinkObserved: pw.RESTLinkObserved,
+			GraphQLHasNextPage: pw.GraphQLHasNextPage, GraphQLEndCursor: pw.GraphQLEndCursor,
+		}, limits)
 		if err != nil {
 			return PaginationClosureV1{}, err
 		}

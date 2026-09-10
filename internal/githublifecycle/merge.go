@@ -49,6 +49,9 @@ type MergeResult struct {
 
 func NewMergeResult(input MergeResultInput, limits Limits) (MergeResult, error) {
 	input = cloneMergeInput(input)
+	if input.Method != MergeMethodMerge {
+		return MergeResult{}, errors.New("sealed production-v1 MergeResult is merge-only; use GenericStrategyResultV1 for squash/rebase evidence")
+	}
 	limitsSHA, err := limits.SHA256()
 	if err != nil {
 		return MergeResult{}, err
@@ -113,6 +116,9 @@ type PostMergeObservation struct {
 
 func NewPostMergeObservation(input PostMergeObservationInput, limits Limits) (PostMergeObservation, error) {
 	input = clonePostMergeInput(input)
+	if input.Method != MergeMethodMerge {
+		return PostMergeObservation{}, errors.New("sealed production-v1 PostMergeObservation is merge-only; use GenericStrategyPostMergeV1 for squash/rebase evidence")
+	}
 	limitsSHA, err := limits.SHA256()
 	if err != nil {
 		return PostMergeObservation{}, err
@@ -217,6 +223,11 @@ func validateMergeInput(input MergeInput, limits Limits) error {
 	if !validSHA256(input.policyDecisionSHA256) || !input.initialPullRequest.valid() || !input.capability.valid() || !input.recipe.valid() ||
 		input.recipe.ExpectedResultSHA().String() == "" || input.digest != input.attempt.payloadSHA256 {
 		return errors.New("merge authorization inputs are incomplete")
+	}
+	derivedRecipe, err := NewMergeCommitRecipeV1(input.attempt.WriteID(), input.authority, limits)
+	if err != nil || input.recipe.SHA256() != derivedRecipe.SHA256() || !bytes.Equal(input.recipe.CanonicalJSON(), derivedRecipe.CanonicalJSON()) ||
+		input.recipe.input.ObjectFormat != "sha1" {
+		return errors.New("merge recipe is not the production policy-derived recipe")
 	}
 	if err := EvaluateMergePolicyV1(input.authority, input.initialPullRequest, input.checks, input.checkRunsClosure, input.commitStatusesClosure, limits); err != nil {
 		return err

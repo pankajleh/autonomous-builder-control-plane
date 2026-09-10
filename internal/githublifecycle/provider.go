@@ -1,10 +1,12 @@
 package githublifecycle
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
@@ -228,9 +230,20 @@ func NewMergeInput(input MergeAuthorizationInputV1, writeID string, limits Limit
 	if !validSHA256(input.PolicyDecisionSHA256) || !input.InitialPullRequest.valid() || !input.Capability.valid() || !input.Recipe.valid() {
 		return MergeInput{}, errors.New("merge authorization snapshot, decision, capability, or recipe is invalid")
 	}
+	derivedRecipe, err := NewMergeCommitRecipeV1(writeID, authority, limits)
+	if err != nil || input.Recipe.SHA256() != derivedRecipe.SHA256() || !bytes.Equal(input.Recipe.CanonicalJSON(), derivedRecipe.CanonicalJSON()) {
+		return MergeInput{}, errors.New("merge recipe was not deterministically derived from authority, policy, and write identity")
+	}
+	if input.Recipe.input.ObjectFormat != "sha1" {
+		return MergeInput{}, errors.New("production-v1 merge admission requires the proved SHA-1 object format")
+	}
 	if err := EvaluateMergePolicyV1(authority, input.InitialPullRequest, input.Checks, input.CheckRunsClosure, input.CommitStatusesClosure, limits); err != nil {
 		return MergeInput{}, err
 	}
+	if err := addUniqueRequestIDs(map[string]struct{}{}, input.InitialPullRequest, input.CheckRunsClosure, input.CommitStatusesClosure); err != nil {
+		return MergeInput{}, err
+	}
+	sort.Slice(input.Checks, func(i, j int) bool { return input.Checks[i].NodeID < input.Checks[j].NodeID })
 	authoritySHA, _ := authority.SHA256()
 	readySHA := authority.ReadyBinding().SHA256()
 	policySHA := authority.MergePolicy().SHA256()
@@ -479,25 +492,6 @@ func (r ReconciliationResult) MergeResult() (MergeResult, bool) {
 	return *r.mergeResult, true
 }
 
-type NotAppliedProofKindV1 string
-
-const (
-	NotAppliedZeroRequestBytes   NotAppliedProofKindV1 = "zero_request_bytes"
-	NotAppliedAtomicBaseRejected NotAppliedProofKindV1 = "atomic_base_before_oid_rejected"
-	NotAppliedAtomicHeadRejected NotAppliedProofKindV1 = "atomic_head_before_oid_rejected"
-)
-
-type NotAppliedProofV1 struct {
-	Kind              NotAppliedProofKindV1
-	CommitmentSHA256  string
-	ResponseRequestID string
-	EvidenceRef       ledger.EvidenceRef
-}
-
-func (p NotAppliedProofV1) valid(l Limits) bool {
-	return (p.Kind == NotAppliedZeroRequestBytes || p.Kind == NotAppliedAtomicBaseRejected || p.Kind == NotAppliedAtomicHeadRejected) && validSHA256(p.CommitmentSHA256) && validOpaqueID(p.ResponseRequestID, l.MaxTextBytes) && validEvidenceRef(p.EvidenceRef)
-}
-
 func NewMergeReconciliationResult(sealed SealedMergeAuthorizationV1, disposition ReconciliationDisposition, mergeResult *MergeResult, notAppliedProof *NotAppliedProofV1, evidenceRefs []ledger.EvidenceRef, limits Limits) (ReconciliationResult, error) {
 	if !sealed.valid() || (disposition != ReconciliationApplied && disposition != ReconciliationNotApplied && disposition != ReconciliationUnknown) {
 		return ReconciliationResult{}, errors.New("merge reconciliation input or disposition is invalid")
@@ -518,10 +512,11 @@ func NewMergeReconciliationResult(sealed SealedMergeAuthorizationV1, disposition
 		copy := *mergeResult
 		result.mergeResult = &copy
 	case ReconciliationNotApplied:
-		if mergeResult != nil || notAppliedProof == nil || !notAppliedProof.valid(limits) || notAppliedProof.CommitmentSHA256 != sealed.input.Commitment.SHA256() {
+		if mergeResult != nil || notAppliedProof == nil || ValidateNotAppliedProofV1(sealed, *notAppliedProof, limits) != nil ||
+			!containsEvidence(evidence, notAppliedProof.input.EvidenceRef) {
 			return ReconciliationResult{}, errors.New("NOT_APPLIED reconciliation requires exact typed authenticated proof")
 		}
-		copy := *notAppliedProof
+		copy := cloneNotAppliedProof(*notAppliedProof)
 		result.notAppliedProof = &copy
 	case ReconciliationUnknown:
 		if mergeResult != nil || notAppliedProof != nil {
