@@ -45,10 +45,12 @@ its newline), and its run-state sequence must equal its transition ordinal.
 The closure must contain the event evidence, repository-mapping evidence, and
 every accepted source's acceptance evidence. A source for the integrated head
 must be present. `CurrentReadyProofV1` independently re-parses the READY
-binding, retains the exact bounded ledger JSONL bytes and matching evidence,
-recomputes the bound-prefix and full-observation digests, verifies the READY
-event at its exact byte offset, and rejects any later transition for the same
-run. A caller-provided no-later-transition summary is never sufficient.
+binding, requires the freshly observed physical ledger identity, retains the
+exact bounded ledger JSONL bytes and matching evidence, parses every canonical
+event from byte zero, rejects duplicate event IDs and discontinuous bound-run
+transitions, derives the READY offset/sequence/ordinal, recomputes the bound-
+prefix and full-observation digests, and rejects any later transition for the
+same run. A caller-provided no-later-transition summary is never sufficient.
 
 `RepositoryBindingV1` binds Phase-3 repository identity/path/canonical remote/
 start SHA to exact GitHub owner/name and stable repository node/database IDs,
@@ -152,6 +154,10 @@ attempt. A merge `WriteAttempt` explicitly binds READY and policy digests in
 addition to repository, principal, operation, write ID, authority digest,
 payload digest, and limits. `ParseCanonicalMergeInput` must reconstruct
 byte-identical input and attempt identities.
+Direct check values are rescanned under the same total-item, text, state/
+conclusion, exact-head, source-scoped node-identity, provenance, and evidence-
+reference bounds used by canonical CI snapshots before their pagination item
+digests or authorization bytes are computed.
 
 `GenericStrategyResultV1` and `GenericStrategyPostMergeV1` preserve
 network-free squash/rebase result, lineage, and containment representation
@@ -162,7 +168,8 @@ not claim executable production support.
 ## Authorization seal and exact target commitment
 
 `FinalRevalidationV1` is a distinct controller-ordered record created after
-a typed current-READY proof. It owns fresh PR, review, check-run, and
+a typed current-READY proof, and both the proof and final interval must follow
+every admission PR/review/check observation. It owns fresh PR, review, check-run, and
 commit-status request identities, rejects every admission request identity and
 cross-source duplicate, bounds all response times to its start/completion
 interval, independently evaluates policy, closes all authority-bearing
@@ -190,9 +197,14 @@ constructor has no independent caller mutation-ID argument. Reconstructing one
 seal therefore produces byte-identical commitment and mutation identity.
 
 `SealedMergeAuthorizationV1` owns the original input, seal, and exact
-commitment. Merge execution accepts this sealed value, never an unsealed
-input. Strict parsers recover the seal, commitment, and sealed chain by all
-nested canonical bytes and digests.
+commitment. `TargetSubmissionV1` deterministically serializes the frozen
+`POST /graphql` `updateRefs` document and exact repository, mutation ID, and
+two ordered ref-update variables; commitment-contract JSON is never mislabeled
+as transport bytes. Merge execution accepts `MergeExecutionInputV1`, which
+owns both the sealed value and that pre-published submission. Typed execution
+results and errors retain the identical submission identity. Strict parsers
+recover the seal, commitment, submission, and sealed chain by all nested
+canonical bytes and digests.
 
 ## Exact reconciliation
 
@@ -201,7 +213,7 @@ attempt alone. `APPLIED` requires the identical materialized and validated
 `MergeResult`. Every disposition also binds the strict-canonical
 `TargetSubmissionV1` published for the one transport invocation: the exact
 sealed authorization, seal, commitment, write/mutation identity, request ID,
-canonical request body/digest/length, and limits. The reconciliation or
+exact method/path, canonical GraphQL request body/digest/length, and limits. The reconciliation or
 cancellation submission proof separately binds the transport-observed request-
 byte count to that exact submission record.
 `NOT_APPLIED` requires strict-canonical

@@ -314,14 +314,18 @@ func EvaluateMergePolicyV1(authority Authority, pr AuthoritativePullRequestSnaps
 	if err := ValidateAuthoritativePullRequestSnapshotV1(authority, pr, limits); err != nil {
 		return err
 	}
+	checks, err := canonicalizeChecksForHead(checks, authority.HeadSHA(), limits)
+	if err != nil {
+		return err
+	}
 	policy := authority.MergePolicy()
 	runItems, statusItems := []CanonicalPaginationItemV1{}, []CanonicalPaginationItemV1{}
 	observed, success := map[string]int{}, map[string]bool{}
-	for _, check := range checks {
-		if !check.Identity.valid(limits) || check.Name != check.Identity.Context || check.HeadSHA != authority.HeadSHA() {
-			return errors.New("check provenance, context, or exact head is invalid")
+	for index, check := range checks {
+		raw, err := json.Marshal(checkWire{check.NodeID, check.Name, check.Identity, check.Status, check.Conclusion, check.HeadSHA.String(), check.EvidenceRefs})
+		if err != nil {
+			return fmt.Errorf("check %d canonicalization failed: %w", index, err)
 		}
-		raw, _ := json.Marshal(checkWire{check.NodeID, check.Name, check.Identity, check.Status, check.Conclusion, check.HeadSHA.String(), check.EvidenceRefs})
 		item := CanonicalPaginationItemV1{Key: check.NodeID, SHA256: digestBytes(raw)}
 		if check.Identity.Source == CheckSourceCheckRun {
 			runItems = append(runItems, item)

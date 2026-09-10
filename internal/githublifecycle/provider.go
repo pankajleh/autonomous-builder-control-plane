@@ -230,6 +230,10 @@ func NewMergeInput(input MergeAuthorizationInputV1, writeID string, limits Limit
 	if !validSHA256(input.PolicyDecisionSHA256) || !input.InitialPullRequest.valid() || !input.Capability.valid() || !input.Recipe.valid() {
 		return MergeInput{}, errors.New("merge authorization snapshot, decision, capability, or recipe is invalid")
 	}
+	input.Checks, err = canonicalizeChecksForHead(input.Checks, authority.HeadSHA(), limits)
+	if err != nil {
+		return MergeInput{}, err
+	}
 	derivedRecipe, err := NewMergeCommitRecipeV1(writeID, authority, limits)
 	if err != nil || input.Recipe.SHA256() != derivedRecipe.SHA256() || !bytes.Equal(input.Recipe.CanonicalJSON(), derivedRecipe.CanonicalJSON()) {
 		return MergeInput{}, errors.New("merge recipe was not deterministically derived from authority, policy, and write identity")
@@ -555,7 +559,7 @@ type Provider interface {
 	FindPullRequests(context.Context, FindPullRequestsInput) (PullRequestPage, error)
 	GetCI(context.Context, GetCIInput) (CISnapshot, error)
 	UpsertPullRequest(context.Context, UpsertPullRequestInput) (PullRequestWriteResult, error)
-	Merge(context.Context, SealedMergeAuthorizationV1) (MergeResult, error)
+	Merge(context.Context, MergeExecutionInputV1) (MergeExecutionResultV1, error)
 	ObservePostMerge(context.Context, ObservePostMergeInput) (PostMergeObservation, error)
 	ReconcileWrite(context.Context, ReconcileWriteInput) (ReconciliationResult, error)
 }
@@ -572,13 +576,15 @@ const (
 )
 
 type OperationError struct {
-	class      FailureClass
-	operation  string
-	write      bool
-	submitted  bool
-	cause      error
-	attempt    WriteAttempt
-	hasAttempt bool
+	class               FailureClass
+	operation           string
+	write               bool
+	submitted           bool
+	cause               error
+	attempt             WriteAttempt
+	hasAttempt          bool
+	targetSubmission    TargetSubmissionV1
+	hasTargetSubmission bool
 }
 
 func NewWriteExecutionError(attempt WriteAttempt, submitted bool, cause error) *OperationError {
@@ -590,6 +596,16 @@ func NewWriteExecutionError(attempt WriteAttempt, submitted bool, cause error) *
 		class = FailureAmbiguousWrite
 	}
 	return &OperationError{class: class, operation: string(attempt.operation), write: true, submitted: submitted, cause: cause, attempt: attempt, hasAttempt: true}
+}
+
+func NewMergeExecutionError(input MergeExecutionInputV1, submitted bool, cause error, limits Limits) (*OperationError, error) {
+	if err := validateMergeExecutionInputV1(input, limits); err != nil {
+		return nil, err
+	}
+	failure := NewWriteExecutionError(input.sealed.input.MergeInput.attempt, submitted, cause)
+	failure.targetSubmission = cloneTargetSubmission(input.submission)
+	failure.hasTargetSubmission = true
+	return failure, nil
 }
 
 func NewReadExecutionError(operation string, cause error) *OperationError {
@@ -634,6 +650,24 @@ func (e *OperationError) Attempt() (WriteAttempt, bool) {
 		return WriteAttempt{}, false
 	}
 	return e.attempt, true
+}
+func (e *OperationError) TargetSubmission() (TargetSubmissionV1, bool) {
+	if e == nil || !e.hasTargetSubmission {
+		return TargetSubmissionV1{}, false
+	}
+	return cloneTargetSubmission(e.targetSubmission), true
+}
+
+func ValidateMergeExecutionError(input MergeExecutionInputV1, failure *OperationError, limits Limits) error {
+	if err := validateMergeExecutionInputV1(input, limits); err != nil {
+		return err
+	}
+	if failure == nil || !failure.write || !failure.hasAttempt || failure.attempt != input.sealed.input.MergeInput.attempt ||
+		!failure.hasTargetSubmission || failure.targetSubmission.SHA256() != input.submission.SHA256() ||
+		!bytes.Equal(failure.targetSubmission.CanonicalJSON(), input.submission.CanonicalJSON()) {
+		return errors.New("merge execution error does not bind the invoked target submission")
+	}
+	return nil
 }
 
 func CanRetry(failure *OperationError, attempts int, limits Limits, expected *WriteAttempt, reconciliation *ReconciliationResult) bool {

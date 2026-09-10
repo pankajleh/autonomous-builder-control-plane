@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -70,12 +71,32 @@ func newFixture(t *testing.T, method MergeMethod) fixture {
 	})
 	readyEvent := ledger.Event{SchemaVersion: 1, EventID: "ready-event-1", Timestamp: time.Unix(1700000000, 1).UTC(), ProjectID: "project-1", PlanID: "plan-1", RunID: "run-1", AttemptID: "attempt-1", EventType: "STATE_TRANSITION", StateFrom: domain.StateIntegrationAccepted, StateTo: domain.StateReadyForMerge, Actor: "controller", Source: "integration-gate", EvidenceRefs: []ledger.EvidenceRef{readyRef}}
 	readyEventJSON, _ := json.Marshal(readyEvent)
-	ledgerPrefix := append([]byte("0123456789"), readyEventJSON...)
-	ledgerPrefix = append(ledgerPrefix, '\n')
+	states := []domain.State{
+		domain.StateRunCreated, domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateImplementing,
+		domain.StateImplementationCompleted, domain.StateBranchAcceptancePending, domain.StateBranchAccepted,
+		domain.StateIntegrationPending, domain.StateIntegrating, domain.StateIntegrationAccepted, domain.StateReadyForMerge,
+	}
+	ledgerPrefix := []byte{}
+	readyOffset := int64(0)
+	for index := 0; index < len(states)-1; index++ {
+		event := ledger.Event{
+			SchemaVersion: 1, EventID: fmt.Sprintf("transition-event-%02d", index+1), Timestamp: time.Unix(1699999900+int64(index), 1).UTC(),
+			ProjectID: "project-1", PlanID: "plan-1", RunID: "run-1", AttemptID: "attempt-1", EventType: "STATE_TRANSITION",
+			StateFrom: states[index], StateTo: states[index+1], Actor: "controller", Source: "fixture",
+		}
+		if event.StateTo == domain.StateReadyForMerge {
+			event = readyEvent
+			readyOffset = int64(len(ledgerPrefix))
+		}
+		eventJSON, _ := json.Marshal(event)
+		ledgerPrefix = append(ledgerPrefix, eventJSON...)
+		ledgerPrefix = append(ledgerPrefix, '\n')
+	}
+	readySequence := int64(len(states) - 1)
 	ready := must(NewReadyAuthorityBindingV1(ReadyAuthorityBindingV1Input{
 		Phase3AuthorityJSON: phase3JSON, Phase3AuthoritySHA256: digestBytes(phase3JSON), ProjectID: "project-1", PlanID: "plan-1", RunID: "run-1", AttemptID: "attempt-1",
 		AcceptedSources:   []AcceptedSourceCandidateV1{{ProjectID: "source-project", PlanID: "source-plan", RunID: "source-run", AttemptID: "source-attempt", RepositoryIdentity: "repo-id", Branch: f.head.String(), StartSHA: f.baseSHA.String(), AcceptedHeadSHA: f.headSHA.String(), AcceptancePolicyIdentity: "accept-v1", AcceptanceEvidence: []ledger.EvidenceRef{readyRef}}},
-		RepositoryBinding: repositoryBinding, ReadyEventJSON: readyEventJSON, ReadyEventSHA256: digestBytes(readyEventJSON), ReadyEventID: readyEvent.EventID, ReadyEventUnixNano: readyEvent.Timestamp.UnixNano(), LedgerIdentity: "ledger-dev-ino", ReadyEventByteOffset: 10, ReadyRunStateSequence: 9, LedgerPrefixLength: int64(len(ledgerPrefix)), LedgerPrefixSHA256: digestBytes(ledgerPrefix), ReadyTransitionOrdinal: 9,
+		RepositoryBinding: repositoryBinding, ReadyEventJSON: readyEventJSON, ReadyEventSHA256: digestBytes(readyEventJSON), ReadyEventID: readyEvent.EventID, ReadyEventUnixNano: readyEvent.Timestamp.UnixNano(), LedgerIdentity: "ledger-dev-ino", ReadyEventByteOffset: readyOffset, ReadyRunStateSequence: readySequence, LedgerPrefixLength: int64(len(ledgerPrefix)), LedgerPrefixSHA256: digestBytes(ledgerPrefix), ReadyTransitionOrdinal: readySequence,
 		ReadyEvidenceRefs: []ledger.EvidenceRef{readyRef}, ReadyDecisionRef: readyRef, EvidenceClosureRefs: []ledger.EvidenceRef{readyRef, configRef}, IntegratedHeadSHA: f.headSHA, BaselineSHA: f.baseSHA, ExpectedTreeSHA: f.headTree,
 	}, f.limits)).(ReadyAuthorityBindingV1)
 	policySource := ledger.EvidenceRef{URI: "evidence/merge-policy.json", Kind: "merge-policy", SHA256: strings.Repeat("f", 64)}
@@ -108,7 +129,7 @@ func newFixture(t *testing.T, method MergeMethod) fixture {
 	approval := ledger.EvidenceRef{URI: "evidence/approval", Kind: "approval", SHA256: strings.Repeat("8", 64)}
 	f.mergeWrite = must(NewMergeInput(MergeAuthorizationInputV1{f.authority, strings.Repeat("9", 64), f.prAuth, []Check{}, f.checkRuns, f.statuses, capability, f.recipe, []ledger.EvidenceRef{approval}}, "merge-write-1", f.limits)).(MergeInput)
 	ledgerEvidence := ledger.EvidenceRef{URI: "evidence/current-ready-ledger", Kind: CurrentReadyLedgerEvidenceKindV1, SHA256: digestBytes(ledgerPrefix)}
-	f.readyProof = must(NewCurrentReadyProofV1(CurrentReadyProofV1Input{ReadyBinding: ready, ControllerSequence: 10, ObservedUnixNano: 1700000001000000000, ObservedBoundPrefixSHA256: ready.input.LedgerPrefixSHA256, ObservedLedgerLength: int64(len(ledgerPrefix)), ObservedLedgerSHA256: digestBytes(ledgerPrefix), ObservedLedgerJSONL: ledgerPrefix, NoLaterTransition: true, EvidenceRefs: []ledger.EvidenceRef{ledgerEvidence}}, f.limits)).(CurrentReadyProofV1)
+	f.readyProof = must(NewCurrentReadyProofV1(CurrentReadyProofV1Input{ReadyBinding: ready, ControllerSequence: 10, ObservedUnixNano: 1700000001000000000, ObservedLedgerIdentity: ready.input.LedgerIdentity, ObservedBoundPrefixSHA256: ready.input.LedgerPrefixSHA256, ObservedLedgerLength: int64(len(ledgerPrefix)), ObservedLedgerSHA256: digestBytes(ledgerPrefix), ObservedLedgerJSONL: ledgerPrefix, NoLaterTransition: true, EvidenceRefs: []ledger.EvidenceRef{ledgerEvidence}}, f.limits)).(CurrentReadyProofV1)
 	finalReviews := emptyPaginationClosure(t, f, PaginationReviews, &f.pr, "request-reviews-final", 1700000002200000000)
 	finalChecks := emptyPaginationClosure(t, f, PaginationCheckRuns, nil, "request-checks-final", 1700000002300000000)
 	finalStatuses := emptyPaginationClosure(t, f, PaginationCommitStatuses, nil, "request-statuses-final", 1700000002400000000)

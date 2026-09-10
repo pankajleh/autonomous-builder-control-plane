@@ -170,24 +170,13 @@ func NewCISnapshot(input CISnapshotInput, limits Limits) (CISnapshot, error) {
 	seen := make(map[string]struct{}, len(input.Checks))
 	for index := range input.Checks {
 		check := &input.Checks[index]
-		if !validOpaqueID(check.NodeID, limits.MaxTextBytes) || !validText(check.Name, limits.MaxTextBytes, false) || !check.Identity.valid(limits) || check.Name != check.Identity.Context || !check.HeadSHA.valid() || check.HeadSHA != input.HeadSHA ||
-			(check.Status != CheckQueued && check.Status != CheckInProgress && check.Status != CheckCompleted) {
-			return CISnapshot{}, fmt.Errorf("check %d is invalid or tied to a different head SHA", index)
-		}
-		if check.Status == CheckCompleted {
-			if check.Conclusion != ConclusionSuccess && check.Conclusion != ConclusionFailure && check.Conclusion != ConclusionCancelled && check.Conclusion != ConclusionNeutral && check.Conclusion != ConclusionSkipped && check.Conclusion != ConclusionTimedOut {
-				return CISnapshot{}, fmt.Errorf("check %d has invalid conclusion", index)
-			}
-		} else if check.Conclusion != "" {
-			return CISnapshot{}, fmt.Errorf("check %d has a conclusion before completion", index)
+		if err := validateCheck(check, input.HeadSHA, limits); err != nil {
+			return CISnapshot{}, fmt.Errorf("check %d: %w", index, err)
 		}
 		if _, exists := seen[check.NodeID]; exists {
 			return CISnapshot{}, fmt.Errorf("check %d duplicates node identity", index)
 		}
 		seen[check.NodeID] = struct{}{}
-		if err := canonicalizeEvidence(&check.EvidenceRefs, limits); err != nil {
-			return CISnapshot{}, fmt.Errorf("check %d: %w", index, err)
-		}
 	}
 	sort.Slice(input.Checks, func(i, j int) bool { return checkKey(input.Checks[i]) < checkKey(input.Checks[j]) })
 	if err := canonicalizeCommon(&input.EvidenceRefs, input.Metadata, limits); err != nil {
@@ -198,6 +187,47 @@ func NewCISnapshot(input CISnapshotInput, limits Limits) (CISnapshot, error) {
 		return CISnapshot{}, err
 	}
 	return CISnapshot{immutableRecord[CISnapshotInput]{data: input, canonical: canonical, digest: digest}}, nil
+}
+
+func validateCheck(check *Check, expectedHead GitSHA, limits Limits) error {
+	if !validOpaqueID(check.NodeID, limits.MaxTextBytes) || !validText(check.Name, limits.MaxTextBytes, false) ||
+		!check.Identity.valid(limits) || check.Name != check.Identity.Context || !check.HeadSHA.valid() || check.HeadSHA != expectedHead ||
+		(check.Status != CheckQueued && check.Status != CheckInProgress && check.Status != CheckCompleted) {
+		return errors.New("identity, provenance, status, or exact head is invalid")
+	}
+	if check.Status == CheckCompleted {
+		if check.Conclusion != ConclusionSuccess && check.Conclusion != ConclusionFailure && check.Conclusion != ConclusionCancelled &&
+			check.Conclusion != ConclusionNeutral && check.Conclusion != ConclusionSkipped && check.Conclusion != ConclusionTimedOut {
+			return errors.New("completed check has an invalid conclusion")
+		}
+	} else if check.Conclusion != "" {
+		return errors.New("check has a conclusion before completion")
+	}
+	if err := canonicalizeEvidence(&check.EvidenceRefs, limits); err != nil {
+		return err
+	}
+	return nil
+}
+
+func canonicalizeChecksForHead(checks []Check, expectedHead GitSHA, limits Limits) ([]Check, error) {
+	checks = cloneChecks(checks)
+	if len(checks) > limits.MaxTotalItems {
+		return nil, errors.New("checks exceed the governed total-item limit")
+	}
+	seen := make(map[string]struct{}, len(checks))
+	for index := range checks {
+		check := &checks[index]
+		if err := validateCheck(check, expectedHead, limits); err != nil {
+			return nil, fmt.Errorf("check %d: %w", index, err)
+		}
+		identity := string(check.Identity.Source) + "\x00" + check.NodeID
+		if _, exists := seen[identity]; exists {
+			return nil, errors.New("check node identity is duplicated within its provider source")
+		}
+		seen[identity] = struct{}{}
+	}
+	sort.Slice(checks, func(i, j int) bool { return checkKey(checks[i]) < checkKey(checks[j]) })
+	return checks, nil
 }
 
 func (s CISnapshot) Input() CISnapshotInput       { return cloneCIInput(s.immutable.data) }

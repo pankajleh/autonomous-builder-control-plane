@@ -9,6 +9,8 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
@@ -181,8 +183,13 @@ func canonicalCommitBytes(i MergeCommitRecipeV1Input) ([]byte, error) {
 }
 
 func validCommitMessage(value string, max int) bool {
-	if value == "" || len(value) > max || strings.ContainsAny(value, "\x00\r") {
+	if value == "" || len(value) > max || !utf8.ValidString(value) || strings.ContainsAny(value, "\x00\r") {
 		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) && character != '\n' && character != '\t' {
+			return false
+		}
 	}
 	for _, line := range strings.Split(value, "\n") {
 		if strings.TrimRight(line, " \t") != line {

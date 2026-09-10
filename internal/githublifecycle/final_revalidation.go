@@ -20,6 +20,7 @@ type CurrentReadyProofV1Input struct {
 	ReadyBinding              ReadyAuthorityBindingV1
 	ControllerSequence        int64
 	ObservedUnixNano          int64
+	ObservedLedgerIdentity    string
 	ObservedBoundPrefixSHA256 string
 	ObservedLedgerLength      int64
 	ObservedLedgerSHA256      string
@@ -73,6 +74,7 @@ func NewCurrentReadyProofV1(input CurrentReadyProofV1Input, limits Limits) (Curr
 	}
 	ready := input.ReadyBinding.input
 	if input.ControllerSequence <= 0 || input.ObservedUnixNano < ready.ReadyEventUnixNano ||
+		!validText(input.ObservedLedgerIdentity, limits.MaxTextBytes, false) || input.ObservedLedgerIdentity != ready.LedgerIdentity ||
 		input.ObservedBoundPrefixSHA256 != ready.LedgerPrefixSHA256 ||
 		!input.NoLaterTransition || len(input.EvidenceRefs) == 0 || canonicalizeEvidence(&input.EvidenceRefs, limits) != nil {
 		return CurrentReadyProofV1{}, errors.New("current READY proof is incomplete, stale, or unbounded")
@@ -92,7 +94,7 @@ func currentReadyProofWire(input CurrentReadyProofV1Input, limitsSHA string) cur
 	ready := input.ReadyBinding.input
 	return currentReadyProofWireV1{
 		CurrentReadyProofSchemaV1, input.ReadyBinding.CanonicalJSON(), input.ReadyBinding.SHA256(), input.ControllerSequence,
-		input.ObservedUnixNano, ready.LedgerIdentity, ready.LedgerPrefixLength, ready.LedgerPrefixSHA256,
+		input.ObservedUnixNano, input.ObservedLedgerIdentity, ready.LedgerPrefixLength, ready.LedgerPrefixSHA256,
 		input.ObservedLedgerLength, input.ObservedLedgerSHA256, input.ObservedLedgerJSONL, ready.ReadyEventID, ready.ReadyEventSHA256,
 		ready.ReadyRunStateSequence, domain.StateReadyForMerge, input.NoLaterTransition, input.EvidenceRefs, limitsSHA,
 	}
@@ -125,6 +127,7 @@ func ParseCanonicalCurrentReadyProofV1(data []byte, limits Limits) (CurrentReady
 	}
 	value, err := NewCurrentReadyProofV1(CurrentReadyProofV1Input{
 		ReadyBinding: ready, ControllerSequence: wire.ControllerSequence, ObservedUnixNano: wire.ObservedUnixNano,
+		ObservedLedgerIdentity:    wire.LedgerIdentity,
 		ObservedBoundPrefixSHA256: wire.BoundPrefixSHA256,
 		ObservedLedgerLength:      wire.ObservedLedgerLength, ObservedLedgerSHA256: wire.ObservedLedgerSHA256,
 		ObservedLedgerJSONL: wire.ObservedLedgerJSONL,
@@ -163,25 +166,61 @@ func validateCurrentReadyLedger(input CurrentReadyProofV1Input, limits Limits) e
 		!bytes.Equal(ledgerBytes[ready.ReadyEventByteOffset:eventEnd], ready.ReadyEventJSON) {
 		return errors.New("current READY proof does not contain the bound READY event at its exact offset")
 	}
-	rest := ledgerBytes[ready.LedgerPrefixLength:]
+	seenEventIDs := make(map[string]struct{})
+	var currentState domain.State
+	var transitionOrdinal int64
+	readyFound := false
+	rest := ledgerBytes
+	var offset int64
 	for len(rest) > 0 {
 		newline := bytes.IndexByte(rest, '\n')
 		if newline < 0 || newline == 0 {
-			return errors.New("current READY ledger suffix is not complete JSONL")
+			return errors.New("current READY ledger observation is not complete JSONL")
 		}
 		line := rest[:newline]
 		var event ledger.Event
 		if err := strictDecode(line, &event); err != nil || event.Validate() != nil {
-			return errors.New("current READY ledger suffix contains an invalid event")
+			return errors.New("current READY ledger observation contains an invalid event")
 		}
 		canonical, _ := json.Marshal(event)
 		if !bytes.Equal(canonical, line) {
-			return errors.New("current READY ledger suffix contains non-canonical event bytes")
+			return errors.New("current READY ledger observation contains non-canonical event bytes")
 		}
-		if event.RunID == ready.RunID && event.StateFrom != "" {
-			return errors.New("current READY proof contains a later transition for the bound run")
+		if _, exists := seenEventIDs[event.EventID]; exists {
+			return errors.New("current READY ledger observation contains a duplicate event identity")
 		}
+		seenEventIDs[event.EventID] = struct{}{}
+
+		boundRun := event.ProjectID == ready.ProjectID && event.PlanID == ready.PlanID && event.RunID == ready.RunID
+		if event.RunID == ready.RunID && event.StateFrom != "" && !boundRun {
+			return errors.New("current READY ledger observation contains an ambiguous bound run identity")
+		}
+		if event.EventID == ready.ReadyEventID && (!boundRun || offset != ready.ReadyEventByteOffset) {
+			return errors.New("current READY event identity appears at the wrong ledger position or run")
+		}
+		if boundRun && event.StateFrom != "" {
+			transitionOrdinal++
+			if currentState != "" && event.StateFrom != currentState {
+				return errors.New("current READY ledger transitions are discontinuous")
+			}
+			currentState = event.StateTo
+			if offset == ready.ReadyEventByteOffset {
+				if readyFound || event.EventID != ready.ReadyEventID || !bytes.Equal(line, ready.ReadyEventJSON) ||
+					transitionOrdinal != ready.ReadyTransitionOrdinal || transitionOrdinal != ready.ReadyRunStateSequence {
+					return errors.New("current READY ledger event, sequence, or transition ordinal is incoherent")
+				}
+				readyFound = true
+			} else if readyFound {
+				return errors.New("current READY proof contains a later transition for the bound run")
+			}
+		} else if offset == ready.ReadyEventByteOffset {
+			return errors.New("current READY offset does not identify the bound run transition")
+		}
+		offset += int64(newline + 1)
 		rest = rest[newline+1:]
+	}
+	if !readyFound || currentState != domain.StateReadyForMerge {
+		return errors.New("current READY ledger observation does not derive the bound current state")
 	}
 	return nil
 }
@@ -257,6 +296,10 @@ func NewFinalRevalidationV1(input FinalRevalidationV1Input, limits Limits) (Fina
 	if err := validateMergeInput(input.MergeInput, limits); err != nil {
 		return FinalRevalidationV1{}, err
 	}
+	input.Checks, err = canonicalizeChecksForHead(input.Checks, input.MergeInput.authority.HeadSHA(), limits)
+	if err != nil {
+		return FinalRevalidationV1{}, err
+	}
 	if !input.CurrentReadyProof.valid() || input.CurrentReadyProof.input.ReadyBinding.SHA256() != input.MergeInput.authority.ReadyBinding().SHA256() {
 		return FinalRevalidationV1{}, errors.New("final revalidation does not bind current READY authority")
 	}
@@ -265,7 +308,9 @@ func NewFinalRevalidationV1(input FinalRevalidationV1Input, limits Limits) (Fina
 		!bytes.Equal(rebuiltReadyProof.CanonicalJSON(), input.CurrentReadyProof.CanonicalJSON()) {
 		return FinalRevalidationV1{}, errors.New("final current-READY proof fails independent validation")
 	}
-	if input.ControllerSequence <= input.CurrentReadyProof.input.ControllerSequence || input.StartedUnixNano <= 0 ||
+	admissionObservedUnixNano := latestObservationUnixNano(input.MergeInput.initialPullRequest, input.MergeInput.checkRunsClosure, input.MergeInput.commitStatusesClosure)
+	if input.ControllerSequence <= input.CurrentReadyProof.input.ControllerSequence || input.StartedUnixNano <= admissionObservedUnixNano ||
+		input.CurrentReadyProof.input.ObservedUnixNano <= admissionObservedUnixNano ||
 		input.CurrentReadyProof.input.ObservedUnixNano > input.StartedUnixNano ||
 		input.CompletedUnixNano < input.StartedUnixNano || input.PullRequest.input.Snapshot.ObservedUnixNano() < input.StartedUnixNano ||
 		input.PullRequest.input.Snapshot.ObservedUnixNano() > input.CompletedUnixNano {
@@ -372,6 +417,19 @@ func requireFreshFinalRequests(input FinalRevalidationV1Input) error {
 		final[requestID] = struct{}{}
 	}
 	return nil
+}
+
+func latestObservationUnixNano(pr AuthoritativePullRequestSnapshotV1, closures ...PaginationClosureV1) int64 {
+	latest := pr.input.Snapshot.ObservedUnixNano()
+	closures = append([]PaginationClosureV1{pr.input.ReviewsClosure}, closures...)
+	for _, closure := range closures {
+		for _, page := range closure.input.Pages {
+			if observed := page.input.Response.ObservedUnixNano(); observed > latest {
+				latest = observed
+			}
+		}
+	}
+	return latest
 }
 
 func requestIDs(pr AuthoritativePullRequestSnapshotV1, closures ...PaginationClosureV1) []string {

@@ -3,6 +3,7 @@ package githublifecycle
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -221,12 +222,32 @@ func TestDeterministicRecipeCapabilityCommitmentAndReconciliation(t *testing.T) 
 		t.Fatalf("full merge reconciliation input: %v", err)
 	}
 	boundSubmission, ok := reconcileInput.TargetSubmission()
-	if !ok || boundSubmission.SHA256() != submission.SHA256() || !bytes.Equal(boundSubmission.RequestBody(), commitment.CanonicalJSON()) ||
-		boundSubmission.RequestBodyBytes() != int64(len(commitment.CanonicalJSON())) {
+	var request gitHubUpdateRefsRequestV1
+	requestBody := boundSubmission.RequestBody()
+	if !ok || boundSubmission.SHA256() != submission.SHA256() || boundSubmission.Method() != GitHubGraphQLMethodV1 ||
+		boundSubmission.Path() != GitHubGraphQLPathV1 || strictDecode(requestBody, &request) != nil ||
+		bytes.Equal(requestBody, commitment.CanonicalJSON()) ||
+		request.Query != GitHubUpdateRefsDocumentV1 || request.Variables.Input.RepositoryID != commitment.repositoryNodeID ||
+		request.Variables.Input.ClientMutationID != commitment.clientMutationID || len(request.Variables.Input.RefUpdates) != 2 ||
+		request.Variables.Input.RefUpdates[0].Name != commitment.updates[0].Name ||
+		request.Variables.Input.RefUpdates[1].BeforeOID != commitment.updates[1].BeforeOID.String() ||
+		boundSubmission.RequestBodyBytes() != int64(len(requestBody)) {
 		t.Fatal("merge reconciliation input did not retain the exact canonical target submission")
+	}
+	execution, err := NewMergeExecutionInputV1(f.sealed, submission, f.limits)
+	if err != nil || execution.TargetSubmission().SHA256() != submission.SHA256() {
+		t.Fatalf("provider execution did not bind the pre-published target submission: %v", err)
 	}
 
 	result := f.validMergeResult(t)
+	executionResult, err := NewMergeExecutionResultV1(execution, result, f.limits)
+	if err != nil || ValidateMergeExecutionResultV1(execution, executionResult, f.limits) != nil {
+		t.Fatalf("provider result did not bind the invoked target submission: %v", err)
+	}
+	executionFailure, err := NewMergeExecutionError(execution, true, errors.New("lost response"), f.limits)
+	if err != nil || ValidateMergeExecutionError(execution, executionFailure, f.limits) != nil {
+		t.Fatalf("provider error did not bind the invoked target submission: %v", err)
+	}
 	applied, err := NewMergeReconciliationResult(f.sealed, submission, ReconciliationApplied, &result, nil, []ledger.EvidenceRef{{URI: "evidence/reconcile", Kind: "reconciliation", SHA256: strings.Repeat("a", 64)}}, f.limits)
 	if err != nil {
 		t.Fatal(err)

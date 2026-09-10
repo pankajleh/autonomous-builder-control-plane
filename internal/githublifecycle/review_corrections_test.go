@@ -49,6 +49,43 @@ func TestFinalRevalidationRejectsAdmissionObservationReuseAndDecisionForgery(t *
 		t.Fatal("seal accepted a forged non-current READY proof")
 	}
 	readyProofInput := final.Input().CurrentReadyProof.Input()
+	readyProofInput.ObservedLedgerIdentity = "replacement-ledger"
+	if _, err := NewCurrentReadyProofV1(readyProofInput, f.limits); err == nil {
+		t.Fatal("current READY proof accepted a replaced physical ledger identity")
+	}
+
+	readyInput := f.authority.ReadyBinding().Input()
+	readyInput.ReadyRunStateSequence++
+	readyInput.ReadyTransitionOrdinal++
+	forgedSequence, err := NewReadyAuthorityBindingV1(readyInput, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyProofInput = final.Input().CurrentReadyProof.Input()
+	readyProofInput.ReadyBinding = forgedSequence
+	if _, err := NewCurrentReadyProofV1(readyProofInput, f.limits); err == nil {
+		t.Fatal("current READY proof accepted a self-asserted ledger sequence and transition ordinal")
+	}
+
+	malformedLedger := final.Input().CurrentReadyProof.input.ObservedLedgerJSONL
+	malformedLedger[0] = '['
+	malformedReadyInput := f.authority.ReadyBinding().Input()
+	malformedReadyInput.LedgerPrefixSHA256 = digestBytes(malformedLedger)
+	malformedReady, err := NewReadyAuthorityBindingV1(malformedReadyInput, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyProofInput = final.Input().CurrentReadyProof.Input()
+	readyProofInput.ReadyBinding = malformedReady
+	readyProofInput.ObservedBoundPrefixSHA256 = malformedReadyInput.LedgerPrefixSHA256
+	readyProofInput.ObservedLedgerJSONL = malformedLedger
+	readyProofInput.ObservedLedgerSHA256 = digestBytes(malformedLedger)
+	readyProofInput.EvidenceRefs = []ledger.EvidenceRef{{URI: "evidence/current-ready-ledger-malformed", Kind: CurrentReadyLedgerEvidenceKindV1, SHA256: readyProofInput.ObservedLedgerSHA256}}
+	if _, err := NewCurrentReadyProofV1(readyProofInput, f.limits); err == nil {
+		t.Fatal("current READY proof accepted an invalid JSONL prefix before the bound event")
+	}
+
+	readyProofInput = final.Input().CurrentReadyProof.Input()
 	readyProofInput.ObservedLedgerSHA256 = strings.Repeat("f", 64)
 	if _, err := NewCurrentReadyProofV1(readyProofInput, f.limits); err == nil {
 		t.Fatal("current READY proof accepted a changed same-length ledger prefix")
@@ -64,6 +101,66 @@ func TestFinalRevalidationRejectsAdmissionObservationReuseAndDecisionForgery(t *
 	readyProofInput.EvidenceRefs = []ledger.EvidenceRef{{URI: "evidence/current-ready-ledger-later", Kind: CurrentReadyLedgerEvidenceKindV1, SHA256: readyProofInput.ObservedLedgerSHA256}}
 	if _, err := NewCurrentReadyProofV1(readyProofInput, f.limits); err == nil {
 		t.Fatal("current READY proof accepted a later transition for the bound run")
+	}
+}
+
+func TestFinalRevalidationMustFollowAdmissionObservations(t *testing.T) {
+	f := newFixture(t, MergeMethodMerge)
+	lateObservation := int64(1700000002600000000)
+	lateReviews := emptyPaginationClosure(t, f, PaginationReviews, &f.pr, "request-reviews-late-admission", lateObservation)
+	lateChecks := emptyPaginationClosure(t, f, PaginationCheckRuns, nil, "request-checks-late-admission", lateObservation)
+	lateStatuses := emptyPaginationClosure(t, f, PaginationCommitStatuses, nil, "request-statuses-late-admission", lateObservation)
+	latePRInput := f.prAuth.Input()
+	latePRInput.Snapshot, _ = NewSnapshotIdentity("github", "request-pr-late-admission", lateObservation)
+	latePRInput.ReviewsClosure = lateReviews
+	lateEnvelope, err := NewPullRequestEnvelopeEvidenceV1("evidence/pr-envelope-late-admission", latePRInput, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latePRInput.EvidenceRefs = replaceEvidenceKind(latePRInput.EvidenceRefs, GitHubPullRequestEnvelopeEvidenceKindV1, lateEnvelope)
+	latePR, err := NewAuthoritativePullRequestSnapshotV1(latePRInput, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateMerge, err := NewMergeInput(MergeAuthorizationInputV1{
+		Authority: f.authority, PolicyDecisionSHA256: f.mergeWrite.policyDecisionSHA256, InitialPullRequest: latePR,
+		Checks: nil, CheckRunsClosure: lateChecks, CommitStatusesClosure: lateStatuses,
+		Capability: f.mergeWrite.capability, Recipe: f.recipe, EvidenceRefs: f.mergeWrite.Evidence(),
+	}, f.mergeWrite.attempt.WriteID(), f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalInput := f.sealed.Seal().input.FinalRevalidation.Input()
+	finalInput.MergeInput = lateMerge
+	if _, err := NewFinalRevalidationV1(finalInput, f.limits); err == nil {
+		t.Fatal("final revalidation accepted observations that preceded admission observations")
+	}
+}
+
+func TestMergePolicyRejectsUnboundedOrMalformedDirectChecks(t *testing.T) {
+	f := newFixture(t, MergeMethodMerge)
+	producer := StableIdentityV1{DatabaseID: 51, NodeID: "producer"}
+	check := Check{
+		NodeID: "bounded-check", Name: "build",
+		Identity: TrustedCheckIdentityV1{Context: "build", Source: CheckSourceCheckRun, Producer: producer},
+		Status:   CheckCompleted, Conclusion: ConclusionSuccess, HeadSHA: f.headSHA,
+	}
+	for index := 0; index <= f.limits.MaxEvidenceRefs; index++ {
+		check.EvidenceRefs = append(check.EvidenceRefs, ledger.EvidenceRef{
+			URI: fmt.Sprintf("evidence/check-%03d", index), Kind: "check", SHA256: fmt.Sprintf("%064x", index+1),
+		})
+	}
+	runClosure := paginationClosureWithItems(t, f, PaginationCheckRuns, "", nil, []CanonicalPaginationItemV1{checkPaginationItem(check)})
+	if err := EvaluateMergePolicyV1(f.authority, f.prAuth, []Check{check}, runClosure, f.statuses, f.limits); err == nil {
+		t.Fatal("merge policy accepted a direct check with an unbounded evidence array")
+	}
+
+	check.EvidenceRefs = nil
+	check.Status = CheckQueued
+	check.Conclusion = ConclusionSuccess
+	runClosure = paginationClosureWithItems(t, f, PaginationCheckRuns, "", nil, []CanonicalPaginationItemV1{checkPaginationItem(check)})
+	if err := EvaluateMergePolicyV1(f.authority, f.prAuth, []Check{check}, runClosure, f.statuses, f.limits); err == nil {
+		t.Fatal("merge policy accepted a non-completed check with a conclusion")
 	}
 }
 
@@ -431,6 +528,11 @@ func checkPaginationItem(check Check) CanonicalPaginationItemV1 {
 
 func TestRecipeIsPolicyDerivedObjectFormatConsistentAndMutationIdentityIsUnique(t *testing.T) {
 	f := newFixture(t, MergeMethodMerge)
+	invalidUTF8Policy := f.authority.MergePolicy().Input()
+	invalidUTF8Policy.Recipe.MessageTemplate = string([]byte{'M', 'e', 'r', 'g', 'e', ' ', 0xff})
+	if _, err := NewMergePolicyV1(invalidUTF8Policy, f.limits); err == nil {
+		t.Fatal("merge recipe policy accepted a commit message containing invalid UTF-8")
+	}
 	recipe := f.recipe.Input()
 	if recipe.Message != "Merge authorized head\n\nABCP-Write-ID: "+f.mergeWrite.Attempt().WriteID() ||
 		recipe.AuthorUnix != f.authority.ReadyBinding().input.ReadyEventUnixNano/1_000_000_000 ||
