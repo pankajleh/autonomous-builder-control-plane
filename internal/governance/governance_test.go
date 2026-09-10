@@ -98,7 +98,7 @@ func TestReviewSetCannotGrowAndLeaseIsOneUse(t *testing.T) {
 	report0 := sealReport(t, capsule, capsuleFile, registry, nil, ReviewScopeReportV1{
 		Kind: "ReviewScopeReportV1", CapsuleFileSHA256: capsuleFile, CapsuleSHA256: capsule.CapsuleSHA256,
 		SemanticRegistrySHA256: registry.RegistrySHA256, ReviewedPreFixHEAD: oidChar("1"),
-		ActiveFindings:       []ActiveFindingV1{{FindingID: "finding.one", RuleID: "rule.invariant", Severity: SeverityMajor, EvidenceRefs: []string{"review/one"}}},
+		ActiveFindings:       []ActiveFindingV1{{FindingID: "finding.one", RuleID: "rule.invariant", Severity: SeverityMajor, Evidence: []EvidenceBindingV1{{Ref: "review/one"}}}},
 		RequestedMutationIDs: []string{"finding.one"}, DeferredObservations: []DeferredObservationV1{},
 		ReviewerIdentity: "reviewer", ProviderIdentity: "provider", ReviewEvidenceSHA256: hashChar("2"),
 	})
@@ -106,11 +106,12 @@ func TestReviewSetCannotGrowAndLeaseIsOneUse(t *testing.T) {
 	report1.Sequence = 1
 	report1.PredecessorReportSHA256 = report0.ReportSHA256
 	report1.ReportSHA256 = ""
-	report1.ActiveFindings = append(report1.ActiveFindings, ActiveFindingV1{FindingID: "finding.two", RuleID: "rule.invariant", Severity: SeverityMajor, EvidenceClass: "TEST", ValidatorIdentity: "governance-test", EvidenceRefs: []string{"review/two"}})
-	if _, err := SealReviewScopeReportV1(capsule, capsuleFile, registry, &report0, report1); ClassOf(err) != ScopeExpansionRequired {
+	report1.ActiveFindings = append(report1.ActiveFindings, ActiveFindingV1{FindingID: "finding.two", RuleID: "rule.invariant", Severity: SeverityMajor, Evidence: []EvidenceBindingV1{{Ref: "review/two"}}})
+	evidence1 := bindReportEvidence(t, capsule, registry, &report1)
+	if _, err := SealReviewScopeReportV1(capsule, capsuleFile, registry, evidence1, &report0, report1); ClassOf(err) != ScopeExpansionRequired {
 		t.Fatalf("growth class = %q, err=%v", ClassOf(err), err)
 	}
-	lease, err := IssueMutationLeaseV1(capsule, registry, report0, MutationLimitsV1{MaxChangedFiles: 2, MaxChangedBytes: 100})
+	lease, err := IssueMutationLeaseV1(capsule, registry, findingEvidenceForReport(t, capsule, registry, report0), report0, MutationLimitsV1{MaxChangedFiles: 2, MaxChangedBytes: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,13 +205,13 @@ func TestActivationGrandfathersOnlyExactPreActivationDigest(t *testing.T) {
 }
 
 func TestControllerActivationCannotBeBypassedByOmittedCallerState(t *testing.T) {
-	statePath := filepath.Join(t.TempDir(), "controller", "state.json")
-	controller, err := OpenControllerV1(statePath)
+	repository, _ := governanceRepository(t)
+	controller, err := OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
 	}
 	grandfathered := hashChar("3")
-	if err := controller.AdmitWorkflowAuthority(contextcapsule.PolicyVersionV2, grandfathered); err != nil {
+	if err := controller.AdmitWorkflowAuthority(repository, "example/project", contextcapsule.PolicyVersionV2, grandfathered); err != nil {
 		t.Fatal(err)
 	}
 	activation, err := SealGovernanceActivationV1(GovernanceActivationV1{
@@ -221,35 +222,41 @@ func TestControllerActivationCannotBeBypassedByOmittedCallerState(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.InstallActivationV1(activation); err != nil {
+	if err := controller.InstallActivationV1(repository, "example/project", activation); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenControllerV1(statePath)
+	reopened, err := OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.AdmitWorkflowAuthority(contextcapsule.PolicyVersionV2, grandfathered); err != nil {
+	if err := reopened.AdmitWorkflowAuthority(repository, "example/project", contextcapsule.PolicyVersionV2, grandfathered); err != nil {
 		t.Fatalf("durably grandfathered authority was rejected: %v", err)
 	}
-	if err := reopened.AdmitWorkflowAuthority(contextcapsule.PolicyVersionV2, hashChar("4")); ClassOf(err) != CapsuleLineageInvalid {
+	if err := reopened.AdmitWorkflowAuthority(repository, "example/project", contextcapsule.PolicyVersionV2, hashChar("4")); ClassOf(err) != CapsuleLineageInvalid {
 		t.Fatalf("post-activation omitted-state bypass class = %q, err=%v", ClassOf(err), err)
 	}
-	if err := reopened.AdmitWorkflowAuthority(contextcapsule.PolicyVersionV3, hashChar("5")); err != nil {
+	if err := reopened.AdmitWorkflowAuthority(repository, "example/project", contextcapsule.PolicyVersionV3, hashChar("5")); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestControllerCountersAndInFlightReservationAreDurable(t *testing.T) {
+	repository, base := governanceRepository(t)
 	capsule := fixtureCapsule(contextcapsule.StageBImplementation, hashChar("a"))
+	capsule.BaseSHA = base
 	capsule.PhaseAuthority.ExecutionBounds.MaxRalphexInvocations = 1
-	path := filepath.Join(t.TempDir(), "state.json")
-	first, err := OpenControllerV1(path)
+	first, err := OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := OpenControllerV1(path)
+	linkedWorktree := filepath.Join(t.TempDir(), "linked-worktree")
+	gitTest(t, repository, "worktree", "add", "--detach", linkedWorktree, base)
+	second, err := OpenControllerV1(linkedWorktree)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if first.ControllerIdentity() != second.ControllerIdentity() {
+		t.Fatal("linked worktree did not share the repository controller identity")
 	}
 	reservation, err := first.ReserveRalphexInvocationV1(capsule, contextcapsule.OperationImplementation, true, "")
 	if err != nil {
@@ -276,6 +283,36 @@ func TestControllerCountersAndInFlightReservationAreDurable(t *testing.T) {
 	}
 }
 
+func TestRepositoryControllerRejectsAlternatePathsAndCopiedState(t *testing.T) {
+	repository, _ := governanceRepository(t)
+	controller, err := OpenControllerV1(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.AdmitWorkflowAuthority(repository, "example/project", contextcapsule.PolicyVersionV2, hashChar("1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenControllerV1(filepath.Join(repository, "caller-selected-state.json")); ClassOf(err) != ExecutionBoundsInvalid {
+		t.Fatalf("caller-selected state path class = %q, err=%v", ClassOf(err), err)
+	}
+
+	otherRepository, _ := governanceRepository(t)
+	other, err := OpenControllerV1(otherRepository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(controller.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other.path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.Snapshot(); ClassOf(err) != ExecutionBoundsInvalid {
+		t.Fatalf("copied controller state class = %q, err=%v", ClassOf(err), err)
+	}
+}
+
 func TestControllerLeaseCASAndReceiptUseIndependentRepositoryProof(t *testing.T) {
 	repository, base := governanceRepository(t)
 	registry := fixtureRegistry(t)
@@ -285,15 +322,18 @@ func TestControllerLeaseCASAndReceiptUseIndependentRepositoryProof(t *testing.T)
 	report := sealReport(t, capsule, capsuleFile, registry, nil, ReviewScopeReportV1{
 		Kind: "ReviewScopeReportV1", CapsuleFileSHA256: capsuleFile, CapsuleSHA256: capsule.CapsuleSHA256,
 		SemanticRegistrySHA256: registry.RegistrySHA256, ReviewedPreFixHEAD: base,
-		ActiveFindings:       []ActiveFindingV1{{FindingID: "finding.one", RuleID: "rule.invariant", Severity: SeverityMajor, EvidenceRefs: []string{"review/one"}}},
+		ActiveFindings:       []ActiveFindingV1{{FindingID: "finding.one", RuleID: "rule.invariant", Severity: SeverityMajor, Evidence: []EvidenceBindingV1{{Ref: "review/one"}}}},
 		RequestedMutationIDs: []string{"finding.one"}, DeferredObservations: []DeferredObservationV1{},
 		ReviewerIdentity: "reviewer", ProviderIdentity: "provider", ReviewEvidenceSHA256: hashChar("2"),
 	})
-	path := filepath.Join(t.TempDir(), "state.json")
-	controller, err := OpenControllerV1(path)
+	controller, err := OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := controller.AdvanceReviewTipV1(repository, capsule, capsuleFile, registry, report); ClassOf(err) != ReviewChainInvalid {
+		t.Fatalf("opaque report evidence class = %q, err=%v", ClassOf(err), err)
+	}
+	recordReportEvidence(t, controller, repository, capsule, registry, report)
 	if err := controller.AdvanceReviewTipV1(repository, capsule, capsuleFile, registry, report); err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +347,7 @@ func TestControllerLeaseCASAndReceiptUseIndependentRepositoryProof(t *testing.T)
 	if err := controller.BeginMutationLeaseV1(lease.LeaseSHA256); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := OpenControllerV1(path)
+	reopened, err := OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,15 +402,20 @@ func TestActiveFindingMustMatchRegistryEvidenceContract(t *testing.T) {
 	base := ReviewScopeReportV1{
 		Kind: "ReviewScopeReportV1", CapsuleFileSHA256: hashChar("a"), CapsuleSHA256: capsule.CapsuleSHA256,
 		SemanticRegistrySHA256: registry.RegistrySHA256, ReviewedPreFixHEAD: oidChar("1"), ReviewedBlockingScopeIDs: append([]string(nil), capsule.PhaseAuthority.BlockingScopeIDs...),
-		ActiveFindings:       []ActiveFindingV1{{FindingID: "finding.one", RuleID: "rule.invariant", Severity: SeverityMajor, EvidenceClass: "WRONG", ValidatorIdentity: "governance-test", EvidenceRefs: []string{"review/one"}}},
+		ActiveFindings:       []ActiveFindingV1{{FindingID: "finding.one", RuleID: "rule.invariant", Severity: SeverityMajor, Evidence: []EvidenceBindingV1{{Ref: "review/one", SHA256: hashChar("8")}}}},
 		RequestedMutationIDs: []string{"finding.one"}, DeferredObservations: []DeferredObservationV1{}, ReviewerIdentity: "reviewer", ProviderIdentity: "provider", ReviewEvidenceSHA256: hashChar("2"),
 	}
-	if _, err := SealReviewScopeReportV1(capsule, base.CapsuleFileSHA256, registry, nil, base); ClassOf(err) != ReviewChainInvalid {
+	if _, err := SealReviewScopeReportV1(capsule, base.CapsuleFileSHA256, registry, nil, nil, base); ClassOf(err) != ReviewChainInvalid {
+		t.Fatalf("opaque evidence ref class = %q, err=%v", ClassOf(err), err)
+	}
+	wrongClass := fixtureFindingEvidence(capsule, registry, base.ActiveFindings[0], "review/one")
+	wrongClass.EvidenceClass = "WRONG"
+	if _, err := SealFindingEvidenceV1(capsule, registry, wrongClass); ClassOf(err) != ReviewChainInvalid {
 		t.Fatalf("evidence-class mismatch = %q, err=%v", ClassOf(err), err)
 	}
-	base.ActiveFindings[0].EvidenceClass = "TEST"
-	base.ActiveFindings[0].ModelJudgmentUsed = true
-	if _, err := SealReviewScopeReportV1(capsule, base.CapsuleFileSHA256, registry, nil, base); ClassOf(err) != ReviewChainInvalid {
+	modelOverride := fixtureFindingEvidence(capsule, registry, base.ActiveFindings[0], "review/one")
+	modelOverride.ModelJudgmentUsed = true
+	if _, err := SealFindingEvidenceV1(capsule, registry, modelOverride); ClassOf(err) != ReviewChainInvalid {
 		t.Fatalf("model override of deterministic validator = %q, err=%v", ClassOf(err), err)
 	}
 	badRegistry, err := SealSemanticAuthorityRegistryV1(SemanticAuthorityRegistryV1{Kind: "SemanticAuthorityRegistryV1", Entries: []SemanticRuleV1{
@@ -384,12 +429,9 @@ func TestActiveFindingMustMatchRegistryEvidenceContract(t *testing.T) {
 	badCapsule.PhaseAuthority.ObservationScopeIDs = []string{"rule.invariant", "rule.non-goal"}
 	badCapsule.PhaseAuthority.BlockingScopeIDs = []string{"rule.invariant", "rule.non-goal"}
 	badCapsule.PhaseAuthority.AuthorizedInvariantIDs = []string{"rule.invariant", "rule.non-goal"}
-	bad := base
-	bad.CapsuleSHA256 = badCapsule.CapsuleSHA256
-	bad.SemanticRegistrySHA256 = badRegistry.RegistrySHA256
-	bad.ReviewedBlockingScopeIDs = append([]string(nil), badCapsule.PhaseAuthority.BlockingScopeIDs...)
-	bad.ActiveFindings = []ActiveFindingV1{{FindingID: "finding.one", RuleID: "rule.non-goal", Severity: SeverityMajor, EvidenceClass: "REVIEW", EvidenceRefs: []string{"review/one"}}}
-	if _, err := SealReviewScopeReportV1(badCapsule, bad.CapsuleFileSHA256, badRegistry, nil, bad); ClassOf(err) != ScopeExpansionRequired {
+	badFinding := ActiveFindingV1{FindingID: "finding.one", RuleID: "rule.non-goal", Severity: SeverityMajor, Evidence: []EvidenceBindingV1{{Ref: "review/one"}}}
+	badEvidence := fixtureFindingEvidence(badCapsule, badRegistry, badFinding, "review/one")
+	if _, err := SealFindingEvidenceV1(badCapsule, badRegistry, badEvidence); ClassOf(err) != ScopeExpansionRequired {
 		t.Fatalf("non-blocking registry kind class = %q, err=%v", ClassOf(err), err)
 	}
 }
@@ -424,14 +466,14 @@ func TestCleanCheckpointsBindValidatedTipZeroVerdictAndFinalFloors(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateImplementationConvergedCheckpointV1(bCapsule, capsuleFile, registry, nil, cleanB, checkpoint, cGrant); err != nil {
+	if err := validateImplementationConvergedCheckpointV1(bCapsule, capsuleFile, registry, nil, cleanB, checkpoint, cGrant); err != nil {
 		t.Fatal(err)
 	}
 	tampered := checkpoint
 	tampered.ReviewScopeTipSHA256 = hashChar("9")
 	tampered.CheckpointSHA256 = ""
 	tampered = sealCheckpoint(t, tampered)
-	if err := ValidateImplementationConvergedCheckpointV1(bCapsule, capsuleFile, registry, nil, cleanB, tampered, cGrant); ClassOf(err) != CheckpointChainInvalid {
+	if err := validateImplementationConvergedCheckpointV1(bCapsule, capsuleFile, registry, nil, cleanB, tampered, cGrant); ClassOf(err) != CheckpointChainInvalid {
 		t.Fatalf("unbound clean tip class = %q, err=%v", ClassOf(err), err)
 	}
 
@@ -450,7 +492,7 @@ func TestCleanCheckpointsBindValidatedTipZeroVerdictAndFinalFloors(t *testing.T)
 		Sequence: 3, PredecessorCheckpointSHA256: hashChar("7"), ControllerEventIdentity: "event-final", ReviewScopeTipSHA256: cleanC.ReportSHA256,
 		ReviewedBlockingScopeIDs: append([]string(nil), cleanC.ReviewedBlockingScopeIDs...),
 	})
-	if err := ValidateFinalReviewCleanCheckpointV1(cCapsule, hashChar("5"), registry, cleanC, final, cGrant); err != nil {
+	if err := validateFinalReviewCleanCheckpointV1(cCapsule, hashChar("5"), registry, nil, cleanC, final, cGrant); err != nil {
 		t.Fatal(err)
 	}
 	missingFloorCapsule := cCapsule
@@ -465,8 +507,122 @@ func TestCleanCheckpointsBindValidatedTipZeroVerdictAndFinalFloors(t *testing.T)
 	missingFloorFinal.ReviewedBlockingScopeIDs = []string{"rule.other"}
 	missingFloorFinal.CheckpointSHA256 = ""
 	missingFloorFinal = sealCheckpoint(t, missingFloorFinal)
-	if err := ValidateFinalReviewCleanCheckpointV1(missingFloorCapsule, hashChar("5"), registry, missingFloorReport, missingFloorFinal, cGrant); ClassOf(err) != FinalReviewInvalidated {
+	if err := validateFinalReviewCleanCheckpointV1(missingFloorCapsule, hashChar("5"), registry, nil, missingFloorReport, missingFloorFinal, cGrant); ClassOf(err) != FinalReviewInvalidated {
 		t.Fatalf("missing final floor class = %q, err=%v", ClassOf(err), err)
+	}
+}
+
+func TestControllerCheckpointGateConsumesOnlyDurableCleanReviewTips(t *testing.T) {
+	repository, base := governanceRepository(t)
+	registry := fixtureRegistry(t)
+	controller, err := OpenControllerV1(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aCapsule := fixtureCapsule(contextcapsule.StageADesign, registry.RegistrySHA256)
+	aCapsule.BaseSHA = base
+	aCapsule.CapsuleSHA256 = hashChar("6")
+	aFile := hashChar("a")
+	design := PhaseCheckpointV1{
+		Kind: CheckpointDesignAccepted, Repository: aCapsule.Repository, CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256,
+		CandidateSHA: base, Operation: contextcapsule.OperationDesignReview, Verdict: "DESIGN_ACCEPTED",
+		Evidence: []EvidenceBindingV1{{Ref: "design/accepted", SHA256: hashChar("1")}}, ControllerPolicyIdentity: "policy-v3",
+		ControllerEventIdentity: "event-design", SemanticRegistrySHA256: registry.RegistrySHA256,
+	}
+	bGrant := fixtureGrant(registry.RegistrySHA256)
+	bGrant.BaseSHA = base
+	design, bGrant, err = SealCheckpointWithNextStageGrantV1(design, bGrant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.AdvanceCheckpointV1(CheckpointAdvanceV1{Repository: repository, Capsule: aCapsule, CapsuleFileSHA256: aFile, Registry: registry, Checkpoint: design, NextStageGrant: &bGrant}); err != nil {
+		t.Fatal(err)
+	}
+
+	bCapsule := fixtureCapsule(contextcapsule.StageBImplementation, registry.RegistrySHA256)
+	bCapsule.BaseSHA = base
+	bCapsule.CapsuleSHA256 = hashChar("7")
+	bCapsule.PhaseAuthority.Parent = &contextcapsule.PhaseParentV1{CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256, Stage: contextcapsule.StageADesign, CheckpointSHA256: design.CheckpointSHA256, CandidateSHA: base, GrantSHA256: bGrant.GrantSHA256}
+	bFile := hashChar("b")
+	blocking := sealReport(t, bCapsule, bFile, registry, nil, ReviewScopeReportV1{
+		Kind: "ReviewScopeReportV1", CapsuleFileSHA256: bFile, CapsuleSHA256: bCapsule.CapsuleSHA256,
+		SemanticRegistrySHA256: registry.RegistrySHA256, ReviewedPreFixHEAD: base,
+		ActiveFindings:       []ActiveFindingV1{{FindingID: "finding.one", RuleID: "rule.invariant", Severity: SeverityMajor, Evidence: []EvidenceBindingV1{{Ref: "review/blocking"}}}},
+		RequestedMutationIDs: []string{}, DeferredObservations: []DeferredObservationV1{}, ReviewerIdentity: "reviewer", ProviderIdentity: "provider", ReviewEvidenceSHA256: hashChar("2"),
+	})
+	recordReportEvidence(t, controller, repository, bCapsule, registry, blocking)
+	if err := controller.AdvanceReviewTipV1(repository, bCapsule, bFile, registry, blocking); err != nil {
+		t.Fatal(err)
+	}
+	cleanB := blocking
+	cleanB.Sequence = 1
+	cleanB.PredecessorReportSHA256 = blocking.ReportSHA256
+	cleanB.ActiveFindings = []ActiveFindingV1{}
+	cleanB.RequestedMutationIDs = []string{}
+	cleanB.ReviewEvidenceSHA256 = hashChar("3")
+	cleanB.ReportSHA256 = ""
+	cleanB = sealReport(t, bCapsule, bFile, registry, &blocking, cleanB)
+
+	converged := PhaseCheckpointV1{
+		Kind: CheckpointImplementationConverged, Repository: bCapsule.Repository, CapsuleFileSHA256: bFile, CapsuleSHA256: bCapsule.CapsuleSHA256,
+		CandidateSHA: base, Operation: contextcapsule.OperationImplementationReview, Verdict: "IMPLEMENTATION_CONVERGED_C0_M0",
+		Evidence: []EvidenceBindingV1{{Ref: "review/clean", SHA256: cleanB.ReviewEvidenceSHA256}}, ControllerPolicyIdentity: "policy-v3",
+		Sequence: 1, PredecessorCheckpointSHA256: design.CheckpointSHA256, ControllerEventIdentity: "event-converged",
+		ReviewScopeTipSHA256: cleanB.ReportSHA256, ReviewedBlockingScopeIDs: append([]string(nil), cleanB.ReviewedBlockingScopeIDs...),
+	}
+	cGrant := fixtureCGrant(registry.RegistrySHA256)
+	cGrant.BaseSHA = base
+	converged, cGrant, err = SealCheckpointWithNextStageGrantV1(converged, cGrant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	convergenceInput := CheckpointAdvanceV1{Repository: repository, Capsule: bCapsule, CapsuleFileSHA256: bFile, Registry: registry, Checkpoint: converged, NextStageGrant: &cGrant}
+	if err := controller.AdvanceCheckpointV1(convergenceInput); ClassOf(err) != CheckpointChainInvalid {
+		t.Fatalf("caller-supplied clean report bypass class = %q, err=%v", ClassOf(err), err)
+	}
+	if err := controller.AdvanceReviewTipV1(repository, bCapsule, bFile, registry, cleanB); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.AdvanceCheckpointV1(convergenceInput); err != nil {
+		t.Fatal(err)
+	}
+
+	cCapsule := fixtureCapsule(contextcapsule.StageCAcceptanceMerge, registry.RegistrySHA256)
+	cCapsule.BaseSHA = base
+	cCapsule.CapsuleSHA256 = hashChar("8")
+	cCapsule.PhaseAuthority.Parent = &contextcapsule.PhaseParentV1{CapsuleFileSHA256: bFile, CapsuleSHA256: bCapsule.CapsuleSHA256, Stage: contextcapsule.StageBImplementation, CheckpointSHA256: converged.CheckpointSHA256, CandidateSHA: base, GrantSHA256: cGrant.GrantSHA256}
+	cFile := hashChar("c")
+	accepted := sealCheckpoint(t, PhaseCheckpointV1{
+		Kind: CheckpointAcceptancePassed, Repository: cCapsule.Repository, CapsuleFileSHA256: cFile, CapsuleSHA256: cCapsule.CapsuleSHA256,
+		CandidateSHA: base, Operation: contextcapsule.OperationAcceptance, Verdict: "PASSED",
+		Evidence: []EvidenceBindingV1{{Ref: "acceptance/passed", SHA256: hashChar("4")}}, ControllerPolicyIdentity: "policy-v3",
+		Sequence: 2, PredecessorCheckpointSHA256: converged.CheckpointSHA256, ControllerEventIdentity: "event-acceptance",
+	})
+	if err := controller.AdvanceCheckpointV1(CheckpointAdvanceV1{Repository: repository, Capsule: cCapsule, CapsuleFileSHA256: cFile, Registry: registry, Checkpoint: accepted}); err != nil {
+		t.Fatal(err)
+	}
+	cleanC := sealReport(t, cCapsule, cFile, registry, nil, ReviewScopeReportV1{
+		Kind: "ReviewScopeReportV1", CapsuleFileSHA256: cFile, CapsuleSHA256: cCapsule.CapsuleSHA256,
+		SemanticRegistrySHA256: registry.RegistrySHA256, ReviewedPreFixHEAD: base, ActiveFindings: []ActiveFindingV1{},
+		RequestedMutationIDs: []string{}, DeferredObservations: []DeferredObservationV1{}, ReviewerIdentity: "final-reviewer", ProviderIdentity: "provider", ReviewEvidenceSHA256: hashChar("5"),
+	})
+	final := sealCheckpoint(t, PhaseCheckpointV1{
+		Kind: CheckpointFinalReviewClean, Repository: cCapsule.Repository, CapsuleFileSHA256: cFile, CapsuleSHA256: cCapsule.CapsuleSHA256,
+		CandidateSHA: base, Operation: contextcapsule.OperationFinalReview, Verdict: "FINAL_REVIEW_CLEAN_C0_M0",
+		Evidence: []EvidenceBindingV1{{Ref: "review/final", SHA256: cleanC.ReviewEvidenceSHA256}}, ControllerPolicyIdentity: "policy-v3",
+		Sequence: 3, PredecessorCheckpointSHA256: accepted.CheckpointSHA256, ControllerEventIdentity: "event-final",
+		ReviewScopeTipSHA256: cleanC.ReportSHA256, ReviewedBlockingScopeIDs: append([]string(nil), cleanC.ReviewedBlockingScopeIDs...),
+	})
+	finalInput := CheckpointAdvanceV1{Repository: repository, Capsule: cCapsule, CapsuleFileSHA256: cFile, Registry: registry, Checkpoint: final}
+	if err := controller.AdvanceCheckpointV1(finalInput); ClassOf(err) != FinalReviewInvalidated {
+		t.Fatalf("unstored final report bypass class = %q, err=%v", ClassOf(err), err)
+	}
+	if err := controller.AdvanceReviewTipV1(repository, cCapsule, cFile, registry, cleanC); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.AdvanceCheckpointV1(finalInput); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -570,17 +726,66 @@ func sealReport(t *testing.T, capsule contextcapsule.Capsule, file string, regis
 	if report.ReviewedBlockingScopeIDs == nil {
 		report.ReviewedBlockingScopeIDs = append([]string(nil), capsule.PhaseAuthority.BlockingScopeIDs...)
 	}
-	rules := registryMap(registry)
-	for index := range report.ActiveFindings {
-		rule := rules[report.ActiveFindings[index].RuleID]
-		report.ActiveFindings[index].EvidenceClass = rule.EvidenceClass
-		report.ActiveFindings[index].ValidatorIdentity = rule.ValidatorIdentity
+	evidence := bindReportEvidence(t, capsule, registry, &report)
+	if previous != nil {
+		evidence = append(evidence, findingEvidenceForReport(t, capsule, registry, *previous)...)
 	}
-	value, err := SealReviewScopeReportV1(capsule, file, registry, previous, report)
+	value, err := SealReviewScopeReportV1(capsule, file, registry, evidence, previous, report)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return value
+}
+
+func fixtureFindingEvidence(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, finding ActiveFindingV1, ref string) FindingEvidenceV1 {
+	rule := registryMap(registry)[finding.RuleID]
+	return FindingEvidenceV1{
+		Kind: "FindingEvidenceV1", Ref: ref, CapsuleSHA256: capsule.CapsuleSHA256, SemanticRegistrySHA256: registry.RegistrySHA256,
+		CandidateSHA: capsule.BaseSHA, FindingID: finding.FindingID, RuleID: finding.RuleID, RegisteredKind: rule.Kind,
+		EvidenceClass: rule.EvidenceClass, ValidatorIdentity: rule.ValidatorIdentity, Outcome: "VIOLATION_CONFIRMED", ArtifactSHA256: hashChar("9"),
+	}
+}
+
+func findingEvidenceForReport(t *testing.T, capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, report ReviewScopeReportV1) []FindingEvidenceV1 {
+	t.Helper()
+	var records []FindingEvidenceV1
+	for _, finding := range report.ActiveFindings {
+		for _, binding := range finding.Evidence {
+			record := fixtureFindingEvidence(capsule, registry, finding, binding.Ref)
+			record.CandidateSHA = report.ReviewedPreFixHEAD
+			sealed, err := SealFindingEvidenceV1(capsule, registry, record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			records = append(records, sealed)
+		}
+	}
+	return records
+}
+
+func bindReportEvidence(t *testing.T, capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, report *ReviewScopeReportV1) []FindingEvidenceV1 {
+	t.Helper()
+	records := findingEvidenceForReport(t, capsule, registry, *report)
+	byRef := make(map[string]string, len(records))
+	for _, record := range records {
+		byRef[record.Ref] = record.EvidenceSHA256
+	}
+	for findingIndex := range report.ActiveFindings {
+		for evidenceIndex := range report.ActiveFindings[findingIndex].Evidence {
+			binding := &report.ActiveFindings[findingIndex].Evidence[evidenceIndex]
+			binding.SHA256 = byRef[binding.Ref]
+		}
+	}
+	return records
+}
+
+func recordReportEvidence(t *testing.T, controller *ControllerV1, repository string, capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, report ReviewScopeReportV1) {
+	t.Helper()
+	for _, record := range findingEvidenceForReport(t, capsule, registry, report) {
+		if err := controller.RecordFindingEvidenceV1(repository, capsule, registry, record); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 func hashChar(character string) string { return strings.Repeat(character, 64) }
 func oidChar(character string) string  { return strings.Repeat(character, 40) }

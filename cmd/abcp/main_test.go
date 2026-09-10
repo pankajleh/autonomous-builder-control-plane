@@ -74,12 +74,11 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	outputRoot := t.TempDir()
 	ledgerPath := filepath.Join(outputRoot, "ledger", "events.jsonl")
 	evidenceRoot := filepath.Join(outputRoot, "evidence")
-	governanceState := filepath.Join(outputRoot, "controller", "governance.json")
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	code := runCLI([]string{
-		"run", "--manifest", manifestPath, "--ledger", ledgerPath, "--evidence-root", evidenceRoot, "--governance-state", governanceState,
+		"run", "--manifest", manifestPath, "--ledger", ledgerPath, "--evidence-root", evidenceRoot,
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("run CLI exited %d: %s", code, stderr.String())
@@ -227,6 +226,20 @@ func TestGovernanceDiagnosticRejectsNonCanonicalJSON(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := runCLI([]string{"governance-checkpoint-validate", "--input", path}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "strict canonical") {
 		t.Fatalf("noncanonical diagnostic exited %d: %s", code, stderr.String())
+	}
+}
+
+func TestGovernanceCLIRejectsCallerSelectedStatePaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "input.json")
+	writeCLIFile(t, path, []byte("{}"), 0o600)
+	var stdout, stderr bytes.Buffer
+	if code := runCLI([]string{"governance-review-advance", "--input", path, "--state", filepath.Join(t.TempDir(), "state.json")}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("caller-selected governance state exited %d: %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runCLI([]string{"run", "--manifest", path, "--ledger", "ledger", "--evidence-root", "evidence", "--governance-state", filepath.Join(t.TempDir(), "state.json")}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("caller-selected run state exited %d: %s", code, stderr.String())
 	}
 }
 

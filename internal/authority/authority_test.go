@@ -394,7 +394,14 @@ func TestNewRejectsInvalidMergeReviewPolicy(t *testing.T) {
 
 func TestNewAdmitsV3BOnlyWithStructuralCapabilityAndCounters(t *testing.T) {
 	manifest := v3BoundManifest(t)
-	governed, err := New(manifest)
+	if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "repository governance controller") {
+		t.Fatalf("controllerless V3 authority was admitted: %v", err)
+	}
+	controller, err := governancev3.OpenControllerV1(manifest.Repository.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	governed, err := NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +411,7 @@ func TestNewAdmitsV3BOnlyWithStructuralCapabilityAndCounters(t *testing.T) {
 	}
 	invalid := cloneManifest(manifest)
 	invalid.Ralphex.Capability.IdleTimeoutFlag = false
-	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "EXECUTION_BOUNDS_INVALID") {
+	if _, err := NewWithGovernanceController(invalid, controller); err == nil || !strings.Contains(err.Error(), "EXECUTION_BOUNDS_INVALID") {
 		t.Fatalf("unsupported V3 capability was admitted: %v", err)
 	}
 	invalid = cloneManifest(manifest)
@@ -416,14 +423,18 @@ func TestNewAdmitsV3BOnlyWithStructuralCapabilityAndCounters(t *testing.T) {
 	writeFile(t, invalid.Ralphex.BinaryPath, binary, 0o700)
 	invalid.Ralphex.BinarySHA256 = fileHash(t, invalid.Ralphex.BinaryPath)
 	invalid.Ralphex.Capability.BinarySHA256 = invalid.Ralphex.BinarySHA256
-	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "differs from the pinned binary probe") {
+	if _, err := NewWithGovernanceController(invalid, controller); err == nil || !strings.Contains(err.Error(), "differs from the pinned binary probe") {
 		t.Fatalf("caller-asserted capability overrode binary probe: %v", err)
 	}
 	// Restore the shared fixture binary before testing independent state input.
 	manifest = v3BoundManifest(t)
+	controller, err = governancev3.OpenControllerV1(manifest.Repository.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	invalid = cloneManifest(manifest)
 	invalid.Ralphex.ExecutionState = &ralphex.ExecutionStateV1{AggregateElapsed: "0s"}
-	if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "controller-owned") {
+	if _, err := NewWithGovernanceController(invalid, controller); err == nil || !strings.Contains(err.Error(), "controller-owned") {
 		t.Fatalf("caller-owned cumulative state was admitted: %v", err)
 	}
 }
@@ -447,6 +458,21 @@ func TestNewRejectsV2ABCGovernanceAssertionWithoutActivation(t *testing.T) {
 	if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "cannot assert A/B/C") {
 		t.Fatalf("V2 governance assertion was admitted: %v", err)
 	}
+	manifest.Governance = nil
+	if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "repository governance controller") {
+		t.Fatalf("controllerless autonomous V2 authority was admitted: %v", err)
+	}
+
+	spec.OperationContext.Kind = contextcapsule.OperationDeployment
+	_, data, err = contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, manifest.ContextCapsule.Path, data, 0o600)
+	manifest.ContextCapsule.SHA256 = fileHash(t, manifest.ContextCapsule.Path)
+	if _, err := New(manifest); err != nil {
+		t.Fatalf("separately governed V2 deployment was changed: %v", err)
+	}
 }
 
 func TestControllerAdmissionRejectsPostActivationV2WhenGovernanceIsOmitted(t *testing.T) {
@@ -464,15 +490,12 @@ func TestControllerAdmissionRejectsPostActivationV2WhenGovernanceIsOmitted(t *te
 	}
 	writeFile(t, manifest.ContextCapsule.Path, data, 0o600)
 	manifest.ContextCapsule.SHA256 = fileHash(t, manifest.ContextCapsule.Path)
-	legacy, err := New(manifest)
+	controller, err := governancev3.OpenControllerV1(manifest.Repository.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	controller, err := governancev3.OpenControllerV1(filepath.Join(t.TempDir(), "state.json"))
+	legacy, err := NewWithGovernanceController(manifest, controller)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := controller.AdmitWorkflowAuthority(contextcapsule.PolicyVersionV2, legacy.SHA256()); err != nil {
 		t.Fatal(err)
 	}
 	activation, err := governancev3.SealGovernanceActivationV1(governancev3.GovernanceActivationV1{
@@ -482,7 +505,7 @@ func TestControllerAdmissionRejectsPostActivationV2WhenGovernanceIsOmitted(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.InstallActivationV1(activation); err != nil {
+	if err := controller.InstallActivationV1(manifest.Repository.Path, manifest.Repository.Identity, activation); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := NewWithGovernanceController(manifest, controller); err != nil {

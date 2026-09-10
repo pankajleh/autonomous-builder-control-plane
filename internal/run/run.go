@@ -135,15 +135,39 @@ func newRunner(governed authority.Authority, events EventAppender, artifacts sup
 	if err != nil {
 		return nil, fmt.Errorf("parse admitted context capsule: %w", err)
 	}
-	if parsedCapsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
-		if controller == nil || !governed.ControllerAdmitted() {
-			return nil, errors.New("EXECUTION_BOUNDS_INVALID: durable governance controller admission is required")
+	if autonomousDevelopmentCapsule(parsedCapsule) {
+		if controller == nil || !governed.ControllerAdmitted() || governed.ControllerIdentity() == "" || governed.ControllerIdentity() != controller.ControllerIdentity() {
+			return nil, errors.New("CAPSULE_LINEAGE_INVALID: exact repository governance controller admission is required")
 		}
+		if err := controller.AdmitWorkflowAuthority(governed.Repository().Path, governed.Repository().Identity, parsedCapsule.PolicyVersion, governed.SHA256()); err != nil {
+			return nil, fmt.Errorf("revalidate repository governance controller admission: %w", err)
+		}
+	}
+	if parsedCapsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
 		if _, ok := processes.(ContainedCommandRunner); !ok {
 			return nil, errors.New("EXECUTION_BOUNDS_INVALID: Linux containment handoff is unavailable")
 		}
 	}
 	return &Runner{governed: governed, capsule: capsule, events: events, artifacts: artifacts, processes: processes, controller: controller, parsedCapsule: parsedCapsule}, nil
+}
+
+func autonomousDevelopmentCapsule(capsule contextcapsule.Capsule) bool {
+	if capsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
+		return true
+	}
+	if capsule.PolicyVersion != contextcapsule.PolicyVersionV2 || capsule.OperationContext == nil {
+		return false
+	}
+	switch capsule.OperationContext.Kind {
+	case contextcapsule.OperationDesignPlanning, contextcapsule.OperationDesignReview,
+		contextcapsule.OperationImplementation, contextcapsule.OperationImplementationReview,
+		contextcapsule.OperationAcceptance, contextcapsule.OperationFinalReview,
+		contextcapsule.OperationPRPublication, contextcapsule.OperationMergeAuthorization,
+		contextcapsule.OperationPostMergeAcceptance:
+		return true
+	default:
+		return false
+	}
 }
 
 // Run executes exactly one governed implementation and branch-acceptance

@@ -127,13 +127,7 @@ type Authority struct {
 	canonicalJSON      []byte
 	sha256             string
 	controllerAdmitted bool
-}
-
-// WorkflowAdmissionController is the controller-owned durable activation
-// boundary. Manifests cannot substitute caller-provided activation state.
-type WorkflowAdmissionController interface {
-	AdmitWorkflowAuthority(policyVersion, authorityDigest string) error
-	ValidateCapsuleUsageV3(contextcapsule.Capsule, contextcapsule.OperationKind, bool, string) error
+	controllerIdentity string
 }
 
 // New validates, canonicalizes, and freezes a run manifest.
@@ -143,14 +137,14 @@ func New(input Manifest) (Authority, error) {
 
 // NewWithGovernanceController validates and durably admits an A/B/C workflow
 // authority against the controller activation tip.
-func NewWithGovernanceController(input Manifest, controller WorkflowAdmissionController) (Authority, error) {
-	if controller == nil {
+func NewWithGovernanceController(input Manifest, controller *governancev3.ControllerV1) (Authority, error) {
+	if controller == nil || controller.ControllerIdentity() == "" {
 		return Authority{}, errors.New("CAPSULE_LINEAGE_INVALID: durable governance controller is required")
 	}
 	return newAuthority(input, controller)
 }
 
-func newAuthority(input Manifest, controller WorkflowAdmissionController) (Authority, error) {
+func newAuthority(input Manifest, controller *governancev3.ControllerV1) (Authority, error) {
 	manifest := cloneManifest(input)
 	if manifest.MergeReview != nil {
 		sort.Slice(manifest.MergeReview.Required, func(i, j int) bool {
@@ -241,11 +235,12 @@ func newAuthority(input Manifest, controller WorkflowAdmissionController) (Autho
 			return Authority{}, err
 		}
 		if workflow {
-			if err := controller.AdmitWorkflowAuthority(policyVersion, authority.sha256); err != nil {
+			if err := controller.AdmitWorkflowAuthority(manifest.Repository.Path, manifest.Repository.Identity, policyVersion, authority.sha256); err != nil {
 				return Authority{}, err
 			}
 		}
 		authority.controllerAdmitted = true
+		authority.controllerIdentity = controller.ControllerIdentity()
 	}
 	return authority, nil
 }
@@ -336,7 +331,13 @@ func (a Authority) ControllerAdmitted() bool {
 	return a.controllerAdmitted
 }
 
-func validateGovernanceAdmission(manifest Manifest, controller WorkflowAdmissionController) error {
+// ControllerIdentity is the repository-owned controller that admitted this
+// authority. Autonomous workflow runners require an exact identity match.
+func (a Authority) ControllerIdentity() string {
+	return a.controllerIdentity
+}
+
+func validateGovernanceAdmission(manifest Manifest, controller *governancev3.ControllerV1) error {
 	if manifest.Governance != nil && (manifest.Governance.Activation != nil || manifest.Governance.IssuedSequence != 0) {
 		return errors.New("CAPSULE_LINEAGE_INVALID: activation and issuance state are controller-owned, not manifest assertions")
 	}
@@ -358,16 +359,22 @@ func validateGovernanceAdmission(manifest Manifest, controller WorkflowAdmission
 		if manifest.Governance != nil {
 			return errors.New("CAPSULE_LINEAGE_INVALID: V2 cannot assert A/B/C governance without activation/grandfather evidence")
 		}
+		workflow, _, workflowErr := autonomousWorkflowPolicy(manifest)
+		if workflowErr != nil {
+			return workflowErr
+		}
+		if workflow && controller == nil {
+			return errors.New("CAPSULE_LINEAGE_INVALID: autonomous V2 workflow authority requires the repository governance controller")
+		}
 		return nil
 	}
 	if manifest.Governance == nil {
 		return errors.New("CAPSULE_USAGE_INVALID: V3 requires explicit governance operation admission")
 	}
 	if controller == nil {
-		if err := governancev3.ValidateCapsuleUsageV3(capsule, manifest.Governance.Operation, manifest.Governance.Mutation, manifest.Governance.LeaseSHA256); err != nil {
-			return err
-		}
-	} else if err := controller.ValidateCapsuleUsageV3(capsule, manifest.Governance.Operation, manifest.Governance.Mutation, manifest.Governance.LeaseSHA256); err != nil {
+		return errors.New("CAPSULE_LINEAGE_INVALID: autonomous V3 workflow authority requires the repository governance controller")
+	}
+	if err := controller.ValidateCapsuleUsageV3(capsule, manifest.Governance.Operation, manifest.Governance.Mutation, manifest.Governance.LeaseSHA256); err != nil {
 		return err
 	}
 	if capsule.PhaseAuthority == nil || capsule.PhaseAuthority.Stage != contextcapsule.StageBImplementation {

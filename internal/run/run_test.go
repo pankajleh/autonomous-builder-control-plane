@@ -81,6 +81,40 @@ func TestRunnerSuccessReachesBranchAcceptedWithOrderedEvidence(t *testing.T) {
 	}
 }
 
+func TestAutonomousRunnerRequiresExactRepositoryController(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	artifacts, err := evidence.NewStore(t.TempDir(), "controller-gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := &recordingEventAppender{}
+	if _, err := New(fixture.authority, events, artifacts, supervisor.New()); err == nil || !strings.Contains(err.Error(), "exact repository governance controller") {
+		t.Fatalf("controllerless autonomous runner was admitted: %v", err)
+	}
+	other := newRunFixture(t, 0, commandPath(t, "true"))
+	if _, err := NewWithController(fixture.authority, events, artifacts, supervisor.New(), other.controller); err == nil || !strings.Contains(err.Error(), "exact repository governance controller") {
+		t.Fatalf("mismatched repository controller was admitted: %v", err)
+	}
+}
+
+func TestRunnerRechecksActivationAfterAuthorityConstruction(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	repository := fixture.authority.Repository()
+	activation, err := governancev3.SealGovernanceActivationV1(governancev3.GovernanceActivationV1{
+		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3, PolicySHA256: strings.Repeat("a", 64),
+		ActivationRepositoryCommit: repository.StartSHA, ActivationSequence: 2, ActivationTime: "2026-09-10T00:00:00Z", GrandfatheredV2Digests: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.controller.InstallActivationV1(repository.Path, repository.Identity, activation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.construct(t, fixture.authority); governancev3.ClassOf(err) != governancev3.CapsuleLineageInvalid {
+		t.Fatalf("post-construction activation bypass class = %q, err=%v", governancev3.ClassOf(err), err)
+	}
+}
+
 func TestV3BReusesCapsuleAtDescendantAndStopsBeforeCAcceptance(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	manifest := fixture.authority.Manifest()
@@ -132,7 +166,7 @@ func TestV3BReusesCapsuleAtDescendantAndStopsBeforeCAcceptance(t *testing.T) {
 		ExecutorModelEffortFlags: true, IsolatedConfig: true, GovernedHandoff: ralphex.HandoffTasksOnly, LinuxContainment: true,
 	}
 	manifest.Governance = &authority.GovernanceManifest{Operation: contextcapsule.OperationImplementation, Mutation: true}
-	controller, err := governancev3.OpenControllerV1(filepath.Join(t.TempDir(), "state.json"))
+	controller, err := governancev3.OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,10 +240,7 @@ func TestRunnerAppliesGovernedRalphexTimeout(t *testing.T) {
 	fixture := newRunFixtureWithScript(t, "#!/bin/sh\nwhile :; do sleep 60; done\n", authority.WorktreePolicy{}, commandPath(t, "true"))
 	manifest := fixture.authority.Manifest()
 	manifest.Ralphex.Timeout = "50ms"
-	governed, err := authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	governed := fixture.admit(t, manifest)
 	fixture.authority = governed
 	result := fixture.execute(t)
 	if result.State != domain.StateFailed || result.Ralphex.Outcome != supervisor.OutcomeTimedOut {
@@ -243,10 +274,7 @@ func TestRunnerReverifiesBoundContextCapsuleBeforeRalphexLaunch(t *testing.T) {
 	capsulePath := filepath.Join(t.TempDir(), "capsule.json")
 	writeTestFile(t, capsulePath, capsuleJSON, 0o600)
 	manifest.ContextCapsule = &authority.ContextCapsuleManifest{Path: capsulePath, SHA256: testHash(t, capsulePath)}
-	fixture.authority, err = authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture.authority = fixture.admit(t, manifest)
 	runner := fixture.runner(t)
 
 	writeTestFile(t, sourcePath, []byte("drift after authority construction"), 0o600)
@@ -287,10 +315,7 @@ func TestNewRequiresExactOperationBase(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	manifest := fixture.authority.Manifest()
 	manifest.Repository.StartSHA = strings.Repeat("0", 40)
-	governed, err := authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	governed := fixture.admit(t, manifest)
 	if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), "does not match governed start SHA") {
 		t.Fatalf("operation/base mismatch error = %v", err)
 	}
@@ -312,10 +337,7 @@ func TestNewEnforcesCodexXHighEffort(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			manifest := fixture.authority.Manifest()
 			test.mutate(&manifest.Executor)
-			governed, err := authority.New(manifest)
-			if err != nil {
-				t.Fatal(err)
-			}
+			governed := fixture.admit(t, manifest)
 			if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), test.field) {
 				t.Fatalf("effort policy error = %v", err)
 			}
@@ -350,11 +372,8 @@ func TestNewEnforcesOperationKindAndRalphexModeMapping(t *testing.T) {
 			manifest := fixture.authority.Manifest()
 			manifest.Ralphex.Mode = test.mode
 			bindOperationCapsule(t, &manifest, test.kind)
-			governed, err := authority.New(manifest)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, err = fixture.construct(t, governed)
+			governed := fixture.admit(t, manifest)
+			_, err := fixture.construct(t, governed)
 			if test.wantErr {
 				if err == nil || !strings.Contains(err.Error(), "requires operation kind") {
 					t.Fatalf("operation kind %q with mode %q error = %v", test.kind, test.mode, err)
@@ -389,10 +408,7 @@ func TestNewRejectsMultipleIncompleteImplementationSectionsInEveryImplementation
 			plan := []byte("### Task 1: first\n\n- [ ] first action\n\n### Task 2: second\n\n- [ ] second action\n")
 			writeTestFile(t, manifest.Plan.Path, plan, 0o600)
 			manifest.Plan.SHA256 = testHash(t, manifest.Plan.Path)
-			governed, err := authority.New(manifest)
-			if err != nil {
-				t.Fatal(err)
-			}
+			governed := fixture.admit(t, manifest)
 			if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), "2 incomplete executable") {
 				t.Fatalf("multiple incomplete task error = %v", err)
 			}
@@ -901,6 +917,7 @@ func TestEP002StateCapExcludesIntegrationAndCompletion(t *testing.T) {
 
 type runFixture struct {
 	authority  authority.Authority
+	controller *governancev3.ControllerV1
 	ledgerPath string
 	evidence   string
 }
@@ -982,13 +999,18 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 		PolicyVersion: "branch-test-v1",
 	}
 	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
-	governed, err := authority.New(manifest)
+	controller, err := governancev3.OpenControllerV1(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	governed, err := authority.NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
 	return runFixture{
 		authority:  governed,
+		controller: controller,
 		ledgerPath: filepath.Join(root, "events", "run.jsonl"),
 		evidence:   filepath.Join(root, "evidence"),
 	}
@@ -1051,7 +1073,16 @@ func (f runFixture) construct(t *testing.T, governed authority.Authority) (*Runn
 	if err != nil {
 		return nil, err
 	}
-	return New(governed, events, artifacts, supervisor.New())
+	return NewWithController(governed, events, artifacts, supervisor.New(), f.controller)
+}
+
+func (f runFixture) admit(t *testing.T, manifest authority.Manifest) authority.Authority {
+	t.Helper()
+	governed, err := authority.NewWithGovernanceController(manifest, f.controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return governed
 }
 
 func (f runFixture) execute(t *testing.T) Result {
@@ -1068,11 +1099,7 @@ func (f runFixture) atCurrentHead(t *testing.T) runFixture {
 	manifest := f.authority.Manifest()
 	manifest.Repository.StartSHA = runGit(t, manifest.Repository.Path, "rev-parse", "HEAD")
 	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
-	governed, err := authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.authority = governed
+	f.authority = f.admit(t, manifest)
 	return f
 }
 

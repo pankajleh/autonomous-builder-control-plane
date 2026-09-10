@@ -222,6 +222,18 @@ type PhaseCheckpointV1 struct {
 	CheckpointSHA256            string                       `json:"checkpoint_sha256"`
 }
 
+// CheckpointAdvanceV1 is the complete controller input for advancing the one
+// repository-owned checkpoint tip. Review predecessors are deliberately not
+// accepted here; convergence gates consume the controller's durable tip.
+type CheckpointAdvanceV1 struct {
+	Repository        string                      `json:"repository"`
+	Capsule           contextcapsule.Capsule      `json:"capsule"`
+	CapsuleFileSHA256 string                      `json:"capsule_file_sha256"`
+	Registry          SemanticAuthorityRegistryV1 `json:"registry"`
+	Checkpoint        PhaseCheckpointV1           `json:"checkpoint"`
+	NextStageGrant    *NextStageGrantV1           `json:"next_stage_grant,omitempty"`
+}
+
 // SealPhaseCheckpointV1 returns a validated checkpoint with its digest set.
 func SealPhaseCheckpointV1(checkpoint PhaseCheckpointV1) (PhaseCheckpointV1, error) {
 	checkpoint.CheckpointSHA256 = ""
@@ -839,13 +851,90 @@ const (
 
 // ActiveFindingV1 maps a reviewer finding to an immutable registry rule.
 type ActiveFindingV1 struct {
-	FindingID         string          `json:"finding_id"`
-	RuleID            string          `json:"rule_id"`
-	Severity          FindingSeverity `json:"severity"`
-	EvidenceClass     string          `json:"evidence_class"`
-	ValidatorIdentity string          `json:"validator_identity,omitempty"`
-	ModelJudgmentUsed bool            `json:"model_judgment_used"`
-	EvidenceRefs      []string        `json:"evidence_refs"`
+	FindingID string              `json:"finding_id"`
+	RuleID    string              `json:"rule_id"`
+	Severity  FindingSeverity     `json:"severity"`
+	Evidence  []EvidenceBindingV1 `json:"evidence"`
+}
+
+// FindingEvidenceV1 is a content-addressed controller evidence record. Review
+// reports name these records by Ref, but cannot assert their evidence class,
+// validator, invariant mapping, or model-judgment status themselves.
+type FindingEvidenceV1 struct {
+	Kind                   string       `json:"kind"`
+	Ref                    string       `json:"ref"`
+	CapsuleSHA256          string       `json:"capsule_sha256"`
+	SemanticRegistrySHA256 string       `json:"semantic_registry_sha256"`
+	CandidateSHA           string       `json:"candidate_sha"`
+	FindingID              string       `json:"finding_id"`
+	RuleID                 string       `json:"rule_id"`
+	RegisteredKind         RegistryKind `json:"registered_kind"`
+	EvidenceClass          string       `json:"evidence_class"`
+	ValidatorIdentity      string       `json:"validator_identity,omitempty"`
+	ModelJudgmentUsed      bool         `json:"model_judgment_used"`
+	Outcome                string       `json:"outcome"`
+	ArtifactSHA256         string       `json:"artifact_sha256"`
+	EvidenceSHA256         string       `json:"evidence_sha256"`
+}
+
+// SealFindingEvidenceV1 binds one exact violation record to the immutable
+// capsule, registry rule, candidate, and underlying artifact digest.
+func SealFindingEvidenceV1(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, evidence FindingEvidenceV1) (FindingEvidenceV1, error) {
+	evidence.EvidenceSHA256 = ""
+	if err := validateFindingEvidenceV1(capsule, registry, evidence); err != nil {
+		return FindingEvidenceV1{}, err
+	}
+	digest, err := findingEvidenceDigest(evidence)
+	if err != nil {
+		return FindingEvidenceV1{}, err
+	}
+	evidence.EvidenceSHA256 = digest
+	return evidence, nil
+}
+
+// ValidateFindingEvidenceV1 rejects evidence whose record or registry-bound
+// semantics differ from the exact content-addressed controller artifact.
+func ValidateFindingEvidenceV1(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, evidence FindingEvidenceV1) error {
+	if err := validateFindingEvidenceV1(capsule, registry, evidence); err != nil {
+		return err
+	}
+	digest, err := findingEvidenceDigest(evidence)
+	if err != nil || digest != evidence.EvidenceSHA256 {
+		return fail(ReviewChainInvalid, "finding evidence digest mismatch")
+	}
+	return nil
+}
+
+func validateFindingEvidenceV1(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, evidence FindingEvidenceV1) error {
+	if err := ValidateSemanticAuthorityRegistryV1(registry); err != nil {
+		return err
+	}
+	if capsule.PolicyVersion != contextcapsule.PolicyVersionV3 || capsule.PhaseAuthority == nil || evidence.Kind != "FindingEvidenceV1" || !validText(evidence.Ref, 2048) || !validOID(evidence.CandidateSHA) || !validSHA256(evidence.ArtifactSHA256) {
+		return fail(ReviewChainInvalid, "finding evidence identity is invalid")
+	}
+	if evidence.CapsuleSHA256 != capsule.CapsuleSHA256 || evidence.SemanticRegistrySHA256 != registry.RegistrySHA256 || registry.RegistrySHA256 != capsule.PhaseAuthority.SemanticRegistrySHA256 || !validID(evidence.FindingID) || !validID(evidence.RuleID) || evidence.Outcome != "VIOLATION_CONFIRMED" {
+		return fail(ReviewChainInvalid, "finding evidence does not bind the exact capsule, registry, finding, and violation outcome")
+	}
+	rule, ok := registryMap(registry)[evidence.RuleID]
+	if !ok || rule.Kind != RegistryInvariant && rule.Kind != RegistryKnownFinding {
+		return fail(ScopeExpansionRequired, "finding evidence has no blocking registry mapping")
+	}
+	if evidence.RegisteredKind != rule.Kind || evidence.EvidenceClass != rule.EvidenceClass || evidence.ValidatorIdentity != rule.ValidatorIdentity {
+		return fail(ReviewChainInvalid, "finding evidence differs from the registered kind, evidence class, or validator identity")
+	}
+	if evidence.ModelJudgmentUsed && (!rule.ModelJudgmentMayObserve || rule.ValidatorIdentity != "") {
+		return fail(ReviewChainInvalid, "model judgment cannot establish this blocking evidence")
+	}
+	if !stringSubset([]string{evidence.RuleID}, capsule.PhaseAuthority.BlockingScopeIDs) || !stringSubset([]string{evidence.RuleID}, capsule.PhaseAuthority.AuthorizedInvariantIDs) {
+		return fail(ScopeExpansionRequired, "finding evidence is outside blocker or invariant authority")
+	}
+	return nil
+}
+
+func findingEvidenceDigest(evidence FindingEvidenceV1) (string, error) {
+	evidence.EvidenceSHA256 = ""
+	type alias FindingEvidenceV1
+	return digestJSON(alias(evidence))
 }
 
 // DeferredObservationV1 is reportable but cannot block or receive a lease.
@@ -876,9 +965,9 @@ type ReviewScopeReportV1 struct {
 
 // SealReviewScopeReportV1 validates and hashes one report relative to the
 // exact durable predecessor tip.
-func SealReviewScopeReportV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, previous *ReviewScopeReportV1, report ReviewScopeReportV1) (ReviewScopeReportV1, error) {
+func SealReviewScopeReportV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, evidence []FindingEvidenceV1, previous *ReviewScopeReportV1, report ReviewScopeReportV1) (ReviewScopeReportV1, error) {
 	report.ReportSHA256 = ""
-	if err := validateReviewPayload(capsule, capsuleFileSHA256, registry, previous, report); err != nil {
+	if err := validateReviewPayload(capsule, capsuleFileSHA256, registry, evidence, previous, report); err != nil {
 		return ReviewScopeReportV1{}, err
 	}
 	digest, err := reviewDigest(report)
@@ -891,11 +980,11 @@ func SealReviewScopeReportV1(capsule contextcapsule.Capsule, capsuleFileSHA256 s
 
 // ValidateReviewScopeReportV1 rejects chain forks, active-set growth,
 // unregistered blockers, and deferred/blocker authority confusion.
-func ValidateReviewScopeReportV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, previous *ReviewScopeReportV1, report ReviewScopeReportV1) error {
+func ValidateReviewScopeReportV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, evidence []FindingEvidenceV1, previous *ReviewScopeReportV1, report ReviewScopeReportV1) error {
 	if previous != nil && report.ReportSHA256 == previous.ReportSHA256 {
-		return validateReviewTip(report, capsule, capsuleFileSHA256, registry)
+		return validateReviewTip(report, capsule, capsuleFileSHA256, registry, evidence)
 	}
-	if err := validateReviewPayload(capsule, capsuleFileSHA256, registry, previous, report); err != nil {
+	if err := validateReviewPayload(capsule, capsuleFileSHA256, registry, evidence, previous, report); err != nil {
 		return err
 	}
 	digest, err := reviewDigest(report)
@@ -917,7 +1006,7 @@ func ValidateReviewCandidateV1(report ReviewScopeReportV1, expectedPreFixHEAD st
 	return nil
 }
 
-func validateReviewPayload(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, previous *ReviewScopeReportV1, report ReviewScopeReportV1) error {
+func validateReviewPayload(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, evidence []FindingEvidenceV1, previous *ReviewScopeReportV1, report ReviewScopeReportV1) error {
 	if capsule.PolicyVersion != contextcapsule.PolicyVersionV3 || capsule.PhaseAuthority == nil || capsule.PhaseAuthority.Stage != contextcapsule.StageBImplementation && capsule.PhaseAuthority.Stage != contextcapsule.StageCAcceptanceMerge {
 		return fail(ReviewChainInvalid, "review report requires B or C context-capsule-v3")
 	}
@@ -938,10 +1027,10 @@ func validateReviewPayload(capsule contextcapsule.Capsule, capsuleFileSHA256 str
 			return fail(ReviewChainInvalid, "first report must be sequence 0 without predecessor")
 		}
 	} else {
-		if err := ValidateReviewScopeReportV1(capsule, capsuleFileSHA256, registry, nilForPreviousValidation(previous), *previous); err != nil {
+		if err := ValidateReviewScopeReportV1(capsule, capsuleFileSHA256, registry, evidence, nilForPreviousValidation(previous), *previous); err != nil {
 			// A caller need not provide the entire chain, but the supplied durable tip
 			// must at least have a valid internal digest and common bindings.
-			if err := validateReviewTip(*previous, capsule, capsuleFileSHA256, registry); err != nil {
+			if err := validateReviewTip(*previous, capsule, capsuleFileSHA256, registry, evidence); err != nil {
 				return err
 			}
 		}
@@ -954,7 +1043,7 @@ func validateReviewPayload(capsule contextcapsule.Capsule, capsuleFileSHA256 str
 	activeRules := make(map[string]string, len(report.ActiveFindings))
 	previousFinding := ""
 	for _, finding := range report.ActiveFindings {
-		if !validID(finding.FindingID) || finding.FindingID <= previousFinding || !validID(finding.RuleID) || finding.Severity != SeverityCritical && finding.Severity != SeverityMajor || validateEvidenceRefs(finding.EvidenceRefs) != nil {
+		if !validID(finding.FindingID) || finding.FindingID <= previousFinding || !validID(finding.RuleID) || finding.Severity != SeverityCritical && finding.Severity != SeverityMajor || validateEvidenceBindings(finding.Evidence) != nil {
 			return fail(ReviewChainInvalid, "active findings are not canonical or valid")
 		}
 		previousFinding = finding.FindingID
@@ -965,11 +1054,8 @@ func validateReviewPayload(capsule contextcapsule.Capsule, capsuleFileSHA256 str
 		if rule.Kind != RegistryInvariant && rule.Kind != RegistryKnownFinding {
 			return fail(ScopeExpansionRequired, "finding %s maps to non-blocking registry kind %s", finding.FindingID, rule.Kind)
 		}
-		if finding.EvidenceClass != rule.EvidenceClass || finding.ValidatorIdentity != rule.ValidatorIdentity {
-			return fail(ReviewChainInvalid, "finding %s evidence class or validator identity differs from the registry", finding.FindingID)
-		}
-		if finding.ModelJudgmentUsed && (!rule.ModelJudgmentMayObserve || rule.ValidatorIdentity != "") {
-			return fail(ReviewChainInvalid, "finding %s cannot use model judgment as blocking evidence", finding.FindingID)
+		if err := resolveFindingEvidenceV1(capsule, registry, evidence, report.ReviewedPreFixHEAD, finding); err != nil {
+			return err
 		}
 		if rule.CorrectionRelation == "DESIGN_GAP" {
 			return fail(DesignGap, "finding %s requires new A-governed design authority", finding.FindingID)
@@ -1044,7 +1130,7 @@ func validateReviewPayload(capsule contextcapsule.Capsule, capsuleFileSHA256 str
 
 func nilForPreviousValidation(_ *ReviewScopeReportV1) *ReviewScopeReportV1 { return nil }
 
-func validateReviewTip(report ReviewScopeReportV1, capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1) error {
+func validateReviewTip(report ReviewScopeReportV1, capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, evidence []FindingEvidenceV1) error {
 	if report.CapsuleFileSHA256 != capsuleFileSHA256 || report.CapsuleSHA256 != capsule.CapsuleSHA256 || report.SemanticRegistrySHA256 != registry.RegistrySHA256 || !validSHA256(report.ReportSHA256) {
 		return fail(ReviewChainInvalid, "supplied review tip binding is invalid")
 	}
@@ -1052,16 +1138,44 @@ func validateReviewTip(report ReviewScopeReportV1, capsule contextcapsule.Capsul
 	if err != nil || digest != report.ReportSHA256 {
 		return fail(ReviewChainInvalid, "supplied review tip digest is invalid")
 	}
+	for _, finding := range report.ActiveFindings {
+		if err := resolveFindingEvidenceV1(capsule, registry, evidence, report.ReviewedPreFixHEAD, finding); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// ValidateImplementationConvergedCheckpointV1 binds convergence to the exact
-// validated, monotonically extended B review tip and a clean 0C/0M result.
-func ValidateImplementationConvergedCheckpointV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, previous *ReviewScopeReportV1, report ReviewScopeReportV1, checkpoint PhaseCheckpointV1, nextGrant NextStageGrantV1) error {
+func resolveFindingEvidenceV1(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, records []FindingEvidenceV1, candidateSHA string, finding ActiveFindingV1) error {
+	byRef := make(map[string]FindingEvidenceV1, len(records))
+	for _, record := range records {
+		if _, duplicate := byRef[record.Ref]; duplicate {
+			return fail(ReviewChainInvalid, "controller evidence contains a competing ref %q", record.Ref)
+		}
+		byRef[record.Ref] = record
+	}
+	for _, binding := range finding.Evidence {
+		record, ok := byRef[binding.Ref]
+		if !ok {
+			return fail(ReviewChainInvalid, "finding %s evidence ref %q is not controller-owned", finding.FindingID, binding.Ref)
+		}
+		if err := ValidateFindingEvidenceV1(capsule, registry, record); err != nil {
+			return err
+		}
+		if binding.SHA256 != record.EvidenceSHA256 || record.CandidateSHA != candidateSHA || record.FindingID != finding.FindingID || record.RuleID != finding.RuleID {
+			return fail(ReviewChainInvalid, "finding %s evidence does not bind the exact candidate and invariant mapping", finding.FindingID)
+		}
+	}
+	return nil
+}
+
+// validateImplementationConvergedCheckpointV1 is called only while holding the
+// controller lock with report equal to the durable review tip.
+func validateImplementationConvergedCheckpointV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, evidence []FindingEvidenceV1, report ReviewScopeReportV1, checkpoint PhaseCheckpointV1, nextGrant NextStageGrantV1) error {
 	if capsule.PolicyVersion != contextcapsule.PolicyVersionV3 || capsule.PhaseAuthority == nil || capsule.PhaseAuthority.Stage != contextcapsule.StageBImplementation {
 		return fail(CheckpointChainInvalid, "implementation convergence requires B context-capsule-v3")
 	}
-	if err := ValidateReviewScopeReportV1(capsule, capsuleFileSHA256, registry, previous, report); err != nil {
+	if err := validateReviewTip(report, capsule, capsuleFileSHA256, registry, evidence); err != nil {
 		return err
 	}
 	if err := validateCleanReviewBinding(capsule, capsuleFileSHA256, report, checkpoint, CheckpointImplementationConverged); err != nil {
@@ -1076,13 +1190,13 @@ func ValidateImplementationConvergedCheckpointV1(capsule contextcapsule.Capsule,
 	return nil
 }
 
-// ValidateFinalReviewCleanCheckpointV1 proves that C reviewed every mandatory
-// blocker floor at the exact accepted candidate and found precisely 0C/0M.
-func ValidateFinalReviewCleanCheckpointV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, report ReviewScopeReportV1, checkpoint PhaseCheckpointV1, grant NextStageGrantV1) error {
+// validateFinalReviewCleanCheckpointV1 is called only while holding the
+// controller lock with report and grant loaded from the durable workflow tip.
+func validateFinalReviewCleanCheckpointV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, evidence []FindingEvidenceV1, report ReviewScopeReportV1, checkpoint PhaseCheckpointV1, grant NextStageGrantV1) error {
 	if capsule.PolicyVersion != contextcapsule.PolicyVersionV3 || capsule.PhaseAuthority == nil || capsule.PhaseAuthority.Stage != contextcapsule.StageCAcceptanceMerge {
 		return fail(FinalReviewInvalidated, "final review requires C context-capsule-v3")
 	}
-	if err := ValidateReviewScopeReportV1(capsule, capsuleFileSHA256, registry, nil, report); err != nil {
+	if err := validateReviewTip(report, capsule, capsuleFileSHA256, registry, evidence); err != nil {
 		return err
 	}
 	if err := validateCleanReviewBinding(capsule, capsuleFileSHA256, report, checkpoint, CheckpointFinalReviewClean); err != nil {
@@ -1135,8 +1249,8 @@ type MutationLeaseV1 struct {
 
 // IssueMutationLeaseV1 deterministically intersects B path authority with the
 // correction path family of every selected registry rule.
-func IssueMutationLeaseV1(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, report ReviewScopeReportV1, limits MutationLimitsV1) (MutationLeaseV1, error) {
-	if err := ValidateReviewScopeReportV1(capsule, report.CapsuleFileSHA256, registry, nil, report); err != nil {
+func IssueMutationLeaseV1(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, evidence []FindingEvidenceV1, report ReviewScopeReportV1, limits MutationLimitsV1) (MutationLeaseV1, error) {
+	if err := ValidateReviewScopeReportV1(capsule, report.CapsuleFileSHA256, registry, evidence, nil, report); err != nil {
 		return MutationLeaseV1{}, err
 	}
 	return issueMutationLease(capsule, registry, report, limits)
@@ -1144,8 +1258,8 @@ func IssueMutationLeaseV1(capsule contextcapsule.Capsule, registry SemanticAutho
 
 // IssueMutationLeaseForTransitionV1 issues from a later report only after
 // validating its exact predecessor report tip.
-func IssueMutationLeaseForTransitionV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, previous ReviewScopeReportV1, report ReviewScopeReportV1, limits MutationLimitsV1) (MutationLeaseV1, error) {
-	if err := ValidateReviewScopeReportV1(capsule, capsuleFileSHA256, registry, &previous, report); err != nil {
+func IssueMutationLeaseForTransitionV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, evidence []FindingEvidenceV1, previous ReviewScopeReportV1, report ReviewScopeReportV1, limits MutationLimitsV1) (MutationLeaseV1, error) {
+	if err := ValidateReviewScopeReportV1(capsule, capsuleFileSHA256, registry, evidence, &previous, report); err != nil {
 		return MutationLeaseV1{}, err
 	}
 	return issueMutationLease(capsule, registry, report, limits)
@@ -1192,8 +1306,8 @@ func issueMutationLease(capsule contextcapsule.Capsule, registry SemanticAuthori
 }
 
 // ValidateMutationLeaseV1 proves a lease equals the controller-derived value.
-func ValidateMutationLeaseV1(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, report ReviewScopeReportV1, lease MutationLeaseV1) error {
-	expected, err := IssueMutationLeaseV1(capsule, registry, report, MutationLimitsV1{lease.MaxChangedFiles, lease.MaxChangedBytes})
+func ValidateMutationLeaseV1(capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, evidence []FindingEvidenceV1, report ReviewScopeReportV1, lease MutationLeaseV1) error {
+	expected, err := IssueMutationLeaseV1(capsule, registry, evidence, report, MutationLimitsV1{lease.MaxChangedFiles, lease.MaxChangedBytes})
 	if err != nil {
 		return err
 	}
@@ -1207,8 +1321,8 @@ func ValidateMutationLeaseV1(capsule contextcapsule.Capsule, registry SemanticAu
 
 // ValidateMutationLeaseForTransitionV1 proves a later-report lease against
 // the exact report transition which authorized it.
-func ValidateMutationLeaseForTransitionV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, previous ReviewScopeReportV1, report ReviewScopeReportV1, lease MutationLeaseV1) error {
-	expected, err := IssueMutationLeaseForTransitionV1(capsule, capsuleFileSHA256, registry, previous, report, MutationLimitsV1{lease.MaxChangedFiles, lease.MaxChangedBytes})
+func ValidateMutationLeaseForTransitionV1(capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, evidence []FindingEvidenceV1, previous ReviewScopeReportV1, report ReviewScopeReportV1, lease MutationLeaseV1) error {
+	expected, err := IssueMutationLeaseForTransitionV1(capsule, capsuleFileSHA256, registry, evidence, previous, report, MutationLimitsV1{lease.MaxChangedFiles, lease.MaxChangedBytes})
 	if err != nil {
 		return err
 	}
@@ -1455,6 +1569,8 @@ type InvocationReservationV1 struct {
 // It is always read and replaced while holding the adjacent controller lock.
 type ControllerStateV1 struct {
 	Kind                  string                   `json:"kind"`
+	ControllerIdentity    string                   `json:"controller_identity"`
+	RepositoryIdentity    string                   `json:"repository_identity,omitempty"`
 	Revision              uint64                   `json:"revision"`
 	NextAuthoritySequence uint64                   `json:"next_authority_sequence"`
 	IssuedV2Authorities   []IssuedAuthorityV1      `json:"issued_v2_authorities"`
@@ -1464,34 +1580,71 @@ type ControllerStateV1 struct {
 	ExecutionState        ralphex.ExecutionStateV1 `json:"execution_state"`
 	ActiveInvocation      *InvocationReservationV1 `json:"active_invocation,omitempty"`
 	ReviewTip             *ReviewScopeReportV1     `json:"review_tip,omitempty"`
+	ReviewCapsuleSHA256   string                   `json:"review_capsule_sha256,omitempty"`
+	FindingEvidence       []FindingEvidenceV1      `json:"finding_evidence"`
 	Lease                 *MutationLeaseV1         `json:"lease,omitempty"`
 	MutationState         *MutationStateV1         `json:"mutation_state,omitempty"`
 	FixBatchLeaseSHA256   string                   `json:"fix_batch_lease_sha256,omitempty"`
+	CheckpointTip         *PhaseCheckpointV1       `json:"checkpoint_tip,omitempty"`
+	NextStageGrant        *NextStageGrantV1        `json:"next_stage_grant,omitempty"`
 }
 
-// ControllerV1 owns a strict-canonical state file and its inter-process lock.
+// ControllerV1 owns the one strict-canonical state file derived from a Git
+// common directory. Callers cannot select a parallel state location.
 type ControllerV1 struct {
-	path string
+	repository string
+	commonDir  string
+	identity   string
+	path       string
 }
 
-// OpenControllerV1 resolves one controller-selected durable workflow path.
-func OpenControllerV1(path string) (*ControllerV1, error) {
-	if strings.TrimSpace(path) == "" {
-		return nil, fail(ExecutionBoundsInvalid, "controller state path is required")
-	}
-	absolute, err := filepath.Abs(path)
+// OpenControllerV1 derives the controller identity and state location from the
+// canonical repository Git common directory. Linked worktrees share the same
+// controller; copying the state into another repository fails identity checks.
+func OpenControllerV1(repository string) (*ControllerV1, error) {
+	root, err := canonicalRepository(repository)
 	if err != nil {
-		return nil, fail(ExecutionBoundsInvalid, "resolve controller state path: %v", err)
+		return nil, fail(ExecutionBoundsInvalid, "resolve controller repository: %v", err)
 	}
-	parent := filepath.Dir(absolute)
-	if err := os.MkdirAll(parent, 0o700); err != nil {
-		return nil, fail(ExecutionBoundsInvalid, "create controller state directory: %v", err)
+	commonDir, err := gitText(root, "rev-parse", "--git-common-dir")
+	if err != nil || commonDir == "" {
+		return nil, fail(ExecutionBoundsInvalid, "resolve repository Git common directory")
 	}
-	parent, err = filepath.EvalSymlinks(parent)
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(root, commonDir)
+	}
+	commonDir, err = filepath.EvalSymlinks(commonDir)
 	if err != nil {
-		return nil, fail(ExecutionBoundsInvalid, "canonicalize controller state directory: %v", err)
+		return nil, fail(ExecutionBoundsInvalid, "canonicalize repository Git common directory: %v", err)
 	}
-	return &ControllerV1{path: filepath.Join(parent, filepath.Base(absolute))}, nil
+	info, err := os.Stat(commonDir)
+	if err != nil || !info.IsDir() {
+		return nil, fail(ExecutionBoundsInvalid, "repository Git common directory is unavailable")
+	}
+	identity, err := digestJSON(struct {
+		Kind      string `json:"kind"`
+		CommonDir string `json:"git_common_dir"`
+	}{Kind: "GovernanceControllerIdentityV1", CommonDir: filepath.Clean(commonDir)})
+	if err != nil {
+		return nil, fail(ExecutionBoundsInvalid, "derive controller identity: %v", err)
+	}
+	directory := filepath.Join(commonDir, "abcp-governance")
+	if err := os.Mkdir(directory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, fail(ExecutionBoundsInvalid, "create repository controller directory: %v", err)
+	}
+	directoryInfo, err := os.Lstat(directory)
+	if err != nil || directoryInfo.Mode()&os.ModeSymlink != 0 || !directoryInfo.IsDir() || directoryInfo.Mode().Perm()&0o077 != 0 {
+		return nil, fail(ExecutionBoundsInvalid, "repository controller directory is not private and canonical")
+	}
+	return &ControllerV1{repository: root, commonDir: filepath.Clean(commonDir), identity: identity, path: filepath.Join(directory, "workflow-state-v1.json")}, nil
+}
+
+// ControllerIdentity returns the repository-owned physical controller identity.
+func (c *ControllerV1) ControllerIdentity() string {
+	if c == nil {
+		return ""
+	}
+	return c.identity
 }
 
 // Snapshot returns a detached copy of the durable controller state.
@@ -1510,33 +1663,175 @@ func (c *ControllerV1) Snapshot() (ControllerStateV1, error) {
 	return result, err
 }
 
+// RecordFindingEvidenceV1 persists one immutable, registry-resolved evidence
+// record before a report may use its ref as blocking evidence.
+func (c *ControllerV1) RecordFindingEvidenceV1(repository string, capsule contextcapsule.Capsule, registry SemanticAuthorityRegistryV1, evidence FindingEvidenceV1) error {
+	if err := c.validateRepository(repository, capsule.Repository); err != nil {
+		return err
+	}
+	if err := ValidateFindingEvidenceV1(capsule, registry, evidence); err != nil {
+		return err
+	}
+	if _, err := ValidateCandidateV1(repository, capsule, evidence.CandidateSHA); err != nil {
+		return err
+	}
+	head, err := gitText(repository, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil || head != evidence.CandidateSHA {
+		return fail(ReviewChainInvalid, "finding evidence is not for the controller's exact current candidate")
+	}
+	return c.withState(func(state *ControllerStateV1) (bool, error) {
+		bound, err := c.bindCapsuleRepository(state, capsule)
+		if err != nil {
+			return false, err
+		}
+		for _, existing := range state.FindingEvidence {
+			if existing.Ref != evidence.Ref {
+				continue
+			}
+			if existing.EvidenceSHA256 == evidence.EvidenceSHA256 {
+				return bound, nil
+			}
+			return false, fail(ReviewChainInvalid, "a competing controller evidence record already uses ref %q", evidence.Ref)
+		}
+		if len(state.FindingEvidence) >= 256 {
+			return false, fail(ReviewChainInvalid, "controller finding evidence limit is exhausted")
+		}
+		state.FindingEvidence = append(state.FindingEvidence, evidence)
+		sort.Slice(state.FindingEvidence, func(i, j int) bool { return state.FindingEvidence[i].Ref < state.FindingEvidence[j].Ref })
+		return true, nil
+	})
+}
+
+// AdvanceCheckpointV1 validates and atomically advances the sole durable
+// checkpoint tip. Clean B/C gates use only the controller's stored review tip
+// and stored C grant; caller-provided predecessor reports cannot satisfy them.
+func (c *ControllerV1) AdvanceCheckpointV1(input CheckpointAdvanceV1) error {
+	if err := c.validateRepository(input.Repository, input.Capsule.Repository); err != nil {
+		return err
+	}
+	if input.Checkpoint.Repository != input.Capsule.Repository || input.Checkpoint.CapsuleFileSHA256 != input.CapsuleFileSHA256 || input.Checkpoint.CapsuleSHA256 != input.Capsule.CapsuleSHA256 {
+		return fail(CheckpointChainInvalid, "checkpoint does not bind the controller repository and exact capsule")
+	}
+	if _, err := ValidateCandidateV1(input.Repository, input.Capsule, input.Checkpoint.CandidateSHA); err != nil {
+		return err
+	}
+	return c.withState(func(state *ControllerStateV1) (bool, error) {
+		bound, err := c.bindCapsuleRepository(state, input.Capsule)
+		if err != nil {
+			return false, err
+		}
+		if err := ValidateCheckpointTransitionV1(state.CheckpointTip, input.Checkpoint); err != nil {
+			return false, err
+		}
+		if state.CheckpointTip != nil && state.CheckpointTip.CheckpointSHA256 == input.Checkpoint.CheckpointSHA256 {
+			if input.Checkpoint.NextStageGrantSHA256 == "" {
+				if input.NextStageGrant != nil {
+					return false, fail(CheckpointChainInvalid, "checkpoint replay supplied an unexpected stage grant")
+				}
+			} else if input.NextStageGrant == nil || state.NextStageGrant == nil || input.NextStageGrant.GrantSHA256 != input.Checkpoint.NextStageGrantSHA256 || state.NextStageGrant.GrantSHA256 != input.Checkpoint.NextStageGrantSHA256 {
+				return false, fail(CheckpointChainInvalid, "checkpoint replay does not verify the durable stage grant")
+			}
+			return bound, nil
+		}
+		switch input.Checkpoint.Kind {
+		case CheckpointDesignAccepted:
+			if input.NextStageGrant == nil {
+				return false, fail(CheckpointChainInvalid, "DESIGN_ACCEPTED requires the exact B grant")
+			}
+			if err := validateCheckpointGrantBinding(input.Checkpoint, *input.NextStageGrant, contextcapsule.StageBImplementation); err != nil {
+				return false, err
+			}
+		case CheckpointImplementationConverged:
+			if input.NextStageGrant == nil || state.NextStageGrant == nil || state.NextStageGrant.Stage != contextcapsule.StageBImplementation || state.ReviewTip == nil || state.ReviewCapsuleSHA256 != input.Capsule.CapsuleSHA256 {
+				return false, fail(CheckpointChainInvalid, "IMPLEMENTATION_CONVERGED requires the exact durable B review tip and C grant")
+			}
+			if state.MutationState != nil && state.MutationState.LeaseStatus != LeaseConsumed {
+				return false, fail(MutationScopeViolation, "unfinished mutation lease blocks implementation convergence")
+			}
+			if err := validateImplementationConvergedCheckpointV1(input.Capsule, input.CapsuleFileSHA256, input.Registry, state.FindingEvidence, *state.ReviewTip, input.Checkpoint, *input.NextStageGrant); err != nil {
+				return false, err
+			}
+			if err := validateCheckpointGrantBinding(input.Checkpoint, *input.NextStageGrant, contextcapsule.StageCAcceptanceMerge); err != nil {
+				return false, err
+			}
+			if !stringSubset(state.NextStageGrant.RequiredInvariantIDs, input.NextStageGrant.RequiredInvariantIDs) || !stringSubset(state.NextStageGrant.RequiredFinalReviewIDs, input.NextStageGrant.RequiredFinalReviewIDs) {
+				return false, fail(CheckpointChainInvalid, "C grant dropped a durable B mandatory final-review floor")
+			}
+		case CheckpointAcceptancePassed:
+			if state.NextStageGrant == nil || input.Capsule.PhaseAuthority == nil || input.Capsule.PhaseAuthority.Parent == nil || input.Capsule.PhaseAuthority.Parent.GrantSHA256 != state.NextStageGrant.GrantSHA256 || input.Capsule.PhaseAuthority.Parent.CheckpointSHA256 != state.CheckpointTip.CheckpointSHA256 {
+				return false, fail(CheckpointChainInvalid, "ACCEPTANCE_PASSED is not under the durable C grant")
+			}
+		case CheckpointFinalReviewClean:
+			if input.NextStageGrant != nil || state.NextStageGrant == nil || state.ReviewTip == nil || state.ReviewCapsuleSHA256 != input.Capsule.CapsuleSHA256 {
+				return false, fail(FinalReviewInvalidated, "FINAL_REVIEW_CLEAN requires the durable C review and grant tips")
+			}
+			if err := validateFinalReviewCleanCheckpointV1(input.Capsule, input.CapsuleFileSHA256, input.Registry, state.FindingEvidence, *state.ReviewTip, input.Checkpoint, *state.NextStageGrant); err != nil {
+				return false, err
+			}
+		default:
+			if input.NextStageGrant != nil {
+				return false, fail(CheckpointChainInvalid, "%s cannot replace the durable stage grant", input.Checkpoint.Kind)
+			}
+		}
+		checkpoint := input.Checkpoint
+		state.CheckpointTip = &checkpoint
+		if input.NextStageGrant != nil {
+			grant := *input.NextStageGrant
+			state.NextStageGrant = &grant
+		}
+		return true, nil
+	})
+}
+
+func validateCheckpointGrantBinding(checkpoint PhaseCheckpointV1, grant NextStageGrantV1, stage contextcapsule.Stage) error {
+	if err := ValidateNextStageGrantV1(grant); err != nil {
+		return err
+	}
+	parent, err := checkpointGrantParentDigest(checkpoint)
+	if err != nil {
+		return err
+	}
+	if grant.Stage != stage || checkpoint.NextStageGrantSHA256 != grant.GrantSHA256 || grant.ParentCheckpointSHA256 != parent || grant.BaseSHA != checkpoint.CandidateSHA {
+		return fail(CheckpointChainInvalid, "checkpoint does not bind the exact next-stage grant")
+	}
+	return nil
+}
+
 // AdmitWorkflowAuthority records pre-activation V2 issuance and, after
-// activation, accepts only the exact controller-recorded grandfather set.
-func (c *ControllerV1) AdmitWorkflowAuthority(policyVersion, authorityDigest string) error {
+// activation, accepts only the exact controller-recorded grandfather set for
+// the repository physically owned by this controller.
+func (c *ControllerV1) AdmitWorkflowAuthority(repository, repositoryIdentity, policyVersion, authorityDigest string) error {
 	if !validSHA256(authorityDigest) {
 		return fail(CapsuleLineageInvalid, "authority digest is invalid")
 	}
+	if err := c.validateRepository(repository, repositoryIdentity); err != nil {
+		return err
+	}
 	return c.withState(func(state *ControllerStateV1) (bool, error) {
+		bound, err := c.bindRepositoryState(state, repositoryIdentity)
+		if err != nil {
+			return false, err
+		}
 		if state.Activation != nil {
 			if policyVersion == contextcapsule.PolicyVersionV3 {
-				return false, nil
+				return bound, nil
 			}
 			if policyVersion != contextcapsule.PolicyVersionV2 {
 				return false, fail(CapsuleLineageInvalid, "A/B/C workflow requires V3 after activation")
 			}
 			for _, issued := range state.IssuedV2Authorities {
 				if issued.AuthoritySHA256 == authorityDigest && issued.Sequence < state.Activation.ActivationSequence && stringSubset([]string{authorityDigest}, state.Activation.GrandfatheredV2Digests) {
-					return false, nil
+					return bound, nil
 				}
 			}
 			return false, fail(CapsuleLineageInvalid, "V2 authority was not durably issued and grandfathered before activation")
 		}
 		if policyVersion != contextcapsule.PolicyVersionV2 {
-			return false, nil
+			return bound, nil
 		}
 		for _, issued := range state.IssuedV2Authorities {
 			if issued.AuthoritySHA256 == authorityDigest {
-				return false, nil
+				return bound, nil
 			}
 		}
 		state.NextAuthoritySequence++
@@ -1548,16 +1843,66 @@ func (c *ControllerV1) AdmitWorkflowAuthority(policyVersion, authorityDigest str
 	})
 }
 
+func (c *ControllerV1) validateRepository(repository, identity string) error {
+	if c == nil || c.identity == "" || !validText(identity, 512) {
+		return fail(CapsuleLineageInvalid, "repository controller identity is invalid")
+	}
+	root, err := canonicalRepository(repository)
+	if err != nil || !repositoryIdentityMatches(root, identity) {
+		return fail(CapsuleLineageInvalid, "repository identity is not controller-owned")
+	}
+	commonDir, err := gitText(root, "rev-parse", "--git-common-dir")
+	if err != nil || commonDir == "" {
+		return fail(CapsuleLineageInvalid, "repository Git common directory is unavailable")
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(root, commonDir)
+	}
+	commonDir, err = filepath.EvalSymlinks(commonDir)
+	if err != nil || filepath.Clean(commonDir) != c.commonDir {
+		return fail(CapsuleLineageInvalid, "repository belongs to a different governance controller")
+	}
+	return nil
+}
+
+func (c *ControllerV1) bindRepositoryState(state *ControllerStateV1, identity string) (bool, error) {
+	if state.ControllerIdentity != c.identity {
+		return false, fail(ExecutionBoundsInvalid, "durable state was copied from a different repository controller")
+	}
+	if state.RepositoryIdentity == "" {
+		state.RepositoryIdentity = identity
+		return true, nil
+	}
+	if state.RepositoryIdentity != identity {
+		return false, fail(CapsuleLineageInvalid, "durable controller repository identity changed")
+	}
+	return false, nil
+}
+
+func (c *ControllerV1) bindCapsuleRepository(state *ControllerStateV1, capsule contextcapsule.Capsule) (bool, error) {
+	if err := c.validateRepository(c.repository, capsule.Repository); err != nil {
+		return false, err
+	}
+	return c.bindRepositoryState(state, capsule.Repository)
+}
+
 // InstallActivationV1 records the one durable activation tip. Its grandfather
 // set must already exist in controller issuance state.
-func (c *ControllerV1) InstallActivationV1(activation GovernanceActivationV1) error {
+func (c *ControllerV1) InstallActivationV1(repository, repositoryIdentity string, activation GovernanceActivationV1) error {
 	if err := ValidateGovernanceActivationV1(activation); err != nil {
 		return err
 	}
+	if err := c.validateRepository(repository, repositoryIdentity); err != nil {
+		return err
+	}
 	return c.withState(func(state *ControllerStateV1) (bool, error) {
+		bound, err := c.bindRepositoryState(state, repositoryIdentity)
+		if err != nil {
+			return false, err
+		}
 		if state.Activation != nil {
 			if state.Activation.ActivationSHA256 == activation.ActivationSHA256 {
-				return false, nil
+				return bound, nil
 			}
 			return false, fail(CapsuleLineageInvalid, "a competing governance activation tip already exists")
 		}
@@ -1596,6 +1941,9 @@ func (c *ControllerV1) ReserveRalphexInvocationV1(capsule contextcapsule.Capsule
 		return reservation, err
 	}
 	err = c.withState(func(state *ControllerStateV1) (bool, error) {
+		if _, err := c.bindCapsuleRepository(state, capsule); err != nil {
+			return false, err
+		}
 		if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest); err != nil {
 			return false, err
 		}
@@ -1673,17 +2021,46 @@ func (c *ControllerV1) FinishRalphexInvocationV1(reservation InvocationReservati
 // AdvanceReviewTipV1 validates the exact repository candidate under the lock,
 // consumes one report slot, and advances the sole durable review tip.
 func (c *ControllerV1) AdvanceReviewTipV1(repository string, capsule contextcapsule.Capsule, capsuleFileSHA256 string, registry SemanticAuthorityRegistryV1, report ReviewScopeReportV1) error {
-	if capsule.PhaseAuthority == nil || capsule.PhaseAuthority.ExecutionBounds == nil {
-		return fail(ReviewChainInvalid, "durable review advancement requires B execution bounds")
+	if capsule.PhaseAuthority == nil || capsule.PhaseAuthority.Stage != contextcapsule.StageBImplementation && capsule.PhaseAuthority.Stage != contextcapsule.StageCAcceptanceMerge {
+		return fail(ReviewChainInvalid, "durable review advancement requires B or C authority")
 	}
-	bounds := *capsule.PhaseAuthority.ExecutionBounds
-	boundsDigest, err := digestJSON(bounds)
-	if err != nil {
+	if err := c.validateRepository(repository, capsule.Repository); err != nil {
 		return err
 	}
 	return c.withState(func(state *ControllerStateV1) (bool, error) {
-		if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest); err != nil {
+		bound, err := c.bindCapsuleRepository(state, capsule)
+		if err != nil {
 			return false, err
+		}
+		var bounds *contextcapsule.ExecutionBoundsV1
+		var previous *ReviewScopeReportV1
+		if capsule.PhaseAuthority.Stage == contextcapsule.StageBImplementation {
+			if capsule.PhaseAuthority.ExecutionBounds == nil {
+				return false, fail(ReviewChainInvalid, "durable B review advancement requires execution bounds")
+			}
+			value := *capsule.PhaseAuthority.ExecutionBounds
+			bounds = &value
+			boundsDigest, digestErr := digestJSON(value)
+			if digestErr != nil {
+				return false, digestErr
+			}
+			if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest); err != nil {
+				return false, err
+			}
+			if state.ReviewCapsuleSHA256 == capsule.CapsuleSHA256 {
+				previous = state.ReviewTip
+			} else if state.ReviewTip != nil {
+				return false, fail(ReviewChainInvalid, "B review cannot replace another durable review chain")
+			}
+		} else {
+			if state.CheckpointTip == nil || state.CheckpointTip.Kind != CheckpointAcceptancePassed || state.NextStageGrant == nil || capsule.PhaseAuthority.Parent == nil || state.CheckpointTip.CandidateSHA != capsule.BaseSHA || state.CheckpointTip.PredecessorCheckpointSHA256 != capsule.PhaseAuthority.Parent.CheckpointSHA256 || state.NextStageGrant.GrantSHA256 != capsule.PhaseAuthority.Parent.GrantSHA256 {
+				return false, fail(FinalReviewInvalidated, "C final review requires the durable exact-head acceptance checkpoint")
+			}
+			if state.ReviewCapsuleSHA256 == capsule.CapsuleSHA256 {
+				previous = state.ReviewTip
+			} else {
+				previous = nil
+			}
 		}
 		if _, err := ValidateCandidateV1(repository, capsule, report.ReviewedPreFixHEAD); err != nil {
 			return false, err
@@ -1692,18 +2069,21 @@ func (c *ControllerV1) AdvanceReviewTipV1(repository string, capsule contextcaps
 		if err != nil || head != report.ReviewedPreFixHEAD {
 			return false, fail(ReviewChainInvalid, "review report does not name the controller's exact current candidate")
 		}
-		if err := ValidateReviewScopeReportV1(capsule, capsuleFileSHA256, registry, state.ReviewTip, report); err != nil {
+		if err := ValidateReviewScopeReportV1(capsule, capsuleFileSHA256, registry, state.FindingEvidence, previous, report); err != nil {
 			return false, err
 		}
-		if state.ReviewTip != nil && state.ReviewTip.ReportSHA256 == report.ReportSHA256 {
-			return false, nil
+		if previous != nil && previous.ReportSHA256 == report.ReportSHA256 {
+			return bound, nil
 		}
-		if state.ExecutionState.ReviewReports >= bounds.MaxReviewReports {
-			return false, fail(ExecutionBoundsInvalid, "B-wide review-report ceiling is exhausted")
+		if bounds != nil {
+			if state.ExecutionState.ReviewReports >= bounds.MaxReviewReports {
+				return false, fail(ExecutionBoundsInvalid, "B-wide review-report ceiling is exhausted")
+			}
+			state.ExecutionState.ReviewReports++
 		}
-		state.ExecutionState.ReviewReports++
 		copy := report
 		state.ReviewTip = &copy
+		state.ReviewCapsuleSHA256 = capsule.CapsuleSHA256
 		return true, nil
 	})
 }
@@ -1721,10 +2101,13 @@ func (c *ControllerV1) IssueMutationLeaseV1(capsule contextcapsule.Capsule, regi
 		return issued, err
 	}
 	err = c.withState(func(state *ControllerStateV1) (bool, error) {
+		if _, err := c.bindCapsuleRepository(state, capsule); err != nil {
+			return false, err
+		}
 		if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest); err != nil {
 			return false, err
 		}
-		if state.ReviewTip == nil || state.ReviewTip.ReportSHA256 != report.ReportSHA256 {
+		if state.ReviewTip == nil || state.ReviewCapsuleSHA256 != capsule.CapsuleSHA256 || state.ReviewTip.ReportSHA256 != report.ReportSHA256 {
 			return false, fail(ReviewChainInvalid, "lease report is not the exact durable review tip")
 		}
 		if state.Lease != nil && state.MutationState != nil && state.MutationState.LeaseStatus != LeaseConsumed {
@@ -1736,7 +2119,7 @@ func (c *ControllerV1) IssueMutationLeaseV1(capsule contextcapsule.Capsule, regi
 		if state.ExecutionState.MutationLeases >= bounds.MaxMutationLeases {
 			return false, fail(ExecutionBoundsInvalid, "B-wide mutation-lease ceiling is exhausted")
 		}
-		lease, err := IssueMutationLeaseV1(capsule, registry, report, limits)
+		lease, err := IssueMutationLeaseV1(capsule, registry, state.FindingEvidence, report, limits)
 		if err != nil {
 			return false, err
 		}
@@ -1793,17 +2176,21 @@ func (c *ControllerV1) ValidateCapsuleUsageV3(capsule contextcapsule.Capsule, op
 	if err := validateCapsuleUsageV3(capsule, operation, mutation); err != nil {
 		return err
 	}
-	if operation != contextcapsule.OperationImplementationReview || !mutation {
-		if leaseSHA256 != "" {
-			return fail(MutationScopeViolation, "non-fix invocation supplied a mutation lease")
-		}
-		return nil
-	}
 	return c.withState(func(state *ControllerStateV1) (bool, error) {
+		bound, err := c.bindCapsuleRepository(state, capsule)
+		if err != nil {
+			return false, err
+		}
+		if operation != contextcapsule.OperationImplementationReview || !mutation {
+			if leaseSHA256 != "" {
+				return false, fail(MutationScopeViolation, "non-fix invocation supplied a mutation lease")
+			}
+			return bound, nil
+		}
 		if state.Lease == nil || state.MutationState == nil || state.Lease.LeaseSHA256 != leaseSHA256 || state.Lease.CapsuleSHA256 != capsule.CapsuleSHA256 || state.MutationState.LeaseTipSHA256 != leaseSHA256 || state.MutationState.LeaseStatus != LeaseConsuming {
 			return false, fail(MutationScopeViolation, "mutation has no exact durable CONSUMING lease tip")
 		}
-		return false, nil
+		return bound, nil
 	})
 }
 
@@ -1811,7 +2198,13 @@ func (c *ControllerV1) ValidateCapsuleUsageV3(capsule contextcapsule.Capsule, op
 // advances both receipt tip and lease status to CONSUMED.
 func (c *ControllerV1) CompleteMutationReceiptV1(repository string, capsule contextcapsule.Capsule, leaseSHA256, candidateSHA string) (MutationReceiptV1, error) {
 	var completed MutationReceiptV1
+	if err := c.validateRepository(repository, capsule.Repository); err != nil {
+		return completed, err
+	}
 	err := c.withState(func(state *ControllerStateV1) (bool, error) {
+		if _, err := c.bindCapsuleRepository(state, capsule); err != nil {
+			return false, err
+		}
 		if state.Lease == nil || state.MutationState == nil || state.Lease.LeaseSHA256 != leaseSHA256 || state.MutationState.LeaseStatus != LeaseConsuming || state.FixBatchLeaseSHA256 != leaseSHA256 {
 			return false, fail(MutationScopeViolation, "receipt has no exact durable CONSUMING lease")
 		}
@@ -1842,7 +2235,7 @@ func (c *ControllerV1) CompleteMutationReceiptV1(repository string, capsule cont
 }
 
 func (c *ControllerV1) withState(update func(*ControllerStateV1) (bool, error)) error {
-	if c == nil || c.path == "" {
+	if c == nil || c.path == "" || c.identity == "" || c.repository == "" || c.commonDir == "" {
 		return fail(ExecutionBoundsInvalid, "durable governance controller is required")
 	}
 	lockPath := c.path + ".lock"
@@ -1880,7 +2273,7 @@ func (c *ControllerV1) withState(update func(*ControllerStateV1) (bool, error)) 
 }
 
 func (c *ControllerV1) loadState() (ControllerStateV1, error) {
-	state := ControllerStateV1{Kind: "GovernanceControllerStateV1", IssuedV2Authorities: []IssuedAuthorityV1{}, ExecutionState: ralphex.ExecutionStateV1{AggregateElapsed: "0s"}}
+	state := ControllerStateV1{Kind: "GovernanceControllerStateV1", ControllerIdentity: c.identity, IssuedV2Authorities: []IssuedAuthorityV1{}, ExecutionState: ralphex.ExecutionStateV1{AggregateElapsed: "0s"}, FindingEvidence: []FindingEvidenceV1{}}
 	info, err := os.Lstat(c.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return state, nil
@@ -1898,7 +2291,7 @@ func (c *ControllerV1) loadState() (ControllerStateV1, error) {
 	if err := ParseCanonical(data, &state); err != nil {
 		return ControllerStateV1{}, fail(ExecutionBoundsInvalid, "decode controller state: %v", err)
 	}
-	if state.Kind != "GovernanceControllerStateV1" || state.IssuedV2Authorities == nil || state.ExecutionState.AggregateElapsed == "" {
+	if state.Kind != "GovernanceControllerStateV1" || state.ControllerIdentity != c.identity || state.IssuedV2Authorities == nil || state.FindingEvidence == nil || state.ExecutionState.AggregateElapsed == "" {
 		return ControllerStateV1{}, fail(ExecutionBoundsInvalid, "controller state payload is invalid")
 	}
 	return state, nil
@@ -2021,6 +2414,20 @@ func validateEvidenceRefs(refs []string) error {
 			return errors.New("evidence refs must be sorted and unique")
 		}
 		previous = ref
+	}
+	return nil
+}
+
+func validateEvidenceBindings(bindings []EvidenceBindingV1) error {
+	if len(bindings) == 0 || len(bindings) > 64 {
+		return errors.New("evidence bindings must be non-empty and bounded")
+	}
+	previous := ""
+	for _, binding := range bindings {
+		if !validText(binding.Ref, 2048) || !validSHA256(binding.SHA256) || binding.Ref <= previous {
+			return errors.New("evidence bindings must be sorted, unique, and content-addressed")
+		}
+		previous = binding.Ref
 	}
 	return nil
 }
