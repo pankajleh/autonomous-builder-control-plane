@@ -40,7 +40,7 @@ func TestProductionLimitsUseStageSpecificNumericBudgets(t *testing.T) {
 		{"ledger scan records", int64(limits.MaxLedgerScanRecords), 262144},
 		{"request body", int64(limits.MaxRequestBodyBytes), 16 * 1024},
 		{"decompressed response body", int64(limits.MaxDecompressedResponseBodyBytes), 4 * 1024 * 1024},
-		{"target response envelope", int64(limits.MaxTargetResponseEnvelopeBytes), 4*1024*1024 + 64*1024},
+		{"target response envelope", int64(limits.MaxTargetResponseEnvelopeBytes), int64(MaxGitHubTargetResponseEnvelopeBytesV1)},
 	}
 	for _, value := range values {
 		t.Run(value.name, func(t *testing.T) {
@@ -58,6 +58,18 @@ func TestProductionLimitsUseStageSpecificNumericBudgets(t *testing.T) {
 	changedSHA, err := changed.SHA256()
 	if err != nil || changedSHA == baseSHA {
 		t.Fatalf("target response envelope limit is absent from canonical limits identity: %v", err)
+	}
+	checkBound := maxCanonicalCheckRecordsBytesV1(limits)
+	for _, mutate := range []func(*Limits){
+		func(value *Limits) { value.MaxObservedChecks++ },
+		func(value *Limits) { value.MaxTextBytes++ },
+		func(value *Limits) { value.MaxEvidenceRefs++ },
+	} {
+		changed = limits
+		mutate(&changed)
+		if derived := maxCanonicalCheckRecordsBytesV1(changed); derived <= checkBound {
+			t.Fatalf("canonical check-record bound did not compose a governing limit: %d <= %d", derived, checkBound)
+		}
 	}
 }
 
@@ -407,6 +419,9 @@ func TestExactPaginationClosureComposesThroughMergeInputFinalRevalidationAndSeal
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(checkBytes) <= f.limits.MaxCumulativePaginationClosureBytes || len(checkBytes) > maxCanonicalCheckRecordsBytesV1(f.limits) {
+		t.Fatalf("decoded checks use %d bytes; pagination=%d derived-checks=%d", len(checkBytes), f.limits.MaxCumulativePaginationClosureBytes, maxCanonicalCheckRecordsBytesV1(f.limits))
+	}
 	reviewBytes, err := canonicalAuthoritativePRReviews(reviews)
 	if err != nil {
 		t.Fatal(err)
@@ -546,6 +561,32 @@ func TestExactPaginationClosureComposesThroughMergeInputFinalRevalidationAndSeal
 		t.Fatalf("exact-limit pagination authorization could not reach target submission: %v", err)
 	}
 
+	overCountInput := input
+	overCountInput.Checks = append(cloneChecks(checks), checks[0])
+	if _, err := NewMergeInput(overCountInput, f.mergeWrite.Attempt().WriteID(), f.limits); err == nil || !strings.Contains(err.Error(), "total-item limit") {
+		t.Fatalf("MergeInput count limit+1 did not fail at the check-count boundary: %v", err)
+	}
+	overTextInput := input
+	overTextInput.Checks = cloneChecks(checks)
+	overTextInput.Checks[0].Name += "x"
+	overTextInput.Checks[0].Identity.Context += "x"
+	if _, err := NewMergeInput(overTextInput, f.mergeWrite.Attempt().WriteID(), f.limits); err == nil || !strings.Contains(err.Error(), "identity, provenance") {
+		t.Fatalf("MergeInput text limit+1 did not fail at per-check validation: %v", err)
+	}
+	overEvidenceInput := input
+	overEvidenceInput.Checks = cloneChecks(checks)
+	overEvidenceInput.Checks[0].EvidenceRefs = makeEvidenceRefs(f.limits.MaxEvidenceRefs+1, "over-check-evidence")
+	if _, err := NewMergeInput(overEvidenceInput, f.mergeWrite.Attempt().WriteID(), f.limits); err == nil || !strings.Contains(err.Error(), "evidence references exceed limit") {
+		t.Fatalf("MergeInput evidence-count limit+1 did not fail at per-check validation: %v", err)
+	}
+	overEvidenceTextInput := input
+	overEvidenceTextInput.Checks = cloneChecks(checks)
+	overEvidenceTextInput.Checks[0].EvidenceRefs = makeEvidenceRefs(1, "over-check-evidence-text")
+	overEvidenceTextInput.Checks[0].EvidenceRefs[0].URI = strings.Repeat("x", f.limits.MaxTextBytes+1)
+	if _, err := NewMergeInput(overEvidenceTextInput, f.mergeWrite.Attempt().WriteID(), f.limits); err == nil || !strings.Contains(err.Error(), "evidence reference 0 is invalid") {
+		t.Fatalf("MergeInput evidence-text limit+1 did not fail at per-check validation: %v", err)
+	}
+
 	overClosure := clonePaginationClosure(runClosure)
 	overClosure.canonical = append(overClosure.canonical, 'x')
 	overClosure.digest = digestBytes(overClosure.canonical)
@@ -658,7 +699,7 @@ func TestTargetResponseBodyAndEnvelopeIndependentExactLimits(t *testing.T) {
 	f := newFixture(t, MergeMethodMerge)
 	invocationID := strings.Repeat("<", f.limits.MaxTextBytes)
 	submission := newTargetSubmission(t, f, invocationID)
-	response, err := NewSnapshotIdentity("github", "response-exact-envelope", f.sealed.Seal().input.FinalRevalidation.input.CompletedUnixNano+1)
+	response, err := NewSnapshotIdentity("github", strings.Repeat("<", f.limits.MaxRequestIDBytes), int64(1<<63-1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,39 +708,15 @@ func TestTargetResponseBodyAndEnvelopeIndependentExactLimits(t *testing.T) {
 		URI: strings.Repeat("<", f.limits.MaxTextBytes), Kind: GitHubTargetResponseBodyEvidenceKindV1, SHA256: digestBytes(body),
 	}
 	input := TargetResponseEnvelopeV1Input{
-		Response: response, HTTPStatus: 200, ResponseBody: body, BodyEvidence: bodyEvidence, EnvelopeURI: "e",
+		Response: response, HTTPStatus: 599, ResponseBody: body, BodyEvidence: bodyEvidence,
+		EnvelopeURI: strings.Repeat("<", f.limits.MaxTextBytes),
 	}
-	limitsSHA, err := f.limits.SHA256()
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseWire := targetResponseEnvelopeWireV1{
-		Schema: TargetResponseEnvelopeSchemaV1, TargetSubmissionSHA256: submission.SHA256(), InvocationID: submission.invocationID,
-		Response: snapshotWire(response), HTTPStatus: input.HTTPStatus, ResponseBody: append(json.RawMessage(nil), body...),
-		ResponseBodySHA256: digestBytes(body), BodyEvidence: bodyEvidence, EnvelopeURI: input.EnvelopeURI, LimitsSHA256: limitsSHA,
-	}
-	baseJSON, err := json.Marshal(baseWire)
-	if err != nil {
-		t.Fatal(err)
-	}
-	remaining := f.limits.MaxTargetResponseEnvelopeBytes - len(baseJSON)
-	if remaining <= 0 {
-		t.Fatalf("bounded metadata already exceeds independent envelope limit by %d", -remaining)
-	}
-	available := f.limits.MaxTextBytes - len(input.EnvelopeURI)
-	escaped := min(remaining/6, available)
-	plain := remaining - escaped*6
-	if escaped+plain > available {
-		escaped--
-		plain = remaining - escaped*6
-	}
-	if escaped < 0 || plain < 0 || escaped+plain > available {
-		t.Fatalf("cannot fill independent envelope bound: remaining=%d capacity=%d", remaining, available)
-	}
-	input.EnvelopeURI += strings.Repeat("<", escaped) + strings.Repeat("x", plain)
 	envelope, err := NewTargetResponseEnvelopeV1(input, submission, f.limits)
 	if err != nil {
-		t.Fatalf("exact 4-MiB body plus bounded metadata failed: %v", err)
+		t.Fatalf("exact 4-MiB body plus worst-case legal metadata failed: %v", err)
+	}
+	if derived := maxTargetResponseEnvelopeBytesV1(f.limits); derived != f.limits.MaxTargetResponseEnvelopeBytes || derived != MaxGitHubTargetResponseEnvelopeBytesV1 {
+		t.Fatalf("target envelope derivation/default/contract disagree: %d/%d/%d", derived, f.limits.MaxTargetResponseEnvelopeBytes, MaxGitHubTargetResponseEnvelopeBytesV1)
 	}
 	if len(body) != f.limits.MaxDecompressedResponseBodyBytes || len(envelope.CanonicalJSON()) != f.limits.MaxTargetResponseEnvelopeBytes {
 		t.Fatalf("body/envelope bytes = %d/%d", len(body), len(envelope.CanonicalJSON()))
@@ -713,7 +730,10 @@ func TestTargetResponseBodyAndEnvelopeIndependentExactLimits(t *testing.T) {
 	if _, err := NewTargetResponseEnvelopeV1(overInput, submission, f.limits); err == nil {
 		t.Fatal("target response constructor accepted outer-limit+1")
 	}
-	overWire := baseWire
+	var overWire targetResponseEnvelopeWireV1
+	if err := strictDecode(envelope.CanonicalJSON(), &overWire); err != nil {
+		t.Fatal(err)
+	}
 	overWire.EnvelopeURI = overInput.EnvelopeURI
 	overJSON, err := json.Marshal(overWire)
 	if err != nil {
@@ -731,6 +751,26 @@ func TestTargetResponseBodyAndEnvelopeIndependentExactLimits(t *testing.T) {
 	overBodyInput.BodyEvidence = ledger.EvidenceRef{URI: "evidence/over-body", Kind: GitHubTargetResponseBodyEvidenceKindV1, SHA256: digestBytes(overBodyInput.ResponseBody)}
 	if _, err := NewTargetResponseEnvelopeV1(overBodyInput, submission, f.limits); err == nil {
 		t.Fatal("target response constructor accepted body-limit+1")
+	}
+	limitsSHA, err := f.limits.SHA256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	overBodyWire := targetResponseEnvelopeWireV1{
+		Schema: TargetResponseEnvelopeSchemaV1, TargetSubmissionSHA256: submission.SHA256(), InvocationID: submission.invocationID,
+		Response: snapshotWire(response), HTTPStatus: overBodyInput.HTTPStatus, ResponseBody: append(json.RawMessage(nil), overBodyInput.ResponseBody...),
+		ResponseBodySHA256: digestBytes(overBodyInput.ResponseBody), BodyEvidence: overBodyInput.BodyEvidence,
+		EnvelopeURI: overBodyInput.EnvelopeURI, LimitsSHA256: limitsSHA,
+	}
+	overBodyJSON, err := json.Marshal(overBodyWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overBodyJSON) > f.limits.MaxTargetResponseEnvelopeBytes {
+		t.Fatalf("body-limit+1 parser fixture unexpectedly hit outer bound first: %d", len(overBodyJSON))
+	}
+	if _, err := ParseCanonicalTargetResponseEnvelopeV1(overBodyJSON, submission, f.limits); err == nil {
+		t.Fatal("target response parser accepted body-limit+1")
 	}
 }
 
@@ -974,14 +1014,20 @@ func makeExactChecksClosure(t *testing.T, f fixture, paginationSource Pagination
 	t.Helper()
 	checks := make([]Check, count)
 	for index := range checks {
-		name := fmt.Sprintf("composed-check-%03d", index)
+		nameSuffix := fmt.Sprintf("-%03d", index)
+		name := strings.Repeat("x", f.limits.MaxTextBytes-len(nameSuffix)) + nameSuffix
+		producerSuffix := fmt.Sprintf("-%03d", index)
+		producerNodeID := strings.Repeat("p", stableIdentityNodeIDBytesV1-len(producerSuffix)) + producerSuffix
+		appNodeID := strings.Repeat("a", stableIdentityNodeIDBytesV1-len(producerSuffix)) + producerSuffix
 		checks[index] = Check{
 			NodeID: fmt.Sprintf("composed-check-node-%03d", index), Name: name,
 			Identity: TrustedCheckIdentityV1{
 				Context: name, Source: checkSource,
-				Producer: StableIdentityV1{DatabaseID: int64(index + 1000), NodeID: fmt.Sprintf("composed-producer-%03d", index)},
+				Producer: StableIdentityV1{DatabaseID: int64(index + 1000), NodeID: producerNodeID},
+				App:      &StableIdentityV1{DatabaseID: int64(index + 2000), NodeID: appNodeID},
 			},
 			Status: CheckCompleted, Conclusion: ConclusionSuccess, HeadSHA: f.headSHA,
+			EvidenceRefs: makeEvidenceRefs(f.limits.MaxEvidenceRefs, fmt.Sprintf("check-%03d", index)),
 		}
 	}
 	items := paginationItemsFromChecks(t, checks)

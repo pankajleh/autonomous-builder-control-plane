@@ -188,7 +188,15 @@ byte-identical input and attempt identities.
 Direct check values are rescanned under the distinct observed-check, text, state/
 conclusion, exact-head, source-scoped node-identity, provenance, and evidence-
 reference bounds used by canonical CI snapshots before their pagination item
-digests or authorization bytes are computed.
+digests or authorization bytes are computed. Their retained canonical array is
+bounded independently of pagination: the byte ceiling is deterministically
+derived from `MaxObservedChecks`, worst-case six-byte canonical JSON escaping
+for every `MaxTextBytes` check/evidence field, the fixed stable-identity and Git
+object-ID widths, the longest legal source/status/conclusion representation,
+and `MaxEvidenceRefs` independently for every check. The pagination-closure
+byte budgets do not cap or contribute to this decoded-record ceiling. The
+governing count, text, identity, evidence, and pagination limits remain
+unchanged and are revalidated before a retained record is accepted.
 
 `GenericStrategyResultV1` and `GenericStrategyPostMergeV1` preserve
 network-free squash/rebase result, lineage, and containment representation
@@ -237,9 +245,17 @@ invocation ID is distinct from GitHub's response-assigned provider request ID.
 `TargetResponseEnvelopeV1` binds both identities, the exact submission digest,
 HTTP status, canonical response body/body evidence, and retained envelope
 evidence. Its decompressed response body retains the independent 4-MiB limit;
-the enclosing canonical envelope has a separate 4-MiB-plus-64-KiB bound, so an
-exact-limit body plus bounded response metadata is representable. Merge
-execution accepts `MergeExecutionInputV1`, which
+the enclosing canonical envelope has a separate deterministically derived
+bound. That outer bound is the exact canonical
+`targetResponseEnvelopeWireV1` skeleton plus the 4-MiB raw JSON body, four
+fixed-width SHA-256 values, the maximum positive observation timestamp and
+three-digit HTTP status, worst-case six-byte JSON escaping for the complete
+invocation ID, provider request ID, body-evidence URI, and envelope URI, and
+the fixed schema/provider/evidence-kind fields. `DefaultLimits` records that
+derived value in `MaxTargetResponseEnvelopeBytes`, so it participates in the
+limits identity; no arbitrary metadata allowance is used. Exact legal maxima
+therefore compose while the body and outer envelope retain independent
+limit-plus-one rejection. Merge execution accepts `MergeExecutionInputV1`, which
 owns both the sealed value and that pre-published submission. Typed execution
 results require the response envelope, matching result snapshot, echoed
 client-mutation ID, and closed body/envelope evidence; errors retain the

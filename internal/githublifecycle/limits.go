@@ -80,7 +80,7 @@ type Limits struct {
 }
 
 func DefaultLimits() Limits {
-	return Limits{
+	limits := Limits{
 		MaxPages: 10, MaxItemsPerPage: 100, MaxTotalItems: 500, MaxParents: 16, MaxLineageEntries: 256,
 		MaxRequiredTrustedChecks: 64, MaxEligibleReviewers: 64, MaxRequiredReviewers: 64, MaxMinimumApprovals: 64,
 		MaxObservedChecks: 500, MaxObservedReviews: 500,
@@ -93,8 +93,7 @@ func DefaultLimits() Limits {
 		MaxLedgerLineBytes: 256 * 1024, MaxReadyLedgerSnapshotBytes: 64 * 1024 * 1024, MaxLedgerScanRecords: 262144,
 		MaxRequestBodyBytes: 16 * 1024, MaxResponseHeaderBytes: 32 * 1024, MaxLinkHeaderBytes: 8 * 1024, MaxRequestIDBytes: 256,
 		MaxCompressedResponseBodyBytes: 4 * 1024 * 1024, MaxDecompressedResponseBodyBytes: 4 * 1024 * 1024,
-		MaxTargetResponseEnvelopeBytes: 4*1024*1024 + 64*1024,
-		MaxPreSubmitHTTPCalls:          28, MaxCommitObjectCreationSubmissions: 1, MaxTargetRefUpdateSubmissions: 1,
+		MaxPreSubmitHTTPCalls: 28, MaxCommitObjectCreationSubmissions: 1, MaxTargetRefUpdateSubmissions: 1,
 		MaxPostMergeHTTPCalls: 8, MaxReconciliationRounds: 8, MaxReconciliationCallsPerRound: 3,
 		MaxPrincipalValidationCalls: 2, MaxHTTPCalls: 64,
 		MaxCumulativeRequestBytes: 1 * 1024 * 1024, MaxCumulativeResponseHeaderBytes: 2 * 1024 * 1024,
@@ -102,6 +101,8 @@ func DefaultLimits() Limits {
 		CallTimeout: 30 * time.Second, MaxCumulativeActiveProviderCallTime: 10 * time.Minute, MaxControllerInvocationTime: 15 * time.Minute,
 		MaxReadRetries: 2, MaxWriteRetries: 1, MaxAmbiguousRetries: 0,
 	}
+	limits.MaxTargetResponseEnvelopeBytes = maxTargetResponseEnvelopeBytesV1(limits)
+	return limits
 }
 
 func (l Limits) Validate() error {
@@ -141,10 +142,94 @@ func (l Limits) Validate() error {
 	if l.MaxReadyEvidenceArtifactBytes > l.MaxReadyEvidenceClosureBytes || l.MaxLedgerLineBytes > l.MaxReadyLedgerSnapshotBytes {
 		return errors.New("one READY artifact or ledger line cannot exceed its cumulative snapshot budget")
 	}
+	if maxCanonicalCheckRecordsBytesV1(l) == 0 {
+		return errors.New("canonical check-record byte bound overflows the platform integer range")
+	}
 	if l.MaxTargetResponseEnvelopeBytes <= l.MaxDecompressedResponseBodyBytes {
 		return errors.New("target response envelope must have an independent bound above the response-body bound")
 	}
 	return nil
+}
+
+const (
+	canonicalJSONMaxByteExpansionV1 = 6 // '<', '>', and '&' become one six-byte \u00xx escape.
+	stableIdentityNodeIDBytesV1     = 256
+
+	// These skeletons preserve the exact checkWire and ledger.EvidenceRef field
+	// order. Variable string contents and evidence array members are empty so
+	// the independently governed maxima can be added without allocating a
+	// potentially very large maximum record.
+	maxCheckWireSkeletonV1     = `{"node_id":"","name":"","identity":{"context":"","source":"commit_status","producer":{"database_id":9223372036854775807,"node_id":""},"app":{"database_id":9223372036854775807,"node_id":""}},"status":"completed","conclusion":"cancelled","head_sha":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","evidence_refs":[]}`
+	maxCheckEvidenceSkeletonV1 = `{"uri":"","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","kind":""}`
+)
+
+// maxCanonicalCheckRecordsBytesV1 derives a safe canonical byte ceiling for
+// the decoded checkWire array. It composes the existing check-count, text,
+// stable-identity, Git-object-ID, state/conclusion, and per-check evidence
+// limits; pagination-closure bytes are deliberately absent. Zero means the
+// configured limits cannot be represented by the platform int used by byte
+// slices.
+func maxCanonicalCheckRecordsBytesV1(l Limits) int {
+	escapedText := checkedLimitProduct(l.MaxTextBytes, canonicalJSONMaxByteExpansionV1)
+	escapedStableNode := checkedLimitProduct(stableIdentityNodeIDBytesV1, canonicalJSONMaxByteExpansionV1)
+	if escapedText == 0 || escapedStableNode == 0 {
+		return 0
+	}
+	evidenceBytes := checkedLimitSum(len(maxCheckEvidenceSkeletonV1), checkedLimitProduct(2, escapedText))
+	if evidenceBytes == 0 {
+		return 0
+	}
+	evidenceArrayBytes := checkedCanonicalArrayBytes(l.MaxEvidenceRefs, evidenceBytes)
+	if evidenceArrayBytes == 0 {
+		return 0
+	}
+	// The skeleton already contains the empty evidence array, so only its
+	// members and separating commas are added here.
+	evidenceMembersBytes := evidenceArrayBytes - len("[]")
+	checkBytes := checkedLimitSum(
+		len(maxCheckWireSkeletonV1),
+		checkedLimitProduct(3, escapedText), // node_id, name, and identity.context
+		checkedLimitProduct(2, escapedStableNode),
+		evidenceMembersBytes,
+	)
+	if checkBytes == 0 {
+		return 0
+	}
+	return checkedCanonicalArrayBytes(l.MaxObservedChecks, checkBytes)
+}
+
+func checkedCanonicalArrayBytes(count, maxItemBytes int) int {
+	if count < 0 || maxItemBytes <= 0 {
+		return 0
+	}
+	if count == 0 {
+		return len("[]")
+	}
+	members := checkedLimitProduct(count, checkedLimitSum(maxItemBytes, 1))
+	if members == 0 {
+		return 0
+	}
+	return checkedLimitSum(1, members)
+}
+
+func checkedLimitProduct(left, right int) int {
+	maxInt := int(^uint(0) >> 1)
+	if left <= 0 || right <= 0 || left > maxInt/right {
+		return 0
+	}
+	return left * right
+}
+
+func checkedLimitSum(values ...int) int {
+	maxInt := int(^uint(0) >> 1)
+	total := 0
+	for _, value := range values {
+		if value < 0 || total > maxInt-value {
+			return 0
+		}
+		total += value
+	}
+	return total
 }
 
 // CanonicalJSON returns the stable, versioned representation of every field

@@ -437,7 +437,7 @@ func finalDecisionDigest(input FinalRevalidationV1Input, limitsSHA string, limit
 	if err != nil {
 		return "", err
 	}
-	checks, err := newRetainedCanonicalRecordV1(retainedFinalChecksKindV1, checkBytes, limits.MaxCumulativePaginationClosureBytes, limits)
+	checks, err := newRetainedCanonicalRecordV1(retainedFinalChecksKindV1, checkBytes, maxCanonicalCheckRecordsBytesV1(limits), limits)
 	if err != nil {
 		return "", err
 	}
@@ -484,7 +484,7 @@ func finalRevalidationWire(input FinalRevalidationV1Input, decision, limitsSHA s
 	if err != nil {
 		return finalRevalidationWireV1{}, err
 	}
-	checksRecord, err := newRetainedCanonicalRecordV1(retainedFinalChecksKindV1, checks, limits.MaxCumulativePaginationClosureBytes, limits)
+	checksRecord, err := newRetainedCanonicalRecordV1(retainedFinalChecksKindV1, checks, maxCanonicalCheckRecordsBytesV1(limits), limits)
 	if err != nil {
 		return finalRevalidationWireV1{}, err
 	}
@@ -598,7 +598,7 @@ func ParseCanonicalFinalRevalidationV1(data []byte, input MergeInput, limits Lim
 	if err != nil {
 		return FinalRevalidationV1{}, err
 	}
-	checkBytes, err := resolveRetainedCanonicalRecordV1(wire.Checks, retainedFinalChecksKindV1, limits.MaxCumulativePaginationClosureBytes, limits, records)
+	checkBytes, err := resolveRetainedCanonicalRecordV1(wire.Checks, retainedFinalChecksKindV1, maxCanonicalCheckRecordsBytesV1(limits), limits, records)
 	if err != nil {
 		return FinalRevalidationV1{}, err
 	}

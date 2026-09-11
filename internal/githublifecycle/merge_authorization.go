@@ -554,7 +554,7 @@ func authorizationSealWire(i AuthorizationSealV1Input, limitsSHA string, limits 
 	if err != nil {
 		return authorizationSealWireV1{}, err
 	}
-	checksRecord, err := newRetainedCanonicalRecordV1(retainedSealFinalChecksKindV1, checkBytes, limits.MaxCumulativePaginationClosureBytes, limits)
+	checksRecord, err := newRetainedCanonicalRecordV1(retainedSealFinalChecksKindV1, checkBytes, maxCanonicalCheckRecordsBytesV1(limits), limits)
 	if err != nil {
 		return authorizationSealWireV1{}, err
 	}
@@ -609,7 +609,7 @@ func ParseCanonicalAuthorizationSealV1(data []byte, input MergeInput, limits Lim
 	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
-	checkBytes, err := resolveRetainedCanonicalRecordV1(wire.FinalChecks, retainedSealFinalChecksKindV1, limits.MaxCumulativePaginationClosureBytes, limits, records)
+	checkBytes, err := resolveRetainedCanonicalRecordV1(wire.FinalChecks, retainedSealFinalChecksKindV1, maxCanonicalCheckRecordsBytesV1(limits), limits, records)
 	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
@@ -1040,7 +1040,7 @@ func checkedMergeAuthorizationPayloadWire(input MergeAuthorizationInputV1, autho
 	if err != nil {
 		return mergeInputWireV1{}, err
 	}
-	checksRecord, err := newRetainedCanonicalRecordV1(retainedMergeChecksKindV1, checks, limits.MaxCumulativePaginationClosureBytes, limits)
+	checksRecord, err := newRetainedCanonicalRecordV1(retainedMergeChecksKindV1, checks, maxCanonicalCheckRecordsBytesV1(limits), limits)
 	if err != nil {
 		return mergeInputWireV1{}, err
 	}
@@ -1078,7 +1078,7 @@ func ParseCanonicalMergeInput(data []byte, limits Limits, records ...CanonicalRe
 	if err != nil {
 		return MergeInput{}, err
 	}
-	checkBytes, err := resolveRetainedCanonicalRecordV1(wire.Checks, retainedMergeChecksKindV1, limits.MaxCumulativePaginationClosureBytes, limits, records)
+	checkBytes, err := resolveRetainedCanonicalRecordV1(wire.Checks, retainedMergeChecksKindV1, maxCanonicalCheckRecordsBytesV1(limits), limits, records)
 	if err != nil {
 		return MergeInput{}, err
 	}

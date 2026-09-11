@@ -20,8 +20,39 @@ const (
 	GitHubGraphQLPathV1                        = "/graphql"
 	MaxGitHubTargetRequestBodyBytesV1          = 16 * 1024
 	MaxGitHubTargetResponseBodyBytesV1         = 4 * 1024 * 1024
-	MaxGitHubTargetResponseEnvelopeBytesV1     = 4*1024*1024 + 64*1024
+	targetResponseEnvelopeTextBytesV1          = 4096
+	targetResponseEnvelopeRequestIDBytesV1     = 256
+	targetResponseEnvelopeEvidenceURIBytesV1   = 4096
+	targetResponseEnvelopePositiveInt64BytesV1 = 19
+	targetResponseEnvelopeHTTPStatusBytesV1    = 3
+	targetResponseEnvelopeSHA256BytesV1        = 64
+	MaxGitHubTargetResponseEnvelopeBytesV1     = len(maxTargetResponseEnvelopeSkeletonV1) +
+		2*targetResponseEnvelopeTextBytesV1*canonicalJSONMaxByteExpansionV1 +
+		targetResponseEnvelopeRequestIDBytesV1*canonicalJSONMaxByteExpansionV1 +
+		(targetResponseEnvelopePositiveInt64BytesV1 - 1) +
+		(targetResponseEnvelopeHTTPStatusBytesV1 - 1) +
+		(MaxGitHubTargetResponseBodyBytesV1 - 1) +
+		4*targetResponseEnvelopeSHA256BytesV1 +
+		targetResponseEnvelopeEvidenceURIBytesV1*canonicalJSONMaxByteExpansionV1
+
+	// The skeleton is the exact targetResponseEnvelopeWireV1 field order with
+	// fixed values present and every independently bounded value empty or zero.
+	// The derived limit replaces each placeholder with its worst legal canonical
+	// representation: two MaxText strings, a request ID, positive int64 time,
+	// three-digit status, raw JSON body, four SHA-256 values, and evidence URI.
+	maxTargetResponseEnvelopeSkeletonV1 = `{"schema":"github-target-response-envelope-v1","target_submission_sha256":"","invocation_id":"","response":{"provider":"github","request_id":"","observed_unix_nano":0},"http_status":0,"response_body":0,"response_body_sha256":"","body_evidence":{"uri":"","sha256":"","kind":"github-target-response-body"},"envelope_uri":"","limits_sha256":""}`
 )
+
+func maxTargetResponseEnvelopeBytesV1(l Limits) int {
+	return len(maxTargetResponseEnvelopeSkeletonV1) +
+		2*l.MaxTextBytes*canonicalJSONMaxByteExpansionV1 +
+		l.MaxRequestIDBytes*canonicalJSONMaxByteExpansionV1 +
+		(targetResponseEnvelopePositiveInt64BytesV1 - 1) + // maximum positive int64 replaces the skeleton's one zero
+		(targetResponseEnvelopeHTTPStatusBytesV1 - 1) + // maximum legal HTTP status replaces the skeleton's one zero
+		(l.MaxDecompressedResponseBodyBytes - 1) +
+		4*targetResponseEnvelopeSHA256BytesV1 + // submission, body, evidence, and limits SHA-256 strings
+		targetResponseEnvelopeEvidenceURIBytesV1*canonicalJSONMaxByteExpansionV1 // ledger.EvidenceRef URI
+}
 
 // TargetSubmissionV1 is the immutable identity of the one transport request
 // made for a sealed target-ref commitment. It is published before transport
