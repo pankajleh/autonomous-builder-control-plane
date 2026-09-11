@@ -213,6 +213,7 @@ type PhaseCheckpointV1 struct {
 	SemanticRegistrySHA256      string                       `json:"semantic_registry_sha256,omitempty"`
 	NextStageGrantSHA256        string                       `json:"next_stage_grant_sha256,omitempty"`
 	ReviewScopeTipSHA256        string                       `json:"review_scope_tip_sha256,omitempty"`
+	AcceptanceResultSHA256      string                       `json:"acceptance_result_sha256,omitempty"`
 	ReviewCritical              int                          `json:"review_critical"`
 	ReviewMajor                 int                          `json:"review_major"`
 	ReviewedBlockingScopeIDs    []string                     `json:"reviewed_blocking_scope_ids,omitempty"`
@@ -224,12 +225,120 @@ type PhaseCheckpointV1 struct {
 // repository-owned checkpoint tip. Review predecessors are deliberately not
 // accepted here; convergence gates consume the controller's durable tip.
 type CheckpointAdvanceV1 struct {
-	Repository        string                      `json:"repository"`
-	Capsule           contextcapsule.Capsule      `json:"capsule"`
-	CapsuleFileSHA256 string                      `json:"capsule_file_sha256"`
-	Registry          SemanticAuthorityRegistryV1 `json:"registry"`
-	Checkpoint        PhaseCheckpointV1           `json:"checkpoint"`
-	NextStageGrant    *NextStageGrantV1           `json:"next_stage_grant,omitempty"`
+	Repository        string                           `json:"repository"`
+	Capsule           contextcapsule.Capsule           `json:"capsule"`
+	CapsuleFileSHA256 string                           `json:"capsule_file_sha256"`
+	Registry          SemanticAuthorityRegistryV1      `json:"registry"`
+	Checkpoint        PhaseCheckpointV1                `json:"checkpoint"`
+	NextStageGrant    *NextStageGrantV1                `json:"next_stage_grant,omitempty"`
+	AcceptanceResult  *DeterministicAcceptanceResultV1 `json:"acceptance_result,omitempty"`
+}
+
+// AcceptanceCheckV1 is one controller-owned deterministic acceptance check.
+// EvidenceRefs names the typed evidence bindings in the enclosing result.
+type AcceptanceCheckV1 struct {
+	Name         string   `json:"name"`
+	Required     bool     `json:"required"`
+	Outcome      string   `json:"outcome"`
+	EvidenceRefs []string `json:"evidence_refs"`
+}
+
+// DeterministicAcceptanceResultV1 is the closed, exact-head result required
+// before an ACCEPTANCE_PASSED checkpoint can advance. Its PASS conclusion is
+// derived from check outcomes and final Git state rather than caller text.
+type DeterministicAcceptanceResultV1 struct {
+	Kind                string              `json:"kind"`
+	CapsuleSHA256       string              `json:"capsule_sha256"`
+	CandidateSHA        string              `json:"candidate_sha"`
+	Checks              []AcceptanceCheckV1 `json:"checks"`
+	FinalGitEvidenceRef string              `json:"final_git_evidence_ref"`
+	FinalRepositoryHEAD string              `json:"final_repository_head"`
+	RepositoryClean     bool                `json:"repository_clean"`
+	Evidence            []EvidenceBindingV1 `json:"evidence"`
+	AcceptanceSHA256    string              `json:"acceptance_sha256"`
+}
+
+// SealDeterministicAcceptanceResultV1 validates and hashes an acceptance
+// result whose PASS state is mechanically derivable.
+func SealDeterministicAcceptanceResultV1(result DeterministicAcceptanceResultV1) (DeterministicAcceptanceResultV1, error) {
+	result.AcceptanceSHA256 = ""
+	if err := validateDeterministicAcceptancePayloadV1(result); err != nil {
+		return DeterministicAcceptanceResultV1{}, err
+	}
+	digest, err := deterministicAcceptanceDigestV1(result)
+	if err != nil {
+		return DeterministicAcceptanceResultV1{}, err
+	}
+	result.AcceptanceSHA256 = digest
+	return result, nil
+}
+
+// ValidateDeterministicAcceptanceResultV1 verifies the derived PASS state and
+// its immutable digest.
+func ValidateDeterministicAcceptanceResultV1(result DeterministicAcceptanceResultV1) error {
+	if err := validateDeterministicAcceptancePayloadV1(result); err != nil {
+		return err
+	}
+	digest, err := deterministicAcceptanceDigestV1(result)
+	if err != nil {
+		return err
+	}
+	if result.AcceptanceSHA256 != digest {
+		return fail(CheckpointChainInvalid, "deterministic acceptance result digest mismatch")
+	}
+	return nil
+}
+
+func validateDeterministicAcceptancePayloadV1(result DeterministicAcceptanceResultV1) error {
+	if result.Kind != "DeterministicAcceptanceResultV1" || !validSHA256(result.CapsuleSHA256) || !validOID(result.CandidateSHA) || result.FinalRepositoryHEAD != result.CandidateSHA || !result.RepositoryClean {
+		return fail(CheckpointChainInvalid, "deterministic acceptance identity or final Git state is invalid")
+	}
+	if len(result.Checks) == 0 || len(result.Checks) > 64 || len(result.Evidence) == 0 || len(result.Evidence) > 256 {
+		return fail(CheckpointChainInvalid, "deterministic acceptance checks or evidence count is invalid")
+	}
+	evidenceByRef := make(map[string]struct{}, len(result.Evidence))
+	previousRef := ""
+	for _, evidence := range result.Evidence {
+		if !validText(evidence.Ref, 2048) || !validSHA256(evidence.SHA256) || evidence.Ref <= previousRef {
+			return fail(CheckpointChainInvalid, "deterministic acceptance evidence must be sorted, unique, and hashed")
+		}
+		previousRef = evidence.Ref
+		evidenceByRef[evidence.Ref] = struct{}{}
+	}
+	if _, ok := evidenceByRef[result.FinalGitEvidenceRef]; !ok {
+		return fail(CheckpointChainInvalid, "deterministic acceptance lacks bound final Git evidence")
+	}
+	required := false
+	previousName := ""
+	usedEvidence := map[string]struct{}{result.FinalGitEvidenceRef: {}}
+	for _, check := range result.Checks {
+		if !validText(check.Name, 256) || check.Name <= previousName || check.Outcome != "PASS" || len(check.EvidenceRefs) == 0 || len(check.EvidenceRefs) > 16 {
+			return fail(CheckpointChainInvalid, "deterministic acceptance check is not a canonical PASS")
+		}
+		previousName = check.Name
+		required = required || check.Required
+		previousEvidence := ""
+		for _, ref := range check.EvidenceRefs {
+			if ref <= previousEvidence {
+				return fail(CheckpointChainInvalid, "deterministic acceptance check evidence is not sorted and unique")
+			}
+			if _, ok := evidenceByRef[ref]; !ok {
+				return fail(CheckpointChainInvalid, "deterministic acceptance check evidence is unresolved")
+			}
+			previousEvidence = ref
+			usedEvidence[ref] = struct{}{}
+		}
+	}
+	if !required || len(usedEvidence) != len(evidenceByRef) {
+		return fail(CheckpointChainInvalid, "deterministic acceptance requires a passing required check and no opaque evidence")
+	}
+	return nil
+}
+
+func deterministicAcceptanceDigestV1(result DeterministicAcceptanceResultV1) (string, error) {
+	result.AcceptanceSHA256 = ""
+	type alias DeterministicAcceptanceResultV1
+	return digestJSON(alias(result))
 }
 
 // SealPhaseCheckpointV1 returns a validated checkpoint with its digest set.
@@ -360,6 +469,11 @@ func validateCheckpointPayload(checkpoint PhaseCheckpointV1) error {
 	if checkpoint.Kind == CheckpointImplementationConverged {
 		if !validSHA256(checkpoint.ReviewScopeTipSHA256) || !validSHA256(checkpoint.NextStageGrantSHA256) || checkpoint.Verdict != "IMPLEMENTATION_CONVERGED_C0_M0" || checkpoint.ReviewCritical != 0 || checkpoint.ReviewMajor != 0 || len(checkpoint.ReviewedBlockingScopeIDs) == 0 || validateIDs(checkpoint.ReviewedBlockingScopeIDs) != nil {
 			return fail(CheckpointChainInvalid, "IMPLEMENTATION_CONVERGED must bind review tip and C grant digests")
+		}
+	}
+	if checkpoint.Kind == CheckpointAcceptancePassed {
+		if checkpoint.Verdict != "ACCEPTANCE_PASSED" || !validSHA256(checkpoint.AcceptanceResultSHA256) {
+			return fail(CheckpointChainInvalid, "ACCEPTANCE_PASSED must bind a deterministic passing acceptance result")
 		}
 	}
 	if checkpoint.Kind == CheckpointFinalReviewClean {
@@ -1498,6 +1612,10 @@ type GovernanceActivationV1 struct {
 	ActivationSHA256           string   `json:"activation_sha256"`
 }
 
+// GovernancePolicyPathV1 is the repository policy object whose exact bytes
+// are activated by GovernanceActivationV1.PolicySHA256.
+const GovernancePolicyPathV1 = "docs/architecture/CONTEXT_AUTHORITY_AND_CAPSULE_POLICY.md"
+
 // SealGovernanceActivationV1 validates and hashes an activation record.
 func SealGovernanceActivationV1(activation GovernanceActivationV1) (GovernanceActivationV1, error) {
 	activation.ActivationSHA256 = ""
@@ -1583,6 +1701,16 @@ type InvocationReservationV1 struct {
 	MutationLeaseSHA256 string `json:"mutation_lease_sha256,omitempty"`
 }
 
+// DurableDerivationV1 preserves the exact controller checkpoint/grant inputs
+// which authorize every later B or C capsule use.
+type DurableDerivationV1 struct {
+	ParentCapsuleFileSHA256 string                 `json:"parent_capsule_file_sha256"`
+	ParentCapsule           contextcapsule.Capsule `json:"parent_capsule"`
+	Checkpoint              PhaseCheckpointV1      `json:"checkpoint"`
+	Grant                   NextStageGrantV1       `json:"grant"`
+	UpstreamGrant           *NextStageGrantV1      `json:"upstream_grant,omitempty"`
+}
+
 // ControllerStateV1 is the single non-forkable durable tip for one workflow.
 // It is always advanced through the workflow-wide authority backend CAS.
 type ControllerStateV1 struct {
@@ -1595,6 +1723,9 @@ type ControllerStateV1 struct {
 	Activation            *GovernanceActivationV1  `json:"activation,omitempty"`
 	BCapsuleSHA256        string                   `json:"b_capsule_sha256,omitempty"`
 	ExecutionBoundsSHA256 string                   `json:"execution_bounds_sha256,omitempty"`
+	BWorkflowStartedAt    string                   `json:"b_workflow_started_at,omitempty"`
+	AggregateUpdatedAt    string                   `json:"aggregate_updated_at,omitempty"`
+	AggregateTimeout      string                   `json:"aggregate_timeout,omitempty"`
 	ExecutionState        ralphex.ExecutionStateV1 `json:"execution_state"`
 	ActiveInvocation      *InvocationReservationV1 `json:"active_invocation,omitempty"`
 	ReviewTip             *ReviewScopeReportV1     `json:"review_tip,omitempty"`
@@ -1605,6 +1736,7 @@ type ControllerStateV1 struct {
 	FixBatchLeaseSHA256   string                   `json:"fix_batch_lease_sha256,omitempty"`
 	CheckpointTip         *PhaseCheckpointV1       `json:"checkpoint_tip,omitempty"`
 	NextStageGrant        *NextStageGrantV1        `json:"next_stage_grant,omitempty"`
+	Derivation            *DurableDerivationV1     `json:"derivation,omitempty"`
 }
 
 // WorkflowAuthorityBackendV1 is the controller-owned, workflow-wide CAS
@@ -1841,6 +1973,16 @@ func (c *ControllerV1) AdvanceCheckpointV1(input CheckpointAdvanceV1) error {
 		if err := ValidateCheckpointTransitionV1(state.CheckpointTip, input.Checkpoint); err != nil {
 			return false, err
 		}
+		if input.Checkpoint.Kind == CheckpointAcceptancePassed {
+			if input.AcceptanceResult == nil {
+				return false, fail(CheckpointChainInvalid, "ACCEPTANCE_PASSED requires the deterministic acceptance result")
+			}
+			if err := validateAcceptancePassedCheckpointV1(input.Capsule, input.Checkpoint, *input.AcceptanceResult); err != nil {
+				return false, err
+			}
+		} else if input.AcceptanceResult != nil {
+			return false, fail(CheckpointChainInvalid, "%s cannot carry an acceptance result", input.Checkpoint.Kind)
+		}
 		if state.CheckpointTip != nil && state.CheckpointTip.CheckpointSHA256 == input.Checkpoint.CheckpointSHA256 {
 			if input.Checkpoint.NextStageGrantSHA256 == "" {
 				if input.NextStageGrant != nil {
@@ -1862,6 +2004,17 @@ func (c *ControllerV1) AdvanceCheckpointV1(input CheckpointAdvanceV1) error {
 		case CheckpointImplementationConverged:
 			if input.NextStageGrant == nil || state.NextStageGrant == nil || state.NextStageGrant.Stage != contextcapsule.StageBImplementation || state.ReviewTip == nil || state.ReviewCapsuleSHA256 != input.Capsule.CapsuleSHA256 {
 				return false, fail(CheckpointChainInvalid, "IMPLEMENTATION_CONVERGED requires the exact durable B review tip and C grant")
+			}
+			if input.Capsule.PhaseAuthority == nil || input.Capsule.PhaseAuthority.ExecutionBounds == nil {
+				return false, fail(ExecutionBoundsInvalid, "implementation convergence requires B execution bounds")
+			}
+			bounds := *input.Capsule.PhaseAuthority.ExecutionBounds
+			boundsDigest, err := digestJSON(bounds)
+			if err != nil {
+				return false, err
+			}
+			if err := bindBWorkflowState(state, input.Capsule.CapsuleSHA256, boundsDigest, bounds); err != nil {
+				return false, err
 			}
 			if state.MutationState != nil && state.MutationState.LeaseStatus != LeaseConsumed {
 				return false, fail(MutationScopeViolation, "unfinished mutation lease blocks implementation convergence")
@@ -1895,10 +2048,46 @@ func (c *ControllerV1) AdvanceCheckpointV1(input CheckpointAdvanceV1) error {
 		state.CheckpointTip = &checkpoint
 		if input.NextStageGrant != nil {
 			grant := *input.NextStageGrant
+			derivation := DurableDerivationV1{
+				ParentCapsuleFileSHA256: input.CapsuleFileSHA256,
+				ParentCapsule:           input.Capsule,
+				Checkpoint:              input.Checkpoint,
+				Grant:                   grant,
+			}
+			if input.Checkpoint.Kind == CheckpointImplementationConverged {
+				upstream := *state.NextStageGrant
+				derivation.UpstreamGrant = &upstream
+			}
+			state.Derivation = &derivation
 			state.NextStageGrant = &grant
 		}
 		return true, nil
 	})
+}
+
+func validateAcceptancePassedCheckpointV1(capsule contextcapsule.Capsule, checkpoint PhaseCheckpointV1, result DeterministicAcceptanceResultV1) error {
+	if err := ValidateDeterministicAcceptanceResultV1(result); err != nil {
+		return err
+	}
+	if capsule.PolicyVersion != contextcapsule.PolicyVersionV3 || capsule.PhaseAuthority == nil || capsule.PhaseAuthority.Stage != contextcapsule.StageCAcceptanceMerge ||
+		checkpoint.Kind != CheckpointAcceptancePassed || checkpoint.Operation != contextcapsule.OperationAcceptance || checkpoint.Verdict != "ACCEPTANCE_PASSED" ||
+		result.CapsuleSHA256 != capsule.CapsuleSHA256 || result.CandidateSHA != capsule.BaseSHA || checkpoint.CandidateSHA != result.CandidateSHA || checkpoint.AcceptanceResultSHA256 != result.AcceptanceSHA256 ||
+		!equalEvidenceBindings(checkpoint.Evidence, result.Evidence) {
+		return fail(CheckpointChainInvalid, "ACCEPTANCE_PASSED is not the exact deterministic acceptance result for C")
+	}
+	return nil
+}
+
+func equalEvidenceBindings(left, right []EvidenceBindingV1) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateCheckpointGrantBinding(checkpoint PhaseCheckpointV1, grant NextStageGrantV1, stage contextcapsule.Stage) error {
@@ -1998,7 +2187,27 @@ func (c *ControllerV1) bindCapsuleRepository(state *ControllerStateV1, capsule c
 	if err := c.validateRepository(c.repository, capsule.Repository); err != nil {
 		return false, err
 	}
-	return c.bindRepositoryState(state, capsule.Repository)
+	bound, err := c.bindRepositoryState(state, capsule.Repository)
+	if err != nil {
+		return false, err
+	}
+	if capsule.PolicyVersion == contextcapsule.PolicyVersionV3 && capsule.PhaseAuthority != nil && capsule.PhaseAuthority.Stage != contextcapsule.StageADesign {
+		if state.Derivation == nil {
+			return false, fail(CapsuleLineageInvalid, "B/C capsule has no controller-issued durable derivation")
+		}
+		input := DerivationV3{
+			ParentCapsuleFileSHA256: state.Derivation.ParentCapsuleFileSHA256,
+			ParentCapsule:           state.Derivation.ParentCapsule,
+			Checkpoint:              state.Derivation.Checkpoint,
+			Grant:                   state.Derivation.Grant,
+			UpstreamGrant:           state.Derivation.UpstreamGrant,
+			ChildCapsule:            capsule,
+		}
+		if err := ValidateDerivationV3(input); err != nil {
+			return false, err
+		}
+	}
+	return bound, nil
 }
 
 // InstallActivationV1 records the one durable activation tip. Its grandfather
@@ -2009,6 +2218,18 @@ func (c *ControllerV1) InstallActivationV1(repository, repositoryIdentity string
 	}
 	if err := c.validateRepository(repository, repositoryIdentity); err != nil {
 		return err
+	}
+	commit, err := gitText(repository, "rev-parse", "--verify", activation.ActivationRepositoryCommit+"^{commit}")
+	if err != nil || commit != activation.ActivationRepositoryCommit {
+		return fail(CapsuleLineageInvalid, "activation repository commit does not exist as the exact commit object")
+	}
+	policy, err := gitBytes(repository, "show", activation.ActivationRepositoryCommit+":"+GovernancePolicyPathV1)
+	if err != nil {
+		return fail(CapsuleLineageInvalid, "activation commit does not contain the governance policy")
+	}
+	policyDigest := sha256.Sum256(policy)
+	if hex.EncodeToString(policyDigest[:]) != activation.PolicySHA256 {
+		return fail(CapsuleLineageInvalid, "activation policy digest does not match the committed policy bytes")
 	}
 	return c.withState(func(state *ControllerStateV1) (bool, error) {
 		bound, err := c.bindRepositoryState(state, repositoryIdentity)
@@ -2059,8 +2280,11 @@ func (c *ControllerV1) ReserveRalphexInvocationV1(capsule contextcapsule.Capsule
 		if _, err := c.bindCapsuleRepository(state, capsule); err != nil {
 			return false, err
 		}
-		if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest); err != nil {
+		if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest, bounds); err != nil {
 			return false, err
+		}
+		if operation == contextcapsule.OperationImplementation && mutation && (state.ReviewTip != nil || state.Lease != nil || state.MutationState != nil) {
+			return false, fail(MutationScopeViolation, "implementation mutation after review begins requires a controller-issued lease")
 		}
 		if state.ActiveInvocation != nil {
 			return false, fail(ExecutionBoundsInvalid, "an invocation is already durably in flight")
@@ -2111,26 +2335,25 @@ func (c *ControllerV1) ReserveRalphexInvocationV1(capsule contextcapsule.Capsule
 // FinishRalphexInvocationV1 atomically accrues real elapsed wall time. Only
 // the exact active token can finish, so another process cannot reset time.
 func (c *ControllerV1) FinishRalphexInvocationV1(reservation InvocationReservationV1) error {
-	return c.withState(func(state *ControllerStateV1) (bool, error) {
+	overrun := false
+	err := c.withState(func(state *ControllerStateV1) (bool, error) {
 		if state.ActiveInvocation == nil || state.ActiveInvocation.Token != reservation.Token || state.ActiveInvocation.CapsuleSHA256 != reservation.CapsuleSHA256 || state.ActiveInvocation.StartedAt != reservation.StartedAt || state.ActiveInvocation.MutationLeaseSHA256 != reservation.MutationLeaseSHA256 {
 			return false, fail(ExecutionBoundsInvalid, "invocation reservation is absent, replayed, or forked")
 		}
-		started, err := time.Parse(time.RFC3339Nano, state.ActiveInvocation.StartedAt)
-		if err != nil {
-			return false, fail(ExecutionBoundsInvalid, "durable invocation start time is invalid")
+		if err := accrueAggregateElapsedV1(state, time.Now().UTC()); err != nil {
+			return false, err
 		}
-		prior, err := time.ParseDuration(state.ExecutionState.AggregateElapsed)
-		if err != nil || prior < 0 {
-			return false, fail(ExecutionBoundsInvalid, "durable aggregate elapsed time is invalid")
-		}
-		elapsed := time.Since(started)
-		if elapsed < 0 {
-			return false, fail(ExecutionBoundsInvalid, "controller clock moved before the invocation reservation")
-		}
-		state.ExecutionState.AggregateElapsed = (prior + elapsed).Round(time.Nanosecond).String()
+		overrun = validateAggregateElapsedV1(state) != nil
 		state.ActiveInvocation = nil
 		return true, nil
 	})
+	if err != nil {
+		return err
+	}
+	if overrun {
+		return fail(ExecutionBoundsInvalid, "B-wide aggregate wall-clock timeout expired before invocation finish")
+	}
+	return nil
 }
 
 // AdvanceReviewTipV1 validates the exact repository candidate under the lock,
@@ -2159,7 +2382,7 @@ func (c *ControllerV1) AdvanceReviewTipV1(repository string, capsule contextcaps
 			if digestErr != nil {
 				return false, digestErr
 			}
-			if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest); err != nil {
+			if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest, value); err != nil {
 				return false, err
 			}
 			if state.ReviewCapsuleSHA256 == capsule.CapsuleSHA256 {
@@ -2219,7 +2442,7 @@ func (c *ControllerV1) IssueMutationLeaseV1(capsule contextcapsule.Capsule, regi
 		if _, err := c.bindCapsuleRepository(state, capsule); err != nil {
 			return false, err
 		}
-		if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest); err != nil {
+		if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest, bounds); err != nil {
 			return false, err
 		}
 		if state.ReviewTip == nil || state.ReviewCapsuleSHA256 != capsule.CapsuleSHA256 || state.ReviewTip.ReportSHA256 != report.ReportSHA256 {
@@ -2234,7 +2457,16 @@ func (c *ControllerV1) IssueMutationLeaseV1(capsule contextcapsule.Capsule, regi
 		if state.ExecutionState.MutationLeases >= bounds.MaxMutationLeases {
 			return false, fail(ExecutionBoundsInvalid, "B-wide mutation-lease ceiling is exhausted")
 		}
-		lease, err := IssueMutationLeaseV1(capsule, registry, state.FindingEvidence, report, limits)
+		if err := ValidateSemanticAuthorityRegistryV1(registry); err != nil {
+			return false, err
+		}
+		if registry.RegistrySHA256 != report.SemanticRegistrySHA256 || registry.RegistrySHA256 != capsule.PhaseAuthority.SemanticRegistrySHA256 {
+			return false, fail(ReviewChainInvalid, "lease registry is not the exact durable report registry")
+		}
+		// AdvanceReviewTipV1 already validated this exact durable tip against
+		// its predecessor. Revalidating it as an initial report would
+		// incorrectly force every lease-bearing report back to sequence zero.
+		lease, err := issueMutationLease(capsule, registry, report, limits)
 		if err != nil {
 			return false, err
 		}
@@ -2255,18 +2487,52 @@ func (c *ControllerV1) IssueMutationLeaseV1(capsule contextcapsule.Capsule, regi
 	return issued, err
 }
 
-func bindBWorkflowState(state *ControllerStateV1, capsuleSHA256, boundsSHA256 string) error {
+func bindBWorkflowState(state *ControllerStateV1, capsuleSHA256, boundsSHA256 string, bounds contextcapsule.ExecutionBoundsV1) error {
 	if !validSHA256(capsuleSHA256) || !validSHA256(boundsSHA256) {
 		return fail(ExecutionBoundsInvalid, "B workflow identity is invalid")
 	}
+	now := time.Now().UTC()
 	if state.BCapsuleSHA256 == "" {
 		state.BCapsuleSHA256 = capsuleSHA256
 		state.ExecutionBoundsSHA256 = boundsSHA256
 		state.ExecutionState.AggregateElapsed = "0s"
+		state.BWorkflowStartedAt = now.Format(time.RFC3339Nano)
+		state.AggregateUpdatedAt = state.BWorkflowStartedAt
+		state.AggregateTimeout = bounds.AggregateWallClockTimeout
 		return nil
 	}
-	if state.BCapsuleSHA256 != capsuleSHA256 || state.ExecutionBoundsSHA256 != boundsSHA256 {
+	if state.BCapsuleSHA256 != capsuleSHA256 || state.ExecutionBoundsSHA256 != boundsSHA256 || state.AggregateTimeout != bounds.AggregateWallClockTimeout {
 		return fail(ExecutionBoundsInvalid, "B capsule or cumulative bounds changed for the workflow")
+	}
+	if err := accrueAggregateElapsedV1(state, now); err != nil {
+		return err
+	}
+	return validateAggregateElapsedV1(state)
+}
+
+func accrueAggregateElapsedV1(state *ControllerStateV1, now time.Time) error {
+	started, err := time.Parse(time.RFC3339Nano, state.BWorkflowStartedAt)
+	if err != nil || started.UTC().Format(time.RFC3339Nano) != state.BWorkflowStartedAt {
+		return fail(ExecutionBoundsInvalid, "durable B workflow start time is invalid")
+	}
+	updated, err := time.Parse(time.RFC3339Nano, state.AggregateUpdatedAt)
+	if err != nil || updated.UTC().Format(time.RFC3339Nano) != state.AggregateUpdatedAt || updated.Before(started) || now.Before(updated) {
+		return fail(ExecutionBoundsInvalid, "durable aggregate elapsed timestamp is invalid")
+	}
+	prior, err := time.ParseDuration(state.ExecutionState.AggregateElapsed)
+	if err != nil || prior < 0 || prior.String() != state.ExecutionState.AggregateElapsed {
+		return fail(ExecutionBoundsInvalid, "durable aggregate elapsed time is invalid")
+	}
+	state.ExecutionState.AggregateElapsed = (prior + now.Sub(updated)).Round(time.Nanosecond).String()
+	state.AggregateUpdatedAt = now.Format(time.RFC3339Nano)
+	return nil
+}
+
+func validateAggregateElapsedV1(state *ControllerStateV1) error {
+	elapsed, err := time.ParseDuration(state.ExecutionState.AggregateElapsed)
+	maximum, maxErr := time.ParseDuration(state.AggregateTimeout)
+	if err != nil || maxErr != nil || elapsed < 0 || maximum <= 0 || elapsed >= maximum {
+		return fail(ExecutionBoundsInvalid, "B-wide aggregate wall-clock timeout is exhausted")
 	}
 	return nil
 }
@@ -2296,9 +2562,25 @@ func (c *ControllerV1) ValidateCapsuleUsageV3(capsule contextcapsule.Capsule, op
 		if err != nil {
 			return false, err
 		}
+		if capsule.PhaseAuthority != nil && capsule.PhaseAuthority.Stage == contextcapsule.StageBImplementation {
+			if capsule.PhaseAuthority.ExecutionBounds == nil {
+				return false, fail(ExecutionBoundsInvalid, "B capsule lacks cumulative execution bounds")
+			}
+			bounds := *capsule.PhaseAuthority.ExecutionBounds
+			boundsDigest, digestErr := digestJSON(bounds)
+			if digestErr != nil {
+				return false, digestErr
+			}
+			if err := bindBWorkflowState(state, capsule.CapsuleSHA256, boundsDigest, bounds); err != nil {
+				return false, err
+			}
+		}
 		if operation != contextcapsule.OperationImplementationReview || !mutation {
 			if leaseSHA256 != "" {
 				return false, fail(MutationScopeViolation, "non-fix invocation supplied a mutation lease")
+			}
+			if operation == contextcapsule.OperationImplementation && mutation && (state.ReviewTip != nil || state.Lease != nil || state.MutationState != nil) {
+				return false, fail(MutationScopeViolation, "implementation mutation after review begins requires a controller-issued lease")
 			}
 			return bound, nil
 		}

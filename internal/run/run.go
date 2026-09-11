@@ -282,6 +282,11 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			processErr = errors.Join(processErr, finishErr)
 		}
 	}
+	if invocation.Mode == ralphex.ModeReview {
+		if reviewErr := validateReadOnlyReviewRepositoryV1(ctx, r.governed.Repository().Path, r.governed.Repository().StartSHA); reviewErr != nil {
+			processErr = errors.Join(processErr, reviewErr)
+		}
+	}
 	result.Ralphex = process
 	if processErr != nil {
 		return r.fail(result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
@@ -412,6 +417,18 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	}
 	result.State = domain.StateBranchAccepted
 	return result, nil
+}
+
+func validateReadOnlyReviewRepositoryV1(ctx context.Context, repository, expectedHEAD string) error {
+	head, err := gitOutput(ctx, repository, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil || head != expectedHEAD {
+		return errors.New("FINAL_REVIEW_INVALIDATED: read-only review changed the exact repository HEAD")
+	}
+	status, err := gitOutput(ctx, repository, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil || status != "" {
+		return errors.New("FINAL_REVIEW_INVALIDATED: read-only review left repository content dirty")
+	}
+	return nil
 }
 
 func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {

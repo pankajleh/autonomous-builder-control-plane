@@ -102,7 +102,7 @@ func TestRunnerRechecksActivationAfterAuthorityConstruction(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	repository := fixture.authority.Repository()
 	activation, err := governancev3.SealGovernanceActivationV1(governancev3.GovernanceActivationV1{
-		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3, PolicySHA256: strings.Repeat("a", 64),
+		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3, PolicySHA256: testHash(t, filepath.Join(repository.Path, governancev3.GovernancePolicyPathV1)),
 		ActivationRepositoryCommit: repository.StartSHA, ActivationSequence: 2, ActivationTime: "2026-09-10T00:00:00Z", GrandfatheredV2Digests: []string{},
 	})
 	if err != nil {
@@ -168,6 +168,7 @@ func TestV3BReusesCapsuleAtDescendantAndStopsBeforeCAcceptance(t *testing.T) {
 	}
 	manifest.Governance = &authority.GovernanceManifest{Operation: contextcapsule.OperationImplementation, Mutation: true}
 	controller := newRunTestController(t, repository, manifest.Repository.Identity)
+	authorizeRunV3Manifest(t, controller, &manifest)
 	governed, err := authority.NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		t.Fatal(err)
@@ -203,6 +204,38 @@ func TestV3BReusesCapsuleAtDescendantAndStopsBeforeCAcceptance(t *testing.T) {
 	}
 	if snapshot.ExecutionState.RalphexInvocations != 1 || snapshot.ExecutionState.TotalFixBatches != 0 {
 		t.Fatalf("B counters = %#v", snapshot.ExecutionState)
+	}
+}
+
+func TestReadOnlyReviewRejectsPostRunRepositoryMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		script string
+		want   string
+	}{
+		{
+			name:   "head changed",
+			script: "#!/bin/sh\nprintf changed > review-change.txt\ngit add review-change.txt || exit 90\ngit commit -qm review-change || exit 91\n",
+			want:   "changed the exact repository HEAD",
+		},
+		{
+			name:   "working tree dirty",
+			script: "#!/bin/sh\nprintf changed > review-change.txt\n",
+			want:   "left repository content dirty",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRunFixtureWithScript(t, test.script, authority.WorktreePolicy{}, commandPath(t, "true"))
+			manifest := fixture.authority.Manifest()
+			manifest.Ralphex.Mode = ralphex.ModeReview
+			bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementationReview)
+			fixture.authority = fixture.admit(t, manifest)
+			result, err := fixture.runner(t).Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), test.want) || result.State != domain.StateFailed {
+				t.Fatalf("mutating review result=%#v err=%v", result, err)
+			}
+		})
 	}
 }
 
@@ -989,6 +1022,69 @@ func newRunTestController(t *testing.T, repository, repositoryIdentity string) *
 	return controller
 }
 
+func authorizeRunV3Manifest(t *testing.T, controller *governancev3.ControllerV1, manifest *authority.Manifest) {
+	t.Helper()
+	data, err := os.ReadFile(manifest.ContextCapsule.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := contextcapsule.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phase := child.PhaseAuthority
+	aCapsule := contextcapsule.Capsule{
+		PolicyVersion: contextcapsule.PolicyVersionV3, Repository: child.Repository, BaseSHA: child.BaseSHA, CapsuleSHA256: strings.Repeat("6", 64),
+		PhaseAuthority: &contextcapsule.PhaseAuthorityV3{
+			Stage: contextcapsule.StageADesign, AllowedOperations: []contextcapsule.OperationKind{contextcapsule.OperationDesignPlanning, contextcapsule.OperationDesignReview},
+			SemanticRegistrySHA256: phase.SemanticRegistrySHA256, ObservationScopeIDs: append([]string{}, phase.ObservationScopeIDs...),
+			BlockingScopeIDs: append([]string{}, phase.BlockingScopeIDs...), MutationScopeIDs: append([]string{}, phase.MutationScopeIDs...),
+			AuthorizedFindingIDs: []string{}, AuthorizedInvariantIDs: append([]string{}, phase.AuthorizedInvariantIDs...),
+			AllowedPaths: append([]string{}, phase.AllowedPaths...), ReviewProfile: contextcapsule.ReviewProfileNone,
+		},
+	}
+	bounds := *phase.ExecutionBounds
+	requiredID := phase.BlockingScopeIDs[0]
+	grant := governancev3.NextStageGrantV1{
+		Kind: "NextStageGrantV1", Stage: contextcapsule.StageBImplementation, BaseSHA: child.BaseSHA, SemanticRegistrySHA256: phase.SemanticRegistrySHA256,
+		AllowedOperations: append([]contextcapsule.OperationKind{}, phase.AllowedOperations...), ObservationScopeIDs: append([]string{}, phase.ObservationScopeIDs...),
+		BlockingScopeIDs: append([]string{}, phase.BlockingScopeIDs...), MutationScopeIDs: append([]string{}, phase.MutationScopeIDs...),
+		AuthorizedFindingIDs: append([]string{}, phase.AuthorizedFindingIDs...), AuthorizedInvariantIDs: append([]string{}, phase.AuthorizedInvariantIDs...),
+		AllowedPaths: append([]string{}, phase.AllowedPaths...), ReviewProfile: phase.ReviewProfile, ExecutionBounds: &bounds,
+		RequiredBlockingScopeIDs: []string{requiredID}, RequiredInvariantIDs: []string{requiredID}, RequiredOperations: []contextcapsule.OperationKind{contextcapsule.OperationImplementation}, RequiredFinalReviewIDs: []string{requiredID},
+	}
+	aFile := strings.Repeat("7", 64)
+	design := governancev3.PhaseCheckpointV1{
+		Kind: governancev3.CheckpointDesignAccepted, Repository: child.Repository, CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256,
+		CandidateSHA: child.BaseSHA, Operation: contextcapsule.OperationDesignReview, Verdict: "DESIGN_ACCEPTED",
+		Evidence: []governancev3.EvidenceBindingV1{{Ref: "design/accepted", SHA256: strings.Repeat("8", 64)}}, ControllerPolicyIdentity: "policy-v3",
+		ControllerEventIdentity: "event-design", SemanticRegistrySHA256: phase.SemanticRegistrySHA256,
+	}
+	design, grant, err = governancev3.SealCheckpointWithNextStageGrantV1(design, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.PhaseAuthority.Parent = &contextcapsule.PhaseParentV1{CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256, Stage: contextcapsule.StageADesign, CheckpointSHA256: design.CheckpointSHA256, CandidateSHA: design.CandidateSHA, GrantSHA256: grant.GrantSHA256}
+	sources := make([]string, len(child.Sources))
+	for index, source := range child.Sources {
+		sources[index] = source.Path
+	}
+	spec := contextcapsule.Spec{
+		PolicyVersion: child.PolicyVersion, Project: child.Project, Plan: child.Plan, RoadmapPhase: child.RoadmapPhase, ExecutionPack: child.ExecutionPack, Task: child.Task,
+		Repository: child.Repository, BaseSHA: child.BaseSHA, Invariants: append([]string{}, child.Invariants...), NonGoals: append([]string{}, child.NonGoals...),
+		PredecessorOutcomes: append([]contextcapsule.Outcome{}, child.PredecessorOutcomes...), Sources: sources, PhaseAuthority: child.PhaseAuthority,
+	}
+	_, rebuilt, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, manifest.ContextCapsule.Path, rebuilt, 0o600)
+	manifest.ContextCapsule.SHA256 = testHash(t, manifest.ContextCapsule.Path)
+	if err := controller.AdvanceCheckpointV1(governancev3.CheckpointAdvanceV1{Repository: manifest.Repository.Path, Capsule: aCapsule, CapsuleFileSHA256: aFile, Checkpoint: design, NextStageGrant: &grant}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (r *testContainedRunner) Run(ctx context.Context, command supervisor.Command) (supervisor.Result, error) {
 	return r.inner.Run(ctx, command)
 }
@@ -1030,7 +1126,11 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 	planPath := filepath.Join(repository, "plan.md")
 	writeTestFile(t, planPath, []byte("# governed plan\n"), 0o600)
 	writeTestFile(t, filepath.Join(repository, "context.md"), []byte("governed operation context\n"), 0o600)
-	runGit(t, repository, "add", "plan.md", "context.md")
+	if err := os.MkdirAll(filepath.Join(repository, filepath.Dir(governancev3.GovernancePolicyPathV1)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(repository, governancev3.GovernancePolicyPathV1), []byte("context authority policy v3\n"), 0o600)
+	runGit(t, repository, "add", "plan.md", "context.md", governancev3.GovernancePolicyPathV1)
 	runGit(t, repository, "commit", "-m", "initial plan")
 	startSHA := runGit(t, repository, "rev-parse", "HEAD")
 

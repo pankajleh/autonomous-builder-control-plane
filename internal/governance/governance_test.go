@@ -46,7 +46,7 @@ func TestCheckpointChainRejectsForkAndCHeadChange(t *testing.T) {
 	}
 	acceptance := sealCheckpoint(t, PhaseCheckpointV1{
 		Kind: CheckpointAcceptancePassed, Repository: design.Repository, CapsuleFileSHA256: hashChar("6"), CapsuleSHA256: hashChar("7"),
-		CandidateSHA: converged.CandidateSHA, Operation: contextcapsule.OperationAcceptance, Verdict: "PASSED",
+		CandidateSHA: converged.CandidateSHA, Operation: contextcapsule.OperationAcceptance, Verdict: "ACCEPTANCE_PASSED", AcceptanceResultSHA256: hashChar("0"),
 		Evidence: []EvidenceBindingV1{{Ref: "evidence/acceptance", SHA256: hashChar("8")}}, ControllerPolicyIdentity: "policy-v3",
 		Sequence: 2, PredecessorCheckpointSHA256: converged.CheckpointSHA256, ControllerEventIdentity: "event-2",
 	})
@@ -92,6 +92,106 @@ func TestDerivationRejectsMandatoryFloorRemoval(t *testing.T) {
 	child.PhaseAuthority.AuthorizedInvariantIDs = []string{"rule.other"}
 	if err := ValidateDerivationV3(DerivationV3{ParentCapsuleFileSHA256: parentFile, ParentCapsule: parent, Checkpoint: checkpoint, Grant: grant, ChildCapsule: child}); ClassOf(err) != CapsuleLineageInvalid {
 		t.Fatalf("floor removal class = %q, err=%v", ClassOf(err), err)
+	}
+}
+
+func TestControllerRejectsUngrantableBCapsuleDerivation(t *testing.T) {
+	repository, base, identity := governanceRepository(t)
+	registry := fixtureRegistry(t)
+	capsule := fixtureCapsule(contextcapsule.StageBImplementation, registry.RegistrySHA256)
+	capsule.BaseSHA = base
+	capsule.Repository = identity
+	backend := newTestWorkflowAuthorityStoreV1()
+	controller, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.seed(t, controller, identity)
+	if err := controller.ValidateCapsuleUsageV3(capsule, contextcapsule.OperationImplementation, true, ""); ClassOf(err) != CapsuleLineageInvalid {
+		t.Fatalf("ungranted B class = %q, err=%v", ClassOf(err), err)
+	}
+	authorizeBCapsule(t, controller, repository, &capsule)
+	if err := controller.ValidateCapsuleUsageV3(capsule, contextcapsule.OperationImplementation, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	tampered := capsule
+	tampered.PhaseAuthority = clonePhaseAuthority(capsule.PhaseAuthority)
+	tampered.PhaseAuthority.AllowedPaths = []string{"internal/governance/**", "outside/**"}
+	if err := controller.ValidateCapsuleUsageV3(tampered, contextcapsule.OperationImplementation, true, ""); ClassOf(err) != CapsuleLineageInvalid {
+		t.Fatalf("grant maxima bypass class = %q, err=%v", ClassOf(err), err)
+	}
+}
+
+func TestControllerRequiresLeaseAfterReviewBegins(t *testing.T) {
+	repository, base, identity := governanceRepository(t)
+	registry := fixtureRegistry(t)
+	capsule := fixtureCapsule(contextcapsule.StageBImplementation, registry.RegistrySHA256)
+	capsule.BaseSHA = base
+	capsule.Repository = identity
+	backend := newTestWorkflowAuthorityStoreV1()
+	controller, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.seed(t, controller, identity)
+	authorizeBCapsule(t, controller, repository, &capsule)
+	report := sealReport(t, capsule, hashChar("a"), registry, nil, ReviewScopeReportV1{
+		Kind: "ReviewScopeReportV1", CapsuleFileSHA256: hashChar("a"), CapsuleSHA256: capsule.CapsuleSHA256,
+		SemanticRegistrySHA256: registry.RegistrySHA256, ReviewedPreFixHEAD: base, ActiveFindings: []ActiveFindingV1{},
+		RequestedMutationIDs: []string{}, DeferredObservations: []DeferredObservationV1{}, ReviewerIdentity: "reviewer", ProviderIdentity: "provider", ReviewEvidenceSHA256: hashChar("2"),
+	})
+	if err := controller.AdvanceReviewTipV1(repository, capsule, hashChar("a"), registry, report); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.ValidateCapsuleUsageV3(capsule, contextcapsule.OperationImplementation, true, ""); ClassOf(err) != MutationScopeViolation {
+		t.Fatalf("post-review implementation class = %q, err=%v", ClassOf(err), err)
+	}
+	if _, err := controller.ReserveRalphexInvocationV1(capsule, contextcapsule.OperationImplementation, true, ""); ClassOf(err) != MutationScopeViolation {
+		t.Fatalf("post-review reservation class = %q, err=%v", ClassOf(err), err)
+	}
+}
+
+func TestControllerIssuesLeaseForLaterDurableReport(t *testing.T) {
+	repository, base, identity := governanceRepository(t)
+	registry := fixtureRegistry(t)
+	capsule := fixtureCapsule(contextcapsule.StageBImplementation, registry.RegistrySHA256)
+	capsule.BaseSHA = base
+	capsule.Repository = identity
+	backend := newTestWorkflowAuthorityStoreV1()
+	controller, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.seed(t, controller, identity)
+	authorizeBCapsule(t, controller, repository, &capsule)
+	report0 := sealReport(t, capsule, hashChar("a"), registry, nil, ReviewScopeReportV1{
+		Kind: "ReviewScopeReportV1", CapsuleFileSHA256: hashChar("a"), CapsuleSHA256: capsule.CapsuleSHA256,
+		SemanticRegistrySHA256: registry.RegistrySHA256, ReviewedPreFixHEAD: base,
+		ActiveFindings:       []ActiveFindingV1{{FindingID: "finding.one", RuleID: "rule.invariant", Severity: SeverityMajor, Evidence: []EvidenceBindingV1{{Ref: "review/zero"}}}},
+		RequestedMutationIDs: []string{}, DeferredObservations: []DeferredObservationV1{}, ReviewerIdentity: "reviewer", ProviderIdentity: "provider", ReviewEvidenceSHA256: hashChar("2"),
+	})
+	recordReportEvidence(t, controller, repository, capsule, registry, report0)
+	if err := controller.AdvanceReviewTipV1(repository, capsule, hashChar("a"), registry, report0); err != nil {
+		t.Fatal(err)
+	}
+	report1 := report0
+	report1.Sequence = 1
+	report1.PredecessorReportSHA256 = report0.ReportSHA256
+	report1.RequestedMutationIDs = []string{"finding.one"}
+	report1.ActiveFindings = []ActiveFindingV1{{FindingID: "finding.one", RuleID: "rule.invariant", Severity: SeverityMajor, Evidence: []EvidenceBindingV1{{Ref: "review/one"}}}}
+	report1.ReviewEvidenceSHA256 = hashChar("3")
+	report1.ReportSHA256 = ""
+	report1 = sealReport(t, capsule, hashChar("a"), registry, &report0, report1)
+	recordReportEvidence(t, controller, repository, capsule, registry, report1)
+	if err := controller.AdvanceReviewTipV1(repository, capsule, hashChar("a"), registry, report1); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := controller.IssueMutationLeaseV1(capsule, registry, report1, MutationLimitsV1{MaxChangedFiles: 2, MaxChangedBytes: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.ReportSHA256 != report1.ReportSHA256 {
+		t.Fatalf("lease report = %s, want later tip %s", lease.ReportSHA256, report1.ReportSHA256)
 	}
 }
 
@@ -210,8 +310,149 @@ func TestActivationGrandfathersOnlyExactPreActivationDigest(t *testing.T) {
 	}
 }
 
+func TestActivationInstallVerifiesCommitAndCommittedPolicy(t *testing.T) {
+	repository, base, identity := governanceRepository(t)
+	backend := newTestWorkflowAuthorityStoreV1()
+	controller, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.seed(t, controller, identity)
+	policySHA := committedPolicySHA256(t, repository, base)
+	blob := gitTest(t, repository, "hash-object", "-w", GovernancePolicyPathV1)
+	activation := func(commit, digest string) GovernanceActivationV1 {
+		value, sealErr := SealGovernanceActivationV1(GovernanceActivationV1{
+			Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3, PolicySHA256: digest,
+			ActivationRepositoryCommit: commit, ActivationSequence: 1, ActivationTime: time.Unix(0, 0).UTC().Format(time.RFC3339), GrandfatheredV2Digests: []string{},
+		})
+		if sealErr != nil {
+			t.Fatal(sealErr)
+		}
+		return value
+	}
+	if err := controller.InstallActivationV1(repository, identity, activation(blob, policySHA)); ClassOf(err) != CapsuleLineageInvalid {
+		t.Fatalf("blob activation class = %q, err=%v", ClassOf(err), err)
+	}
+	if err := controller.InstallActivationV1(repository, identity, activation(base, hashChar("1"))); ClassOf(err) != CapsuleLineageInvalid {
+		t.Fatalf("policy mismatch class = %q, err=%v", ClassOf(err), err)
+	}
+	if err := controller.InstallActivationV1(repository, identity, activation(base, policySHA)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAcceptancePassedRequiresDerivedDeterministicResult(t *testing.T) {
+	capsule := fixtureCapsule(contextcapsule.StageCAcceptanceMerge, hashChar("a"))
+	result := fixtureAcceptanceResult(t, capsule)
+	checkpoint := PhaseCheckpointV1{
+		Kind: CheckpointAcceptancePassed, Repository: capsule.Repository, CapsuleFileSHA256: hashChar("b"), CapsuleSHA256: capsule.CapsuleSHA256,
+		CandidateSHA: capsule.BaseSHA, Operation: contextcapsule.OperationAcceptance, Verdict: "caller says pass",
+		Evidence: append([]EvidenceBindingV1(nil), result.Evidence...), ControllerPolicyIdentity: "policy-v3", ControllerEventIdentity: "event-acceptance",
+		AcceptanceResultSHA256: result.AcceptanceSHA256,
+	}
+	if _, err := SealPhaseCheckpointV1(checkpoint); ClassOf(err) != CheckpointChainInvalid {
+		t.Fatalf("arbitrary verdict class = %q, err=%v", ClassOf(err), err)
+	}
+	opaque := result
+	opaque.AcceptanceSHA256 = ""
+	opaque.Evidence = append(opaque.Evidence, EvidenceBindingV1{Ref: "acceptance/unused", SHA256: hashChar("9")})
+	if _, err := SealDeterministicAcceptanceResultV1(opaque); ClassOf(err) != CheckpointChainInvalid {
+		t.Fatalf("opaque acceptance evidence class = %q, err=%v", ClassOf(err), err)
+	}
+	checkpoint.Verdict = "ACCEPTANCE_PASSED"
+	checkpoint = sealCheckpoint(t, checkpoint)
+	if err := validateAcceptancePassedCheckpointV1(capsule, checkpoint, result); err != nil {
+		t.Fatal(err)
+	}
+	tampered := result
+	tampered.Checks[0].Outcome = "FAIL"
+	if err := validateAcceptancePassedCheckpointV1(capsule, checkpoint, tampered); ClassOf(err) != CheckpointChainInvalid {
+		t.Fatalf("failed deterministic check class = %q, err=%v", ClassOf(err), err)
+	}
+}
+
+func TestAggregateElapsedIncludesHandoffsAndFinishOverrun(t *testing.T) {
+	t.Run("handoff", func(t *testing.T) {
+		repository, base, identity := governanceRepository(t)
+		registry := fixtureRegistry(t)
+		capsule := fixtureCapsule(contextcapsule.StageBImplementation, registry.RegistrySHA256)
+		capsule.BaseSHA = base
+		capsule.Repository = identity
+		backend := newTestWorkflowAuthorityStoreV1()
+		controller, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend.seed(t, controller, identity)
+		authorizeBCapsule(t, controller, repository, &capsule)
+		reservation, err := controller.ReserveRalphexInvocationV1(capsule, contextcapsule.OperationImplementation, true, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := controller.FinishRalphexInvocationV1(reservation); err != nil {
+			t.Fatal(err)
+		}
+		backend.rewriteState(t, controller, func(state *ControllerStateV1) {
+			then := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano)
+			state.BWorkflowStartedAt = then
+			state.AggregateUpdatedAt = then
+		})
+		report := sealReport(t, capsule, hashChar("a"), registry, nil, ReviewScopeReportV1{
+			Kind: "ReviewScopeReportV1", CapsuleFileSHA256: hashChar("a"), CapsuleSHA256: capsule.CapsuleSHA256,
+			SemanticRegistrySHA256: registry.RegistrySHA256, ReviewedPreFixHEAD: base, ActiveFindings: []ActiveFindingV1{}, RequestedMutationIDs: []string{},
+			DeferredObservations: []DeferredObservationV1{}, ReviewerIdentity: "reviewer", ProviderIdentity: "provider", ReviewEvidenceSHA256: hashChar("2"),
+		})
+		if err := controller.AdvanceReviewTipV1(repository, capsule, hashChar("a"), registry, report); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := controller.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		elapsed, err := time.ParseDuration(snapshot.ExecutionState.AggregateElapsed)
+		if err != nil || elapsed < 10*time.Minute {
+			t.Fatalf("handoff elapsed = %s, err=%v", snapshot.ExecutionState.AggregateElapsed, err)
+		}
+	})
+
+	t.Run("finish overrun", func(t *testing.T) {
+		repository, base, identity := governanceRepository(t)
+		capsule := fixtureCapsule(contextcapsule.StageBImplementation, hashChar("a"))
+		capsule.BaseSHA = base
+		capsule.Repository = identity
+		backend := newTestWorkflowAuthorityStoreV1()
+		controller, err := OpenControllerWithAuthorityBackendV1(repository, backend.client("host-a"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend.seed(t, controller, identity)
+		authorizeBCapsule(t, controller, repository, &capsule)
+		reservation, err := controller.ReserveRalphexInvocationV1(capsule, contextcapsule.OperationImplementation, true, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend.rewriteState(t, controller, func(state *ControllerStateV1) {
+			then := time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339Nano)
+			state.BWorkflowStartedAt = then
+			state.AggregateUpdatedAt = then
+			state.ExecutionState.AggregateElapsed = "0s"
+		})
+		if err := controller.FinishRalphexInvocationV1(reservation); ClassOf(err) != ExecutionBoundsInvalid {
+			t.Fatalf("finish overrun class = %q, err=%v", ClassOf(err), err)
+		}
+		snapshot, err := controller.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		elapsed, _ := time.ParseDuration(snapshot.ExecutionState.AggregateElapsed)
+		if snapshot.ActiveInvocation != nil || elapsed < 2*time.Hour {
+			t.Fatalf("overrun was not durably closed: active=%#v elapsed=%s", snapshot.ActiveInvocation, snapshot.ExecutionState.AggregateElapsed)
+		}
+	})
+}
+
 func TestControllerActivationCannotBeBypassedByOmittedCallerState(t *testing.T) {
-	repository, _, identity := governanceRepository(t)
+	repository, base, identity := governanceRepository(t)
 	localOnly, err := OpenControllerV1(repository)
 	if err != nil {
 		t.Fatal(err)
@@ -230,8 +471,8 @@ func TestControllerActivationCannotBeBypassedByOmittedCallerState(t *testing.T) 
 		t.Fatal(err)
 	}
 	activation, err := SealGovernanceActivationV1(GovernanceActivationV1{
-		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3, PolicySHA256: hashChar("1"),
-		ActivationRepositoryCommit: oidChar("2"), ActivationSequence: 2, ActivationTime: time.Unix(0, 0).UTC().Format(time.RFC3339),
+		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3, PolicySHA256: committedPolicySHA256(t, repository, base),
+		ActivationRepositoryCommit: base, ActivationSequence: 2, ActivationTime: time.Unix(0, 0).UTC().Format(time.RFC3339),
 		GrandfatheredV2Digests: []string{grandfathered},
 	})
 	if err != nil {
@@ -285,6 +526,7 @@ func TestControllerCountersAndInFlightReservationAreDurable(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend.seed(t, first, identity)
+	authorizeBCapsule(t, first, repository, &capsule)
 	remote := gitTest(t, repository, "remote", "get-url", "origin")
 	freshClone := filepath.Join(t.TempDir(), "fresh-clone")
 	gitTest(t, "", "clone", "--quiet", repository, freshClone)
@@ -375,6 +617,7 @@ func TestControllerLeaseCASAndReceiptUseIndependentRepositoryProof(t *testing.T)
 		t.Fatal(err)
 	}
 	backend.seed(t, controller, identity)
+	authorizeBCapsule(t, controller, repository, &capsule)
 	if err := controller.AdvanceReviewTipV1(repository, capsule, capsuleFile, registry, report); ClassOf(err) != ReviewChainInvalid {
 		t.Fatalf("opaque report evidence class = %q, err=%v", ClassOf(err), err)
 	}
@@ -525,6 +768,7 @@ func TestControllerResolvesFindingEvidenceAndRunsRegisteredValidator(t *testing.
 		t.Fatal(err)
 	}
 	backend.seed(t, controller, identity)
+	authorizeBCapsule(t, controller, repository, &capsule)
 	evidence, err := controller.RecordFindingEvidenceV1(repository, capsule, registry, FindingEvidenceRequestV1{
 		Ref: "review/resolved", CandidateSHA: base, FindingID: "finding.one", RuleID: "rule.invariant",
 	})
@@ -720,13 +964,14 @@ func TestControllerCheckpointGateConsumesOnlyDurableCleanReviewTips(t *testing.T
 	cCapsule.CapsuleSHA256 = hashChar("8")
 	cCapsule.PhaseAuthority.Parent = &contextcapsule.PhaseParentV1{CapsuleFileSHA256: bFile, CapsuleSHA256: bCapsule.CapsuleSHA256, Stage: contextcapsule.StageBImplementation, CheckpointSHA256: converged.CheckpointSHA256, CandidateSHA: base, GrantSHA256: cGrant.GrantSHA256}
 	cFile := hashChar("c")
+	acceptanceResult := fixtureAcceptanceResult(t, cCapsule)
 	accepted := sealCheckpoint(t, PhaseCheckpointV1{
 		Kind: CheckpointAcceptancePassed, Repository: cCapsule.Repository, CapsuleFileSHA256: cFile, CapsuleSHA256: cCapsule.CapsuleSHA256,
-		CandidateSHA: base, Operation: contextcapsule.OperationAcceptance, Verdict: "PASSED",
-		Evidence: []EvidenceBindingV1{{Ref: "acceptance/passed", SHA256: hashChar("4")}}, ControllerPolicyIdentity: "policy-v3",
+		CandidateSHA: base, Operation: contextcapsule.OperationAcceptance, Verdict: "ACCEPTANCE_PASSED", AcceptanceResultSHA256: acceptanceResult.AcceptanceSHA256,
+		Evidence: append([]EvidenceBindingV1(nil), acceptanceResult.Evidence...), ControllerPolicyIdentity: "policy-v3",
 		Sequence: 2, PredecessorCheckpointSHA256: converged.CheckpointSHA256, ControllerEventIdentity: "event-acceptance",
 	})
-	if err := controller.AdvanceCheckpointV1(CheckpointAdvanceV1{Repository: repository, Capsule: cCapsule, CapsuleFileSHA256: cFile, Registry: registry, Checkpoint: accepted}); err != nil {
+	if err := controller.AdvanceCheckpointV1(CheckpointAdvanceV1{Repository: repository, Capsule: cCapsule, CapsuleFileSHA256: cFile, Registry: registry, Checkpoint: accepted, AcceptanceResult: &acceptanceResult}); err != nil {
 		t.Fatal(err)
 	}
 	cleanC := sealReport(t, cCapsule, cFile, registry, nil, ReviewScopeReportV1{
@@ -820,13 +1065,93 @@ func fixtureBounds() *contextcapsule.ExecutionBoundsV1 {
 	return &contextcapsule.ExecutionBoundsV1{MaxIterations: 3, SessionTimeout: "30m0s", IdleTimeout: "10m0s", WallClockTimeout: "1h0m0s", AggregateWallClockTimeout: "2h0m0s", MaxIncompleteTasks: 1, MaxInitialActiveFindings: 4, MaxRalphexInvocations: 3, MaxReviewReports: 4, MaxMutationLeases: 3, MaxTotalFixBatches: 3, MaxChangedFiles: 10, MaxChangedBytes: 1000}
 }
 
+func fixtureAcceptanceResult(t *testing.T, capsule contextcapsule.Capsule) DeterministicAcceptanceResultV1 {
+	t.Helper()
+	result, err := SealDeterministicAcceptanceResultV1(DeterministicAcceptanceResultV1{
+		Kind: "DeterministicAcceptanceResultV1", CapsuleSHA256: capsule.CapsuleSHA256, CandidateSHA: capsule.BaseSHA,
+		Checks:              []AcceptanceCheckV1{{Name: "go test ./...", Required: true, Outcome: "PASS", EvidenceRefs: []string{"acceptance/test"}}},
+		FinalGitEvidenceRef: "acceptance/git", FinalRepositoryHEAD: capsule.BaseSHA, RepositoryClean: true,
+		Evidence: []EvidenceBindingV1{{Ref: "acceptance/git", SHA256: hashChar("4")}, {Ref: "acceptance/test", SHA256: hashChar("5")}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func authorizeBCapsule(t *testing.T, controller *ControllerV1, repository string, child *contextcapsule.Capsule) {
+	t.Helper()
+	if child == nil || child.PhaseAuthority == nil || child.PhaseAuthority.Stage != contextcapsule.StageBImplementation {
+		t.Fatal("B capsule is required")
+	}
+	phase := child.PhaseAuthority
+	aCapsule := contextcapsule.Capsule{
+		PolicyVersion: contextcapsule.PolicyVersionV3,
+		Repository:    child.Repository,
+		BaseSHA:       child.BaseSHA,
+		CapsuleSHA256: hashChar("6"),
+		PhaseAuthority: &contextcapsule.PhaseAuthorityV3{
+			Stage:                  contextcapsule.StageADesign,
+			AllowedOperations:      []contextcapsule.OperationKind{contextcapsule.OperationDesignPlanning, contextcapsule.OperationDesignReview},
+			SemanticRegistrySHA256: phase.SemanticRegistrySHA256,
+			ObservationScopeIDs:    append([]string(nil), phase.ObservationScopeIDs...),
+			BlockingScopeIDs:       append([]string(nil), phase.BlockingScopeIDs...),
+			MutationScopeIDs:       append([]string(nil), phase.MutationScopeIDs...),
+			AuthorizedFindingIDs:   []string{},
+			AuthorizedInvariantIDs: append([]string(nil), phase.AuthorizedInvariantIDs...),
+			AllowedPaths:           append([]string(nil), phase.AllowedPaths...),
+			ReviewProfile:          contextcapsule.ReviewProfileNone,
+		},
+	}
+	aFile := hashChar("7")
+	requiredID := ""
+	for _, blocker := range phase.BlockingScopeIDs {
+		if stringSubset([]string{blocker}, phase.AuthorizedInvariantIDs) {
+			requiredID = blocker
+			break
+		}
+	}
+	if requiredID == "" {
+		t.Fatal("B fixture lacks a blocker/invariant floor")
+	}
+	bounds := *phase.ExecutionBounds
+	grant := NextStageGrantV1{
+		Kind: "NextStageGrantV1", Stage: contextcapsule.StageBImplementation, BaseSHA: child.BaseSHA,
+		SemanticRegistrySHA256: phase.SemanticRegistrySHA256,
+		AllowedOperations:      append([]contextcapsule.OperationKind(nil), phase.AllowedOperations...), ObservationScopeIDs: append([]string(nil), phase.ObservationScopeIDs...),
+		BlockingScopeIDs: append([]string(nil), phase.BlockingScopeIDs...), MutationScopeIDs: append([]string(nil), phase.MutationScopeIDs...),
+		AuthorizedFindingIDs: append([]string{}, phase.AuthorizedFindingIDs...), AuthorizedInvariantIDs: append([]string{}, phase.AuthorizedInvariantIDs...),
+		AllowedPaths: append([]string(nil), phase.AllowedPaths...), ReviewProfile: phase.ReviewProfile, ExecutionBounds: &bounds,
+		RequiredBlockingScopeIDs: []string{requiredID}, RequiredInvariantIDs: []string{requiredID},
+		RequiredOperations: []contextcapsule.OperationKind{contextcapsule.OperationImplementation}, RequiredFinalReviewIDs: []string{requiredID},
+	}
+	design := PhaseCheckpointV1{
+		Kind: CheckpointDesignAccepted, Repository: child.Repository, CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256,
+		CandidateSHA: child.BaseSHA, Operation: contextcapsule.OperationDesignReview, Verdict: "DESIGN_ACCEPTED",
+		Evidence: []EvidenceBindingV1{{Ref: "design/accepted", SHA256: hashChar("8")}}, ControllerPolicyIdentity: "policy-v3",
+		ControllerEventIdentity: "event-design", SemanticRegistrySHA256: phase.SemanticRegistrySHA256,
+	}
+	var err error
+	design, grant, err = SealCheckpointWithNextStageGrantV1(design, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.PhaseAuthority.Parent = &contextcapsule.PhaseParentV1{
+		CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256, Stage: contextcapsule.StageADesign,
+		CheckpointSHA256: design.CheckpointSHA256, CandidateSHA: design.CandidateSHA, GrantSHA256: grant.GrantSHA256,
+	}
+	if err := controller.AdvanceCheckpointV1(CheckpointAdvanceV1{Repository: repository, Capsule: aCapsule, CapsuleFileSHA256: aFile, Checkpoint: design, NextStageGrant: &grant}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func clonePhaseAuthority(input *contextcapsule.PhaseAuthorityV3) *contextcapsule.PhaseAuthorityV3 {
 	clone := *input
 	clone.AllowedOperations = append([]contextcapsule.OperationKind(nil), input.AllowedOperations...)
 	clone.ObservationScopeIDs = append([]string(nil), input.ObservationScopeIDs...)
 	clone.BlockingScopeIDs = append([]string(nil), input.BlockingScopeIDs...)
 	clone.MutationScopeIDs = append([]string(nil), input.MutationScopeIDs...)
-	clone.AuthorizedFindingIDs = append([]string(nil), input.AuthorizedFindingIDs...)
+	clone.AuthorizedFindingIDs = append([]string{}, input.AuthorizedFindingIDs...)
 	clone.AuthorizedInvariantIDs = append([]string(nil), input.AuthorizedInvariantIDs...)
 	clone.AllowedPaths = append([]string(nil), input.AllowedPaths...)
 	return &clone
@@ -1038,6 +1363,26 @@ func (s *testWorkflowAuthorityStoreV1) copyRecord(t *testing.T, sourceIdentity, 
 	s.records[targetIdentity] = testWorkflowAuthorityRecordV1{canonicalState: append([]byte(nil), record.canonicalState...), revision: record.revision}
 }
 
+func (s *testWorkflowAuthorityStoreV1) rewriteState(t *testing.T, controller *ControllerV1, mutate func(*ControllerStateV1)) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.records[controller.identity]
+	if !ok {
+		t.Fatal("controller state is absent")
+	}
+	var state ControllerStateV1
+	if err := ParseCanonical(record.canonicalState, &state); err != nil {
+		t.Fatal(err)
+	}
+	mutate(&state)
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.records[controller.identity] = testWorkflowAuthorityRecordV1{canonicalState: data, revision: record.revision}
+}
+
 func hashChar(character string) string { return strings.Repeat(character, 64) }
 func oidChar(character string) string  { return strings.Repeat(character, 40) }
 
@@ -1065,10 +1410,23 @@ func governanceRepository(t *testing.T) (string, string, string) {
 	if err := os.MkdirAll(filepath.Join(repository, "internal", "governance"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(repository, filepath.Dir(GovernancePolicyPathV1)), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(repository, "internal", "governance", "base.go"), []byte("package governance\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, GovernancePolicyPathV1), []byte("context authority policy v3\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	gitTest(t, repository, "add", ".")
 	gitTest(t, repository, "commit", "-m", "base")
 	return repository, gitTest(t, repository, "rev-parse", "HEAD"), identity
+}
+
+func committedPolicySHA256(t *testing.T, repository, commit string) string {
+	t.Helper()
+	data := gitTest(t, repository, "show", commit+":"+GovernancePolicyPathV1)
+	digest := sha256.Sum256([]byte(data + "\n"))
+	return hex.EncodeToString(digest[:])
 }

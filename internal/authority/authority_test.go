@@ -401,6 +401,7 @@ func TestNewAdmitsV3BOnlyWithStructuralCapabilityAndCounters(t *testing.T) {
 		t.Fatalf("controllerless V3 authority was admitted: %v", err)
 	}
 	controller := newAuthorityTestController(t, manifest.Repository.Path, manifest.Repository.Identity)
+	authorizeV3Manifest(t, controller, &manifest)
 	governed, err := NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		t.Fatal(err)
@@ -429,6 +430,7 @@ func TestNewAdmitsV3BOnlyWithStructuralCapabilityAndCounters(t *testing.T) {
 	// Restore the shared fixture binary before testing independent state input.
 	manifest = v3BoundManifest(t)
 	controller = newAuthorityTestController(t, manifest.Repository.Path, manifest.Repository.Identity)
+	authorizeV3Manifest(t, controller, &manifest)
 	invalid = cloneManifest(manifest)
 	invalid.Ralphex.ExecutionState = &ralphex.ExecutionStateV1{AggregateElapsed: "0s"}
 	if _, err := NewWithGovernanceController(invalid, controller); err == nil || !strings.Contains(err.Error(), "controller-owned") {
@@ -493,8 +495,8 @@ func TestControllerAdmissionRejectsPostActivationV2WhenGovernanceIsOmitted(t *te
 		t.Fatal(err)
 	}
 	activation, err := governancev3.SealGovernanceActivationV1(governancev3.GovernanceActivationV1{
-		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3, PolicySHA256: strings.Repeat("a", 64),
-		ActivationRepositoryCommit: strings.Repeat("b", 40), ActivationSequence: 2, ActivationTime: "1970-01-01T00:00:00Z", GrandfatheredV2Digests: []string{legacy.SHA256()},
+		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3, PolicySHA256: fileHash(t, filepath.Join(manifest.Repository.Path, governancev3.GovernancePolicyPathV1)),
+		ActivationRepositoryCommit: head, ActivationSequence: 2, ActivationTime: "1970-01-01T00:00:00Z", GrandfatheredV2Digests: []string{legacy.SHA256()},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -566,6 +568,10 @@ func boundCapsuleManifest(t *testing.T) Manifest {
 	t.Helper()
 	manifest := fixtureManifest(t)
 	writeFile(t, filepath.Join(manifest.Repository.Path, "source.md"), []byte("governed source"), 0o600)
+	if err := os.MkdirAll(filepath.Join(manifest.Repository.Path, filepath.Dir(governancev3.GovernancePolicyPathV1)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(manifest.Repository.Path, governancev3.GovernancePolicyPathV1), []byte("context authority policy v3\n"), 0o600)
 	gitAuthorityCommand(t, manifest.Repository.Path, "init", "-b", "main")
 	gitAuthorityCommand(t, manifest.Repository.Path, "config", "user.email", "authority@example.test")
 	gitAuthorityCommand(t, manifest.Repository.Path, "config", "user.name", "Authority Test")
@@ -574,7 +580,7 @@ func boundCapsuleManifest(t *testing.T) Manifest {
 	remoteURL := "https://example.test/" + manifest.Repository.Identity + ".git"
 	gitAuthorityCommand(t, manifest.Repository.Path, "remote", "add", "origin", remoteURL)
 	manifest.Repository.Remotes = map[string]string{"origin": remoteURL}
-	gitAuthorityCommand(t, manifest.Repository.Path, "add", "plan.md", "source.md")
+	gitAuthorityCommand(t, manifest.Repository.Path, "add", "plan.md", "source.md", governancev3.GovernancePolicyPathV1)
 	gitAuthorityCommand(t, manifest.Repository.Path, "commit", "-m", "governed inputs")
 	head := gitAuthorityCommand(t, manifest.Repository.Path, "rev-parse", "HEAD")
 	manifest.Repository.StartSHA = head
@@ -653,6 +659,75 @@ func newAuthorityTestController(t *testing.T, repository, repositoryIdentity str
 	}
 	backend.records[controller.ControllerIdentity()] = authorityTestBackendRecord{data: data, revision: state.Revision}
 	return controller
+}
+
+func authorizeV3Manifest(t *testing.T, controller *governancev3.ControllerV1, manifest *Manifest) {
+	t.Helper()
+	data, err := os.ReadFile(manifest.ContextCapsule.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := contextcapsule.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phase := child.PhaseAuthority
+	aCapsule := contextcapsule.Capsule{
+		PolicyVersion: contextcapsule.PolicyVersionV3, Repository: child.Repository, BaseSHA: child.BaseSHA, CapsuleSHA256: strings.Repeat("6", 64),
+		PhaseAuthority: &contextcapsule.PhaseAuthorityV3{
+			Stage: contextcapsule.StageADesign, AllowedOperations: []contextcapsule.OperationKind{contextcapsule.OperationDesignPlanning, contextcapsule.OperationDesignReview},
+			SemanticRegistrySHA256: phase.SemanticRegistrySHA256, ObservationScopeIDs: append([]string{}, phase.ObservationScopeIDs...),
+			BlockingScopeIDs: append([]string{}, phase.BlockingScopeIDs...), MutationScopeIDs: append([]string{}, phase.MutationScopeIDs...),
+			AuthorizedFindingIDs: []string{}, AuthorizedInvariantIDs: append([]string{}, phase.AuthorizedInvariantIDs...),
+			AllowedPaths: append([]string{}, phase.AllowedPaths...), ReviewProfile: contextcapsule.ReviewProfileNone,
+		},
+	}
+	bounds := *phase.ExecutionBounds
+	requiredID := phase.BlockingScopeIDs[0]
+	grant := governancev3.NextStageGrantV1{
+		Kind: "NextStageGrantV1", Stage: contextcapsule.StageBImplementation, BaseSHA: child.BaseSHA, SemanticRegistrySHA256: phase.SemanticRegistrySHA256,
+		AllowedOperations: append([]contextcapsule.OperationKind{}, phase.AllowedOperations...), ObservationScopeIDs: append([]string{}, phase.ObservationScopeIDs...),
+		BlockingScopeIDs: append([]string{}, phase.BlockingScopeIDs...), MutationScopeIDs: append([]string{}, phase.MutationScopeIDs...),
+		AuthorizedFindingIDs: append([]string{}, phase.AuthorizedFindingIDs...), AuthorizedInvariantIDs: append([]string{}, phase.AuthorizedInvariantIDs...),
+		AllowedPaths: append([]string{}, phase.AllowedPaths...), ReviewProfile: phase.ReviewProfile, ExecutionBounds: &bounds,
+		RequiredBlockingScopeIDs: []string{requiredID}, RequiredInvariantIDs: []string{requiredID}, RequiredOperations: []contextcapsule.OperationKind{contextcapsule.OperationImplementation}, RequiredFinalReviewIDs: []string{requiredID},
+	}
+	aFile := strings.Repeat("7", 64)
+	design := governancev3.PhaseCheckpointV1{
+		Kind: governancev3.CheckpointDesignAccepted, Repository: child.Repository, CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256,
+		CandidateSHA: child.BaseSHA, Operation: contextcapsule.OperationDesignReview, Verdict: "DESIGN_ACCEPTED",
+		Evidence: []governancev3.EvidenceBindingV1{{Ref: "design/accepted", SHA256: strings.Repeat("8", 64)}}, ControllerPolicyIdentity: "policy-v3",
+		ControllerEventIdentity: "event-design", SemanticRegistrySHA256: phase.SemanticRegistrySHA256,
+	}
+	design, grant, err = governancev3.SealCheckpointWithNextStageGrantV1(design, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.PhaseAuthority.Parent = &contextcapsule.PhaseParentV1{CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256, Stage: contextcapsule.StageADesign, CheckpointSHA256: design.CheckpointSHA256, CandidateSHA: design.CandidateSHA, GrantSHA256: grant.GrantSHA256}
+	// Rebuild the capsule so its internal digest and bound file reflect the
+	// controller-issued parent rather than the test placeholder.
+	spec := contextcapsule.Spec{
+		PolicyVersion: child.PolicyVersion, Project: child.Project, Plan: child.Plan, RoadmapPhase: child.RoadmapPhase, ExecutionPack: child.ExecutionPack, Task: child.Task,
+		Repository: child.Repository, BaseSHA: child.BaseSHA, Invariants: append([]string{}, child.Invariants...), NonGoals: append([]string{}, child.NonGoals...),
+		PredecessorOutcomes: append([]contextcapsule.Outcome{}, child.PredecessorOutcomes...), Sources: capsuleSourcePaths(child), PhaseAuthority: child.PhaseAuthority,
+	}
+	_, rebuilt, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, manifest.ContextCapsule.Path, rebuilt, 0o600)
+	manifest.ContextCapsule.SHA256 = fileHash(t, manifest.ContextCapsule.Path)
+	if err := controller.AdvanceCheckpointV1(governancev3.CheckpointAdvanceV1{Repository: manifest.Repository.Path, Capsule: aCapsule, CapsuleFileSHA256: aFile, Checkpoint: design, NextStageGrant: &grant}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func capsuleSourcePaths(capsule contextcapsule.Capsule) []string {
+	paths := make([]string, len(capsule.Sources))
+	for index, source := range capsule.Sources {
+		paths[index] = source.Path
+	}
+	return paths
 }
 
 func gitAuthorityCommand(t *testing.T, directory string, args ...string) string {
