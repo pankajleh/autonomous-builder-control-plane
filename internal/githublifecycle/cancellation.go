@@ -137,6 +137,9 @@ func NewCancellationAuthorityV1(input CancellationAuthorityV1Input, limits Limit
 	if err != nil {
 		return CancellationAuthorityV1{}, err
 	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCancellationAuthorityBytes, "cancellation authority"); err != nil {
+		return CancellationAuthorityV1{}, err
+	}
 	return CancellationAuthorityV1{input, id, canonical, digest, limitsSHA}, nil
 }
 func (c CancellationAuthorityV1) Input() CancellationAuthorityV1Input {
@@ -355,6 +358,12 @@ func validateCancellationSubmissionExpectationV1(expected CancellationAuthorityE
 }
 
 func ParseCanonicalCancellationAuthorityV1(data []byte, limits Limits) (CancellationAuthorityV1, error) {
+	if err := limits.Validate(); err != nil {
+		return CancellationAuthorityV1{}, err
+	}
+	if err := requireCanonicalObjectSize(data, limits.MaxCancellationAuthorityBytes, "cancellation authority"); err != nil {
+		return CancellationAuthorityV1{}, err
+	}
 	var w cancellationAuthorityWireV1
 	if err := strictDecode(data, &w); err != nil {
 		return CancellationAuthorityV1{}, err

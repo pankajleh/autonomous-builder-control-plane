@@ -100,7 +100,8 @@ func NewAuthoritativePullRequestSnapshotV1(input AuthoritativePullRequestSnapsho
 	if err != nil {
 		return AuthoritativePullRequestSnapshotV1{}, err
 	}
-	if !input.Snapshot.valid() || input.Snapshot.Provider() != "github" || !validSHA256(input.ResponseBodySHA256) || !validText(input.APIVersion, limits.MaxTextBytes, false) ||
+	if !input.Snapshot.valid() || len(input.Snapshot.RequestID()) > limits.MaxRequestIDBytes ||
+		input.Snapshot.Provider() != "github" || !validSHA256(input.ResponseBodySHA256) || !validText(input.APIVersion, limits.MaxTextBytes, false) ||
 		!input.RepositoryBinding.valid() || !input.PullRequest.valid() || input.PullRequestDatabaseID <= 0 || !input.Actor.valid() || !input.BaseOID.valid() || !input.HeadOID.valid() {
 		return AuthoritativePullRequestSnapshotV1{}, errors.New("authoritative PR snapshot identity is invalid")
 	}
@@ -122,7 +123,7 @@ func NewAuthoritativePullRequestSnapshotV1(input AuthoritativePullRequestSnapsho
 	if input.State == nil || *input.State != PullRequestOpen || input.IsDraft == nil || *input.IsDraft || input.Merged == nil || *input.Merged || input.MergedAtUnixNano != nil {
 		return AuthoritativePullRequestSnapshotV1{}, errors.New("pull request is not authoritatively open, non-draft, and unmerged")
 	}
-	if len(input.Reviews) > limits.MaxTotalItems {
+	if len(input.Reviews) > limits.MaxObservedReviews {
 		return AuthoritativePullRequestSnapshotV1{}, errors.New("review collection exceeds limits")
 	}
 	reviewItems := make([]CanonicalPaginationItemV1, len(input.Reviews))
@@ -170,6 +171,9 @@ func NewAuthoritativePullRequestSnapshotV1(input AuthoritativePullRequestSnapsho
 	}
 	canonical, digest, err := canonicalJSON(authoritativePRWire(input, limitsSHA))
 	if err != nil {
+		return AuthoritativePullRequestSnapshotV1{}, err
+	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "authoritative pull request observation"); err != nil {
 		return AuthoritativePullRequestSnapshotV1{}, err
 	}
 	return AuthoritativePullRequestSnapshotV1{input, canonical, digest, limitsSHA}, nil
@@ -254,6 +258,12 @@ func ValidateAuthoritativePullRequestSnapshotV1(authority Authority, snapshot Au
 }
 
 func ParseCanonicalAuthoritativePullRequestSnapshotV1(data []byte, limits Limits) (AuthoritativePullRequestSnapshotV1, error) {
+	if err := limits.Validate(); err != nil {
+		return AuthoritativePullRequestSnapshotV1{}, err
+	}
+	if err := requireCanonicalObjectSize(data, limits.MaxCanonicalObjectBytes, "authoritative pull request observation"); err != nil {
+		return AuthoritativePullRequestSnapshotV1{}, err
+	}
 	var wire authoritativePRWireV1
 	if err := strictDecode(data, &wire); err != nil {
 		return AuthoritativePullRequestSnapshotV1{}, err

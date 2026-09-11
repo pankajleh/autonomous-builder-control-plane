@@ -371,6 +371,9 @@ func TestPaginationRejectsSelfCertifiedSourcePathAndAmbiguousTerminal(t *testing
 func TestPaginationRejectsCrossPageLastShortAndRepeatedCursor(t *testing.T) {
 	f := newFixture(t, MergeMethodMerge)
 	limits := f.limits
+	limits.MaxPaginationPages = 3
+	limits.MaxPaginationItemsPerPage = 1
+	limits.MaxObservedItemsPerPaginationSource = 3
 	limits.MaxPages = 3
 	limits.MaxItemsPerPage = 1
 	limits.MaxTotalItems = 3

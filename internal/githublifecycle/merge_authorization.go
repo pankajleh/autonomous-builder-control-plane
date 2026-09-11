@@ -81,7 +81,8 @@ func NewMergeCommitRecipeV1(writeID string, authority Authority, limits Limits) 
 		WriteID: writeID, AuthoritySHA256: authoritySHA, PolicySHA256: policy.SHA256(),
 		ReadyBindingSHA256: ready.SHA256(), LimitsSHA256: limitsSHA,
 	}
-	if !validCommitMessage(input.Message, limits.MaxTextBytes) || strings.HasSuffix(input.Message, "\n\n") || input.AuthorUnix <= 0 ||
+	if len(input.Parents) != limits.RequiredProductionMergeParents ||
+		!validCommitMessage(input.Message, limits.MaxTextBytes) || strings.HasSuffix(input.Message, "\n\n") || input.AuthorUnix <= 0 ||
 		!oidsMatchObjectFormat(input.ObjectFormat, append([]GitSHA{input.ExpectedResultTree}, input.Parents...)) {
 		return MergeCommitRecipeV1{}, errors.New("policy-derived merge commit recipe is invalid or uses inconsistent object IDs")
 	}
@@ -324,14 +325,115 @@ type MergeAuthorizationInputV1 struct {
 }
 
 type AuthorizationCountersV1 struct {
-	ReadCalls    int   `json:"read_calls"`
-	Items        int   `json:"items"`
-	Bytes        int64 `json:"bytes"`
-	ElapsedNanos int64 `json:"elapsed_nanos"`
+	AdmissionHTTPCalls                  int   `json:"admission_http_calls"`
+	AdmissionObservedChecks             int   `json:"admission_observed_checks"`
+	AdmissionObservedReviews            int   `json:"admission_observed_reviews"`
+	AdmissionPaginationSources          int   `json:"admission_pagination_sources"`
+	AdmissionPaginationPages            int   `json:"admission_pagination_pages"`
+	AdmissionPaginationItems            int   `json:"admission_pagination_items"`
+	AdmissionPaginationClosureBytes     int64 `json:"admission_pagination_closure_bytes"`
+	FinalRevalidationHTTPCalls          int   `json:"final_revalidation_http_calls"`
+	FinalObservedChecks                 int   `json:"final_observed_checks"`
+	FinalObservedReviews                int   `json:"final_observed_reviews"`
+	FinalPaginationSources              int   `json:"final_pagination_sources"`
+	FinalPaginationPages                int   `json:"final_pagination_pages"`
+	FinalPaginationItems                int   `json:"final_pagination_items"`
+	FinalPaginationClosureBytes         int64 `json:"final_pagination_closure_bytes"`
+	ReadyLedgerBytes                    int64 `json:"ready_ledger_bytes"`
+	ReadyLedgerRecords                  int   `json:"ready_ledger_records"`
+	PreSubmitHTTPCalls                  int   `json:"pre_submit_http_calls"`
+	CommitObjectCreationSubmissions     int   `json:"commit_object_creation_submissions"`
+	TargetRefUpdateSubmissions          int   `json:"target_ref_update_submissions"`
+	PostMergeHTTPCalls                  int   `json:"post_merge_http_calls"`
+	ReconciliationRounds                int   `json:"reconciliation_rounds"`
+	ReconciliationHTTPCalls             int   `json:"reconciliation_http_calls"`
+	PrincipalValidationHTTPCalls        int   `json:"principal_validation_http_calls"`
+	TotalHTTPCalls                      int   `json:"total_http_calls"`
+	CumulativeRequestBytes              int64 `json:"cumulative_request_bytes"`
+	CumulativeResponseHeaderBytes       int64 `json:"cumulative_response_header_bytes"`
+	CumulativeCompressedResponseBytes   int64 `json:"cumulative_compressed_response_bytes"`
+	CumulativeDecompressedResponseBytes int64 `json:"cumulative_decompressed_response_bytes"`
+	CumulativeActiveProviderCallNanos   int64 `json:"cumulative_active_provider_call_nanos"`
+	ControllerInvocationNanos           int64 `json:"controller_invocation_nanos"`
 }
 
-func (c AuthorizationCountersV1) valid() bool {
-	return c.ReadCalls >= 0 && c.Items >= 0 && c.Bytes >= 0 && c.ElapsedNanos >= 0
+func (c AuthorizationCountersV1) valid(limits Limits) bool {
+	if c.AdmissionHTTPCalls < 0 || c.AdmissionObservedChecks < 0 || c.AdmissionObservedReviews < 0 ||
+		c.AdmissionPaginationSources < 0 || c.AdmissionPaginationPages < 0 || c.AdmissionPaginationItems < 0 ||
+		c.AdmissionPaginationClosureBytes < 0 || c.FinalRevalidationHTTPCalls < 0 || c.FinalObservedChecks < 0 ||
+		c.FinalObservedReviews < 0 || c.FinalPaginationSources < 0 || c.FinalPaginationPages < 0 ||
+		c.FinalPaginationItems < 0 || c.FinalPaginationClosureBytes < 0 || c.ReadyLedgerBytes < 0 ||
+		c.ReadyLedgerRecords < 0 || c.PreSubmitHTTPCalls < 0 || c.CommitObjectCreationSubmissions < 0 ||
+		c.TargetRefUpdateSubmissions < 0 || c.PostMergeHTTPCalls < 0 || c.ReconciliationRounds < 0 ||
+		c.ReconciliationHTTPCalls < 0 || c.PrincipalValidationHTTPCalls < 0 || c.TotalHTTPCalls < 0 ||
+		c.CumulativeRequestBytes < 0 || c.CumulativeResponseHeaderBytes < 0 || c.CumulativeCompressedResponseBytes < 0 ||
+		c.CumulativeDecompressedResponseBytes < 0 || c.CumulativeActiveProviderCallNanos < 0 || c.ControllerInvocationNanos < 0 {
+		return false
+	}
+	if c.AdmissionObservedChecks > limits.MaxObservedChecks || c.FinalObservedChecks > limits.MaxObservedChecks ||
+		c.AdmissionObservedReviews > limits.MaxObservedReviews || c.FinalObservedReviews > limits.MaxObservedReviews ||
+		c.AdmissionPaginationSources != limits.RequiredPaginationSources || c.FinalPaginationSources != limits.RequiredPaginationSources ||
+		!withinProduct(c.AdmissionPaginationPages, limits.RequiredPaginationSources, limits.MaxPaginationPages) ||
+		!withinProduct(c.FinalPaginationPages, limits.RequiredPaginationSources, limits.MaxPaginationPages) ||
+		!withinCombinedLimit(c.AdmissionPaginationItems, limits.MaxObservedChecks, limits.MaxObservedReviews) ||
+		!withinCombinedLimit(c.FinalPaginationItems, limits.MaxObservedChecks, limits.MaxObservedReviews) ||
+		c.AdmissionPaginationClosureBytes > int64(limits.MaxCumulativePaginationClosureBytes) ||
+		c.FinalPaginationClosureBytes > int64(limits.MaxCumulativePaginationClosureBytes) ||
+		c.ReadyLedgerBytes > int64(limits.MaxReadyLedgerSnapshotBytes) || c.ReadyLedgerRecords > limits.MaxLedgerScanRecords {
+		return false
+	}
+	if c.PreSubmitHTTPCalls > limits.MaxPreSubmitHTTPCalls ||
+		c.CommitObjectCreationSubmissions > limits.MaxCommitObjectCreationSubmissions ||
+		c.TargetRefUpdateSubmissions > limits.MaxTargetRefUpdateSubmissions ||
+		c.PostMergeHTTPCalls > limits.MaxPostMergeHTTPCalls ||
+		c.ReconciliationRounds > limits.MaxReconciliationRounds ||
+		!withinProduct(c.ReconciliationHTTPCalls, limits.MaxReconciliationRounds, limits.MaxReconciliationCallsPerRound) ||
+		!withinProduct(c.ReconciliationHTTPCalls, c.ReconciliationRounds, limits.MaxReconciliationCallsPerRound) ||
+		c.PrincipalValidationHTTPCalls > limits.MaxPrincipalValidationCalls || c.TotalHTTPCalls > limits.MaxHTTPCalls {
+		return false
+	}
+	if !sumEquals(c.PreSubmitHTTPCalls, c.AdmissionHTTPCalls, c.FinalRevalidationHTTPCalls) {
+		return false
+	}
+	if !sumEquals(c.TotalHTTPCalls, c.PreSubmitHTTPCalls, c.CommitObjectCreationSubmissions,
+		c.TargetRefUpdateSubmissions, c.PostMergeHTTPCalls, c.ReconciliationHTTPCalls, c.PrincipalValidationHTTPCalls) {
+		return false
+	}
+	if c.CumulativeRequestBytes > limits.MaxCumulativeRequestBytes ||
+		c.CumulativeResponseHeaderBytes > limits.MaxCumulativeResponseHeaderBytes ||
+		c.CumulativeCompressedResponseBytes > limits.MaxCumulativeCompressedResponseBytes ||
+		c.CumulativeDecompressedResponseBytes > limits.MaxCumulativeDecompressedResponseBytes ||
+		c.CumulativeActiveProviderCallNanos > int64(limits.MaxCumulativeActiveProviderCallTime) ||
+		c.ControllerInvocationNanos > int64(limits.MaxControllerInvocationTime) ||
+		c.CumulativeActiveProviderCallNanos > c.ControllerInvocationNanos {
+		return false
+	}
+	return true
+}
+
+func withinProduct(value, left, right int) bool {
+	if value == 0 {
+		return true
+	}
+	return left > 0 && right > 0 && (value-1)/right < left
+}
+
+func withinCombinedLimit(value, left, right int) bool {
+	if value <= left {
+		return true
+	}
+	return value-left <= right
+}
+
+func sumEquals(total int, values ...int) bool {
+	remaining := total
+	for _, value := range values {
+		if value < 0 || value > remaining {
+			return false
+		}
+		remaining -= value
+	}
+	return remaining == 0
 }
 
 type AuthorizationSealV1Input struct {
@@ -365,6 +467,9 @@ func NewAuthorizationSealV1(input AuthorizationSealV1Input, limits Limits) (Auth
 	}
 	canonical, digest, err := canonicalJSON(authorizationSealWire(input, limitsSHA))
 	if err != nil {
+		return AuthorizationSealV1{}, err
+	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "authorization decision seal"); err != nil {
 		return AuthorizationSealV1{}, err
 	}
 	return AuthorizationSealV1{input, canonical, digest, limitsSHA}, nil
@@ -434,6 +539,12 @@ func authorizationSealWire(i AuthorizationSealV1Input, limitsSHA string) authori
 }
 
 func ParseCanonicalAuthorizationSealV1(data []byte, input MergeInput, limits Limits) (AuthorizationSealV1, error) {
+	if err := limits.Validate(); err != nil {
+		return AuthorizationSealV1{}, err
+	}
+	if err := requireCanonicalObjectSize(data, limits.MaxCanonicalObjectBytes, "authorization decision seal"); err != nil {
+		return AuthorizationSealV1{}, err
+	}
 	var wire authorizationSealWireV1
 	if err := strictDecode(data, &wire); err != nil {
 		return AuthorizationSealV1{}, err
@@ -755,6 +866,12 @@ func mergeAuthorizationPayloadWire(input MergeAuthorizationInputV1, authority Au
 }
 
 func ParseCanonicalMergeInput(data []byte, limits Limits) (MergeInput, error) {
+	if err := limits.Validate(); err != nil {
+		return MergeInput{}, err
+	}
+	if err := requireCanonicalObjectSize(data, limits.MaxCanonicalObjectBytes, "merge input"); err != nil {
+		return MergeInput{}, err
+	}
 	var wire mergeInputWireV1
 	if err := strictDecode(data, &wire); err != nil {
 		return MergeInput{}, err

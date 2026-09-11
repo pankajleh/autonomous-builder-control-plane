@@ -48,7 +48,7 @@ func NewGenericStrategyResultV1(input GenericStrategyResultV1Input, limits Limit
 		!input.AcceptedHeadSHA.valid() || !input.AcceptedHeadTree.valid() || !input.BaseBeforeSHA.valid() ||
 		!input.ResultSHA.valid() || !input.ResultTree.valid() || input.ResultTree != input.AcceptedHeadTree ||
 		(input.Method != MergeMethodSquash && input.Method != MergeMethodRebase) ||
-		len(input.Parents) > limits.MaxParents || len(input.Lineage) > limits.MaxLineageEntries ||
+		len(input.Parents) > limits.MaxContractParents || len(input.Lineage) > limits.MaxContractLineageEntries ||
 		len(input.EvidenceRefs) == 0 || canonicalizeEvidence(&input.EvidenceRefs, limits) != nil {
 		return GenericStrategyResultV1{}, errors.New("generic squash/rebase strategy result is invalid or unbounded")
 	}
@@ -57,7 +57,7 @@ func NewGenericStrategyResultV1(input GenericStrategyResultV1Input, limits Limit
 	}
 	for _, entry := range input.Lineage {
 		if !entry.SourceSHA.valid() || !entry.SourceTree.valid() || !entry.ResultSHA.valid() || !entry.ResultTree.valid() ||
-			len(entry.Parents) > limits.MaxParents || validateSHAs(entry.Parents, "generic lineage parents") != nil {
+			len(entry.Parents) > limits.MaxContractParents || validateSHAs(entry.Parents, "generic lineage parents") != nil {
 			return GenericStrategyResultV1{}, errors.New("generic strategy lineage is invalid")
 		}
 	}

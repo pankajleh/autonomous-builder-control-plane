@@ -70,7 +70,7 @@ func DerivePaginationQueryV1(scope PaginationQueryScopeV1, limits Limits) (Pagin
 	base := "/repos/" + scope.Repository.Owner() + "/" + scope.Repository.Name()
 	query := PaginationQueryV1{
 		Source: scope.Source, Protocol: PaginationREST, Method: "GET", APIVersion: GitHubAPIVersionV1,
-		RepositoryNodeID: scope.RepositoryNodeID, HeadSHA: scope.HeadSHA.String(), Variables: map[string]string{}, PerPage: limits.MaxItemsPerPage,
+		RepositoryNodeID: scope.RepositoryNodeID, HeadSHA: scope.HeadSHA.String(), Variables: map[string]string{}, PerPage: limits.MaxPaginationItemsPerPage,
 	}
 	switch scope.Source {
 	case PaginationCheckRuns:
@@ -101,7 +101,7 @@ func (q PaginationQueryV1) valid(limits Limits) bool {
 	if (q.Source != PaginationCheckRuns && q.Source != PaginationCommitStatuses && q.Source != PaginationReviews) ||
 		(q.Protocol != PaginationREST && q.Protocol != PaginationGraphQL) || !validText(q.Method, 16, false) ||
 		!validText(q.PathOrDocumentSHA256, limits.MaxTextBytes, false) || !validText(q.APIVersion, limits.MaxTextBytes, false) ||
-		!validOpaqueID(q.RepositoryNodeID, limits.MaxTextBytes) || q.PerPage <= 0 || q.PerPage > limits.MaxItemsPerPage {
+		!validOpaqueID(q.RepositoryNodeID, limits.MaxTextBytes) || q.PerPage <= 0 || q.PerPage > limits.MaxPaginationItemsPerPage {
 		return false
 	}
 	if q.Protocol == PaginationGraphQL && !validSHA256(q.PathOrDocumentSHA256) {
@@ -175,7 +175,7 @@ func NewPaginationPageV1(input PaginationPageV1Input, limits Limits) (Pagination
 	if !input.Query.valid(limits) || input.Ordinal < 0 || !input.Response.valid() || input.Response.Provider() != "github" || !validSHA256(input.RawBodySHA256) ||
 		!validEvidenceRef(input.ResponseEvidence) || input.ResponseEvidence.Kind != GitHubPaginationBodyEvidenceKindV1 ||
 		input.ResponseEvidence.SHA256 != input.RawBodySHA256 || !validEvidenceRef(input.EnvelopeEvidence) ||
-		input.EnvelopeEvidence.Kind != GitHubPaginationEnvelopeEvidenceKindV1 || len(input.Items) > limits.MaxItemsPerPage {
+		input.EnvelopeEvidence.Kind != GitHubPaginationEnvelopeEvidenceKindV1 || len(input.Items) > limits.MaxPaginationItemsPerPage {
 		return PaginationPageV1{}, errors.New("pagination page identity or bounds are invalid")
 	}
 	seen := map[string]struct{}{}
@@ -188,7 +188,8 @@ func NewPaginationPageV1(input PaginationPageV1Input, limits Limits) (Pagination
 		}
 		seen[item.Key] = struct{}{}
 	}
-	if len(input.RESTLinkHeader) > limits.MaxTextBytes || (input.RESTLinkObserved && (input.GraphQLHasNextPage != nil || input.GraphQLEndCursor != "")) {
+	if len(input.Response.RequestID()) > limits.MaxRequestIDBytes || len(input.RESTLinkHeader) > limits.MaxLinkHeaderBytes ||
+		(input.RESTLinkObserved && (input.GraphQLHasNextPage != nil || input.GraphQLEndCursor != "")) {
 		return PaginationPageV1{}, errors.New("pagination page mixes REST and GraphQL terminal evidence")
 	}
 	if input.GraphQLHasNextPage != nil && (input.RESTLinkObserved || input.RESTLinkHeader != "" || !validText(input.GraphQLEndCursor, limits.MaxTextBytes, true)) {
@@ -272,13 +273,51 @@ type PaginationClosureV1 struct {
 	limitsSHA string
 }
 
+type paginationBoundaryStatsV1 struct {
+	Sources      int
+	Pages        int
+	Items        int
+	ClosureBytes int64
+}
+
+// validatePaginationBoundaryV1 enforces the complete production-v1 source set
+// and its cumulative closure budget at an authorization boundary.
+func validatePaginationBoundaryV1(reviews, checkRuns, commitStatuses PaginationClosureV1, limits Limits) (paginationBoundaryStatsV1, error) {
+	closures := []PaginationClosureV1{reviews, checkRuns, commitStatuses}
+	if len(closures) != limits.RequiredPaginationSources {
+		return paginationBoundaryStatsV1{}, errors.New("authorization boundary does not contain the required pagination source count")
+	}
+	expected := []PaginationSourceKind{PaginationReviews, PaginationCheckRuns, PaginationCommitStatuses}
+	seen := make(map[PaginationSourceKind]struct{}, len(closures))
+	stats := paginationBoundaryStatsV1{Sources: len(closures)}
+	for index, closure := range closures {
+		if !closure.valid() || requireLimitsSHA(limits, closure.limitsSHA) != nil ||
+			closure.input.Query.Source != expected[index] || len(closure.canonical) > limits.MaxPaginationClosureBytes {
+			return paginationBoundaryStatsV1{}, errors.New("authorization boundary pagination source is missing, reordered, or unbounded")
+		}
+		if _, exists := seen[closure.input.Query.Source]; exists {
+			return paginationBoundaryStatsV1{}, errors.New("authorization boundary pagination source is duplicated")
+		}
+		seen[closure.input.Query.Source] = struct{}{}
+		stats.Pages += len(closure.input.Pages)
+		stats.ClosureBytes += int64(len(closure.canonical))
+		for _, page := range closure.input.Pages {
+			stats.Items += len(page.input.Items)
+		}
+	}
+	if stats.ClosureBytes > int64(limits.MaxCumulativePaginationClosureBytes) {
+		return paginationBoundaryStatsV1{}, errors.New("authorization boundary exceeds the cumulative pagination closure byte limit")
+	}
+	return stats, nil
+}
+
 func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (PaginationClosureV1, error) {
 	input = clonePaginationClosureInput(input)
 	limitsSHA, err := limits.SHA256()
 	if err != nil {
 		return PaginationClosureV1{}, err
 	}
-	if !input.Query.valid(limits) || len(input.Pages) == 0 || len(input.Pages) > limits.MaxPages {
+	if !input.Query.valid(limits) || len(input.Pages) == 0 || len(input.Pages) > limits.MaxPaginationPages {
 		return PaginationClosureV1{}, errors.New("pagination query or page count is invalid")
 	}
 	all := map[string]struct{}{}
@@ -310,7 +349,7 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 			return PaginationClosureV1{}, errors.New("pagination page ordinal is missing, repeated, or reordered")
 		}
 		total += len(p.Items)
-		if total > limits.MaxTotalItems {
+		if total > limits.MaxObservedItemsPerPaginationSource {
 			return PaginationClosureV1{}, errors.New("pagination closure item limit exceeded")
 		}
 		for _, item := range p.Items {
@@ -469,6 +508,12 @@ func ValidatePaginationClosureV1(scope PaginationQueryScopeV1, closure Paginatio
 }
 
 func ParseCanonicalPaginationClosureV1(data []byte, limits Limits) (PaginationClosureV1, error) {
+	if err := limits.Validate(); err != nil {
+		return PaginationClosureV1{}, err
+	}
+	if len(data) == 0 || len(data) > limits.MaxPaginationClosureBytes {
+		return PaginationClosureV1{}, errors.New("pagination closure exceeds byte limit")
+	}
 	var w paginationClosureWireV1
 	if err := strictDecode(data, &w); err != nil {
 		return PaginationClosureV1{}, err

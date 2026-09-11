@@ -178,7 +178,8 @@ func NewReadyAuthorityBindingV1(input ReadyAuthorityBindingV1Input, limits Limit
 		input.LedgerPrefixLength <= 0 || input.ReadyTransitionOrdinal <= 0 || !validSHA256(input.LedgerPrefixSHA256) {
 		return ReadyAuthorityBindingV1{}, errors.New("READY authority binding contains an invalid identity")
 	}
-	if len(input.Phase3AuthorityJSON) == 0 || digestBytes(input.Phase3AuthorityJSON) != input.Phase3AuthoritySHA256 {
+	if len(input.Phase3AuthorityJSON) == 0 || len(input.Phase3AuthorityJSON) > limits.MaxCanonicalObjectBytes ||
+		digestBytes(input.Phase3AuthorityJSON) != input.Phase3AuthoritySHA256 {
 		return ReadyAuthorityBindingV1{}, errors.New("Phase-3 authority bytes and digest disagree")
 	}
 	var generic any
@@ -209,6 +210,10 @@ func NewReadyAuthorityBindingV1(input ReadyAuthorityBindingV1Input, limits Limit
 		!validText(phase3.Plan.Path, limits.MaxTextBytes, false) || !validSHA256(phase3.Plan.SHA256) || !validText(phase3.PolicyVersion, limits.MaxTextBytes, false) {
 		return ReadyAuthorityBindingV1{}, errors.New("Phase-3 authority identities do not match the READY repository/run binding")
 	}
+	if len(input.ReadyEventJSON) == 0 || len(input.ReadyEventJSON) > limits.MaxLedgerLineBytes ||
+		input.LedgerPrefixLength > int64(limits.MaxReadyLedgerSnapshotBytes) {
+		return ReadyAuthorityBindingV1{}, errors.New("READY event or bound ledger prefix exceeds its stage-specific limit")
+	}
 	var readyEvent ledger.Event
 	if err := strictDecode(input.ReadyEventJSON, &readyEvent); err != nil || readyEvent.Validate() != nil {
 		return ReadyAuthorityBindingV1{}, errors.New("READY event is not valid canonical ledger evidence")
@@ -225,7 +230,7 @@ func NewReadyAuthorityBindingV1(input ReadyAuthorityBindingV1Input, limits Limit
 		input.ReadyRunStateSequence != input.ReadyTransitionOrdinal {
 		return ReadyAuthorityBindingV1{}, errors.New("READY ledger offset, sequence, ordinal, and prefix are incoherent")
 	}
-	if len(input.AcceptedSources) == 0 || len(input.AcceptedSources) > limits.MaxTotalItems {
+	if len(input.AcceptedSources) == 0 || len(input.AcceptedSources) > limits.MaxReadyAcceptedSources {
 		return ReadyAuthorityBindingV1{}, errors.New("accepted source closure is empty or excessive")
 	}
 	seenSources := map[string]struct{}{}
@@ -266,7 +271,7 @@ func NewReadyAuthorityBindingV1(input ReadyAuthorityBindingV1Input, limits Limit
 		!equalEvidence(input.ReadyEvidenceRefs, readyEvent.EvidenceRefs) {
 		return ReadyAuthorityBindingV1{}, errors.New("READY event evidence and decision reference do not agree")
 	}
-	if len(input.EvidenceClosureRefs) == 0 || canonicalizeEvidence(&input.EvidenceClosureRefs, limits) != nil || !containsEvidence(input.EvidenceClosureRefs, input.ReadyDecisionRef) {
+	if len(input.EvidenceClosureRefs) == 0 || canonicalizeReadyEvidenceClosure(&input.EvidenceClosureRefs, limits) != nil || !containsEvidence(input.EvidenceClosureRefs, input.ReadyDecisionRef) {
 		return ReadyAuthorityBindingV1{}, errors.New("READY evidence closure is incomplete")
 	}
 	requiredClosure := append([]ledger.EvidenceRef(nil), input.ReadyEvidenceRefs...)
@@ -538,7 +543,10 @@ func NewMergePolicyV1(input MergePolicyV1Input, limits Limits) (MergePolicyV1, e
 	sort.Slice(input.RequiredChecks, func(i, j int) bool {
 		return checkIdentityKey(input.RequiredChecks[i]) < checkIdentityKey(input.RequiredChecks[j])
 	})
-	if len(input.RequiredChecks) > limits.MaxTotalItems || len(input.EligibleReviewers) > limits.MaxTotalItems || len(input.RequiredReviewers) > limits.MaxTotalItems {
+	if len(input.RequiredChecks) > limits.MaxRequiredTrustedChecks ||
+		len(input.EligibleReviewers) > limits.MaxEligibleReviewers ||
+		len(input.RequiredReviewers) > limits.MaxRequiredReviewers ||
+		input.MinimumApprovals > limits.MaxMinimumApprovals {
 		return MergePolicyV1{}, errors.New("merge policy collection exceeds limits")
 	}
 	eligible := map[string]struct{}{}
@@ -574,6 +582,9 @@ func NewMergePolicyV1(input MergePolicyV1Input, limits Limits) (MergePolicyV1, e
 	})
 	canonical, digest, err := canonicalJSON(mergePolicyWire(input))
 	if err != nil {
+		return MergePolicyV1{}, err
+	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "merge policy"); err != nil {
 		return MergePolicyV1{}, err
 	}
 	return MergePolicyV1{input, canonical, digest}, nil
@@ -626,6 +637,12 @@ func stableIdentityKey(i StableIdentityV1) string {
 }
 
 func ParseCanonicalMergePolicyV1(data []byte, limits Limits) (MergePolicyV1, error) {
+	if err := limits.Validate(); err != nil {
+		return MergePolicyV1{}, err
+	}
+	if err := requireCanonicalObjectSize(data, limits.MaxCanonicalObjectBytes, "merge policy"); err != nil {
+		return MergePolicyV1{}, err
+	}
 	var w mergePolicyWireV1
 	if err := strictDecode(data, &w); err != nil {
 		return MergePolicyV1{}, err

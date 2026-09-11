@@ -74,6 +74,9 @@ func NewMergeResult(input MergeResultInput, limits Limits) (MergeResult, error) 
 	if err != nil {
 		return MergeResult{}, err
 	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "merge result"); err != nil {
+		return MergeResult{}, err
+	}
 	return MergeResult{immutableRecord[MergeResultInput]{data: input, canonical: canonical, digest: digest}}, nil
 }
 
@@ -139,6 +142,9 @@ func NewPostMergeObservation(input PostMergeObservationInput, limits Limits) (Po
 	if err != nil {
 		return PostMergeObservation{}, err
 	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "post-merge observation"); err != nil {
+		return PostMergeObservation{}, err
+	}
 	return PostMergeObservation{immutableRecord[PostMergeObservationInput]{data: input, canonical: canonical, digest: digest}}, nil
 }
 
@@ -168,15 +174,19 @@ func validateMergeFields(snapshot SnapshotIdentity, repository Repository, pr Pu
 		expected.SourceIntegratedHeadSHA() != acceptedHead || acceptedTree != expected.ExpectedResultTreeSHA() || resultTree != expected.ExpectedResultTreeSHA() {
 		return errors.New("merge result does not bind the merge attempt or controller-expected tree")
 	}
-	if len(parents) > limits.MaxParents || len(lineage) > limits.MaxLineageEntries {
+	if len(parents) > limits.MaxContractParents || len(lineage) > limits.MaxContractLineageEntries {
 		return errors.New("merge lineage exceeds governed limits")
+	}
+	if method == MergeMethodMerge && (len(parents) != limits.RequiredProductionMergeParents ||
+		len(lineage) > limits.MaxProductionMergeLineageEntries) {
+		return errors.New("production merge result violates the exact parent or lineage profile")
 	}
 	if err := validateSHAs(parents, "result parents"); err != nil {
 		return err
 	}
 	seenResults := make(map[GitSHA]struct{}, len(lineage))
 	for index, entry := range lineage {
-		if !entry.SourceSHA.valid() || !entry.SourceTree.valid() || !entry.ResultSHA.valid() || !entry.ResultTree.valid() || len(entry.Parents) > limits.MaxParents {
+		if !entry.SourceSHA.valid() || !entry.SourceTree.valid() || !entry.ResultSHA.valid() || !entry.ResultTree.valid() || len(entry.Parents) > limits.MaxContractParents {
 			return fmt.Errorf("lineage entry %d is invalid", index)
 		}
 		if err := validateSHAs(entry.Parents, fmt.Sprintf("lineage entry %d parents", index)); err != nil {
@@ -232,6 +242,9 @@ func validateMergeInput(input MergeInput, limits Limits) error {
 	if err := EvaluateMergePolicyV1(input.authority, input.initialPullRequest, input.checks, input.checkRunsClosure, input.commitStatusesClosure, limits); err != nil {
 		return err
 	}
+	if _, err := validatePaginationBoundaryV1(input.initialPullRequest.input.ReviewsClosure, input.checkRunsClosure, input.commitStatusesClosure, limits); err != nil {
+		return err
+	}
 	evidence := append([]ledger.EvidenceRef(nil), input.approvalEvidence...)
 	if len(evidence) == 0 || canonicalizeEvidence(&evidence, limits) != nil {
 		return errors.New("merge approval evidence fails bounded revalidation")
@@ -239,7 +252,8 @@ func validateMergeInput(input MergeInput, limits Limits) error {
 	authorizationInput := MergeAuthorizationInputV1{input.authority, input.policyDecisionSHA256, input.initialPullRequest, input.checks,
 		input.checkRunsClosure, input.commitStatusesClosure, input.capability, input.recipe, evidence}
 	payload, payloadSHA, err := canonicalJSON(mergeAuthorizationPayloadWire(authorizationInput, input.authority, input.limitsSHA256))
-	if err != nil || payloadSHA != input.attempt.payloadSHA256 || !bytes.Equal(payload, input.canonicalPayload) {
+	if err != nil || requireCanonicalObjectSize(payload, limits.MaxCanonicalObjectBytes, "merge input") != nil ||
+		payloadSHA != input.attempt.payloadSHA256 || !bytes.Equal(payload, input.canonicalPayload) {
 		return errors.New("merge canonical payload does not match write attempt")
 	}
 	return nil
@@ -288,7 +302,7 @@ func SelectPullRequest(authority Authority, snapshots []PullRequestSnapshot, lim
 	if err := limits.Validate(); err != nil {
 		return PullRequestSnapshot{}, err
 	}
-	if len(snapshots) > limits.MaxTotalItems {
+	if len(snapshots) > limits.MaxObservedItemsPerPaginationSource {
 		return PullRequestSnapshot{}, errors.New("pull request candidates exceed item limit")
 	}
 	var matched []PullRequestSnapshot

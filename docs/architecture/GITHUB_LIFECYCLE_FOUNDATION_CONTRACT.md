@@ -157,7 +157,7 @@ attempt. A merge `WriteAttempt` explicitly binds READY and policy digests in
 addition to repository, principal, operation, write ID, authority digest,
 payload digest, and limits. `ParseCanonicalMergeInput` must reconstruct
 byte-identical input and attempt identities.
-Direct check values are rescanned under the same total-item, text, state/
+Direct check values are rescanned under the distinct observed-check, text, state/
 conclusion, exact-head, source-scoped node-identity, provenance, and evidence-
 reference bounds used by canonical CI snapshots before their pagination item
 digests or authorization bytes are computed.
@@ -314,11 +314,20 @@ controller-derived expected tree.
 
 ## Limits and failure semantics
 
-`Limits` deterministically binds numeric page, per-page, total-item, text,
-evidence, metadata, parent, lineage, pagination-closure-byte, descendant-
-distance, call-time, and retry bounds. Constructor and independent-validator
-rescans use the controller's exact limits digest. Exact `limit` is accepted;
-`limit+1` fails.
+`Limits` is a stage-specific canonical identity rather than a shared
+`total-items/evidence/bytes` bucket. It independently binds the 64-entry
+required-check and reviewer policy caps, the 500-entry observed-check and
+observed-review caps, pagination pages/items/source counts and 1 MiB/3 MiB
+closure bounds, general and READY evidence-reference bounds, the 64 MiB READY
+ledger snapshot and 262,144-record scan bounds, canonical-object and
+cancellation-authority bounds, request/response bounds, and phase plus hard
+aggregate call/byte/time counters. `MergeInput` and final revalidation each
+require exactly the reviews, check-runs, and commit-statuses closures and
+independently enforce their cumulative bytes. Authorization counters are
+matched to both retained observation sets and the READY scan; a phase cannot
+exceed its aggregate. Constructor and independent-validator rescans use the
+controller's exact limits digest. Every governed field participates in
+canonical JSON/SHA-256. Exact `limit` is accepted; `limit+1` fails.
 
 Provider unavailability, ambiguous possible writes, policy/CI/review failure,
 and invalid evidence remain distinct. Cancellation or deadline after possible

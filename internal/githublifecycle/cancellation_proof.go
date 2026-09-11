@@ -53,7 +53,7 @@ func NewCancellationSubmissionProofV1(input CancellationSubmissionProofV1Input, 
 	if err != nil {
 		return CancellationSubmissionProofV1{}, err
 	}
-	if !validEvidenceRef(input.EvidenceRef) || input.RequestBytes < 0 || input.RequestBytes > int64(limits.MaxPaginationClosureBytes) {
+	if !validEvidenceRef(input.EvidenceRef) || input.RequestBytes < 0 || input.RequestBytes > limits.MaxCumulativeRequestBytes {
 		return CancellationSubmissionProofV1{}, errors.New("cancellation submission proof evidence or byte count is invalid")
 	}
 	hasAttempt := input.Attempt != nil

@@ -65,6 +65,9 @@ func NewResultCommitObservationV1(input ResultCommitObservationV1Input, limits L
 	if err != nil {
 		return ResultCommitObservationV1{}, err
 	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "result commit observation"); err != nil {
+		return ResultCommitObservationV1{}, err
+	}
 	return ResultCommitObservationV1{input, canonical, digest, limitsSHA}, nil
 }
 func (r ResultCommitObservationV1) CanonicalJSON() []byte { return append([]byte(nil), r.canonical...) }
@@ -141,6 +144,9 @@ func NewTargetContainmentProofV1(input TargetContainmentProofV1Input, limits Lim
 	}{TargetContainmentProofSchemaV1, snapshotWire(input.Snapshot), repositoryWire(input.Repository), input.TargetRef, input.ResultSHA.String(), input.ObservedTargetTipSHA.String(), input.Mechanism, input.Status, input.MergeBaseSHA.String(), input.DescendantDistance, input.EvidenceRefs, limitsSHA}
 	canonical, digest, err := canonicalJSON(wire)
 	if err != nil {
+		return TargetContainmentProofV1{}, err
+	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "target containment observation"); err != nil {
 		return TargetContainmentProofV1{}, err
 	}
 	return TargetContainmentProofV1{input, canonical, digest, limitsSHA}, nil

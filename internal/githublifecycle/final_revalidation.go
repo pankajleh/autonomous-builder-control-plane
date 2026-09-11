@@ -153,7 +153,7 @@ func ParseCanonicalCurrentReadyProofV1(data []byte, limits Limits) (CurrentReady
 func validateCurrentReadyLedger(input CurrentReadyProofV1Input, limits Limits) error {
 	ready := input.ReadyBinding.input
 	ledgerBytes := input.ObservedLedgerJSONL
-	if len(ledgerBytes) == 0 || len(ledgerBytes) > limits.MaxPaginationClosureBytes ||
+	if len(ledgerBytes) == 0 || len(ledgerBytes) > limits.MaxReadyLedgerSnapshotBytes ||
 		input.ObservedLedgerLength != int64(len(ledgerBytes)) || input.ObservedLedgerLength < ready.LedgerPrefixLength ||
 		input.ObservedLedgerSHA256 != digestBytes(ledgerBytes) || !containsEvidenceDigest(input.EvidenceRefs, CurrentReadyLedgerEvidenceKindV1, input.ObservedLedgerSHA256) {
 		return errors.New("current READY proof lacks exact bounded ledger bytes and retained evidence")
@@ -172,10 +172,15 @@ func validateCurrentReadyLedger(input CurrentReadyProofV1Input, limits Limits) e
 	readyFound := false
 	rest := ledgerBytes
 	var offset int64
+	records := 0
 	for len(rest) > 0 {
 		newline := bytes.IndexByte(rest, '\n')
-		if newline < 0 || newline == 0 {
+		if newline < 0 || newline == 0 || newline > limits.MaxLedgerLineBytes {
 			return errors.New("current READY ledger observation is not complete JSONL")
+		}
+		records++
+		if records > limits.MaxLedgerScanRecords {
+			return errors.New("current READY ledger observation exceeds the ledger record scan limit")
 		}
 		line := rest[:newline]
 		var event ledger.Event
@@ -330,9 +335,12 @@ func NewFinalRevalidationV1(input FinalRevalidationV1Input, limits Limits) (Fina
 	if err := EvaluateMergePolicyV1(input.MergeInput.authority, input.PullRequest, input.Checks, input.CheckRunsClosure, input.CommitStatusesClosure, limits); err != nil {
 		return FinalRevalidationV1{}, err
 	}
+	if err := validateAuthorizationCountersV1(input, limits); err != nil {
+		return FinalRevalidationV1{}, err
+	}
 	sort.Slice(input.Checks, func(i, j int) bool { return checkKey(input.Checks[i]) < checkKey(input.Checks[j]) })
 	if !input.Capability.valid() || input.Capability.SHA256() != input.MergeInput.capability.SHA256() ||
-		!input.Recipe.valid() || input.Recipe.SHA256() != input.MergeInput.recipe.SHA256() || !input.Counters.valid() ||
+		!input.Recipe.valid() || input.Recipe.SHA256() != input.MergeInput.recipe.SHA256() ||
 		!input.NoTargetRequestAttempted || len(input.EvidenceRefs) == 0 || canonicalizeEvidence(&input.EvidenceRefs, limits) != nil {
 		return FinalRevalidationV1{}, errors.New("final revalidation does not bind the unchanged authorized attempt")
 	}
@@ -349,7 +357,7 @@ func NewFinalRevalidationV1(input FinalRevalidationV1Input, limits Limits) (Fina
 	if err := requireFreshFinalRequests(input); err != nil {
 		return FinalRevalidationV1{}, err
 	}
-	decision, err := finalDecisionDigest(input, limitsSHA)
+	decision, err := finalDecisionDigest(input, limitsSHA, limits.MaxCanonicalObjectBytes)
 	if err != nil {
 		return FinalRevalidationV1{}, err
 	}
@@ -358,10 +366,56 @@ func NewFinalRevalidationV1(input FinalRevalidationV1Input, limits Limits) (Fina
 	if err != nil {
 		return FinalRevalidationV1{}, err
 	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "final revalidation"); err != nil {
+		return FinalRevalidationV1{}, err
+	}
 	return FinalRevalidationV1{input, decision, canonical, digest, limitsSHA}, nil
 }
 
-func finalDecisionDigest(input FinalRevalidationV1Input, limitsSHA string) (string, error) {
+func validateAuthorizationCountersV1(input FinalRevalidationV1Input, limits Limits) error {
+	counters := input.Counters
+	if !counters.valid(limits) {
+		return errors.New("authorization counters exceed a stage or aggregate limit")
+	}
+	admission, err := validatePaginationBoundaryV1(input.MergeInput.initialPullRequest.input.ReviewsClosure,
+		input.MergeInput.checkRunsClosure, input.MergeInput.commitStatusesClosure, limits)
+	if err != nil {
+		return err
+	}
+	final, err := validatePaginationBoundaryV1(input.PullRequest.input.ReviewsClosure,
+		input.CheckRunsClosure, input.CommitStatusesClosure, limits)
+	if err != nil {
+		return err
+	}
+	if counters.AdmissionObservedChecks != len(input.MergeInput.checks) ||
+		counters.AdmissionObservedReviews != len(input.MergeInput.initialPullRequest.input.Reviews) ||
+		counters.AdmissionPaginationSources != admission.Sources ||
+		counters.AdmissionPaginationPages != admission.Pages ||
+		counters.AdmissionPaginationItems != admission.Items ||
+		counters.AdmissionPaginationClosureBytes != admission.ClosureBytes ||
+		counters.FinalObservedChecks != len(input.Checks) ||
+		counters.FinalObservedReviews != len(input.PullRequest.input.Reviews) ||
+		counters.FinalPaginationSources != final.Sources ||
+		counters.FinalPaginationPages != final.Pages ||
+		counters.FinalPaginationItems != final.Items ||
+		counters.FinalPaginationClosureBytes != final.ClosureBytes {
+		return errors.New("authorization counters disagree with admission or final pagination observations")
+	}
+	ledgerBytes := input.CurrentReadyProof.input.ObservedLedgerJSONL
+	if counters.ReadyLedgerBytes != int64(len(ledgerBytes)) ||
+		counters.ReadyLedgerRecords != bytes.Count(ledgerBytes, []byte{'\n'}) {
+		return errors.New("authorization counters disagree with the independently validated READY ledger scan")
+	}
+	if counters.AdmissionHTTPCalls < admission.Pages+1 || counters.FinalRevalidationHTTPCalls < final.Pages+1 ||
+		counters.TargetRefUpdateSubmissions != 0 || counters.PostMergeHTTPCalls != 0 ||
+		counters.ReconciliationRounds != 0 || counters.ReconciliationHTTPCalls != 0 ||
+		counters.ControllerInvocationNanos < input.CompletedUnixNano-input.StartedUnixNano {
+		return errors.New("authorization counters do not prove the pre-submit observation boundary")
+	}
+	return nil
+}
+
+func finalDecisionDigest(input FinalRevalidationV1Input, limitsSHA string, maxCanonicalObjectBytes int) (string, error) {
 	authoritySHA, err := input.MergeInput.authority.SHA256()
 	if err != nil {
 		return "", err
@@ -389,7 +443,10 @@ func finalDecisionDigest(input FinalRevalidationV1Input, limitsSHA string) (stri
 		input.CurrentReadyProof.SHA256(), input.PullRequest.SHA256(), checkWires(input.Checks), input.CheckRunsClosure.SHA256(),
 		input.CommitStatusesClosure.SHA256(), input.MergeInput.authority.MergePolicy().SHA256(), input.Capability.SHA256(),
 		input.Recipe.SHA256(), input.ControllerSequence, input.CompletedUnixNano, input.Counters, input.NoTargetRequestAttempted, limitsSHA}
-	_, digest, err := canonicalJSON(decision)
+	canonical, digest, err := canonicalJSON(decision)
+	if err == nil {
+		err = requireCanonicalObjectSize(canonical, maxCanonicalObjectBytes, "final authorization decision")
+	}
 	return digest, err
 }
 
@@ -467,6 +524,12 @@ func (r FinalRevalidationV1) valid() bool {
 }
 
 func ParseCanonicalFinalRevalidationV1(data []byte, input MergeInput, limits Limits) (FinalRevalidationV1, error) {
+	if err := limits.Validate(); err != nil {
+		return FinalRevalidationV1{}, err
+	}
+	if err := requireCanonicalObjectSize(data, limits.MaxCanonicalObjectBytes, "final revalidation"); err != nil {
+		return FinalRevalidationV1{}, err
+	}
 	var wire finalRevalidationWireV1
 	if err := strictDecode(data, &wire); err != nil {
 		return FinalRevalidationV1{}, err

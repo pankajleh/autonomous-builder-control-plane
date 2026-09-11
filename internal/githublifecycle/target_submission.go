@@ -19,7 +19,7 @@ const (
 	GitHubGraphQLMethodV1                      = "POST"
 	GitHubGraphQLPathV1                        = "/graphql"
 	MaxGitHubTargetRequestBodyBytesV1          = 16 * 1024
-	MaxGitHubTargetResponseBodyBytesV1         = 16 * 1024
+	MaxGitHubTargetResponseBodyBytesV1         = 4 * 1024 * 1024
 )
 
 // TargetSubmissionV1 is the immutable identity of the one transport request
@@ -95,7 +95,7 @@ func NewTargetSubmissionV1(invocationID string, sealed SealedMergeAuthorizationV
 		return TargetSubmissionV1{}, errors.New("target submission invocation identity is invalid")
 	}
 	body, err := targetRequestBody(sealed)
-	if err != nil || len(body) > limits.MaxPaginationClosureBytes || validateTargetRequestBody(body, limits.MaxTextBytes) != nil {
+	if err != nil || validateTargetRequestBody(body, limits.MaxRequestBodyBytes, limits.MaxTextBytes) != nil {
 		return TargetSubmissionV1{}, errors.New("target submission GraphQL request body is invalid or unbounded")
 	}
 	wire := targetSubmissionWire(sealed, invocationID, body, limitsSHA)
@@ -140,7 +140,7 @@ func (s TargetSubmissionV1) MarshalJSON() ([]byte, error) {
 func (s TargetSubmissionV1) valid() bool {
 	if !validSHA256(s.sealedSHA) || !validSHA256(s.sealSHA) || !validSHA256(s.commitmentSHA) || s.writeID == "" ||
 		s.clientMutationID != s.writeID || s.invocationID == "" || s.method != GitHubGraphQLMethodV1 || s.path != GitHubGraphQLPathV1 ||
-		validateTargetRequestBody(s.requestBody, MaxGitHubTargetRequestBodyBytesV1) != nil || !validSHA256(s.requestBodySHA256) ||
+		validateTargetRequestBody(s.requestBody, MaxGitHubTargetRequestBodyBytesV1, 4096) != nil || !validSHA256(s.requestBodySHA256) ||
 		digestBytes(s.requestBody) != s.requestBodySHA256 || int64(len(s.requestBody)) != s.requestBodyBytes ||
 		len(s.canonical) == 0 || !validSHA256(s.digest) || digestBytes(s.canonical) != s.digest || !validSHA256(s.limitsSHA) {
 		return false
@@ -192,7 +192,7 @@ func parseUnboundTargetSubmissionV1(data []byte, limits Limits) (TargetSubmissio
 		!validSHA256(wire.AuthorizationSealSHA256) || !validSHA256(wire.CommitmentSHA256) ||
 		!validOpaqueID(wire.WriteID, limits.MaxTextBytes) || wire.ClientMutationID != wire.WriteID ||
 		!validOpaqueID(wire.InvocationID, limits.MaxTextBytes) || wire.Method != GitHubGraphQLMethodV1 || wire.Path != GitHubGraphQLPathV1 ||
-		len(wire.RequestBody) > limits.MaxPaginationClosureBytes || validateTargetRequestBody(wire.RequestBody, limits.MaxTextBytes) != nil ||
+		validateTargetRequestBody(wire.RequestBody, limits.MaxRequestBodyBytes, limits.MaxTextBytes) != nil ||
 		wire.RequestBodySHA256 != digestBytes(wire.RequestBody) || wire.RequestBodyBytes != int64(len(wire.RequestBody)) ||
 		wire.LimitsSHA256 != limitsSHA {
 		return TargetSubmissionV1{}, errors.New("target submission wire is invalid or unbounded")
@@ -227,8 +227,8 @@ func targetRequestBody(sealed SealedMergeAuthorizationV1) ([]byte, error) {
 	})
 }
 
-func validateTargetRequestBody(body []byte, maxTextBytes int) error {
-	if len(body) == 0 || len(body) > MaxGitHubTargetRequestBodyBytesV1 {
+func validateTargetRequestBody(body []byte, maxBodyBytes, maxTextBytes int) error {
+	if len(body) == 0 || len(body) > maxBodyBytes {
 		return errors.New("target GraphQL request body is empty or exceeds the fixed limit")
 	}
 	var request gitHubUpdateRefsRequestV1
@@ -301,8 +301,9 @@ func NewTargetResponseEnvelopeV1(input TargetResponseEnvelopeV1Input, submission
 		return TargetResponseEnvelopeV1{}, err
 	}
 	if !submission.valid() || requireLimitsSHA(limits, submission.limitsSHA) != nil || !input.Response.valid() ||
+		len(input.Response.RequestID()) > limits.MaxRequestIDBytes ||
 		input.Response.Provider() != "github" || input.Response.RequestID() == submission.invocationID || input.HTTPStatus < 100 || input.HTTPStatus > 599 ||
-		len(input.ResponseBody) == 0 || len(input.ResponseBody) > MaxGitHubTargetResponseBodyBytesV1 ||
+		len(input.ResponseBody) == 0 || len(input.ResponseBody) > limits.MaxDecompressedResponseBodyBytes ||
 		!validEvidenceRef(input.BodyEvidence) || input.BodyEvidence.Kind != GitHubTargetResponseBodyEvidenceKindV1 ||
 		input.BodyEvidence.SHA256 != digestBytes(input.ResponseBody) || !validText(input.EnvelopeURI, limits.MaxTextBytes, false) {
 		return TargetResponseEnvelopeV1{}, errors.New("target response envelope identity or evidence is invalid")
@@ -322,7 +323,7 @@ func NewTargetResponseEnvelopeV1(input TargetResponseEnvelopeV1Input, submission
 		LimitsSHA256: limitsSHA,
 	}
 	canonical, digest, err := canonicalJSON(wire)
-	if err != nil || len(canonical) > limits.MaxPaginationClosureBytes {
+	if err != nil || len(canonical) > limits.MaxDecompressedResponseBodyBytes {
 		return TargetResponseEnvelopeV1{}, errors.New("target response envelope is invalid or unbounded")
 	}
 	return TargetResponseEnvelopeV1{input: input, submission: submission, canonical: canonical, digest: digest, limitsSHA: limitsSHA}, nil

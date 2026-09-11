@@ -98,13 +98,13 @@ func NewNotAppliedProofV1(input NotAppliedProofV1Input, sealed SealedMergeAuthor
 			return NotAppliedProofV1{}, errors.New("zero-byte NOT_APPLIED proof contains submitted request or response state")
 		}
 	case NotAppliedAtomicBaseRejected, NotAppliedAtomicHeadRejected:
-		if input.EvidenceRef.Kind != NotAppliedAtomicRejectionEvidenceKindV1 || input.RequestBytes <= 0 || input.RequestBytes > int64(limits.MaxPaginationClosureBytes) || input.Response == nil || !input.Response.valid() ||
+		if input.EvidenceRef.Kind != NotAppliedAtomicRejectionEvidenceKindV1 || input.RequestBytes <= 0 || input.RequestBytes > limits.MaxCumulativeRequestBytes || input.Response == nil || !input.Response.valid() ||
 			input.Response.Provider() != "github" || input.ResponseEnvelope == nil ||
 			ValidateTargetResponseEnvelopeV1(submission, *input.ResponseEnvelope, limits) != nil ||
 			input.ResponseEnvelope.input.Response != *input.Response || input.ResponseEnvelope.input.HTTPStatus != input.HTTPStatus ||
 			!bytes.Equal(input.ResponseEnvelope.input.ResponseBody, input.ResponseBody) || input.ResponseEnvelope.input.BodyEvidence.SHA256 != input.EvidenceRef.SHA256 ||
 			input.Response.ObservedUnixNano() < sealed.input.Seal.input.FinalRevalidation.input.CompletedUnixNano ||
-			input.HTTPStatus != 200 || len(input.ResponseBody) == 0 || len(input.ResponseBody) > limits.MaxPaginationClosureBytes ||
+			input.HTTPStatus != 200 || len(input.ResponseBody) == 0 || len(input.ResponseBody) > limits.MaxDecompressedResponseBodyBytes ||
 			!validSHA256(input.ResponseBodySHA256) || input.ResponseBodySHA256 != digestBytes(input.ResponseBody) ||
 			input.EvidenceRef.SHA256 != input.ResponseBodySHA256 {
 			return NotAppliedProofV1{}, errors.New("atomic rejection proof lacks authenticated request/response evidence")

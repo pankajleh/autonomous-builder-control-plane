@@ -8,43 +8,134 @@ import (
 	"time"
 )
 
-// Limits bounds every provider-facing collection and field. A Limits value is
-// immutable because it contains scalars only.
+// Limits is the canonical identity of the stage-specific production budgets
+// consumed by the lifecycle contracts. Fields are deliberately not shared by
+// unrelated stages even when their production-v1 values happen to be equal.
+// A Limits value is immutable because it contains scalars only.
 type Limits struct {
-	MaxPages                  int
-	MaxItemsPerPage           int
-	MaxTotalItems             int
-	MaxTextBytes              int
-	MaxEvidenceRefs           int
-	MaxMetadataItems          int
-	MaxParents                int
-	MaxLineageEntries         int
-	MaxPaginationClosureBytes int
-	MaxDescendantDistance     int
-	CallTimeout               time.Duration
-	MaxReadRetries            int
-	MaxWriteRetries           int
-	MaxAmbiguousRetries       int
+	// Deprecated compatibility mirrors for the pre-M-01 prlifecycle adapter.
+	// They are not governing fields and Validate requires exact agreement with
+	// their stage-specific replacements.
+	MaxPages          int
+	MaxItemsPerPage   int
+	MaxTotalItems     int
+	MaxParents        int
+	MaxLineageEntries int
+
+	MaxRequiredTrustedChecks               int
+	MaxEligibleReviewers                   int
+	MaxRequiredReviewers                   int
+	MaxMinimumApprovals                    int
+	MaxObservedChecks                      int
+	MaxObservedReviews                     int
+	MaxPaginationPages                     int
+	MaxPaginationItemsPerPage              int
+	MaxObservedItemsPerPaginationSource    int
+	RequiredPaginationSources              int
+	MaxPaginationClosureBytes              int
+	MaxCumulativePaginationClosureBytes    int
+	MaxTextBytes                           int
+	MaxEvidenceRefs                        int
+	MaxMetadataItems                       int
+	MaxReadyEvidenceClosureRefs            int
+	MaxReadyAcceptedSources                int
+	MaxReadyEvidenceArtifactBytes          int
+	MaxReadyEvidenceClosureBytes           int
+	MaxContractParents                     int
+	MaxContractLineageEntries              int
+	RequiredProductionMergeParents         int
+	MaxProductionMergeLineageEntries       int
+	MaxDescendantDistance                  int
+	MaxCanonicalObjectBytes                int
+	MaxCancellationAuthorityBytes          int
+	MaxLedgerLineBytes                     int
+	MaxReadyLedgerSnapshotBytes            int
+	MaxLedgerScanRecords                   int
+	MaxRequestBodyBytes                    int
+	MaxResponseHeaderBytes                 int
+	MaxLinkHeaderBytes                     int
+	MaxRequestIDBytes                      int
+	MaxCompressedResponseBodyBytes         int
+	MaxDecompressedResponseBodyBytes       int
+	MaxPreSubmitHTTPCalls                  int
+	MaxCommitObjectCreationSubmissions     int
+	MaxTargetRefUpdateSubmissions          int
+	MaxPostMergeHTTPCalls                  int
+	MaxReconciliationRounds                int
+	MaxReconciliationCallsPerRound         int
+	MaxPrincipalValidationCalls            int
+	MaxHTTPCalls                           int
+	MaxCumulativeRequestBytes              int64
+	MaxCumulativeResponseHeaderBytes       int64
+	MaxCumulativeCompressedResponseBytes   int64
+	MaxCumulativeDecompressedResponseBytes int64
+	CallTimeout                            time.Duration
+	MaxCumulativeActiveProviderCallTime    time.Duration
+	MaxControllerInvocationTime            time.Duration
+	MaxReadRetries                         int
+	MaxWriteRetries                        int
+	MaxAmbiguousRetries                    int
 }
 
 func DefaultLimits() Limits {
 	return Limits{
-		MaxPages: 10, MaxItemsPerPage: 100, MaxTotalItems: 500,
-		MaxTextBytes: 4096, MaxEvidenceRefs: 64, MaxMetadataItems: 32,
-		MaxParents: 16, MaxLineageEntries: 256, MaxPaginationClosureBytes: 4 * 1024 * 1024, MaxDescendantDistance: 500, CallTimeout: 30 * time.Second,
+		MaxPages: 10, MaxItemsPerPage: 100, MaxTotalItems: 500, MaxParents: 16, MaxLineageEntries: 256,
+		MaxRequiredTrustedChecks: 64, MaxEligibleReviewers: 64, MaxRequiredReviewers: 64, MaxMinimumApprovals: 64,
+		MaxObservedChecks: 500, MaxObservedReviews: 500,
+		MaxPaginationPages: 10, MaxPaginationItemsPerPage: 100, MaxObservedItemsPerPaginationSource: 500,
+		RequiredPaginationSources: 3, MaxPaginationClosureBytes: 1 * 1024 * 1024, MaxCumulativePaginationClosureBytes: 3 * 1024 * 1024,
+		MaxTextBytes: 4096, MaxEvidenceRefs: 64, MaxMetadataItems: 32, MaxReadyEvidenceClosureRefs: 256, MaxReadyAcceptedSources: 500,
+		MaxReadyEvidenceArtifactBytes: 16 * 1024 * 1024, MaxReadyEvidenceClosureBytes: 64 * 1024 * 1024,
+		MaxContractParents: 16, MaxContractLineageEntries: 256, RequiredProductionMergeParents: 2, MaxProductionMergeLineageEntries: 0,
+		MaxDescendantDistance: 500, MaxCanonicalObjectBytes: 256 * 1024, MaxCancellationAuthorityBytes: 256 * 1024,
+		MaxLedgerLineBytes: 256 * 1024, MaxReadyLedgerSnapshotBytes: 64 * 1024 * 1024, MaxLedgerScanRecords: 262144,
+		MaxRequestBodyBytes: 16 * 1024, MaxResponseHeaderBytes: 32 * 1024, MaxLinkHeaderBytes: 8 * 1024, MaxRequestIDBytes: 256,
+		MaxCompressedResponseBodyBytes: 4 * 1024 * 1024, MaxDecompressedResponseBodyBytes: 4 * 1024 * 1024,
+		MaxPreSubmitHTTPCalls: 28, MaxCommitObjectCreationSubmissions: 1, MaxTargetRefUpdateSubmissions: 1,
+		MaxPostMergeHTTPCalls: 8, MaxReconciliationRounds: 8, MaxReconciliationCallsPerRound: 3,
+		MaxPrincipalValidationCalls: 2, MaxHTTPCalls: 64,
+		MaxCumulativeRequestBytes: 1 * 1024 * 1024, MaxCumulativeResponseHeaderBytes: 2 * 1024 * 1024,
+		MaxCumulativeCompressedResponseBytes: 256 * 1024 * 1024, MaxCumulativeDecompressedResponseBytes: 256 * 1024 * 1024,
+		CallTimeout: 30 * time.Second, MaxCumulativeActiveProviderCallTime: 10 * time.Minute, MaxControllerInvocationTime: 15 * time.Minute,
 		MaxReadRetries: 2, MaxWriteRetries: 1, MaxAmbiguousRetries: 0,
 	}
 }
 
 func (l Limits) Validate() error {
-	if l.MaxPages <= 0 || l.MaxItemsPerPage <= 0 || l.MaxTotalItems <= 0 ||
-		l.MaxTextBytes <= 0 || l.MaxEvidenceRefs <= 0 || l.MaxMetadataItems <= 0 ||
-		l.MaxParents <= 0 || l.MaxLineageEntries <= 0 || l.MaxPaginationClosureBytes <= 0 || l.MaxDescendantDistance <= 0 || l.CallTimeout <= 0 ||
-		l.MaxReadRetries < 0 || l.MaxWriteRetries < 0 || l.MaxAmbiguousRetries != 0 {
+	if l.MaxPages != l.MaxPaginationPages || l.MaxItemsPerPage != l.MaxPaginationItemsPerPage ||
+		l.MaxTotalItems != l.MaxObservedItemsPerPaginationSource || l.MaxParents != l.MaxContractParents ||
+		l.MaxLineageEntries != l.MaxContractLineageEntries {
+		return errors.New("deprecated resource-limit mirrors disagree with stage-specific limits")
+	}
+	if l.MaxRequiredTrustedChecks <= 0 || l.MaxEligibleReviewers <= 0 || l.MaxRequiredReviewers <= 0 || l.MaxMinimumApprovals <= 0 ||
+		l.MaxObservedChecks <= 0 || l.MaxObservedReviews <= 0 || l.MaxPaginationPages <= 0 || l.MaxPaginationItemsPerPage <= 0 ||
+		l.MaxObservedItemsPerPaginationSource <= 0 || l.RequiredPaginationSources <= 0 || l.MaxPaginationClosureBytes <= 0 ||
+		l.MaxCumulativePaginationClosureBytes <= 0 || l.MaxTextBytes <= 0 || l.MaxEvidenceRefs <= 0 || l.MaxMetadataItems <= 0 ||
+		l.MaxReadyEvidenceClosureRefs <= 0 || l.MaxReadyAcceptedSources <= 0 || l.MaxReadyEvidenceArtifactBytes <= 0 || l.MaxReadyEvidenceClosureBytes <= 0 ||
+		l.MaxContractParents <= 0 || l.MaxContractLineageEntries <= 0 || l.RequiredProductionMergeParents <= 0 ||
+		l.MaxProductionMergeLineageEntries < 0 || l.MaxDescendantDistance <= 0 || l.MaxCanonicalObjectBytes <= 0 ||
+		l.MaxCancellationAuthorityBytes <= 0 || l.MaxLedgerLineBytes <= 0 || l.MaxReadyLedgerSnapshotBytes <= 0 ||
+		l.MaxLedgerScanRecords <= 0 || l.MaxRequestBodyBytes <= 0 || l.MaxResponseHeaderBytes <= 0 || l.MaxLinkHeaderBytes <= 0 ||
+		l.MaxRequestIDBytes <= 0 || l.MaxCompressedResponseBodyBytes <= 0 || l.MaxDecompressedResponseBodyBytes <= 0 ||
+		l.MaxPreSubmitHTTPCalls <= 0 || l.MaxCommitObjectCreationSubmissions <= 0 || l.MaxTargetRefUpdateSubmissions <= 0 ||
+		l.MaxPostMergeHTTPCalls <= 0 || l.MaxReconciliationRounds <= 0 || l.MaxReconciliationCallsPerRound <= 0 ||
+		l.MaxPrincipalValidationCalls <= 0 || l.MaxHTTPCalls <= 0 || l.MaxCumulativeRequestBytes <= 0 ||
+		l.MaxCumulativeResponseHeaderBytes <= 0 || l.MaxCumulativeCompressedResponseBytes <= 0 ||
+		l.MaxCumulativeDecompressedResponseBytes <= 0 || l.CallTimeout <= 0 || l.MaxCumulativeActiveProviderCallTime <= 0 ||
+		l.MaxControllerInvocationTime <= 0 || l.MaxReadRetries < 0 || l.MaxWriteRetries < 0 || l.MaxAmbiguousRetries != 0 {
 		return errors.New("resource limits must be positive and ambiguous-write retries must be zero")
 	}
-	if l.MaxItemsPerPage > l.MaxTotalItems {
-		return errors.New("items per page cannot exceed total items")
+	if l.MaxRequiredReviewers > l.MaxEligibleReviewers || l.MaxMinimumApprovals > l.MaxEligibleReviewers {
+		return errors.New("required reviewers and minimum approvals cannot exceed eligible reviewers")
+	}
+	if l.MaxPaginationItemsPerPage > l.MaxObservedItemsPerPaginationSource {
+		return errors.New("pagination items per page cannot exceed observed items per source")
+	}
+	if l.MaxPaginationClosureBytes > l.MaxCumulativePaginationClosureBytes {
+		return errors.New("one pagination closure cannot exceed the cumulative closure budget")
+	}
+	if l.MaxReadyEvidenceArtifactBytes > l.MaxReadyEvidenceClosureBytes || l.MaxLedgerLineBytes > l.MaxReadyLedgerSnapshotBytes {
+		return errors.New("one READY artifact or ledger line cannot exceed its cumulative snapshot budget")
 	}
 	return nil
 }
@@ -57,24 +148,77 @@ func (l Limits) CanonicalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(struct {
-		SchemaVersion             int   `json:"schema_version"`
-		MaxPages                  int   `json:"max_pages"`
-		MaxItemsPerPage           int   `json:"max_items_per_page"`
-		MaxTotalItems             int   `json:"max_total_items"`
-		MaxTextBytes              int   `json:"max_text_bytes"`
-		MaxEvidenceRefs           int   `json:"max_evidence_refs"`
-		MaxMetadataItems          int   `json:"max_metadata_items"`
-		MaxParents                int   `json:"max_parents"`
-		MaxLineageEntries         int   `json:"max_lineage_entries"`
-		MaxPaginationClosureBytes int   `json:"max_pagination_closure_bytes"`
-		MaxDescendantDistance     int   `json:"max_descendant_distance"`
-		CallTimeoutNanos          int64 `json:"call_timeout_nanos"`
-		MaxReadRetries            int   `json:"max_read_retries"`
-		MaxWriteRetries           int   `json:"max_write_retries"`
-		MaxAmbiguousRetries       int   `json:"max_ambiguous_retries"`
-	}{1, l.MaxPages, l.MaxItemsPerPage, l.MaxTotalItems, l.MaxTextBytes, l.MaxEvidenceRefs,
-		l.MaxMetadataItems, l.MaxParents, l.MaxLineageEntries, l.MaxPaginationClosureBytes, l.MaxDescendantDistance, int64(l.CallTimeout),
-		l.MaxReadRetries, l.MaxWriteRetries, l.MaxAmbiguousRetries})
+		SchemaVersion                            int   `json:"schema_version"`
+		MaxRequiredTrustedChecks                 int   `json:"max_required_trusted_checks"`
+		MaxEligibleReviewers                     int   `json:"max_eligible_reviewers"`
+		MaxRequiredReviewers                     int   `json:"max_required_reviewers"`
+		MaxMinimumApprovals                      int   `json:"max_minimum_approvals"`
+		MaxObservedChecks                        int   `json:"max_observed_checks"`
+		MaxObservedReviews                       int   `json:"max_observed_reviews"`
+		MaxPaginationPages                       int   `json:"max_pagination_pages"`
+		MaxPaginationItemsPerPage                int   `json:"max_pagination_items_per_page"`
+		MaxObservedItemsPerPaginationSource      int   `json:"max_observed_items_per_pagination_source"`
+		RequiredPaginationSources                int   `json:"required_pagination_sources"`
+		MaxPaginationClosureBytes                int   `json:"max_pagination_closure_bytes"`
+		MaxCumulativePaginationClosureBytes      int   `json:"max_cumulative_pagination_closure_bytes"`
+		MaxTextBytes                             int   `json:"max_text_bytes"`
+		MaxEvidenceRefs                          int   `json:"max_evidence_refs"`
+		MaxMetadataItems                         int   `json:"max_metadata_items"`
+		MaxReadyEvidenceClosureRefs              int   `json:"max_ready_evidence_closure_refs"`
+		MaxReadyAcceptedSources                  int   `json:"max_ready_accepted_sources"`
+		MaxReadyEvidenceArtifactBytes            int   `json:"max_ready_evidence_artifact_bytes"`
+		MaxReadyEvidenceClosureBytes             int   `json:"max_ready_evidence_closure_bytes"`
+		MaxContractParents                       int   `json:"max_contract_parents"`
+		MaxContractLineageEntries                int   `json:"max_contract_lineage_entries"`
+		RequiredProductionMergeParents           int   `json:"required_production_merge_parents"`
+		MaxProductionMergeLineageEntries         int   `json:"max_production_merge_lineage_entries"`
+		MaxDescendantDistance                    int   `json:"max_descendant_distance"`
+		MaxCanonicalObjectBytes                  int   `json:"max_canonical_object_bytes"`
+		MaxCancellationAuthorityBytes            int   `json:"max_cancellation_authority_bytes"`
+		MaxLedgerLineBytes                       int   `json:"max_ledger_line_bytes"`
+		MaxReadyLedgerSnapshotBytes              int   `json:"max_ready_ledger_snapshot_bytes"`
+		MaxLedgerScanRecords                     int   `json:"max_ledger_scan_records"`
+		MaxRequestBodyBytes                      int   `json:"max_request_body_bytes"`
+		MaxResponseHeaderBytes                   int   `json:"max_response_header_bytes"`
+		MaxLinkHeaderBytes                       int   `json:"max_link_header_bytes"`
+		MaxRequestIDBytes                        int   `json:"max_request_id_bytes"`
+		MaxCompressedResponseBodyBytes           int   `json:"max_compressed_response_body_bytes"`
+		MaxDecompressedResponseBodyBytes         int   `json:"max_decompressed_response_body_bytes"`
+		MaxPreSubmitHTTPCalls                    int   `json:"max_pre_submit_http_calls"`
+		MaxCommitObjectCreationSubmissions       int   `json:"max_commit_object_creation_submissions"`
+		MaxTargetRefUpdateSubmissions            int   `json:"max_target_ref_update_submissions"`
+		MaxPostMergeHTTPCalls                    int   `json:"max_post_merge_http_calls"`
+		MaxReconciliationRounds                  int   `json:"max_reconciliation_rounds"`
+		MaxReconciliationCallsPerRound           int   `json:"max_reconciliation_calls_per_round"`
+		MaxPrincipalValidationCalls              int   `json:"max_principal_validation_calls"`
+		MaxHTTPCalls                             int   `json:"max_http_calls"`
+		MaxCumulativeRequestBytes                int64 `json:"max_cumulative_request_bytes"`
+		MaxCumulativeResponseHeaderBytes         int64 `json:"max_cumulative_response_header_bytes"`
+		MaxCumulativeCompressedResponseBytes     int64 `json:"max_cumulative_compressed_response_bytes"`
+		MaxCumulativeDecompressedResponseBytes   int64 `json:"max_cumulative_decompressed_response_bytes"`
+		CallTimeoutNanos                         int64 `json:"call_timeout_nanos"`
+		MaxCumulativeActiveProviderCallTimeNanos int64 `json:"max_cumulative_active_provider_call_time_nanos"`
+		MaxControllerInvocationTimeNanos         int64 `json:"max_controller_invocation_time_nanos"`
+		MaxReadRetries                           int   `json:"max_read_retries"`
+		MaxWriteRetries                          int   `json:"max_write_retries"`
+		MaxAmbiguousRetries                      int   `json:"max_ambiguous_retries"`
+	}{
+		2, l.MaxRequiredTrustedChecks, l.MaxEligibleReviewers, l.MaxRequiredReviewers, l.MaxMinimumApprovals,
+		l.MaxObservedChecks, l.MaxObservedReviews, l.MaxPaginationPages, l.MaxPaginationItemsPerPage,
+		l.MaxObservedItemsPerPaginationSource, l.RequiredPaginationSources, l.MaxPaginationClosureBytes,
+		l.MaxCumulativePaginationClosureBytes, l.MaxTextBytes, l.MaxEvidenceRefs, l.MaxMetadataItems,
+		l.MaxReadyEvidenceClosureRefs, l.MaxReadyAcceptedSources, l.MaxReadyEvidenceArtifactBytes, l.MaxReadyEvidenceClosureBytes,
+		l.MaxContractParents, l.MaxContractLineageEntries, l.RequiredProductionMergeParents,
+		l.MaxProductionMergeLineageEntries, l.MaxDescendantDistance, l.MaxCanonicalObjectBytes,
+		l.MaxCancellationAuthorityBytes, l.MaxLedgerLineBytes, l.MaxReadyLedgerSnapshotBytes, l.MaxLedgerScanRecords,
+		l.MaxRequestBodyBytes, l.MaxResponseHeaderBytes, l.MaxLinkHeaderBytes, l.MaxRequestIDBytes,
+		l.MaxCompressedResponseBodyBytes, l.MaxDecompressedResponseBodyBytes, l.MaxPreSubmitHTTPCalls,
+		l.MaxCommitObjectCreationSubmissions, l.MaxTargetRefUpdateSubmissions, l.MaxPostMergeHTTPCalls,
+		l.MaxReconciliationRounds, l.MaxReconciliationCallsPerRound, l.MaxPrincipalValidationCalls, l.MaxHTTPCalls,
+		l.MaxCumulativeRequestBytes, l.MaxCumulativeResponseHeaderBytes, l.MaxCumulativeCompressedResponseBytes,
+		l.MaxCumulativeDecompressedResponseBytes, int64(l.CallTimeout), int64(l.MaxCumulativeActiveProviderCallTime),
+		int64(l.MaxControllerInvocationTime), l.MaxReadRetries, l.MaxWriteRetries, l.MaxAmbiguousRetries,
+	})
 }
 
 // SHA256 is the deterministic identity of the complete validated policy.
@@ -102,8 +246,16 @@ func validatePage(l Limits, page, itemCount, totalCount int) error {
 	if err := l.Validate(); err != nil {
 		return err
 	}
-	if page <= 0 || page > l.MaxPages || itemCount < 0 || itemCount > l.MaxItemsPerPage || totalCount < itemCount || totalCount > l.MaxTotalItems {
+	if page <= 0 || page > l.MaxPaginationPages || itemCount < 0 || itemCount > l.MaxPaginationItemsPerPage ||
+		totalCount < itemCount || totalCount > l.MaxObservedItemsPerPaginationSource {
 		return errors.New("remote pagination exceeds governed limits")
+	}
+	return nil
+}
+
+func requireCanonicalObjectSize(data []byte, limit int, object string) error {
+	if len(data) == 0 || len(data) > limit {
+		return errors.New(object + " canonical object exceeds its governed byte limit")
 	}
 	return nil
 }

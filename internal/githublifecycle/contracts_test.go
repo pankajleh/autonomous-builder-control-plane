@@ -1,6 +1,7 @@
 package githublifecycle
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -143,10 +144,30 @@ func newFixture(t *testing.T, method MergeMethod) fixture {
 	finalEvidence = append(finalEvidence, finalReviews.input.EvidenceRefs...)
 	finalEvidence = append(finalEvidence, finalChecks.input.EvidenceRefs...)
 	finalEvidence = append(finalEvidence, finalStatuses.input.EvidenceRefs...)
+	admissionStats, err := validatePaginationBoundaryV1(reviews, f.checkRuns, f.statuses, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalStats, err := validatePaginationBoundaryV1(finalReviews, finalChecks, finalStatuses, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admissionCalls, finalCalls := admissionStats.Pages+1, finalStats.Pages+1
+	counters := AuthorizationCountersV1{
+		AdmissionHTTPCalls: admissionCalls, AdmissionObservedChecks: 0, AdmissionObservedReviews: 0,
+		AdmissionPaginationSources: admissionStats.Sources, AdmissionPaginationPages: admissionStats.Pages,
+		AdmissionPaginationItems: admissionStats.Items, AdmissionPaginationClosureBytes: admissionStats.ClosureBytes,
+		FinalRevalidationHTTPCalls: finalCalls, FinalObservedChecks: 0, FinalObservedReviews: 0,
+		FinalPaginationSources: finalStats.Sources, FinalPaginationPages: finalStats.Pages,
+		FinalPaginationItems: finalStats.Items, FinalPaginationClosureBytes: finalStats.ClosureBytes,
+		ReadyLedgerBytes: int64(len(ledgerPrefix)), ReadyLedgerRecords: bytes.Count(ledgerPrefix, []byte{'\n'}),
+		PreSubmitHTTPCalls: admissionCalls + finalCalls, TotalHTTPCalls: admissionCalls + finalCalls,
+		ControllerInvocationNanos: 1_000_000_000,
+	}
 	final := must(NewFinalRevalidationV1(FinalRevalidationV1Input{
 		MergeInput: f.mergeWrite, ControllerSequence: 11, StartedUnixNano: 1700000002000000000, CompletedUnixNano: 1700000003000000000,
 		CurrentReadyProof: f.readyProof, PullRequest: finalPR, Checks: []Check{}, CheckRunsClosure: finalChecks,
-		CommitStatusesClosure: finalStatuses, Capability: capability, Recipe: f.recipe, Counters: AuthorizationCountersV1{},
+		CommitStatusesClosure: finalStatuses, Capability: capability, Recipe: f.recipe, Counters: counters,
 		NoTargetRequestAttempted: true, EvidenceRefs: finalEvidence,
 	}, f.limits)).(FinalRevalidationV1)
 	seal := must(NewAuthorizationSealV1(AuthorizationSealV1Input{MergeInput: f.mergeWrite, FinalRevalidation: final}, f.limits)).(AuthorizationSealV1)
@@ -538,7 +559,7 @@ func TestBoundsUnsafeIdentifiersAndSubstantiveClasses(t *testing.T) {
 	if err := invalidLimits.Validate(); err == nil {
 		t.Fatal("missing per-call timeout accepted")
 	}
-	checks := make([]Check, f.limits.MaxTotalItems+1)
+	checks := make([]Check, f.limits.MaxObservedChecks+1)
 	if _, err := NewCISnapshot(CISnapshotInput{Snapshot: f.snapshot, Repository: f.repository, HeadSHA: f.headSHA, Checks: checks}, f.limits); err == nil || !strings.Contains(err.Error(), "item limit") {
 		t.Fatalf("expected oversized collection failure, got %v", err)
 	}

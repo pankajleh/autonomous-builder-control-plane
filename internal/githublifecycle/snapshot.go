@@ -65,7 +65,7 @@ func NewPullRequestSnapshot(input PullRequestSnapshotInput, limits Limits) (Pull
 		return PullRequestSnapshot{}, err
 	}
 	input.LimitsSHA256 = limitsSHA
-	if !input.Snapshot.valid() || !input.Repository.valid() || !input.PullRequest.valid() ||
+	if !input.Snapshot.valid() || len(input.Snapshot.RequestID()) > limits.MaxRequestIDBytes || !input.Repository.valid() || !input.PullRequest.valid() ||
 		!input.BaseBranch.valid() || !input.BaseTipSHA.valid() || !input.HeadBranch.valid() || !input.HeadSHA.valid() {
 		return PullRequestSnapshot{}, errors.New("pull request snapshot contains an invalid identity")
 	}
@@ -75,7 +75,7 @@ func NewPullRequestSnapshot(input PullRequestSnapshotInput, limits Limits) (Pull
 	if input.MergeMethod != "" && !input.MergeMethod.Valid() {
 		return PullRequestSnapshot{}, errors.New("pull request merge method is unsupported")
 	}
-	if len(input.Reviews) > limits.MaxTotalItems {
+	if len(input.Reviews) > limits.MaxObservedReviews {
 		return PullRequestSnapshot{}, errors.New("pull request reviews exceed item limit")
 	}
 	seen := make(map[string]struct{}, len(input.Reviews))
@@ -95,6 +95,9 @@ func NewPullRequestSnapshot(input PullRequestSnapshotInput, limits Limits) (Pull
 	}
 	canonical, digest, err := canonicalJSON(prWire(input))
 	if err != nil {
+		return PullRequestSnapshot{}, err
+	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "pull request observation"); err != nil {
 		return PullRequestSnapshot{}, err
 	}
 	return PullRequestSnapshot{immutableRecord[PullRequestSnapshotInput]{data: input, canonical: canonical, digest: digest}}, nil
@@ -161,10 +164,10 @@ func NewCISnapshot(input CISnapshotInput, limits Limits) (CISnapshot, error) {
 		return CISnapshot{}, err
 	}
 	input.LimitsSHA256 = limitsSHA
-	if !input.Snapshot.valid() || !input.Repository.valid() || !input.HeadSHA.valid() {
+	if !input.Snapshot.valid() || len(input.Snapshot.RequestID()) > limits.MaxRequestIDBytes || !input.Repository.valid() || !input.HeadSHA.valid() {
 		return CISnapshot{}, errors.New("CI snapshot contains an invalid identity")
 	}
-	if len(input.Checks) > limits.MaxTotalItems {
+	if len(input.Checks) > limits.MaxObservedChecks {
 		return CISnapshot{}, errors.New("CI checks exceed item limit")
 	}
 	seen := make(map[string]struct{}, len(input.Checks))
@@ -184,6 +187,9 @@ func NewCISnapshot(input CISnapshotInput, limits Limits) (CISnapshot, error) {
 	}
 	canonical, digest, err := canonicalJSON(ciWire(input))
 	if err != nil {
+		return CISnapshot{}, err
+	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "CI observation"); err != nil {
 		return CISnapshot{}, err
 	}
 	return CISnapshot{immutableRecord[CISnapshotInput]{data: input, canonical: canonical, digest: digest}}, nil
@@ -211,7 +217,7 @@ func validateCheck(check *Check, expectedHead GitSHA, limits Limits) error {
 
 func canonicalizeChecksForHead(checks []Check, expectedHead GitSHA, limits Limits) ([]Check, error) {
 	checks = cloneChecks(checks)
-	if len(checks) > limits.MaxTotalItems {
+	if len(checks) > limits.MaxObservedChecks {
 		return nil, errors.New("checks exceed the governed total-item limit")
 	}
 	seen := make(map[string]struct{}, len(checks))
@@ -339,7 +345,15 @@ func canonicalizeCommon(evidence *[]ledger.EvidenceRef, metadata map[string]stri
 }
 
 func canonicalizeEvidence(refs *[]ledger.EvidenceRef, limits Limits) error {
-	if len(*refs) > limits.MaxEvidenceRefs {
+	return canonicalizeEvidenceWithLimit(refs, limits, limits.MaxEvidenceRefs)
+}
+
+func canonicalizeReadyEvidenceClosure(refs *[]ledger.EvidenceRef, limits Limits) error {
+	return canonicalizeEvidenceWithLimit(refs, limits, limits.MaxReadyEvidenceClosureRefs)
+}
+
+func canonicalizeEvidenceWithLimit(refs *[]ledger.EvidenceRef, limits Limits, maxRefs int) error {
+	if len(*refs) > maxRefs {
 		return errors.New("evidence references exceed limit")
 	}
 	seen := make(map[string]struct{}, len(*refs))

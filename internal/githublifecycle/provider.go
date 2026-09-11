@@ -234,6 +234,9 @@ func NewMergeInput(input MergeAuthorizationInputV1, writeID string, limits Limit
 	if err != nil {
 		return MergeInput{}, err
 	}
+	if _, err := validatePaginationBoundaryV1(input.InitialPullRequest.input.ReviewsClosure, input.CheckRunsClosure, input.CommitStatusesClosure, limits); err != nil {
+		return MergeInput{}, err
+	}
 	derivedRecipe, err := NewMergeCommitRecipeV1(writeID, authority, limits)
 	if err != nil || input.Recipe.SHA256() != derivedRecipe.SHA256() || !bytes.Equal(input.Recipe.CanonicalJSON(), derivedRecipe.CanonicalJSON()) {
 		return MergeInput{}, errors.New("merge recipe was not deterministically derived from authority, policy, and write identity")
@@ -269,6 +272,9 @@ func NewMergeInput(input MergeAuthorizationInputV1, writeID string, limits Limit
 	input.EvidenceRefs = copyEvidence
 	payload, payloadSHA, err := canonicalJSON(mergeAuthorizationPayloadWire(input, authority, limitsSHA))
 	if err != nil {
+		return MergeInput{}, err
+	}
+	if err := requireCanonicalObjectSize(payload, limits.MaxCanonicalObjectBytes, "merge input"); err != nil {
 		return MergeInput{}, err
 	}
 	attempt, err := newWriteAttempt(OperationMerge, authority, writeID, payloadSHA, limits)

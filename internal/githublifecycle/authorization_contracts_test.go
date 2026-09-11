@@ -118,6 +118,9 @@ func TestTrustedChecksAndIndependentPaginationBoundaries(t *testing.T) {
 	}
 
 	limits := f.limits
+	limits.MaxPaginationPages = 2
+	limits.MaxPaginationItemsPerPage = 1
+	limits.MaxObservedItemsPerPaginationSource = 2
 	limits.MaxPages = 2
 	limits.MaxItemsPerPage = 1
 	limits.MaxTotalItems = 2
@@ -176,6 +179,7 @@ func TestTrustedChecksAndIndependentPaginationBoundaries(t *testing.T) {
 		t.Fatal("cross-page duplicate accepted")
 	}
 	excess := limits
+	excess.MaxPaginationPages = 1
 	excess.MaxPages = 1
 	if _, err := NewPaginationClosureV1(PaginationClosureV1Input{query, []PaginationPageV1{p1, p2}, evidence}, excess); err == nil {
 		t.Fatal("pagination limit+1 accepted")
