@@ -53,7 +53,7 @@ Each entrypoint must assert the mandatory evidence in its matrix row, including 
 
 There is exactly one implementation task in this plan. It must close all nine rows together. It may not introduce a second correction task, new blocker family, Task-3 behavior, or design rewrite.
 
-### Task 1 — Close exact Task-2 review findings C-01 + M-01…M-08
+### Task 1: Close exact Task-2 review findings C-01 + M-01…M-08
 
 - [ ] Implement the root-cause corrections for all nine matrix rows without editing frozen Task-1 contracts.
 - [ ] Add deterministic regression tests named/tagged or otherwise directly traceable to every matrix ID.
