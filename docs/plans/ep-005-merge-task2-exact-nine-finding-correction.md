@@ -33,6 +33,22 @@ Permitted implementation changes are only:
 | T2-CORR-M07 | **M-07 Linux state/ledger vulnerable to path replacement.** Master design §§1,5,7 require descriptor-relative no-follow/no-replace filesystem operations and stable physical ledger/state identity. | Durable store and ledger reopen path names and use replace-capable path operations; physical identity is only cleaned path text. | Retain trusted directory/file descriptors; perform traversal/read/create/publication with descriptor-relative no-follow operations; verify regular type/owner/link count; use no-replace publication; bind stable device/inode identity and reject replacement across snapshots/recovery. | Parent/path replacement, symlink/hard-link/device/socket, same-name substitution, destination race, and replaced ledger inode all fail closed. Byte-identical create-or-verify remains idempotent; no unsafe entry is followed, replaced or deleted. |
 | T2-CORR-M08 | **M-08 Required repository/base lock absent.** Master design §§1–3 requires run-transition plus repository/base lock across final revalidation, sealing, target submission and settlement/barrier persistence. | Only run-transition lease exists, so distinct READY runs for the same repository/base can interleave. | Add durable repository/base lease keyed by authority-bound stable repository identity plus full base ref. Acquire in a fixed documented order with the run lease and retain it through final revalidation/seal/submission/settlement or unresolved-barrier persistence. | Two runs same repository/base serialize deterministically; different bases may proceed independently; wrong repository/ref cannot alias. Crash/restart cannot create two mutation rights. Lock-order test proves no inversion/deadlock with run transition and storage locks. |
 
+## Frozen regression entrypoints
+
+The implementation must provide these exact Go test entrypoints; acceptance invokes them by name, so self-authored generic tests cannot substitute for a missing matrix row:
+
+- `internal/mergelifecycle`: `TestCorrectionC01TerminalCoreRecovery`
+- `internal/mergelifecycle`: `TestCorrectionM01AuthorityEvidenceBytes`
+- `internal/mergelifecycle`: `TestCorrectionM02ExactCommitPreparationProof`
+- `internal/mergelifecycle`: `TestCorrectionM03CanonicalTerminalReasons`
+- `internal/mergelifecycle`: `TestCorrectionM04CancellationRecoveryBinding`
+- `internal/mergelifecycle`: `TestCorrectionM05CumulativeProviderBudgets`
+- `internal/mergelifecycle`: `TestCorrectionM06StorageReservationsCleanupLimits`
+- `internal/ledger`: `TestCorrectionM07DescriptorRelativeDurability`
+- `internal/mergelifecycle`: `TestCorrectionM08RepositoryBaseLock`
+
+Each entrypoint must assert the mandatory evidence in its matrix row, including negative/fault/restart boundaries; a placeholder, skipped test, or assertion-free test is a failed matrix row.
+
 ## One correction implementation only
 
 There is exactly one implementation task in this plan. It must close all nine rows together. It may not introduce a second correction task, new blocker family, Task-3 behavior, or design rewrite.
