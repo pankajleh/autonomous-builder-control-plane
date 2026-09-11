@@ -59,6 +59,15 @@ type Config struct {
 	Events        EventAppender
 	Artifacts     ArtifactWriter
 	Processes     acceptance.CommandRunner
+	Provenance    TransitionProvenance
+}
+
+// TransitionProvenance is immutable controller configuration, not request
+// policy. It is copied onto integration state transitions for READY recovery.
+type TransitionProvenance struct {
+	ProjectID string
+	PlanID    string
+	AttemptID string
 }
 
 type ReviewRequirement = authority.ReviewRequirement
@@ -91,6 +100,7 @@ type Request struct {
 	Reviews        []ReviewAttestation           `json:"reviews"`
 	Prerequisites  Prerequisites                 `json:"prerequisites"`
 	EvidencePrefix string                        `json:"evidence_prefix"`
+	transition     TransitionProvenance
 }
 
 type Result struct {
@@ -118,6 +128,7 @@ type Gate struct {
 	workspace    workspaceController
 	combined     combinedEvaluator
 	evidenceRoot string
+	provenance   TransitionProvenance
 }
 
 func New(config Config) (*Gate, error) {
@@ -130,8 +141,13 @@ func New(config Config) (*Gate, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !emptyTransitionProvenance(config.Provenance) {
+		if err := validateTransitionProvenance(config.Provenance); err != nil {
+			return nil, err
+		}
+	}
 	return &Gate{events: config.Events, artifacts: config.Artifacts, workspace: workspace,
-		combined: combinedacceptance.New(config.Processes, config.Artifacts), evidenceRoot: config.Artifacts.Root()}, nil
+		combined: combinedacceptance.New(config.Processes, config.Artifacts), evidenceRoot: config.Artifacts.Root(), provenance: config.Provenance}, nil
 }
 
 // Run performs one serial integration decision. Callers supply only governed
@@ -170,11 +186,11 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 		return finished, err
 	}
 	initialRefs := []ledger.EvidenceRef{inputRef, initialHeadRef}
-	if err := g.transition(prepared.Authority.RunID(), result.State, domain.StateIntegrationPending, initialRefs, map[string]any{"risk_sha256": prepared.RiskReport.SHA256()}); err != nil {
+	if err := g.transition(prepared, result.State, domain.StateIntegrationPending, initialRefs, map[string]any{"risk_sha256": prepared.RiskReport.SHA256()}); err != nil {
 		return g.handleTransitionFailure(prepared, result, domain.StateIntegrationPending, "emit integration pending", initialRefs, err)
 	}
 	result.State = domain.StateIntegrationPending
-	if err := g.transition(prepared.Authority.RunID(), result.State, domain.StateIntegrating, initialRefs, nil); err != nil {
+	if err := g.transition(prepared, result.State, domain.StateIntegrating, initialRefs, nil); err != nil {
 		return g.handleTransitionFailure(prepared, result, domain.StateIntegrating, "emit integrating", initialRefs, err)
 	}
 	result.State = domain.StateIntegrating
@@ -248,7 +264,7 @@ func (g *Gate) Run(ctx context.Context, request Request) (Result, error) {
 			return g.finish(prepared, accepted, domain.StateFailed, headErr.Error(), inputRef)
 		}
 		refs := terminalRefs(accepted, inputRef)
-		if err := g.transition(prepared.Authority.RunID(), accepted.State, domain.StateReadyForMerge, refs, map[string]any{"combined_acceptance_sha256": combinedResult.SHA256()}); err != nil {
+		if err := g.transition(prepared, accepted.State, domain.StateReadyForMerge, refs, map[string]any{"combined_acceptance_sha256": combinedResult.SHA256()}); err != nil {
 			return g.handleTransitionFailure(prepared, accepted, domain.StateReadyForMerge, "emit ready for merge", refs, err)
 		}
 		accepted.State = domain.StateReadyForMerge
@@ -290,7 +306,7 @@ func (g *Gate) finish(request Request, result Result, state domain.State, reason
 		return g.fallback(request, result, state, reason, refs, err)
 	}
 	refs = collectRefs(append(refs, decisionRef)...)
-	if err := g.transition(request.Authority.RunID(), result.State, state, refs, map[string]any{"reason": reason}); err != nil {
+	if err := g.transition(request, result.State, state, refs, map[string]any{"reason": reason}); err != nil {
 		var verificationErr *evidenceVerificationError
 		if errors.As(err, &verificationErr) {
 			return g.fallback(request, result, state, reason, refs, err)
@@ -304,25 +320,26 @@ func (g *Gate) finish(request Request, result Result, state domain.State, reason
 	return result, nil
 }
 
-func (g *Gate) transition(runID string, from, to domain.State, refs []ledger.EvidenceRef, payload map[string]any) error {
+func (g *Gate) transition(request Request, from, to domain.State, refs []ledger.EvidenceRef, payload map[string]any) error {
 	if err := g.verifyTransitionEvidence(refs); err != nil {
 		return err
 	}
-	return g.appendTransition(runID, from, to, refs, payload)
+	return g.appendTransition(request, from, to, refs, payload)
 }
 
-func (g *Gate) appendTransition(runID string, from, to domain.State, refs []ledger.EvidenceRef, payload map[string]any) error {
+func (g *Gate) appendTransition(request Request, from, to domain.State, refs []ledger.EvidenceRef, payload map[string]any) error {
 	if err := domain.ValidateTransition(from, to); err != nil {
 		return err
 	}
 	if len(refs) == 0 {
 		return errors.New("every gate transition requires evidence")
 	}
-	event, err := ledger.NewEvent(runID, eventStateTransition, "integration-controller", "integration-gate")
+	event, err := ledger.NewEvent(request.Authority.RunID(), eventStateTransition, "controller", "integration-gate")
 	if err != nil {
 		return err
 	}
 	event.StateFrom, event.StateTo, event.Payload, event.EvidenceRefs = from, to, payload, append([]ledger.EvidenceRef(nil), refs...)
+	event.ProjectID, event.PlanID, event.AttemptID = request.transition.ProjectID, request.transition.PlanID, request.transition.AttemptID
 	return g.events.Append(event)
 }
 
@@ -443,7 +460,7 @@ func (g *Gate) fallback(request Request, result Result, intended domain.State, o
 	}
 	refs := collectRefs(append(verified, fallbackRef)...)
 	failureReason := fmt.Sprintf("original cause: %s; fallback classification: %s; evidence failure: %s", boundedText(original), classification, boundedText(trigger.Error()))
-	if err := g.transition(request.Authority.RunID(), result.State, target, refs, map[string]any{"reason": failureReason}); err != nil {
+	if err := g.transition(request, result.State, target, refs, map[string]any{"reason": failureReason}); err != nil {
 		result.FailureReason = infrastructureFailure(failureReason, "verify or append one-shot fallback transition", err)
 		return result, err
 	}
@@ -534,6 +551,13 @@ func (g *Gate) validateRequest(ctx context.Context, request Request) (Request, [
 	if len(request.Authority.CanonicalJSON()) == 0 || digest(request.Authority.CanonicalJSON()) != request.Authority.SHA256() {
 		return Request{}, nil, errors.New("validated authority is required")
 	}
+	request.transition = g.provenance
+	if emptyTransitionProvenance(request.transition) {
+		request.transition = TransitionProvenance{ProjectID: request.Authority.Repository().Identity, PlanID: request.Authority.Plan().SHA256, AttemptID: request.Authority.RunID()}
+	}
+	if err := validateTransitionProvenance(request.transition); err != nil {
+		return Request{}, nil, err
+	}
 	if !validSHA(request.BaselineSHA) || request.BaselineSHA != request.Authority.Repository().StartSHA {
 		return Request{}, nil, errors.New("baseline must match governed authority")
 	}
@@ -608,6 +632,19 @@ func (g *Gate) validateRequest(ctx context.Context, request Request) (Request, [
 		return Request{}, nil, err
 	}
 	return request, data, nil
+}
+
+func emptyTransitionProvenance(value TransitionProvenance) bool {
+	return value.ProjectID == "" && value.PlanID == "" && value.AttemptID == ""
+}
+
+func validateTransitionProvenance(value TransitionProvenance) error {
+	for name, field := range map[string]string{"project": value.ProjectID, "plan": value.PlanID, "attempt": value.AttemptID} {
+		if !validText(field) || len(field) > 4096 {
+			return fmt.Errorf("%s transition provenance is invalid", name)
+		}
+	}
+	return nil
 }
 
 func validateBlockers(prerequisites Prerequisites) error {

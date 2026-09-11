@@ -49,17 +49,17 @@ Implementation may change only:
 
 ### Task 1: Implement Task 2 controller policy, admission, execution and recovery
 
-- [ ] Add ledger transition-barrier and exact append-or-verify semantics shared by state writers; preserve existing transition behavior when no barrier is active.
-- [ ] Add only the narrow `run` and `integrationgate` provenance needed for exact project/plan/run/attempt READY reconstruction and controller/integration-gate provenance.
-- [ ] Create network-free `internal/mergelifecycle` controller schemas, immutable limits/configuration, strict canonical recovery, and provider dependency interfaces.
-- [ ] Implement Linux authority derivation, safe durable attempt store, counters/reservations, bounded `records/` and `tmp/`, cancellation replay/channel, terminal-intents channel, cleanup incidents, recovery inventory, and fail-closed non-Linux stubs.
-- [ ] Implement controller-only initial authorization/admission, deterministic merge recipe/result-commit preparation, fresh final PR/pagination/policy revalidation under shared locks, authorization-seal fsync linearization, target commitment/barrier, and exactly one fake target submission.
-- [ ] Implement full-input reconciliation, typed APPLIED/NOT_APPLIED/UNKNOWN handling, cancellation precedence, descendant-aware post-merge acceptance, and exact READY_FOR_MERGE -> MERGED/FAILED/CANCELLED terminal/event append-or-verify recovery.
-- [ ] Ensure valid applied result plus durable post-merge proof immediately persists irreversible MERGED intent/event before cleanup; every later cleanup failure is local-only with zero provider retries and no second transition.
-- [ ] Add deterministic fake-provider, concurrency, authority/policy, cumulative-budget, cancellation, storage-integrity, crash-boundary, reconciliation, ledger-ambiguity, post-merge and terminal-order adversarial tests. Use deterministic synchronization rather than sleeps.
-- [ ] Prove no Task-3 dependency: Task-2 production files contain no `net/http`, `api.github.com`, `/graphql`, ordinary PR merge endpoint, REST ref-update implementation, credentials, `httptest`, or live conformance logic; `go list -deps ./internal/mergelifecycle` must not contain `net/http`.
-- [ ] Run gofmt, Task-2 package tests, repeated concurrency/crash tests, race tests, full repository tests/vet, non-Linux compile-only validation, scope checks and `git diff --check`.
-- [ ] Commit implementation and move this plan to `docs/plans/completed/` only after all implementation-owned checks pass. Do not claim deterministic ABCP acceptance or exact-head review inside the implementation task.
+- [x] Add ledger transition-barrier and exact append-or-verify semantics shared by state writers; preserve existing transition behavior when no barrier is active.
+- [x] Add only the narrow `run` and `integrationgate` provenance needed for exact project/plan/run/attempt READY reconstruction and controller/integration-gate provenance.
+- [x] Create network-free `internal/mergelifecycle` controller schemas, immutable limits/configuration, strict canonical recovery, and provider dependency interfaces.
+- [x] Implement Linux authority derivation, safe durable attempt store, counters/reservations, bounded `records/` and `tmp/`, cancellation replay/channel, terminal-intents channel, cleanup incidents, recovery inventory, and fail-closed non-Linux stubs.
+- [x] Implement controller-only initial authorization/admission, deterministic merge recipe/result-commit preparation, fresh final PR/pagination/policy revalidation under shared locks, authorization-seal fsync linearization, target commitment/barrier, and exactly one fake target submission.
+- [x] Implement full-input reconciliation, typed APPLIED/NOT_APPLIED/UNKNOWN handling, cancellation precedence, descendant-aware post-merge acceptance, and exact READY_FOR_MERGE -> MERGED/FAILED/CANCELLED terminal/event append-or-verify recovery.
+- [x] Ensure valid applied result plus durable post-merge proof immediately persists irreversible MERGED intent/event before cleanup; every later cleanup failure is local-only with zero provider retries and no second transition.
+- [x] Add deterministic fake-provider, concurrency, authority/policy, cumulative-budget, cancellation, storage-integrity, crash-boundary, reconciliation, ledger-ambiguity, post-merge and terminal-order adversarial tests. Use deterministic synchronization rather than sleeps.
+- [x] Prove no Task-3 dependency: Task-2 production files contain no `net/http`, `api.github.com`, `/graphql`, ordinary PR merge endpoint, REST ref-update implementation, credentials, `httptest`, or live conformance logic; `go list -deps ./internal/mergelifecycle` must not contain `net/http`.
+- [x] Run gofmt, Task-2 package tests, repeated concurrency/crash tests, race tests, full repository tests/vet, non-Linux compile-only validation, scope checks and `git diff --check`.
+- [x] Commit implementation and move this plan to `docs/plans/completed/` only after all implementation-owned checks pass. Do not claim deterministic ABCP acceptance or exact-head review inside the implementation task.
 
 ## Required deterministic gates
 
