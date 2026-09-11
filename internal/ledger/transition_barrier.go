@@ -53,6 +53,9 @@ func (l *JSONLLedger) AcquireRunTransition(runID string) (*RunTransitionLease, e
 	if l == nil || !safeBarrierRunID.MatchString(runID) {
 		return nil, errors.New("valid ledger and run ID are required")
 	}
+	if err := l.verifyPhysicalIdentity(); err != nil {
+		return nil, err
+	}
 	file, err := l.acquireRunTransitionFile(runID)
 	if err != nil {
 		return nil, err
@@ -77,8 +80,14 @@ func (l *RunTransitionLease) Close() error {
 }
 
 func (l *JSONLLedger) acquireRunTransitionFile(runID string) (*os.File, error) {
+	if err := l.verifyPhysicalIdentity(); err != nil {
+		return nil, err
+	}
 	directory := l.path + ".run-locks"
 	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return nil, err
+	}
+	if err := verifyLedgerControlDirectory(directory); err != nil {
 		return nil, err
 	}
 	sum := sha256.Sum256([]byte(runID))
@@ -86,6 +95,12 @@ func (l *JSONLLedger) acquireRunTransitionFile(runID string) (*os.File, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
+	}
+	info, statErr := file.Stat()
+	nameInfo, nameErr := os.Lstat(path)
+	if statErr != nil || nameErr != nil || nameInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, nameInfo) || verifyLedgerFileInfo(info) != nil {
+		_ = file.Close()
+		return nil, errors.Join(errors.New("run-transition lock is unsafe"), statErr, nameErr)
 	}
 	if err := lockLedgerFile(file, ledgerFileLockWait); err != nil {
 		_ = file.Close()
@@ -146,6 +161,9 @@ func (l *JSONLLedger) InstallTransitionBarrier(barrier TransitionBarrier) error 
 	if l == nil || barrier.Validate() != nil {
 		return errors.New("valid transition barrier and ledger are required")
 	}
+	if err := l.verifyPhysicalIdentity(); err != nil {
+		return err
+	}
 	file, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
@@ -154,25 +172,28 @@ func (l *JSONLLedger) InstallTransitionBarrier(barrier TransitionBarrier) error 
 	return l.WithFileLock(file, func() error {
 		path := l.barrierPath(barrier.RunID)
 		data, _ := json.Marshal(barrier)
-		existing, err := os.ReadFile(path)
-		if err == nil {
-			if !bytes.Equal(existing, data) {
+		if err := os.MkdirAll(l.barrierDirectory(), 0o700); err != nil {
+			return err
+		}
+		if err := verifyLedgerControlDirectory(l.barrierDirectory()); err != nil {
+			return err
+		}
+		active, found, err := l.readBarrier(barrier.RunID)
+		if err != nil {
+			return err
+		}
+		if found {
+			if active.SHA256 != barrier.SHA256 {
 				return errors.New("a conflicting transition barrier is active")
 			}
 			return nil
 		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		if err := os.MkdirAll(l.barrierDirectory(), 0o700); err != nil {
-			return err
-		}
 		temporary := path + ".new"
-		if staged, err := os.ReadFile(temporary); err == nil {
+		if staged, err := readSafeBarrierFile(temporary); err == nil {
 			if !bytes.Equal(staged, data) {
 				return errors.New("a conflicting staged transition barrier exists")
 			}
-			if err := os.Rename(temporary, path); err != nil {
+			if err := publishNoReplace(temporary, path); err != nil {
 				return err
 			}
 			return syncDirectory(l.barrierDirectory())
@@ -189,7 +210,7 @@ func (l *JSONLLedger) InstallTransitionBarrier(barrier TransitionBarrier) error 
 		if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
 			return err
 		}
-		if err := os.Rename(temporary, path); err != nil {
+		if err := publishNoReplace(temporary, path); err != nil {
 			return err
 		}
 		return syncDirectory(l.barrierDirectory())
@@ -199,6 +220,9 @@ func (l *JSONLLedger) InstallTransitionBarrier(barrier TransitionBarrier) error 
 func (l *JSONLLedger) ActiveTransitionBarrier(runID string) (TransitionBarrier, bool, error) {
 	if l == nil || !safeBarrierRunID.MatchString(runID) {
 		return TransitionBarrier{}, false, errors.New("valid ledger and run ID are required")
+	}
+	if err := l.verifyPhysicalIdentity(); err != nil {
+		return TransitionBarrier{}, false, err
 	}
 	file, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -220,6 +244,9 @@ func (l *JSONLLedger) ActiveTransitionBarrier(runID string) (TransitionBarrier, 
 func (l *JSONLLedger) ResolveTransitionBarrier(barrier TransitionBarrier) error {
 	if l == nil || barrier.Validate() != nil {
 		return errors.New("valid transition barrier and ledger are required")
+	}
+	if err := l.verifyPhysicalIdentity(); err != nil {
+		return err
 	}
 	file, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -262,12 +289,29 @@ func (l *JSONLLedger) authorizeTransition(event Event, supplied string) error {
 }
 
 func (l *JSONLLedger) readBarrier(runID string) (TransitionBarrier, bool, error) {
-	data, err := os.ReadFile(l.barrierPath(runID))
+	path := l.barrierPath(runID)
+	if err := verifyLedgerControlDirectory(l.barrierDirectory()); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return TransitionBarrier{}, false, nil
+		}
+		return TransitionBarrier{}, false, err
+	}
+	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return TransitionBarrier{}, false, nil
 	}
 	if err != nil {
 		return TransitionBarrier{}, false, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	nameInfo, nameErr := os.Lstat(path)
+	if err != nil || nameErr != nil || !os.SameFile(info, nameInfo) || verifyLedgerFileInfo(info) != nil {
+		return TransitionBarrier{}, false, errors.Join(errors.New("active transition barrier is unsafe or replaced"), err, nameErr)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxLedgerLineBytes+1))
+	if err != nil || len(data) > maxLedgerLineBytes {
+		return TransitionBarrier{}, false, errors.Join(errors.New("active transition barrier is unreadable or oversized"), err)
 	}
 	b, err := ParseTransitionBarrier(data)
 	if err != nil || b.RunID != runID {
@@ -291,10 +335,64 @@ func validHexDigest(value string) bool {
 }
 
 func syncDirectory(path string) error {
+	if err := verifyLedgerControlDirectory(path); err != nil {
+		return err
+	}
 	dir, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+func verifyLedgerControlDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 || !ledgerInfoOwnedByEffectiveUser(info) {
+		return errors.New("ledger control directory is unsafe")
+	}
+	resolved, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer resolved.Close()
+	resolvedInfo, err := resolved.Stat()
+	if err != nil || !os.SameFile(info, resolvedInfo) {
+		return errors.Join(errors.New("ledger control directory was replaced"), err)
+	}
+	return nil
+}
+
+func readSafeBarrierFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	nameInfo, nameErr := os.Lstat(path)
+	if err != nil || nameErr != nil || !os.SameFile(info, nameInfo) || verifyLedgerFileInfo(info) != nil {
+		return nil, errors.Join(errors.New("transition barrier staging file is unsafe or replaced"), err, nameErr)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxLedgerLineBytes+1))
+	if err != nil || len(data) > maxLedgerLineBytes {
+		return nil, errors.Join(errors.New("transition barrier staging file is unreadable or oversized"), err)
+	}
+	return data, nil
+}
+
+// publishNoReplace atomically adds the destination name without ever replacing
+// an entry won by another process. Linking keeps this portable; removing the
+// staging name after the link leaves the published barrier singly linked.
+func publishNoReplace(temporary, destination string) error {
+	if err := os.Link(temporary, destination); err != nil {
+		return err
+	}
+	if err := os.Remove(temporary); err != nil {
+		return err
+	}
+	return nil
 }

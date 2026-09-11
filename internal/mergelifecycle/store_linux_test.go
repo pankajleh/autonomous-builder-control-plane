@@ -71,7 +71,8 @@ func TestCumulativeCounterLimitsExactAndPlusOne(t *testing.T) {
 		PostMergeCalls: limits.postMergeCalls, ReconciliationRounds: limits.reconciliationRounds,
 		ReconciliationCalls: limits.reconciliationCalls, TotalProviderCalls: limits.providerCalls,
 		CumulativeRequestBytes: limits.cumulativeRequestBytes, CumulativeHeaderBytes: limits.cumulativeHeaderBytes,
-		CumulativeResponseBytes: limits.cumulativeResponseBytes, CumulativeCallNanos: int64(limits.cumulativeProviderTime)}
+		CumulativeCompressedBytes: limits.cumulativeCompressedBytes, CumulativeDecompressedBytes: limits.cumulativeDecompressedBytes,
+		CumulativeCallNanos: int64(limits.cumulativeProviderTime), LastInvocationNanos: int64(limits.invocationTimeout)}
 	if err := exact.validate(limits); err != nil {
 		t.Fatalf("exact cumulative limits failed: %v", err)
 	}
@@ -88,8 +89,10 @@ func TestCumulativeCounterLimitsExactAndPlusOne(t *testing.T) {
 		{"provider calls", func(c *Counters) { c.TotalProviderCalls++ }},
 		{"request bytes", func(c *Counters) { c.CumulativeRequestBytes++ }},
 		{"header bytes", func(c *Counters) { c.CumulativeHeaderBytes++ }},
-		{"response bytes", func(c *Counters) { c.CumulativeResponseBytes++ }},
+		{"compressed response bytes", func(c *Counters) { c.CumulativeCompressedBytes++ }},
+		{"decompressed response bytes", func(c *Counters) { c.CumulativeDecompressedBytes++ }},
 		{"provider time", func(c *Counters) { c.CumulativeCallNanos++ }},
+		{"invocation time", func(c *Counters) { c.LastInvocationNanos++ }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -99,5 +102,32 @@ func TestCumulativeCounterLimitsExactAndPlusOne(t *testing.T) {
 				t.Fatal("limit+1 counter was accepted")
 			}
 		})
+	}
+}
+
+func TestStateNamespaceReplacementFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newDurableStore(root, productionLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	channels := root + "/channels"
+	if err := os.Rename(channels, channels+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(channels, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(`{"state":"replacement"}`)
+	if _, err := store.appendChannel("terminal-intents", "replacement", digest(data), data, MaxTerminalRecordBytes); err == nil {
+		t.Fatal("replacement channel namespace was followed")
+	}
+	entries, err := os.ReadDir(channels)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("replacement namespace was mutated: entries=%v err=%v", entries, err)
 	}
 }

@@ -55,12 +55,12 @@ There is exactly one implementation task in this plan. It must close all nine ro
 
 ### Task 1: Close exact Task-2 review findings C-01 + M-01…M-08
 
-- [ ] Implement the root-cause corrections for all nine matrix rows without editing frozen Task-1 contracts.
-- [ ] Add deterministic regression tests named/tagged or otherwise directly traceable to every matrix ID.
-- [ ] Prove every matrix row's mandatory evidence independently; passing generic package tests alone is insufficient.
-- [ ] Run Task-2 focused tests, repeated crash/concurrency tests, race tests, Task-1 regression, full repository tests/vet, smoke with VCS stamping disabled in metadata-free checkout, non-Linux compile-only, scope/frozen-contract/network-free/dependency/diff checks.
-- [ ] Emit a correction evidence manifest mapping all 9/9 IDs to exact test commands/results before committing.
-- [ ] Commit exactly one correction implementation commit after all 9/9 rows pass; move this plan to `docs/plans/completed/` in that same commit.
+- [x] Implement the root-cause corrections for all nine matrix rows without editing frozen Task-1 contracts.
+- [x] Add deterministic regression tests named/tagged or otherwise directly traceable to every matrix ID.
+- [x] Prove every matrix row's mandatory evidence independently; passing generic package tests alone is insufficient.
+- [x] Run Task-2 focused tests, repeated crash/concurrency tests, race tests, Task-1 regression, full repository tests/vet, smoke with VCS stamping disabled in metadata-free checkout, non-Linux compile-only, scope/frozen-contract/network-free/dependency/diff checks.
+- [x] Emit a correction evidence manifest mapping all 9/9 IDs to exact test commands/results before committing.
+- [x] Commit exactly one correction implementation commit after all 9/9 rows pass; move this plan to `docs/plans/completed/` in that same commit.
 
 ## Completion gate
 

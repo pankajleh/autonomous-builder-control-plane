@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
@@ -22,15 +23,19 @@ type Config struct {
 }
 
 type Controller struct {
-	ledger         *ledger.JSONLLedger
-	source         AuthoritySource
-	cancellations  CancellationSource
-	provider       Provider
-	store          *durableStore
-	limits         Limits
-	contracts      githublifecycle.Limits
-	now            func() time.Time
-	beforeTerminal func(*attemptStore) error
+	ledger                   *ledger.JSONLLedger
+	source                   AuthoritySource
+	cancellations            CancellationSource
+	provider                 Provider
+	store                    *durableStore
+	limits                   Limits
+	contracts                githublifecycle.Limits
+	now                      func() time.Time
+	beforeTerminal           func(*attemptStore) error
+	afterTerminalCore        func(TerminalCoreV1) error
+	afterTerminalEvent       func(TerminalCoreV1) error
+	afterCancellationIndexed func() error
+	afterTargetOutcome       func(TargetOutcome) error
 }
 
 func New(config Config) (*Controller, error) {
@@ -79,15 +84,33 @@ func (c *Controller) Execute(ctx context.Context, request ExecuteRequest) (Resul
 	if governed.Phase3Authority.RunID() != request.RunID {
 		return zero, wrap(CodeInvalidAuthority, false, "", errors.New("authority source returned a different run"))
 	}
+	identified, identificationErr := scanReadyLedger(ledgerBytes, governed.ProjectID, governed.PlanID, request.RunID, governed.AttemptID, c.contracts.MaxLedgerScanRecords)
+	if identificationErr != nil {
+		return zero, wrap(CodeInvalidAuthority, false, "", identificationErr)
+	}
 	assembled, err := assembleAuthority(governed, ledgerBytes, ledgerID, c.contracts)
 	if err != nil {
+		if identified.current == domain.StateReadyForMerge {
+			result, terminalErr := c.terminalizeIdentifiedAuthorityFailure(lease, governed, identified)
+			return result, errors.Join(wrap(CodeInvalidAuthority, false, result.AttemptID, err), terminalErr)
+		}
 		return zero, wrap(CodeInvalidAuthority, false, "", err)
 	}
+	repositoryLease, err := c.store.acquireRepositoryBase(repositoryBaseLockKey(assembled))
+	if err != nil {
+		return zero, wrap(CodeLocalStorageIntegrityFailure, false, "", err)
+	}
+	defer repositoryLease.close()
 	if assembled.ledgerState.current != domain.StateReadyForMerge {
 		if terminal, ok := existingTerminal(assembled.ledgerState); ok {
-			return c.recoverTerminal(assembled, terminal)
+			return c.recoverTerminal(invocation, assembled, terminal)
 		}
 		return zero, wrap(CodeStaleReadyAuthority, false, "", errors.New("READY is not current"))
+	}
+	if core, coreBytes, coreSHA, found, findErr := c.store.findTerminalCore(request.RunID); findErr != nil {
+		return zero, wrap(CodeLocalStorageIntegrityFailure, false, "", findErr)
+	} else if found {
+		return c.finishSelectedTerminal(invocation, lease, assembled, core, coreBytes, coreSHA)
 	}
 	writeID := deterministicWriteID(assembled)
 	key := attemptKey(assembled, writeID)
@@ -100,6 +123,9 @@ func (c *Controller) Execute(ctx context.Context, request ExecuteRequest) (Resul
 }
 
 func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransitionLease, assembled assembledAuthority, attempt *attemptStore, writeID string) (Result, error) {
+	if result, handled, err := c.recoverIndexedCancellation(ctx, lease, assembled, attempt, writeID); handled || err != nil {
+		return result, err
+	}
 	mergeInput, found, err := c.loadAdmission(attempt)
 	if err != nil {
 		return Result{}, wrap(CodeLocalStorageIntegrityFailure, false, writeID, err)
@@ -108,13 +134,13 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 		if _, err := attempt.reserveCounter("pre-submit"); err != nil {
 			return c.failBeforeSubmission(lease, assembled, attempt, writeID, CodeAuthorizationFailed, err)
 		}
-		initial, err := c.observe(ctx, ObservationInitial, assembled.authority)
+		initial, err := c.observe(ctx, attempt, ObservationInitial, assembled.authority)
 		if err != nil {
-			return c.failBeforeSubmission(lease, assembled, attempt, writeID, CodeAuthorizationFailed, err)
+			return c.failBeforeSubmission(lease, assembled, attempt, writeID, classifyAuthorizationFailure(err), err)
 		}
 		recipe, err := githublifecycle.NewMergeCommitRecipeV1(writeID, assembled.authority, c.contracts)
 		if err != nil {
-			return c.failBeforeSubmission(lease, assembled, attempt, writeID, CodeUnsupportedMergeMethod, err)
+			return c.failBeforeSubmission(lease, assembled, attempt, writeID, CodeUnsupportedAtomicCAS, err)
 		}
 		decision := digest(bytes.Join([][]byte{assembled.policy.CanonicalJSON(), initial.PullRequest.CanonicalJSON(),
 			initial.CheckRunsClosure.CanonicalJSON(), initial.CommitStatusClosure.CanonicalJSON()}, nil))
@@ -157,19 +183,29 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 		if err != nil {
 			return c.failBeforeSubmission(lease, assembled, attempt, writeID, CodeAuthorizationFailed, err)
 		}
-		callContext, callCancel := context.WithTimeout(ctx, c.limits.providerCallTimeout)
+		callContext, callCancel, budgetErr := c.providerCallContext(ctx, attempt)
+		if budgetErr != nil {
+			return Result{State: domain.StateReadyForMerge, AttemptID: writeID, Unresolved: true}, wrap(CodeTargetUnknown, true, writeID, budgetErr)
+		}
 		outcome, callErr := c.provider.SubmitTarget(callContext, execution)
 		callCancel()
+		fallbackEvidence := []ledger.EvidenceRef{localEvidence(attempt, "target-submission.json", submission.CanonicalJSON(), "target-submission")}
 		if callErr != nil {
-			outcome = TargetOutcome{Disposition: githublifecycle.ReconciliationUnknown, RequestBytes: 1,
-				EvidenceRefs: []ledger.EvidenceRef{localEvidence(attempt, "target-submission.json", submission.CanonicalJSON(), "target-submission")}}
+			outcome = unknownTargetOutcome(outcome.Accounting, submission.RequestBodyBytes(), fallbackEvidence)
 		}
 		if err := c.validateTargetOutcome(sealed, submission, outcome); err != nil {
-			outcome = TargetOutcome{Disposition: githublifecycle.ReconciliationUnknown, RequestBytes: max64(1, outcome.RequestBytes),
-				EvidenceRefs: []ledger.EvidenceRef{localEvidence(attempt, "target-submission.json", submission.CanonicalJSON(), "target-submission")}}
+			outcome = unknownTargetOutcome(outcome.Accounting, submission.RequestBodyBytes(), fallbackEvidence)
+		}
+		if accountErr := c.accountProvider(attempt, outcome.Accounting); accountErr != nil {
+			return Result{State: domain.StateReadyForMerge, AttemptID: writeID, Unresolved: true}, wrap(CodeTargetUnknown, true, writeID, accountErr)
 		}
 		if err := c.persistTargetOutcome(attempt, "target-outcome.json", outcome); err != nil {
 			return Result{State: domain.StateReadyForMerge, AttemptID: writeID, Unresolved: true}, wrap(CodeTargetUnknown, true, writeID, err)
+		}
+		if c.afterTargetOutcome != nil {
+			if err := c.afterTargetOutcome(outcome); err != nil {
+				return Result{State: domain.StateReadyForMerge, AttemptID: writeID, Unresolved: true}, err
+			}
 		}
 		return c.settle(ctx, lease, assembled, attempt, sealed, submission, barrier, outcome)
 	}
@@ -187,9 +223,16 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 		if err != nil {
 			return Result{}, err
 		}
-		callContext, cancel := context.WithTimeout(ctx, c.limits.providerCallTimeout)
-		postMerge, err = c.provider.ObservePostMerge(callContext, observeInput)
+		callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+		if budgetErr != nil {
+			return Result{}, budgetErr
+		}
+		postOutcome, observeErr := c.provider.ObservePostMerge(callContext, observeInput)
 		cancel()
+		if accountErr := c.accountProvider(attempt, postOutcome.Accounting); accountErr != nil {
+			return Result{}, accountErr
+		}
+		postMerge, err = postOutcome.Observation, observeErr
 		if err != nil || githublifecycle.VerifyPostMerge(sealed, mergeResult, postMerge, c.contracts) != nil {
 			return c.terminalize(lease, assembled, attempt, terminalSelection{sealed: sealed, submission: submission, mergeResult: mergeResult,
 				destination: domain.StateFailed, reason: CodePostMergeAcceptanceFailed, barrier: &barrier})
@@ -203,21 +246,75 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 	return c.reconcile(ctx, lease, assembled, attempt, sealed, submission, barrier)
 }
 
-func (c *Controller) observe(ctx context.Context, phase ObservationPhase, authority githublifecycle.Authority) (AuthorizationObservation, error) {
-	callContext, cancel := context.WithTimeout(ctx, c.limits.providerCallTimeout)
+func (c *Controller) recoverIndexedCancellation(ctx context.Context, lease *ledger.RunTransitionLease, assembled assembledAuthority, attempt *attemptStore, writeID string) (Result, bool, error) {
+	durable, expectation, found, err := c.indexedCancellation(ctx, assembled, attempt)
+	if err != nil || !found {
+		return Result{}, false, err
+	}
+	authority := durable.Authority()
+	boundary := authority.Input().Boundary
+	if boundary == githublifecycle.CancellationTargetSubmissionUnknown {
+		if _, _, err := attempt.publish("pending-cancellation.json", durable.CanonicalJSON()); err != nil {
+			return Result{}, true, err
+		}
+		return Result{}, false, nil
+	}
+	var proof githublifecycle.NotAppliedProofV1
+	proofs := []githublifecycle.NotAppliedProofV1(nil)
+	if bound := authority.Input().SubmissionProof.Input().NotAppliedProof; bound != nil {
+		proof = *bound
+		proofs = append(proofs, proof)
+	}
+	if err := githublifecycle.AuthorizeCancelledV1(durable, expectation, githublifecycle.ReconciliationNotApplied, c.contracts, proofs...); err != nil {
+		return Result{}, true, err
+	}
+	reason := CodeCancelledBeforeSubmission
+	if boundary == githublifecycle.CancellationTargetNotApplied && proof.Input().RequestBytes > 0 {
+		reason = CodeCancelledAfterNotApplied
+	}
+	selection := terminalSelection{cancellation: durable, notApplied: proof, destination: domain.StateCancelled,
+		reason: reason, writeID: writeID, selectedUnixNano: authority.Input().ReceiptUnixNano}
+	if boundary == githublifecycle.CancellationTargetNotApplied {
+		sealedData, _, err := attempt.read("sealed-authorization.json")
+		if err != nil {
+			return Result{}, true, err
+		}
+		sealed, err := githublifecycle.ParseCanonicalSealedMergeAuthorizationV1(sealedData, c.contracts)
+		if err != nil {
+			return Result{}, true, err
+		}
+		selection.sealed = sealed
+		if barrier, active, barrierErr := c.ledger.ActiveTransitionBarrier(authority.Input().RunID); barrierErr != nil {
+			return Result{}, true, barrierErr
+		} else if active {
+			selection.barrier = &barrier
+		}
+	}
+	result, err := c.terminalize(lease, assembled, attempt, selection)
+	return result, true, err
+}
+
+func (c *Controller) observe(ctx context.Context, attempt *attemptStore, phase ObservationPhase, authority githublifecycle.Authority) (AuthorizationObservation, error) {
+	callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+	if budgetErr != nil {
+		return AuthorizationObservation{}, typedTerminalFailure(CodeResourceLimitExhausted, budgetErr)
+	}
 	defer cancel()
 	observation, err := c.provider.ObserveAuthorization(callContext, phase, authority)
+	if accountErr := c.accountProvider(attempt, observation.Accounting); accountErr != nil {
+		return observation, typedTerminalFailure(CodeResourceLimitExhausted, accountErr)
+	}
 	if err != nil {
-		return observation, err
+		return observation, typedTerminalFailure(CodePreSubmitUnavailable, err)
 	}
 	if len(observation.EvidenceRefs) == 0 || validateEvidence(observation.EvidenceRefs) != nil || observation.StartedUnixNano <= 0 || observation.CompletedUnixNano < observation.StartedUnixNano {
-		return observation, errors.New("provider authorization observation is incomplete")
+		return observation, typedTerminalFailure(CodePreSubmitUnavailable, errors.New("provider authorization observation is incomplete"))
 	}
 	if err := githublifecycle.ValidateAuthoritativePullRequestSnapshotV1(authority, observation.PullRequest, c.contracts); err != nil {
-		return observation, err
+		return observation, typedTerminalFailure(CodePullRequestIneligible, err)
 	}
 	if err := githublifecycle.EvaluateMergePolicyV1(authority, observation.PullRequest, observation.Checks, observation.CheckRunsClosure, observation.CommitStatusClosure, c.contracts); err != nil {
-		return observation, err
+		return observation, typedTerminalFailure(classifyAuthorizationFailure(err), err)
 	}
 	return observation, nil
 }
@@ -258,24 +355,42 @@ func (c *Controller) ensureCommitPreparation(ctx context.Context, attempt *attem
 		if _, reserveErr := attempt.reserveCounter("reconciliation-call"); reserveErr != nil {
 			return reserveErr
 		}
-		callContext, cancel := context.WithTimeout(ctx, c.limits.providerCallTimeout)
+		callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+		if budgetErr != nil {
+			return budgetErr
+		}
 		preparation, err = c.provider.ReconcileResultCommit(callContext, input.Recipe())
 		cancel()
+		if accountErr := c.accountProvider(attempt, preparation.Accounting); accountErr != nil {
+			return accountErr
+		}
 	} else {
 		if _, err := attempt.reserveCounter("commit-submission"); err != nil {
 			return err
 		}
-		callContext, cancel := context.WithTimeout(ctx, c.limits.providerCallTimeout)
+		callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+		if budgetErr != nil {
+			return budgetErr
+		}
 		preparation, err = c.provider.PrepareResultCommit(callContext, input.Recipe())
 		cancel()
+		if accountErr := c.accountProvider(attempt, preparation.Accounting); accountErr != nil {
+			return accountErr
+		}
 		if err != nil {
 			// The marker removes retry authority. Reconciliation is read-only.
 			if _, reserveErr := attempt.reserveCounter("reconciliation-call"); reserveErr != nil {
 				return errors.Join(err, reserveErr)
 			}
-			callContext, cancel = context.WithTimeout(ctx, c.limits.providerCallTimeout)
+			callContext, cancel, budgetErr = c.providerCallContext(ctx, attempt)
+			if budgetErr != nil {
+				return budgetErr
+			}
 			preparation, err = c.provider.ReconcileResultCommit(callContext, input.Recipe())
 			cancel()
+			if accountErr := c.accountProvider(attempt, preparation.Accounting); accountErr != nil {
+				return accountErr
+			}
 		}
 	}
 	if err != nil || preparation.validate(input.Recipe()) != nil {
@@ -312,7 +427,7 @@ func (c *Controller) ensureSealedSubmission(ctx context.Context, assembled assem
 		if _, err := attempt.reserveCounter("pre-submit"); err != nil {
 			return sealed, submission, false, ledger.TransitionBarrier{}, err
 		}
-		final, err := c.observe(ctx, ObservationFinal, assembled.authority)
+		final, err := c.observe(ctx, attempt, ObservationFinal, assembled.authority)
 		if err != nil {
 			return sealed, submission, false, ledger.TransitionBarrier{}, err
 		}
@@ -380,7 +495,7 @@ func (c *Controller) ensureSealedSubmission(ctx context.Context, assembled assem
 }
 
 func (c *Controller) reconcile(ctx context.Context, lease *ledger.RunTransitionLease, assembled assembledAuthority, attempt *attemptStore, sealed githublifecycle.SealedMergeAuthorizationV1, submission githublifecycle.TargetSubmissionV1, barrier ledger.TransitionBarrier) (Result, error) {
-	if _, err := attempt.reserveCounter("reconciliation-round"); err != nil {
+	if _, err := attempt.reserveReconciliation(c.now().UnixNano()); err != nil {
 		return Result{State: domain.StateReadyForMerge, AttemptID: submission.InvocationID(), Unresolved: true}, wrap(CodeTargetUnknown, true, submission.InvocationID(), err)
 	}
 	if _, err := attempt.reserveCounter("reconciliation-call"); err != nil {
@@ -391,14 +506,20 @@ func (c *Controller) reconcile(ctx context.Context, lease *ledger.RunTransitionL
 	if err != nil {
 		return Result{}, err
 	}
-	callContext, cancel := context.WithTimeout(ctx, c.limits.providerCallTimeout)
+	callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+	if budgetErr != nil {
+		return Result{State: domain.StateReadyForMerge, AttemptID: submission.InvocationID(), Unresolved: true}, wrap(CodeTargetUnknown, true, submission.InvocationID(), budgetErr)
+	}
 	outcome, err := c.provider.ReconcileTarget(callContext, input)
 	cancel()
 	if err != nil {
-		outcome = TargetOutcome{Disposition: githublifecycle.ReconciliationUnknown, RequestBytes: 1, EvidenceRefs: evidence}
+		outcome = unknownTargetOutcome(outcome.Accounting, submission.RequestBodyBytes(), evidence)
 	}
 	if err := c.validateTargetOutcome(sealed, submission, outcome); err != nil {
-		outcome = TargetOutcome{Disposition: githublifecycle.ReconciliationUnknown, RequestBytes: max64(1, outcome.RequestBytes), EvidenceRefs: evidence}
+		outcome = unknownTargetOutcome(outcome.Accounting, submission.RequestBodyBytes(), evidence)
+	}
+	if accountErr := c.accountProvider(attempt, outcome.Accounting); accountErr != nil {
+		return Result{State: domain.StateReadyForMerge, AttemptID: submission.InvocationID(), Unresolved: true}, wrap(CodeTargetUnknown, true, submission.InvocationID(), accountErr)
 	}
 	reconciliation, err := githublifecycle.NewMergeReconciliationResult(sealed, submission, outcome.Disposition, resultPointer(outcome), proofPointer(outcome), outcome.EvidenceRefs, c.contracts)
 	if err != nil {
@@ -423,6 +544,11 @@ func (c *Controller) reconcile(ctx context.Context, lease *ledger.RunTransitionL
 		if err := c.persistTargetOutcome(attempt, "target-reconciliation.json", outcome); err != nil {
 			return Result{}, err
 		}
+		if c.afterTargetOutcome != nil {
+			if err := c.afterTargetOutcome(outcome); err != nil {
+				return Result{State: domain.StateReadyForMerge, AttemptID: submission.InvocationID(), Unresolved: true}, err
+			}
+		}
 	}
 	return c.settle(ctx, lease, assembled, attempt, sealed, submission, barrier, outcome)
 }
@@ -439,7 +565,10 @@ func (c *Controller) settle(ctx context.Context, lease *ledger.RunTransitionLeas
 			if err != nil {
 				return Result{}, err
 			}
-			expected := cancellationExpectation(durable.Authority(), sealed)
+			indexed, expected, indexedFound, err := c.indexedCancellation(ctx, assembled, attempt)
+			if err != nil || !indexedFound || indexed.SHA256() != durable.SHA256() {
+				return Result{}, errors.Join(errors.New("pending cancellation is not independently indexed"), err)
+			}
 			if err := githublifecycle.AuthorizeCancelledV1(durable, expected, githublifecycle.ReconciliationNotApplied, c.contracts, outcome.NotAppliedProof); err != nil {
 				return Result{}, err
 			}
@@ -448,7 +577,7 @@ func (c *Controller) settle(ctx context.Context, lease *ledger.RunTransitionLeas
 				reason: CodeCancelledAfterNotApplied, barrier: &barrier})
 		}
 		return c.terminalize(lease, assembled, attempt, terminalSelection{sealed: sealed, submission: submission, notApplied: outcome.NotAppliedProof,
-			destination: domain.StateFailed, reason: CodeTargetNotApplied, barrier: &barrier})
+			destination: domain.StateFailed, reason: notAppliedReason(outcome.NotAppliedProof), barrier: &barrier})
 	case githublifecycle.ReconciliationApplied:
 		result := outcome.Result
 		if err := githublifecycle.ValidateMergeResult(sealed, result, c.contracts); err != nil {
@@ -465,9 +594,16 @@ func (c *Controller) settle(ctx context.Context, lease *ledger.RunTransitionLeas
 		if err != nil {
 			return Result{}, err
 		}
-		callContext, cancel := context.WithTimeout(ctx, c.limits.providerCallTimeout)
-		post, err := c.provider.ObservePostMerge(callContext, observeInput)
+		callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+		if budgetErr != nil {
+			return Result{}, budgetErr
+		}
+		postOutcome, observeErr := c.provider.ObservePostMerge(callContext, observeInput)
 		cancel()
+		if accountErr := c.accountProvider(attempt, postOutcome.Accounting); accountErr != nil {
+			return Result{}, accountErr
+		}
+		post, err := postOutcome.Observation, observeErr
 		if err != nil || githublifecycle.VerifyPostMerge(sealed, result, post, c.contracts) != nil {
 			return c.terminalize(lease, assembled, attempt, terminalSelection{sealed: sealed, submission: submission, mergeResult: result,
 				destination: domain.StateFailed, reason: CodePostMergeAcceptanceFailed, barrier: &barrier})
@@ -485,7 +621,8 @@ func (c *Controller) settle(ctx context.Context, lease *ledger.RunTransitionLeas
 }
 
 func (c *Controller) validateTargetOutcome(sealed githublifecycle.SealedMergeAuthorizationV1, submission githublifecycle.TargetSubmissionV1, outcome TargetOutcome) error {
-	if outcome.RequestBytes < 0 || outcome.RequestBytes > c.limits.cumulativeRequestBytes ||
+	if outcome.RequestBytes < 0 || outcome.RequestBytes > c.limits.cumulativeRequestBytes || outcome.Accounting.validate() != nil ||
+		outcome.Accounting.RequestBytes != outcome.RequestBytes ||
 		len(outcome.EvidenceRefs) > c.contracts.MaxEvidenceRefs || validateEvidence(outcome.EvidenceRefs) != nil {
 		return errors.New("target outcome evidence is invalid")
 	}
@@ -517,7 +654,7 @@ func (c *Controller) persistTargetOutcome(attempt *attemptStore, name string, ou
 }
 
 func canonicalTargetOutcome(outcome TargetOutcome) []byte {
-	record := targetOutcomeRecordV1{Schema: "merge-target-outcome-v1", Disposition: outcome.Disposition, RequestBytes: outcome.RequestBytes, EvidenceRefs: outcome.EvidenceRefs}
+	record := targetOutcomeRecordV1{Schema: "merge-target-outcome-v1", Disposition: outcome.Disposition, RequestBytes: outcome.RequestBytes, EvidenceRefs: outcome.EvidenceRefs, Accounting: outcome.Accounting}
 	if outcome.Result.SHA256() != "" {
 		record.Result, record.ResultSHA256 = outcome.Result.CanonicalJSON(), outcome.Result.SHA256()
 	}
@@ -526,6 +663,14 @@ func canonicalTargetOutcome(outcome TargetOutcome) []byte {
 	}
 	data, _ := json.Marshal(record)
 	return data
+}
+
+func unknownTargetOutcome(accounting ProviderAccountingV1, requestBytes int64, evidence []ledger.EvidenceRef) TargetOutcome {
+	if accounting.RequestBytes <= 0 {
+		accounting.RequestBytes = requestBytes
+	}
+	return TargetOutcome{Disposition: githublifecycle.ReconciliationUnknown, RequestBytes: accounting.RequestBytes,
+		EvidenceRefs: evidence, Accounting: accounting}
 }
 
 func (c *Controller) loadAdmission(attempt *attemptStore) (githublifecycle.MergeInput, bool, error) {
@@ -553,8 +698,46 @@ func (c *Controller) persistAdmission(attempt *attemptStore, assembled assembled
 }
 
 func (c *Controller) failBeforeSubmission(lease *ledger.RunTransitionLease, assembled assembledAuthority, attempt *attemptStore, writeID, reason string, cause error) (Result, error) {
+	if reason == CodeAuthorizationFailed {
+		reason = classifyAuthorizationFailure(cause)
+	}
 	result, terminalErr := c.terminalize(lease, assembled, attempt, terminalSelection{destination: domain.StateFailed, reason: reason, writeID: writeID})
 	return result, errors.Join(wrap(reason, false, writeID, cause), terminalErr)
+}
+
+func classifyAuthorizationFailure(err error) string {
+	var classified *terminalFailureError
+	if errors.As(err, &classified) && legalTerminalReason(domain.StateFailed, classified.reason) {
+		return classified.reason
+	}
+	message := strings.ToLower(fmt.Sprint(err))
+	switch {
+	case strings.Contains(message, "pagination"), strings.Contains(message, "closure"):
+		return CodePaginationInvalid
+	case strings.Contains(message, "pull request"), strings.Contains(message, "draft"), strings.Contains(message, "merged"):
+		return CodePullRequestIneligible
+	case strings.Contains(message, "policy"), strings.Contains(message, "review"), strings.Contains(message, "check"):
+		return CodeAuthorizationFailed
+	case strings.Contains(message, "capability"), strings.Contains(message, "atomic"):
+		return CodeUnsupportedAtomicCAS
+	case strings.Contains(message, "budget"), strings.Contains(message, "limit"):
+		return CodeResourceLimitExhausted
+	default:
+		return CodePreSubmitUnavailable
+	}
+}
+
+func notAppliedReason(proof githublifecycle.NotAppliedProofV1) string {
+	switch proof.Input().Kind {
+	case githublifecycle.NotAppliedAtomicBaseRejected:
+		return CodeTargetNotAppliedBase
+	case githublifecycle.NotAppliedAtomicHeadRejected:
+		return CodeTargetNotAppliedHead
+	case githublifecycle.NotAppliedZeroRequestBytes:
+		return CodeTargetNotSubmitted
+	default:
+		return CodeTargetNotAppliedRefs
+	}
 }
 
 func authorizationCounters(input githublifecycle.MergeInput, final AuthorizationObservation, ledgerBytes []byte) githublifecycle.AuthorizationCountersV1 {
@@ -654,11 +837,21 @@ func proofPointer(outcome TargetOutcome) *githublifecycle.NotAppliedProofV1 {
 	}
 	return &outcome.NotAppliedProof
 }
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
+func (c *Controller) accountProvider(attempt *attemptStore, accounting ProviderAccountingV1) error {
+	if accounting.InvocationNanos == 0 {
+		accounting.InvocationNanos = accounting.ActiveNanos
 	}
-	return b
+	_, err := attempt.accountProvider(accounting)
+	return err
+}
+
+func (c *Controller) providerCallContext(parent context.Context, attempt *attemptStore) (context.Context, context.CancelFunc, error) {
+	budget, err := attempt.providerBudget()
+	if err != nil {
+		return nil, func() {}, err
+	}
+	callContext, cancel := context.WithTimeout(parent, c.limits.providerCallTimeout)
+	return context.WithValue(callContext, providerBudgetContextKey{}, budget), cancel, nil
 }
 
 func existingTerminal(state readyLedgerState) (Result, bool) {

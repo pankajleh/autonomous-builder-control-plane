@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"reflect"
 	"strings"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
@@ -78,6 +81,9 @@ func assembleAuthority(governed GovernedAuthority, ledgerBytes []byte, ledgerID 
 		expected.SourceIntegrationEvidence() != governed.ExpectedContent.SourceIntegrationEvidence() {
 		return result, errors.New("expected merge content changed during reconstruction")
 	}
+	if err := verifyAuthorityEvidence(governed, state.event.EvidenceRefs, expected.SourceIntegrationEvidence()); err != nil {
+		return result, fmt.Errorf("verify controller authority evidence: %w", err)
+	}
 	readyInput := githublifecycle.ReadyAuthorityBindingV1Input{
 		Phase3AuthorityJSON: phase3JSON, Phase3AuthoritySHA256: digest(phase3JSON), ProjectID: governed.ProjectID,
 		PlanID: governed.PlanID, RunID: phase3.RunID(), AttemptID: governed.AttemptID, AcceptedSources: governed.AcceptedSources,
@@ -122,6 +128,82 @@ func assembleAuthority(governed GovernedAuthority, ledgerBytes []byte, ledgerID 
 	}
 	result = assembledAuthority{governed, repository, ready, policy, value, state, append([]byte(nil), ledgerBytes...), ledgerID}
 	return result, nil
+}
+
+func verifyAuthorityEvidence(governed GovernedAuthority, readyRefs []ledger.EvidenceRef, readyDecision ledger.EvidenceRef) error {
+	if governed.EvidenceRoot == "" || len(governed.EvidenceClosure) == 0 || len(governed.EvidenceClosure) > 256 {
+		return errors.New("controller evidence root or READY closure is missing")
+	}
+	if governed.RepositoryBinding.ConfigurationEvidence.Kind != "repository-binding" || governed.Policy.SourceConfiguration.Kind != "merge-policy" ||
+		readyDecision.Kind != "serial-integration-gate-decision" {
+		return errors.New("repository, policy, or READY artifact has the wrong canonical kind")
+	}
+	readyIncluded := false
+	for _, ref := range readyRefs {
+		readyIncluded = readyIncluded || ref == readyDecision
+	}
+	if !readyIncluded {
+		return errors.New("READY decision is not carried by the exact READY transition")
+	}
+	required := []ledger.EvidenceRef{governed.RepositoryBinding.ConfigurationEvidence, governed.Policy.SourceConfiguration, readyDecision}
+	required = append(required, readyRefs...)
+	for _, source := range governed.AcceptedSources {
+		required = append(required, source.AcceptanceEvidence...)
+	}
+	closure := make(map[string]struct{}, len(governed.EvidenceClosure))
+	var cumulative int64
+	for _, ref := range governed.EvidenceClosure {
+		key := evidenceKey(ref)
+		if key == "" {
+			return errors.New("READY evidence closure contains an invalid identity")
+		}
+		if _, duplicate := closure[key]; duplicate {
+			return errors.New("READY evidence closure contains a duplicate identity")
+		}
+		closure[key] = struct{}{}
+		if err := verifyEvidenceMetadata(ref.URI); err != nil {
+			return err
+		}
+		data, err := evidence.ReadVerifiedLocal(governed.EvidenceRoot, ref, 16<<20)
+		if err != nil {
+			return err
+		}
+		cumulative += int64(len(data))
+		if cumulative > 64<<20 {
+			return errors.New("READY evidence closure byte bound exceeded")
+		}
+	}
+	for _, ref := range required {
+		if _, ok := closure[evidenceKey(ref)]; !ok {
+			return errors.New("authority-bearing artifact is omitted from the READY closure")
+		}
+	}
+	return nil
+}
+
+func evidenceKey(ref ledger.EvidenceRef) string {
+	if ref.URI == "" || ref.Kind == "" || !validDigest(ref.SHA256) {
+		return ""
+	}
+	return ref.URI + "\x00" + ref.SHA256 + "\x00" + ref.Kind
+}
+
+func verifyEvidenceMetadata(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.Join(errors.New("authority evidence must be a no-follow regular file"), err)
+	}
+	value := reflect.Indirect(reflect.ValueOf(info.Sys()))
+	if !value.IsValid() {
+		return errors.New("authority evidence physical identity is unavailable")
+	}
+	if field := value.FieldByName("Nlink"); field.IsValid() && field.Uint() != 1 {
+		return errors.New("authority evidence must not be hard linked")
+	}
+	if field := value.FieldByName("Uid"); field.IsValid() && field.Uint() != uint64(os.Geteuid()) {
+		return errors.New("authority evidence is not controller-owned")
+	}
+	return nil
 }
 
 func scanReadyLedger(data []byte, projectID, planID, runID, attemptID string, maxRecords int) (readyLedgerState, error) {
@@ -218,4 +300,11 @@ func attemptKey(a assembledAuthority, writeID string) string {
 		a.governed.Phase3Authority.RunID(), a.ready.Input().ReadyEventID, a.ready.Input().ReadyEventSHA256, authorityDigest(a.authority), writeID}, "\x00")
 	sum := sha256.Sum256([]byte(payload))
 	return fmt.Sprintf("%x", sum[:])
+}
+
+func repositoryBaseLockKey(a assembledAuthority) string {
+	input := a.repository.Input()
+	payload := strings.Join([]string{"merge-repository-base-lock-v1", input.GitHubRepository.String(), input.GitHubRepositoryNodeID,
+		fmt.Sprintf("%d", input.GitHubRepositoryDatabaseID), "refs/heads/" + a.governed.BaseBranch.String()}, "\x00")
+	return digest([]byte(payload))
 }

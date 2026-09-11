@@ -490,7 +490,14 @@ func newControllerFixture(t *testing.T) controllerFixture {
 	headBranch, _ := githublifecycle.NewBranch("feature/exact-head")
 	pr, _ := githublifecycle.NewPullRequestIdentity(17, "PR_node_17")
 	actor, _ := githublifecycle.NewAppInstallationIdentity("github-app:builder", 90210)
-	configRef := evidenceRef("repository-binding", "a")
+	configRef, err := writer.WriteBytes("repository-binding.json", "repository-binding", []byte(`{"repository":"octo-org/control-plane"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyRef, err := writer.WriteBytes("merge-policy.json", "merge-policy", []byte(`{"policy":"merge-v1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	capability, err := githublifecycle.NewProviderCapabilityV1(githublifecycle.ProviderCapabilityV1Input{
 		Name: githublifecycle.GitHubAtomicBaseHeadCapabilityV1, RepositoryNodeID: "R_repo", APIVersion: githublifecycle.GitHubAPIVersionV1,
 		Atomic: true, AllOrNothing: true, SupportsNoOp: true, BaseThenHeadOrder: true, ForceFalse: true, EvidenceRefs: []ledger.EvidenceRef{configRef},
@@ -520,9 +527,9 @@ func newControllerFixture(t *testing.T) controllerFixture {
 		AcceptedSources:   []githublifecycle.AcceptedSourceCandidateV1{{ProjectID: "source-project", PlanID: "source-plan", RunID: "source-run", AttemptID: "source-attempt", RepositoryIdentity: "octo-org/control-plane", Branch: headBranch.String(), StartSHA: baseSHA, AcceptedHeadSHA: headSHA, AcceptancePolicyIdentity: "accept-v1", AcceptanceEvidence: []ledger.EvidenceRef{readyRef}}},
 		RepositoryBinding: githublifecycle.RepositoryBindingV1Input{Phase3RepositoryIdentity: "octo-org/control-plane", Phase3RepositoryPath: repositoryPath, Phase3CanonicalRemote: "https://github.com/octo-org/control-plane", Phase3StartSHA: base, GitHubRepository: repository, GitHubRepositoryNodeID: "R_repo", GitHubRepositoryDatabaseID: 99, ConfigurationEvidence: configRef},
 		Repository:        repository, BaseBranch: baseBranch, HeadBranch: headBranch, PullRequest: pr, ExpectedContent: expected,
-		Policy: PolicyDefinition{Version: "merge-v1", SourceConfiguration: evidenceRef("merge-policy", "f"), RequiredPrincipal: actor,
+		Policy: PolicyDefinition{Version: "merge-v1", SourceConfiguration: policyRef, RequiredPrincipal: actor,
 			Recipe: githublifecycle.MergeCommitRecipePolicyV1{MessageTemplate: "Merge authorized head", TrailerTemplate: "ABCP-Write-ID", Author: identity, Committer: identity, TimestampDerivation: "ready-event-time", ObjectFormat: "sha1", OrderedParents: true}},
-		ProviderCapability: capability, EvidenceClosure: []ledger.EvidenceRef{readyRef, configRef},
+		ProviderCapability: capability, EvidenceClosure: []ledger.EvidenceRef{readyRef, configRef, policyRef}, EvidenceRoot: evidenceRoot,
 	}
 	stateRoot := t.TempDir()
 	if err := os.Chmod(stateRoot, 0o700); err != nil {
@@ -546,19 +553,23 @@ func (f controllerFixture) controller(t *testing.T, provider Provider) *Controll
 }
 
 type fakeProvider struct {
-	t                    *testing.T
-	mu                   sync.Mutex
-	disposition          githublifecycle.ReconciliationDisposition
-	reconcileDisposition githublifecycle.ReconciliationDisposition
-	prepareCalls         int
-	submitCalls          int
-	reconcileCalls       int
-	postMergeCalls       int
-	observeCalls         int
-	descendant           bool
+	t                     *testing.T
+	mu                    sync.Mutex
+	disposition           githublifecycle.ReconciliationDisposition
+	reconcileDisposition  githublifecycle.ReconciliationDisposition
+	prepareCalls          int
+	prepareReconcileCalls int
+	submitCalls           int
+	reconcileCalls        int
+	postMergeCalls        int
+	observeCalls          int
+	descendant            bool
+	invalidPreparation    bool
+	prepareError          bool
 }
 
-func (p *fakeProvider) ObserveAuthorization(_ context.Context, phase ObservationPhase, auth githublifecycle.Authority) (AuthorizationObservation, error) {
+func (p *fakeProvider) ObserveAuthorization(ctx context.Context, phase ObservationPhase, auth githublifecycle.Authority) (AuthorizationObservation, error) {
+	checkProviderBudget(p.t, ctx, providerAccounting(100))
 	p.mu.Lock()
 	p.observeCalls++
 	call := p.observeCalls
@@ -570,22 +581,36 @@ func (p *fakeProvider) ObserveAuthorization(_ context.Context, phase Observation
 	return newAuthorizationObservation(p.t, auth, phase, start)
 }
 
-func (p *fakeProvider) PrepareResultCommit(_ context.Context, recipe githublifecycle.MergeCommitRecipeV1) (CommitPreparation, error) {
+func (p *fakeProvider) PrepareResultCommit(ctx context.Context, recipe githublifecycle.MergeCommitRecipeV1) (CommitPreparation, error) {
+	checkProviderBudget(p.t, ctx, providerAccounting(100))
 	p.mu.Lock()
 	p.prepareCalls++
 	p.mu.Unlock()
-	return CommitPreparation{"merge-commit-preparation-v1", recipe.SHA256(), recipe.ExpectedResultSHA().String(), []ledger.EvidenceRef{evidenceRef("prepare", "1")}}, nil
+	preparation := exactCommitPreparation(recipe, "prepare", "1")
+	if p.invalidPreparation {
+		preparation.Observation.Message += " changed"
+	}
+	if p.prepareError {
+		return preparation, errors.New("ambiguous commit preparation")
+	}
+	return preparation, nil
 }
-func (p *fakeProvider) ReconcileResultCommit(_ context.Context, recipe githublifecycle.MergeCommitRecipeV1) (CommitPreparation, error) {
-	return CommitPreparation{"merge-commit-preparation-v1", recipe.SHA256(), recipe.ExpectedResultSHA().String(), []ledger.EvidenceRef{evidenceRef("prepare-reconcile", "2")}}, nil
+func (p *fakeProvider) ReconcileResultCommit(ctx context.Context, recipe githublifecycle.MergeCommitRecipeV1) (CommitPreparation, error) {
+	checkProviderBudget(p.t, ctx, providerAccounting(100))
+	p.mu.Lock()
+	p.prepareReconcileCalls++
+	p.mu.Unlock()
+	return exactCommitPreparation(recipe, "prepare-reconcile", "2"), nil
 }
-func (p *fakeProvider) SubmitTarget(_ context.Context, input githublifecycle.MergeExecutionInputV1) (TargetOutcome, error) {
+func (p *fakeProvider) SubmitTarget(ctx context.Context, input githublifecycle.MergeExecutionInputV1) (TargetOutcome, error) {
+	checkProviderBudget(p.t, ctx, providerAccounting(100))
 	p.mu.Lock()
 	p.submitCalls++
 	p.mu.Unlock()
 	return p.outcome(input.SealedAuthorization(), input.TargetSubmission(), p.disposition)
 }
-func (p *fakeProvider) ReconcileTarget(_ context.Context, input githublifecycle.ReconcileWriteInput) (TargetOutcome, error) {
+func (p *fakeProvider) ReconcileTarget(ctx context.Context, input githublifecycle.ReconcileWriteInput) (TargetOutcome, error) {
+	checkProviderBudget(p.t, ctx, providerAccounting(100))
 	p.mu.Lock()
 	p.reconcileCalls++
 	p.mu.Unlock()
@@ -599,7 +624,7 @@ func (p *fakeProvider) ReconcileTarget(_ context.Context, input githublifecycle.
 }
 func (p *fakeProvider) outcome(sealed githublifecycle.SealedMergeAuthorizationV1, submission githublifecycle.TargetSubmissionV1, disposition githublifecycle.ReconciliationDisposition) (TargetOutcome, error) {
 	evidence := []ledger.EvidenceRef{evidenceRef("target", "3")}
-	result := TargetOutcome{Disposition: disposition, EvidenceRefs: evidence, RequestBytes: 100}
+	result := TargetOutcome{Disposition: disposition, EvidenceRefs: evidence, RequestBytes: 100, Accounting: providerAccounting(100)}
 	if disposition == githublifecycle.ReconciliationApplied {
 		recipe := sealed.MergeInput().Recipe()
 		auth := sealed.MergeInput().Authority()
@@ -637,7 +662,8 @@ func (p *fakeProvider) outcome(sealed githublifecycle.SealedMergeAuthorizationV1
 	}
 	return result, nil
 }
-func (p *fakeProvider) ObservePostMerge(_ context.Context, input githublifecycle.ObservePostMergeInput) (githublifecycle.PostMergeObservation, error) {
+func (p *fakeProvider) ObservePostMerge(ctx context.Context, input githublifecycle.ObservePostMergeInput) (PostMergeOutcome, error) {
+	checkProviderBudget(p.t, ctx, providerAccounting(100))
 	p.mu.Lock()
 	p.postMergeCalls++
 	p.mu.Unlock()
@@ -650,7 +676,7 @@ func (p *fakeProvider) ObservePostMerge(_ context.Context, input githublifecycle
 		ResultSHA: r.ResultSHA, ResultTree: r.ResultTree, Parents: r.Parents, Message: recipe.Message, Author: recipe.Author, Committer: recipe.Committer,
 		AuthorUnix: recipe.AuthorUnix, CommitterUnix: recipe.CommitterUnix, RecipeSHA256: r.Recipe.SHA256(), EvidenceRefs: objectEvidence}, githublifecycle.DefaultLimits())
 	if err != nil {
-		return githublifecycle.PostMergeObservation{}, err
+		return PostMergeOutcome{}, err
 	}
 	containSnapshot, _ := githublifecycle.NewSnapshotIdentity("github", "containment", time.Now().UnixNano())
 	containEvidence := []ledger.EvidenceRef{evidenceRef("containment", "5")}
@@ -666,19 +692,20 @@ func (p *fakeProvider) ObservePostMerge(_ context.Context, input githublifecycle
 		TargetRef: "refs/heads/" + input.Authority().BaseBranch().String(), ResultSHA: r.ResultSHA, ObservedTargetTipSHA: targetTip,
 		Mechanism: githublifecycle.GitHubCompareProofV1, Status: status, MergeBaseSHA: r.ResultSHA, DescendantDistance: distance, EvidenceRefs: containEvidence}, githublifecycle.DefaultLimits())
 	if err != nil {
-		return githublifecycle.PostMergeObservation{}, err
+		return PostMergeOutcome{}, err
 	}
 	observationEvidence := append(objectEvidence, containEvidence...)
-	return githublifecycle.NewPostMergeObservation(githublifecycle.PostMergeObservationInput{Snapshot: containSnapshot, Repository: r.Repository,
+	observation, err := githublifecycle.NewPostMergeObservation(githublifecycle.PostMergeObservationInput{Snapshot: containSnapshot, Repository: r.Repository,
 		BaseBranch: input.Authority().BaseBranch(), PullRequest: r.PullRequest, Actor: r.Actor, AcceptedHeadSHA: r.AcceptedHeadSHA,
 		AcceptedHeadTree: r.AcceptedHeadTree, BaseBeforeSHA: r.BaseBeforeSHA, Method: r.Method, ResultSHA: r.ResultSHA, ObservedTargetTipSHA: targetTip,
 		ResultTree: r.ResultTree, Parents: r.Parents, Lineage: r.Lineage, EvidenceRefs: observationEvidence, Attempt: r.Attempt,
 		ExpectedContent: r.ExpectedContent, SealedAuthorization: r.SealedAuthorization, ResultObject: object, ContainmentProof: proof}, githublifecycle.DefaultLimits())
+	return PostMergeOutcome{Observation: observation, Accounting: providerAccounting(100)}, err
 }
 func (p *fakeProvider) totalCalls() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.observeCalls + p.prepareCalls + p.submitCalls + p.reconcileCalls + p.postMergeCalls
+	return p.observeCalls + p.prepareCalls + p.prepareReconcileCalls + p.submitCalls + p.reconcileCalls + p.postMergeCalls
 }
 
 func newAuthorizationObservation(t *testing.T, auth githublifecycle.Authority, phase ObservationPhase, started int64) (AuthorizationObservation, error) {
@@ -711,7 +738,38 @@ func newAuthorizationObservation(t *testing.T, auth githublifecycle.Authority, p
 	evidence = append(evidence, reviews.Input().EvidenceRefs...)
 	evidence = append(evidence, checks.Input().EvidenceRefs...)
 	evidence = append(evidence, statuses.Input().EvidenceRefs...)
-	return AuthorizationObservation{snapshot, nil, checks, statuses, evidence, started, stamp + 4*int64(time.Millisecond), githublifecycle.AuthorizationCountersV1{}}, nil
+	return AuthorizationObservation{snapshot, nil, checks, statuses, evidence, started, stamp + 4*int64(time.Millisecond), githublifecycle.AuthorizationCountersV1{}, providerAccounting(100)}, nil
+}
+
+func exactCommitPreparation(recipe githublifecycle.MergeCommitRecipeV1, kind, fill string) CommitPreparation {
+	i := recipe.Input()
+	parents := make([]string, len(i.Parents))
+	for index := range i.Parents {
+		parents[index] = i.Parents[index].String()
+	}
+	evidence := []ledger.EvidenceRef{evidenceRef(kind, fill)}
+	observation := CommitPreparationObservationV1{
+		Schema: "merge-commit-preparation-observation-v1", Repository: i.Repository.String(), ResultSHA: i.ExpectedResultSHA.String(),
+		ResultTree: i.ExpectedResultTree.String(), Parents: parents, Message: i.Message, Author: i.Author, Committer: i.Committer,
+		AuthorUnix: i.AuthorUnix, CommitterUnix: i.CommitterUnix, ObjectFormat: i.ObjectFormat, ObjectBytes: recipe.CommitBytes(),
+		ObjectBytesSHA256: digest(recipe.CommitBytes()), RecipeSHA256: recipe.SHA256(), EvidenceRefs: evidence,
+	}
+	return CommitPreparation{"merge-commit-preparation-v1", recipe.SHA256(), recipe.ExpectedResultSHA().String(), observation, evidence, providerAccounting(100)}
+}
+
+func providerAccounting(request int64) ProviderAccountingV1 {
+	return ProviderAccountingV1{RequestBytes: request, HeaderBytes: 64, CompressedResponseBytes: 128,
+		DecompressedResponseBytes: 128, ActiveNanos: int64(time.Millisecond), InvocationNanos: int64(time.Second)}
+}
+
+func checkProviderBudget(t *testing.T, ctx context.Context, accounting ProviderAccountingV1) {
+	t.Helper()
+	budget, ok := ProviderBudgetFromContext(ctx)
+	if !ok || accounting.RequestBytes > budget.RequestBytes || accounting.HeaderBytes > budget.HeaderBytes ||
+		accounting.CompressedResponseBytes > budget.CompressedResponseBytes || accounting.DecompressedResponseBytes > budget.DecompressedResponseBytes ||
+		accounting.ActiveNanos > budget.ActiveNanos {
+		t.Fatalf("provider operation lacks an enforceable cumulative budget: %+v, present=%v", budget, ok)
+	}
 }
 
 func emptyClosure(t *testing.T, auth githublifecycle.Authority, source githublifecycle.PaginationSourceKind, pr *githublifecycle.PullRequestIdentity, requestID string, observed int64) githublifecycle.PaginationClosureV1 {

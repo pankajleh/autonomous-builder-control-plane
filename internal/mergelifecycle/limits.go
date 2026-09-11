@@ -11,31 +11,32 @@ import (
 )
 
 const (
-	MaxPublishedFilesPerAttempt   = 32
-	MaxPublishedBytesPerAttempt   = 8 << 20
-	MaxTemporaryFilesPerAttempt   = 1
-	MaxTemporaryBytesPerAttempt   = 1 << 20
-	MaxLiveFilesPerAttempt        = 33
-	MaxLiveBytesPerAttempt        = 9 << 20
-	MaxActiveTemporaryFiles       = 64
-	MaxPublishedFilesTotal        = 4096
-	MaxPublishedBytesTotal        = 64 << 20
-	MaxTerminalChannelBytes       = 64 << 20
-	MaxTerminalChannelRecords     = 4096
-	MaxTerminalRecordBytes        = 512 << 10
-	MaxCleanupIncidentBytes       = 64 << 10
-	MaxCleanupRecoveryAttempts    = 32
-	MaxCleanupIncidentsPerAttempt = 32
-	MaxProviderCalls              = 64
-	MaxPreSubmitCalls             = 28
-	MaxCommitSubmissions          = 1
-	MaxTargetSubmissions          = 1
-	MaxPostMergeCalls             = 8
-	MaxReconciliationRounds       = 8
-	MaxReconciliationCalls        = 24
-	MaxCumulativeRequestBytes     = 1 << 20
-	MaxCumulativeHeaderBytes      = 2 << 20
-	MaxCumulativeResponseBytes    = 256 << 20
+	MaxPublishedFilesPerAttempt    = 32
+	MaxPublishedBytesPerAttempt    = 8 << 20
+	MaxTemporaryFilesPerAttempt    = 1
+	MaxTemporaryBytesPerAttempt    = 1 << 20
+	MaxLiveFilesPerAttempt         = 33
+	MaxLiveBytesPerAttempt         = 9 << 20
+	MaxActiveTemporaryFiles        = 64
+	MaxPublishedFilesTotal         = 4096
+	MaxPublishedBytesTotal         = 64 << 20
+	MaxTerminalChannelBytes        = 64 << 20
+	MaxTerminalChannelRecords      = 4096
+	MaxTerminalRecordBytes         = 512 << 10
+	MaxCleanupIncidentBytes        = 64 << 10
+	MaxCleanupRecoveryAttempts     = 32
+	MaxCleanupIncidentsPerAttempt  = 32
+	MaxProviderCalls               = 64
+	MaxPreSubmitCalls              = 28
+	MaxCommitSubmissions           = 1
+	MaxTargetSubmissions           = 1
+	MaxPostMergeCalls              = 8
+	MaxReconciliationRounds        = 8
+	MaxReconciliationCalls         = 24
+	MaxCumulativeRequestBytes      = 1 << 20
+	MaxCumulativeHeaderBytes       = 2 << 20
+	MaxCumulativeCompressedBytes   = 256 << 20
+	MaxCumulativeDecompressedBytes = 256 << 20
 )
 
 const (
@@ -58,7 +59,7 @@ type Limits struct {
 	targetSubmissions, postMergeCalls                       int
 	reconciliationRounds, reconciliationCalls               int
 	cumulativeRequestBytes, cumulativeHeaderBytes           int64
-	cumulativeResponseBytes                                 int64
+	cumulativeCompressedBytes, cumulativeDecompressedBytes  int64
 	providerCallTimeout, invocationTimeout                  time.Duration
 	cumulativeProviderTime, reconciliationInterval          time.Duration
 }
@@ -72,7 +73,7 @@ func productionLimits() Limits {
 		MaxCleanupIncidentBytes, MaxCleanupRecoveryAttempts, MaxCleanupIncidentsPerAttempt,
 		MaxProviderCalls, MaxPreSubmitCalls, MaxCommitSubmissions, MaxTargetSubmissions,
 		MaxPostMergeCalls, MaxReconciliationRounds, MaxReconciliationCalls,
-		MaxCumulativeRequestBytes, MaxCumulativeHeaderBytes, MaxCumulativeResponseBytes,
+		MaxCumulativeRequestBytes, MaxCumulativeHeaderBytes, MaxCumulativeCompressedBytes, MaxCumulativeDecompressedBytes,
 		ProviderCallTimeout, ControllerInvocationTimeout, MaxCumulativeProviderCallTime,
 		MinimumReconciliationInterval,
 	}
@@ -104,7 +105,8 @@ type limitsWire struct {
 	ReconciliationCalls         int    `json:"reconciliation_calls"`
 	CumulativeRequestBytes      int64  `json:"cumulative_request_bytes"`
 	CumulativeHeaderBytes       int64  `json:"cumulative_header_bytes"`
-	CumulativeResponseBytes     int64  `json:"cumulative_response_bytes"`
+	CumulativeCompressedBytes   int64  `json:"cumulative_compressed_response_bytes"`
+	CumulativeDecompressedBytes int64  `json:"cumulative_decompressed_response_bytes"`
 	ProviderCallTimeoutNanos    int64  `json:"provider_call_timeout_nanos"`
 	InvocationTimeoutNanos      int64  `json:"invocation_timeout_nanos"`
 	CumulativeProviderTimeNanos int64  `json:"cumulative_provider_time_nanos"`
@@ -127,7 +129,7 @@ func (l Limits) wire() limitsWire {
 		l.terminalChannelBytes, l.terminalChannelRecords, l.terminalRecordBytes, l.cleanupIncidentBytes,
 		l.cleanupAttempts, l.cleanupIncidents, l.providerCalls, l.preSubmitCalls, l.commitSubmissions,
 		l.targetSubmissions, l.postMergeCalls, l.reconciliationRounds, l.reconciliationCalls,
-		l.cumulativeRequestBytes, l.cumulativeHeaderBytes, l.cumulativeResponseBytes,
+		l.cumulativeRequestBytes, l.cumulativeHeaderBytes, l.cumulativeCompressedBytes, l.cumulativeDecompressedBytes,
 		int64(l.providerCallTimeout), int64(l.invocationTimeout), int64(l.cumulativeProviderTime), int64(l.reconciliationInterval)}
 }
 
@@ -152,33 +154,39 @@ func ProductionLimitsCanonicalJSON() []byte { return productionLimits().Canonica
 func ProductionLimitsSHA256() string        { return productionLimits().SHA256() }
 
 type Counters struct {
-	Schema                  string `json:"schema"`
-	Sequence                int64  `json:"sequence"`
-	PreSubmitCalls          int    `json:"pre_submit_calls"`
-	CommitSubmissions       int    `json:"commit_submissions"`
-	TargetSubmissions       int    `json:"target_submissions"`
-	PostMergeCalls          int    `json:"post_merge_calls"`
-	ReconciliationRounds    int    `json:"reconciliation_rounds"`
-	ReconciliationCalls     int    `json:"reconciliation_calls"`
-	TotalProviderCalls      int    `json:"total_provider_calls"`
-	CumulativeRequestBytes  int64  `json:"cumulative_request_bytes"`
-	CumulativeHeaderBytes   int64  `json:"cumulative_header_bytes"`
-	CumulativeResponseBytes int64  `json:"cumulative_response_bytes"`
-	CumulativeCallNanos     int64  `json:"cumulative_call_nanos"`
+	Schema                      string `json:"schema"`
+	Sequence                    int64  `json:"sequence"`
+	PreSubmitCalls              int    `json:"pre_submit_calls"`
+	CommitSubmissions           int    `json:"commit_submissions"`
+	TargetSubmissions           int    `json:"target_submissions"`
+	PostMergeCalls              int    `json:"post_merge_calls"`
+	ReconciliationRounds        int    `json:"reconciliation_rounds"`
+	ReconciliationCalls         int    `json:"reconciliation_calls"`
+	TotalProviderCalls          int    `json:"total_provider_calls"`
+	ProviderAccountingPending   bool   `json:"provider_accounting_pending"`
+	CumulativeRequestBytes      int64  `json:"cumulative_request_bytes"`
+	CumulativeHeaderBytes       int64  `json:"cumulative_header_bytes"`
+	CumulativeCompressedBytes   int64  `json:"cumulative_compressed_response_bytes"`
+	CumulativeDecompressedBytes int64  `json:"cumulative_decompressed_response_bytes"`
+	CumulativeCallNanos         int64  `json:"cumulative_call_nanos"`
+	LastInvocationNanos         int64  `json:"last_invocation_nanos"`
+	LastReconciliationUnixNano  int64  `json:"last_reconciliation_unix_nano"`
 }
 
 func (c Counters) validate(l Limits) error {
 	if c.Schema != "merge-counters-v1" || c.Sequence < 0 || c.PreSubmitCalls < 0 || c.CommitSubmissions < 0 ||
 		c.TargetSubmissions < 0 || c.PostMergeCalls < 0 || c.ReconciliationRounds < 0 || c.ReconciliationCalls < 0 ||
 		c.TotalProviderCalls < 0 || c.CumulativeRequestBytes < 0 || c.CumulativeHeaderBytes < 0 ||
-		c.CumulativeResponseBytes < 0 || c.CumulativeCallNanos < 0 {
+		c.CumulativeCompressedBytes < 0 || c.CumulativeDecompressedBytes < 0 || c.CumulativeCallNanos < 0 ||
+		c.LastInvocationNanos < 0 || c.LastReconciliationUnixNano < 0 {
 		return errors.New("merge counters are invalid")
 	}
 	if c.PreSubmitCalls > l.preSubmitCalls || c.CommitSubmissions > l.commitSubmissions || c.TargetSubmissions > l.targetSubmissions ||
 		c.PostMergeCalls > l.postMergeCalls || c.ReconciliationRounds > l.reconciliationRounds || c.ReconciliationCalls > l.reconciliationCalls ||
 		c.TotalProviderCalls > l.providerCalls || c.CumulativeRequestBytes > l.cumulativeRequestBytes ||
-		c.CumulativeHeaderBytes > l.cumulativeHeaderBytes || c.CumulativeResponseBytes > l.cumulativeResponseBytes ||
-		time.Duration(c.CumulativeCallNanos) > l.cumulativeProviderTime {
+		c.CumulativeHeaderBytes > l.cumulativeHeaderBytes || c.CumulativeCompressedBytes > l.cumulativeCompressedBytes ||
+		c.CumulativeDecompressedBytes > l.cumulativeDecompressedBytes || time.Duration(c.CumulativeCallNanos) > l.cumulativeProviderTime ||
+		time.Duration(c.LastInvocationNanos) > l.invocationTimeout {
 		return errors.New("merge cumulative budget exhausted")
 	}
 	return nil

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -21,18 +22,64 @@ const (
 )
 
 type JSONLLedger struct {
-	path string
-	mu   sync.Mutex
+	path       string
+	parentPath string
+	file       *os.File
+	parent     *os.File
+	fileInfo   os.FileInfo
+	parentInfo os.FileInfo
+	physicalID string
+	mu         sync.Mutex
 }
 
 func NewJSONLLedger(path string) (*JSONLLedger, error) {
-	if path == "" {
-		return nil, fmt.Errorf("ledger path is required")
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, fmt.Errorf("canonical absolute ledger path is required")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	parentPath := filepath.Dir(path)
+	if err := os.MkdirAll(parentPath, 0o700); err != nil {
 		return nil, fmt.Errorf("create ledger directory: %w", err)
 	}
-	return &JSONLLedger{path: path}, nil
+	resolvedParent, err := filepath.EvalSymlinks(parentPath)
+	if err != nil || filepath.Clean(resolvedParent) != parentPath {
+		return nil, errors.Join(errors.New("ledger parent traversal contains a symbolic link"), err)
+	}
+	parent, err := os.Open(parentPath)
+	if err != nil {
+		return nil, fmt.Errorf("open ledger parent: %w", err)
+	}
+	parentInfo, err := parent.Stat()
+	if err != nil || !parentInfo.IsDir() {
+		_ = parent.Close()
+		return nil, errors.Join(errors.New("ledger parent is not a directory"), err)
+	}
+	parentNameInfo, err := os.Lstat(parentPath)
+	if err != nil || parentNameInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(parentInfo, parentNameInfo) {
+		_ = parent.Close()
+		return nil, errors.Join(errors.New("ledger parent is unsafe or replaced"), err)
+	}
+	exists := false
+	if existing, statErr := os.Lstat(path); statErr == nil {
+		if existing.Mode()&os.ModeSymlink != 0 || verifyLedgerFileInfo(existing) != nil {
+			_ = parent.Close()
+			return nil, errors.New("existing ledger file is unsafe")
+		}
+		exists = true
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		_ = parent.Close()
+		return nil, statErr
+	}
+	result := &JSONLLedger{path: path, parentPath: parentPath, parent: parent, parentInfo: parentInfo}
+	if exists {
+		result.mu.Lock()
+		err = result.pinLedgerFileLocked(false)
+		result.mu.Unlock()
+		if err != nil {
+			_ = parent.Close()
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 func (l *JSONLLedger) Append(event Event) error {
@@ -74,6 +121,9 @@ func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyEx
 	if err := event.Validate(); err != nil {
 		return fmt.Errorf("validate event: %w", err)
 	}
+	if err := l.ensurePhysicalIdentity(true); err != nil {
+		return err
+	}
 	line, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)
@@ -90,11 +140,7 @@ func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyEx
 		}()
 	}
 
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
-	if err != nil {
-		return fmt.Errorf("open ledger: %w", err)
-	}
-	defer f.Close()
+	f := l.file
 
 	return l.WithFileLock(f, func() error {
 		if err := l.authorizeTransition(event, barrierSHA256); err != nil {
@@ -145,18 +191,17 @@ func (l *JSONLLedger) Snapshot() ([]byte, string, error) {
 	if l == nil {
 		return nil, "", errors.New("ledger is required")
 	}
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, "", fmt.Errorf("open ledger snapshot: %w", err)
+	if err := l.ensurePhysicalIdentity(true); err != nil {
+		return nil, "", err
 	}
-	defer f.Close()
+	f := l.file
 	var data []byte
-	err = l.WithFileLock(f, func() error {
+	err := l.WithFileLock(f, func() error {
 		var readErr error
 		data, readErr = readBoundedLedger(f)
 		return readErr
 	})
-	return data, filepath.Clean(l.path), err
+	return data, l.physicalID, err
 }
 
 // WithFileLock serializes one complete authoritative-ledger transaction with
@@ -169,6 +214,18 @@ func (l *JSONLLedger) WithFileLock(file *os.File, operation func() error) (resul
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.file == nil {
+		if err := l.pinLedgerFileLocked(false); err != nil {
+			return err
+		}
+	}
+	if err := l.verifyPhysicalIdentityLocked(); err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil || !os.SameFile(info, l.fileInfo) {
+		return errors.Join(errors.New("authoritative ledger descriptor identity changed"), err)
+	}
 	if err := lockLedgerFile(file, ledgerFileLockWait); err != nil {
 		return fmt.Errorf("lock authoritative ledger file: %w", err)
 	}
@@ -178,6 +235,129 @@ func (l *JSONLLedger) WithFileLock(file *os.File, operation func() error) (resul
 		}
 	}()
 	return operation()
+}
+
+func (l *JSONLLedger) verifyPhysicalIdentity() error {
+	if l == nil {
+		return errors.New("ledger is required")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.verifyPhysicalIdentityLocked()
+}
+
+func (l *JSONLLedger) ensurePhysicalIdentity(create bool) error {
+	if l == nil {
+		return errors.New("ledger is required")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		if err := l.pinLedgerFileLocked(create); err != nil {
+			return err
+		}
+	}
+	return l.verifyPhysicalIdentityLocked()
+}
+
+func (l *JSONLLedger) pinLedgerFileLocked(create bool) error {
+	flags := os.O_RDWR | os.O_APPEND
+	if create {
+		flags |= os.O_CREATE
+	}
+	file, err := os.OpenFile(l.path, flags, 0o600)
+	if err != nil {
+		return fmt.Errorf("open ledger: %w", err)
+	}
+	fileInfo, err := file.Stat()
+	nameInfo, nameErr := os.Lstat(l.path)
+	if err != nil || nameErr != nil || nameInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(fileInfo, nameInfo) || verifyLedgerFileInfo(fileInfo) != nil {
+		_ = file.Close()
+		return errors.Join(errors.New("ledger file is unsafe or replaced"), err, nameErr)
+	}
+	l.file, l.fileInfo, l.physicalID = file, fileInfo, physicalLedgerIdentity(fileInfo)
+	return nil
+}
+
+func (l *JSONLLedger) verifyPhysicalIdentityLocked() error {
+	if l.parent == nil {
+		return errors.New("authoritative ledger parent descriptor is not pinned")
+	}
+	pinnedParent, err := l.parent.Stat()
+	if err != nil || !os.SameFile(pinnedParent, l.parentInfo) {
+		return errors.Join(errors.New("pinned ledger parent identity changed"), err)
+	}
+	resolvedParent, err := os.Open(l.parentPath)
+	if err != nil {
+		return err
+	}
+	resolvedParentInfo, statErr := resolvedParent.Stat()
+	closeErr := resolvedParent.Close()
+	if statErr != nil || closeErr != nil || !os.SameFile(resolvedParentInfo, l.parentInfo) {
+		return errors.Join(errors.New("ledger parent path was replaced"), statErr, closeErr)
+	}
+	if l.file == nil {
+		if _, err := os.Lstat(l.path); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return errors.New("an unpinned ledger path appeared")
+	}
+	pinnedFile, err := l.file.Stat()
+	if err != nil || !os.SameFile(pinnedFile, l.fileInfo) || verifyLedgerFileInfo(pinnedFile) != nil {
+		return errors.Join(errors.New("pinned ledger file identity changed"), err)
+	}
+	resolved, err := os.Open(l.path)
+	if err != nil {
+		return err
+	}
+	resolvedInfo, statErr := resolved.Stat()
+	closeErr = resolved.Close()
+	nameInfo, nameErr := os.Lstat(l.path)
+	if statErr != nil || closeErr != nil || nameErr != nil || nameInfo.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(resolvedInfo, l.fileInfo) || !os.SameFile(nameInfo, l.fileInfo) || verifyLedgerFileInfo(resolvedInfo) != nil {
+		return errors.Join(errors.New("ledger path was replaced or became unsafe"), statErr, closeErr, nameErr)
+	}
+	return nil
+}
+
+func verifyLedgerFileInfo(info os.FileInfo) error {
+	if info == nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return errors.New("ledger must be a mode-0600 regular file")
+	}
+	value := reflect.Indirect(reflect.ValueOf(info.Sys()))
+	if value.IsValid() {
+		if field := value.FieldByName("Nlink"); field.IsValid() && field.Uint() != 1 {
+			return errors.New("ledger must not be hard linked")
+		}
+		if field := value.FieldByName("Uid"); field.IsValid() && field.Uint() != uint64(os.Geteuid()) {
+			return errors.New("ledger is not controller-owned")
+		}
+	}
+	return nil
+}
+
+func ledgerInfoOwnedByEffectiveUser(info os.FileInfo) bool {
+	if info == nil {
+		return false
+	}
+	value := reflect.Indirect(reflect.ValueOf(info.Sys()))
+	if value.IsValid() {
+		if field := value.FieldByName("Uid"); field.IsValid() {
+			return field.Uint() == uint64(os.Geteuid())
+		}
+	}
+	return true
+}
+
+func physicalLedgerIdentity(info os.FileInfo) string {
+	value := reflect.Indirect(reflect.ValueOf(info.Sys()))
+	if value.IsValid() {
+		device, inode := value.FieldByName("Dev"), value.FieldByName("Ino")
+		if device.IsValid() && inode.IsValid() {
+			return fmt.Sprintf("ledger-dev-%d-inode-%d", device.Uint(), inode.Uint())
+		}
+	}
+	return "ledger-physical-identity-unavailable"
 }
 
 func scanExactEvent(file *os.File, eventID string, expected []byte) (bool, error) {
