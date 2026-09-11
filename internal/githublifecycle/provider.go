@@ -270,7 +270,11 @@ func NewMergeInput(input MergeAuthorizationInputV1, writeID string, limits Limit
 	}
 	expected := authority.ExpectedContent()
 	input.EvidenceRefs = copyEvidence
-	payload, payloadSHA, err := canonicalJSON(mergeAuthorizationPayloadWire(input, authority, limitsSHA))
+	payloadWire, err := checkedMergeAuthorizationPayloadWire(input, authority, limitsSHA, limits)
+	if err != nil {
+		return MergeInput{}, err
+	}
+	payload, payloadSHA, err := canonicalJSON(payloadWire)
 	if err != nil {
 		return MergeInput{}, err
 	}

@@ -20,6 +20,7 @@ const (
 	GitHubGraphQLPathV1                        = "/graphql"
 	MaxGitHubTargetRequestBodyBytesV1          = 16 * 1024
 	MaxGitHubTargetResponseBodyBytesV1         = 4 * 1024 * 1024
+	MaxGitHubTargetResponseEnvelopeBytesV1     = 4*1024*1024 + 64*1024
 )
 
 // TargetSubmissionV1 is the immutable identity of the one transport request
@@ -323,7 +324,7 @@ func NewTargetResponseEnvelopeV1(input TargetResponseEnvelopeV1Input, submission
 		LimitsSHA256: limitsSHA,
 	}
 	canonical, digest, err := canonicalJSON(wire)
-	if err != nil || len(canonical) > limits.MaxDecompressedResponseBodyBytes {
+	if err != nil || len(canonical) > limits.MaxTargetResponseEnvelopeBytes {
 		return TargetResponseEnvelopeV1{}, errors.New("target response envelope is invalid or unbounded")
 	}
 	return TargetResponseEnvelopeV1{input: input, submission: submission, canonical: canonical, digest: digest, limitsSHA: limitsSHA}, nil
@@ -348,7 +349,8 @@ func (e TargetResponseEnvelopeV1) valid() bool {
 		e.input.HTTPStatus >= 100 && e.input.HTTPStatus <= 599 && len(e.input.ResponseBody) > 0 &&
 		len(e.input.ResponseBody) <= MaxGitHubTargetResponseBodyBytesV1 && validEvidenceRef(e.input.BodyEvidence) &&
 		e.input.BodyEvidence.Kind == GitHubTargetResponseBodyEvidenceKindV1 && e.input.BodyEvidence.SHA256 == digestBytes(e.input.ResponseBody) &&
-		validEvidenceRef(e.EvidenceRef()) && validSHA256(e.digest) && digestBytes(e.canonical) == e.digest && validSHA256(e.limitsSHA)
+		validEvidenceRef(e.EvidenceRef()) && len(e.canonical) <= MaxGitHubTargetResponseEnvelopeBytesV1 &&
+		validSHA256(e.digest) && digestBytes(e.canonical) == e.digest && validSHA256(e.limitsSHA)
 }
 
 func ValidateTargetResponseEnvelopeV1(submission TargetSubmissionV1, envelope TargetResponseEnvelopeV1, limits Limits) error {
@@ -364,6 +366,9 @@ func ValidateTargetResponseEnvelopeV1(submission TargetSubmissionV1, envelope Ta
 }
 
 func ParseCanonicalTargetResponseEnvelopeV1(data []byte, submission TargetSubmissionV1, limits Limits) (TargetResponseEnvelopeV1, error) {
+	if err := requireCanonicalObjectSize(data, limits.MaxTargetResponseEnvelopeBytes, "target response envelope"); err != nil {
+		return TargetResponseEnvelopeV1{}, err
+	}
 	var wire targetResponseEnvelopeWireV1
 	if err := strictDecode(data, &wire); err != nil {
 		return TargetResponseEnvelopeV1{}, err

@@ -46,7 +46,9 @@ The closure must contain the event evidence, repository-mapping evidence, and
 every accepted source's acceptance evidence. A source for the integrated head
 must be present. `CurrentReadyProofV1` independently re-parses the READY
 binding, requires the freshly observed physical ledger identity, retains the
-exact bounded ledger JSONL bytes and matching evidence, parses every canonical
+exact bounded ledger JSONL bytes and matching evidence, and binds those bytes
+through a typed content reference once they exceed the canonical inline
+cutoff. It parses every canonical
 event from byte zero, rejects duplicate event IDs and discontinuous bound-run
 transitions, requires the bound run's first transition to start at
 `RUN_CREATED`, derives the READY offset/sequence/ordinal, recomputes the bound-
@@ -74,6 +76,28 @@ authority, expected content, and every nested durable merge value. They accept
 only byte-identical canonical JSON. Unknown or duplicate fields, whitespace,
 key reordering, omitted/defaulted values, altered nested bytes, digest
 disagreement, and invalid constructor inputs fail closed.
+
+Canonical containers limited to 256 KiB do not inline a retained child record
+above the fixed 32-KiB representation cutoff. They instead contain its typed
+record kind, exact byte length, SHA-256, and deterministic `sha256:` reference.
+Recovery supplies exact bytes through `CanonicalRecordSetV1`, a concrete
+in-memory, network-free contract value with no filesystem or callback
+behavior. The parser requires exactly one such set whenever an external
+reference occurs, checks reference/kind/length/digest identity before parsing,
+and then re-runs the child's strict parser and ordinary constructor under its
+independent stage limit. Missing records, references to another valid record,
+bytes stored under a substituted reference, and length or digest disagreement
+all fail closed. This abstraction defines recoverability and identity only;
+Task 2 remains responsible for any durable storage.
+
+An individual bounded record parser therefore requires the corresponding
+`CanonicalRecordSetV1`. The uncapped `SealedMergeAuthorizationV1` recovery
+aggregate carries a deterministic, digest-ordered bundle of only the external
+records needed by its nested references, so existing full-chain strict
+revalidation remains self-contained. Bundle entries are independently checked
+for order, uniqueness, length, reference, and digest before any nested parser
+runs; removing or substituting an entry fails closed. This is a canonical
+recovery representation, not a storage layout or publication implementation.
 
 ## Stable PR, check, review, and pagination evidence
 
@@ -110,7 +134,10 @@ filters, and page size are independently produced by
 Each closure binds its exact derived source/query/filters, ordered page or
 cursor requests, unique provider request/body identities, canonical response
 envelopes, stable item keys/digests, closure-wide set digest, evidence, and
-limits. Every page requires a GitHub response identity, binds a retained body
+limits. Its enclosing PR observation, `MergeInput`, final revalidation, and
+seal use typed content references for large closure and decoded-observation
+records; they do not charge those retained bytes again to the 256-KiB parent.
+Every page requires a GitHub response identity, binds a retained body
 evidence ref whose digest equals the raw-body digest, and binds a second
 retained response-envelope evidence ref covering the response identity,
 independently derived query, requested page/cursor, decoded items, and exact
@@ -151,7 +178,8 @@ have the width selected by the object format. Production-v1 admission
 additionally requires the proved SHA-1 format; SHA-256 remains contract-only.
 
 `MergeInput` owns the full authority, initial authoritative PR and policy
-decision, canonical checks, all three independently validated source closures,
+decision, canonical checks, all three independently validated source closures
+(by exact retained-record identity when large),
 frozen provider capability, exact recipe/result OID, evidence, limits, and
 attempt. A merge `WriteAttempt` explicitly binds READY and policy digests in
 addition to repository, principal, operation, write ID, authority digest,
@@ -180,7 +208,8 @@ response evidence, and recomputes `final-authorization-decision-v1` canonical
 bytes and digest. A caller decision digest is never accepted.
 
 `AuthorizationSealV1` binds one unchanged `MergeInput` to the full canonical
-`FinalRevalidationV1` bytes/digest and independently derived final decision
+`FinalRevalidationV1` bytes/digest (using its exact retained-record identity
+when large) and independently derived final decision
 digest, exact authorized verdict and PR eligibility, base/head refs and OIDs,
 recipe/result, capability, cumulative counters, evidence, limits, and the fact
 that no target request was attempted. Reusing admission observations or
@@ -207,7 +236,10 @@ commitment-contract JSON is never mislabeled as transport bytes. The local
 invocation ID is distinct from GitHub's response-assigned provider request ID.
 `TargetResponseEnvelopeV1` binds both identities, the exact submission digest,
 HTTP status, canonical response body/body evidence, and retained envelope
-evidence. Merge execution accepts `MergeExecutionInputV1`, which
+evidence. Its decompressed response body retains the independent 4-MiB limit;
+the enclosing canonical envelope has a separate 4-MiB-plus-64-KiB bound, so an
+exact-limit body plus bounded response metadata is representable. Merge
+execution accepts `MergeExecutionInputV1`, which
 owns both the sealed value and that pre-published submission. Typed execution
 results require the response envelope, matching result snapshot, echoed
 client-mutation ID, and closed body/envelope evidence; errors retain the
@@ -320,7 +352,8 @@ required-check and reviewer policy caps, the 500-entry observed-check and
 observed-review caps, pagination pages/items/source counts and 1 MiB/3 MiB
 closure bounds, general and READY evidence-reference bounds, the 64 MiB READY
 ledger snapshot and 262,144-record scan bounds, canonical-object and
-cancellation-authority bounds, request/response bounds, and phase plus hard
+cancellation-authority bounds, the independent 4-MiB response-body and
+4-MiB-plus-64-KiB target-response-envelope bounds, and phase plus hard
 aggregate call/byte/time counters. `MergeInput` and final revalidation each
 require exactly the reviews, check-runs, and commit-statuses closures and
 independently enforce their cumulative bytes. Authorization counters are

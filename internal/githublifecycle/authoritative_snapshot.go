@@ -16,6 +16,8 @@ const (
 	GitHubPullRequestResponseEvidenceKindV1  = "github-pull-request-response-body"
 	GitHubPullRequestEnvelopeEvidenceKindV1  = "github-pull-request-response-envelope"
 	GitHubPullRequestEnvelopeSchemaV1        = "github-pull-request-response-envelope-v1"
+	retainedAuthoritativePRReviewsKindV1     = "authoritative-pr-reviews-v1"
+	retainedReviewsClosureKindV1             = "reviews-pagination-closure-v1"
 )
 
 type AuthoritativePullRequestSnapshotV1Input struct {
@@ -169,7 +171,11 @@ func NewAuthoritativePullRequestSnapshotV1(input AuthoritativePullRequestSnapsho
 	if err != nil || !containsEvidenceDigest(input.EvidenceRefs, GitHubPullRequestEnvelopeEvidenceKindV1, digestBytes(responseEnvelope)) {
 		return AuthoritativePullRequestSnapshotV1{}, errors.New("authoritative PR evidence does not bind the GitHub request, body, and decoded response fields")
 	}
-	canonical, digest, err := canonicalJSON(authoritativePRWire(input, limitsSHA))
+	wire, err := authoritativePRWire(input, limitsSHA, limits)
+	if err != nil {
+		return AuthoritativePullRequestSnapshotV1{}, err
+	}
+	canonical, digest, err := canonicalJSON(wire)
 	if err != nil {
 		return AuthoritativePullRequestSnapshotV1{}, err
 	}
@@ -197,40 +203,57 @@ func (s AuthoritativePullRequestSnapshotV1) valid() bool {
 }
 
 type authoritativePRWireV1 struct {
-	Schema                string               `json:"schema"`
-	Snapshot              identityWire         `json:"snapshot"`
-	ResponseBodySHA256    string               `json:"response_body_sha256"`
-	APIVersion            string               `json:"api_version"`
-	RepositoryBinding     json.RawMessage      `json:"repository_binding"`
-	PullRequest           prIdentityWire       `json:"pull_request"`
-	PullRequestDatabaseID int64                `json:"pull_request_database_id"`
-	BaseRepositoryNodeID  string               `json:"base_repository_node_id"`
-	BaseRef               string               `json:"base_ref"`
-	BaseOID               string               `json:"base_oid"`
-	HeadRepositoryNodeID  string               `json:"head_repository_node_id"`
-	HeadRef               string               `json:"head_ref"`
-	HeadOID               string               `json:"head_oid"`
-	State                 *PullRequestState    `json:"state"`
-	IsDraft               *bool                `json:"is_draft"`
-	Merged                *bool                `json:"merged"`
-	MergedAtUnixNano      *int64               `json:"merged_at_unix_nano"`
-	Actor                 actorWire            `json:"actor"`
-	Reviews               []reviewWire         `json:"reviews"`
-	ReviewsClosure        json.RawMessage      `json:"reviews_closure"`
-	ReviewsClosureSHA256  string               `json:"reviews_closure_sha256"`
-	EvidenceRefs          []ledger.EvidenceRef `json:"evidence_refs"`
-	LimitsSHA256          string               `json:"limits_sha256"`
+	Schema                string                    `json:"schema"`
+	Snapshot              identityWire              `json:"snapshot"`
+	ResponseBodySHA256    string                    `json:"response_body_sha256"`
+	APIVersion            string                    `json:"api_version"`
+	RepositoryBinding     json.RawMessage           `json:"repository_binding"`
+	PullRequest           prIdentityWire            `json:"pull_request"`
+	PullRequestDatabaseID int64                     `json:"pull_request_database_id"`
+	BaseRepositoryNodeID  string                    `json:"base_repository_node_id"`
+	BaseRef               string                    `json:"base_ref"`
+	BaseOID               string                    `json:"base_oid"`
+	HeadRepositoryNodeID  string                    `json:"head_repository_node_id"`
+	HeadRef               string                    `json:"head_ref"`
+	HeadOID               string                    `json:"head_oid"`
+	State                 *PullRequestState         `json:"state"`
+	IsDraft               *bool                     `json:"is_draft"`
+	Merged                *bool                     `json:"merged"`
+	MergedAtUnixNano      *int64                    `json:"merged_at_unix_nano"`
+	Actor                 actorWire                 `json:"actor"`
+	Reviews               retainedCanonicalRecordV1 `json:"reviews"`
+	ReviewsClosure        retainedCanonicalRecordV1 `json:"reviews_closure"`
+	ReviewsClosureSHA256  string                    `json:"reviews_closure_sha256"`
+	EvidenceRefs          []ledger.EvidenceRef      `json:"evidence_refs"`
+	LimitsSHA256          string                    `json:"limits_sha256"`
 }
 
-func authoritativePRWire(input AuthoritativePullRequestSnapshotV1Input, limitsSHA string) authoritativePRWireV1 {
-	reviews := make([]reviewWire, len(input.Reviews))
-	for index, review := range input.Reviews {
-		reviews[index] = reviewWire{review.NodeID, review.DatabaseID, review.Reviewer, review.State, review.CommitSHA.String()}
+func authoritativePRWire(input AuthoritativePullRequestSnapshotV1Input, limitsSHA string, limits Limits) (authoritativePRWireV1, error) {
+	reviewBytes, err := canonicalAuthoritativePRReviews(input.Reviews)
+	if err != nil {
+		return authoritativePRWireV1{}, err
+	}
+	reviewRecord, err := newRetainedCanonicalRecordV1(retainedAuthoritativePRReviewsKindV1, reviewBytes, limits.MaxCumulativePaginationClosureBytes, limits)
+	if err != nil {
+		return authoritativePRWireV1{}, err
+	}
+	closureRecord, err := newRetainedCanonicalRecordV1(retainedReviewsClosureKindV1, input.ReviewsClosure.CanonicalJSON(), limits.MaxPaginationClosureBytes, limits)
+	if err != nil {
+		return authoritativePRWireV1{}, err
 	}
 	return authoritativePRWireV1{AuthoritativePullRequestSnapshotSchemaV1, snapshotWire(input.Snapshot), input.ResponseBodySHA256, input.APIVersion,
 		input.RepositoryBinding.CanonicalJSON(), pullRequestWire(input.PullRequest), input.PullRequestDatabaseID, input.BaseRepositoryNodeID,
 		input.BaseRef, input.BaseOID.String(), input.HeadRepositoryNodeID, input.HeadRef, input.HeadOID.String(), input.State, input.IsDraft, input.Merged,
-		input.MergedAtUnixNano, actingWire(input.Actor), reviews, input.ReviewsClosure.CanonicalJSON(), input.ReviewsClosure.SHA256(), input.EvidenceRefs, limitsSHA}
+		input.MergedAtUnixNano, actingWire(input.Actor), reviewRecord, closureRecord, input.ReviewsClosure.SHA256(), input.EvidenceRefs, limitsSHA}, nil
+}
+
+func canonicalAuthoritativePRReviews(reviews []Review) ([]byte, error) {
+	wires := make([]reviewWire, len(reviews))
+	for index, review := range reviews {
+		wires[index] = reviewWire{review.NodeID, review.DatabaseID, review.Reviewer, review.State, review.CommitSHA.String()}
+	}
+	canonical, _, err := canonicalJSON(wires)
+	return canonical, err
 }
 
 func ValidateAuthoritativePullRequestSnapshotV1(authority Authority, snapshot AuthoritativePullRequestSnapshotV1, limits Limits) error {
@@ -257,7 +280,7 @@ func ValidateAuthoritativePullRequestSnapshotV1(authority Authority, snapshot Au
 	return nil
 }
 
-func ParseCanonicalAuthoritativePullRequestSnapshotV1(data []byte, limits Limits) (AuthoritativePullRequestSnapshotV1, error) {
+func ParseCanonicalAuthoritativePullRequestSnapshotV1(data []byte, limits Limits, records ...CanonicalRecordSetV1) (AuthoritativePullRequestSnapshotV1, error) {
 	if err := limits.Validate(); err != nil {
 		return AuthoritativePullRequestSnapshotV1{}, err
 	}
@@ -295,15 +318,27 @@ func ParseCanonicalAuthoritativePullRequestSnapshotV1(data []byte, limits Limits
 	if err != nil {
 		return AuthoritativePullRequestSnapshotV1{}, err
 	}
-	reviews := make([]Review, len(wire.Reviews))
-	for index, item := range wire.Reviews {
+	reviewBytes, err := resolveRetainedCanonicalRecordV1(wire.Reviews, retainedAuthoritativePRReviewsKindV1, limits.MaxCumulativePaginationClosureBytes, limits, records)
+	if err != nil {
+		return AuthoritativePullRequestSnapshotV1{}, err
+	}
+	var reviewWires []reviewWire
+	if err := strictDecode(reviewBytes, &reviewWires); err != nil {
+		return AuthoritativePullRequestSnapshotV1{}, err
+	}
+	reviews := make([]Review, len(reviewWires))
+	for index, item := range reviewWires {
 		sha, err := NewGitSHA(item.CommitSHA)
 		if err != nil {
 			return AuthoritativePullRequestSnapshotV1{}, err
 		}
 		reviews[index] = Review{item.NodeID, item.DatabaseID, item.Reviewer, item.State, sha}
 	}
-	closure, err := ParseCanonicalPaginationClosureV1(wire.ReviewsClosure, limits)
+	closureBytes, err := resolveRetainedCanonicalRecordV1(wire.ReviewsClosure, retainedReviewsClosureKindV1, limits.MaxPaginationClosureBytes, limits, records)
+	if err != nil {
+		return AuthoritativePullRequestSnapshotV1{}, err
+	}
+	closure, err := ParseCanonicalPaginationClosureV1(closureBytes, limits)
 	if err != nil {
 		return AuthoritativePullRequestSnapshotV1{}, err
 	}

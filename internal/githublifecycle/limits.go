@@ -1,6 +1,7 @@
 package githublifecycle
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -57,6 +58,7 @@ type Limits struct {
 	MaxRequestIDBytes                      int
 	MaxCompressedResponseBodyBytes         int
 	MaxDecompressedResponseBodyBytes       int
+	MaxTargetResponseEnvelopeBytes         int
 	MaxPreSubmitHTTPCalls                  int
 	MaxCommitObjectCreationSubmissions     int
 	MaxTargetRefUpdateSubmissions          int
@@ -91,7 +93,8 @@ func DefaultLimits() Limits {
 		MaxLedgerLineBytes: 256 * 1024, MaxReadyLedgerSnapshotBytes: 64 * 1024 * 1024, MaxLedgerScanRecords: 262144,
 		MaxRequestBodyBytes: 16 * 1024, MaxResponseHeaderBytes: 32 * 1024, MaxLinkHeaderBytes: 8 * 1024, MaxRequestIDBytes: 256,
 		MaxCompressedResponseBodyBytes: 4 * 1024 * 1024, MaxDecompressedResponseBodyBytes: 4 * 1024 * 1024,
-		MaxPreSubmitHTTPCalls: 28, MaxCommitObjectCreationSubmissions: 1, MaxTargetRefUpdateSubmissions: 1,
+		MaxTargetResponseEnvelopeBytes: 4*1024*1024 + 64*1024,
+		MaxPreSubmitHTTPCalls:          28, MaxCommitObjectCreationSubmissions: 1, MaxTargetRefUpdateSubmissions: 1,
 		MaxPostMergeHTTPCalls: 8, MaxReconciliationRounds: 8, MaxReconciliationCallsPerRound: 3,
 		MaxPrincipalValidationCalls: 2, MaxHTTPCalls: 64,
 		MaxCumulativeRequestBytes: 1 * 1024 * 1024, MaxCumulativeResponseHeaderBytes: 2 * 1024 * 1024,
@@ -117,6 +120,7 @@ func (l Limits) Validate() error {
 		l.MaxCancellationAuthorityBytes <= 0 || l.MaxLedgerLineBytes <= 0 || l.MaxReadyLedgerSnapshotBytes <= 0 ||
 		l.MaxLedgerScanRecords <= 0 || l.MaxRequestBodyBytes <= 0 || l.MaxResponseHeaderBytes <= 0 || l.MaxLinkHeaderBytes <= 0 ||
 		l.MaxRequestIDBytes <= 0 || l.MaxCompressedResponseBodyBytes <= 0 || l.MaxDecompressedResponseBodyBytes <= 0 ||
+		l.MaxTargetResponseEnvelopeBytes <= 0 ||
 		l.MaxPreSubmitHTTPCalls <= 0 || l.MaxCommitObjectCreationSubmissions <= 0 || l.MaxTargetRefUpdateSubmissions <= 0 ||
 		l.MaxPostMergeHTTPCalls <= 0 || l.MaxReconciliationRounds <= 0 || l.MaxReconciliationCallsPerRound <= 0 ||
 		l.MaxPrincipalValidationCalls <= 0 || l.MaxHTTPCalls <= 0 || l.MaxCumulativeRequestBytes <= 0 ||
@@ -136,6 +140,9 @@ func (l Limits) Validate() error {
 	}
 	if l.MaxReadyEvidenceArtifactBytes > l.MaxReadyEvidenceClosureBytes || l.MaxLedgerLineBytes > l.MaxReadyLedgerSnapshotBytes {
 		return errors.New("one READY artifact or ledger line cannot exceed its cumulative snapshot budget")
+	}
+	if l.MaxTargetResponseEnvelopeBytes <= l.MaxDecompressedResponseBodyBytes {
+		return errors.New("target response envelope must have an independent bound above the response-body bound")
 	}
 	return nil
 }
@@ -184,6 +191,7 @@ func (l Limits) CanonicalJSON() ([]byte, error) {
 		MaxRequestIDBytes                        int   `json:"max_request_id_bytes"`
 		MaxCompressedResponseBodyBytes           int   `json:"max_compressed_response_body_bytes"`
 		MaxDecompressedResponseBodyBytes         int   `json:"max_decompressed_response_body_bytes"`
+		MaxTargetResponseEnvelopeBytes           int   `json:"max_target_response_envelope_bytes"`
 		MaxPreSubmitHTTPCalls                    int   `json:"max_pre_submit_http_calls"`
 		MaxCommitObjectCreationSubmissions       int   `json:"max_commit_object_creation_submissions"`
 		MaxTargetRefUpdateSubmissions            int   `json:"max_target_ref_update_submissions"`
@@ -203,7 +211,7 @@ func (l Limits) CanonicalJSON() ([]byte, error) {
 		MaxWriteRetries                          int   `json:"max_write_retries"`
 		MaxAmbiguousRetries                      int   `json:"max_ambiguous_retries"`
 	}{
-		2, l.MaxRequiredTrustedChecks, l.MaxEligibleReviewers, l.MaxRequiredReviewers, l.MaxMinimumApprovals,
+		3, l.MaxRequiredTrustedChecks, l.MaxEligibleReviewers, l.MaxRequiredReviewers, l.MaxMinimumApprovals,
 		l.MaxObservedChecks, l.MaxObservedReviews, l.MaxPaginationPages, l.MaxPaginationItemsPerPage,
 		l.MaxObservedItemsPerPaginationSource, l.RequiredPaginationSources, l.MaxPaginationClosureBytes,
 		l.MaxCumulativePaginationClosureBytes, l.MaxTextBytes, l.MaxEvidenceRefs, l.MaxMetadataItems,
@@ -212,7 +220,7 @@ func (l Limits) CanonicalJSON() ([]byte, error) {
 		l.MaxProductionMergeLineageEntries, l.MaxDescendantDistance, l.MaxCanonicalObjectBytes,
 		l.MaxCancellationAuthorityBytes, l.MaxLedgerLineBytes, l.MaxReadyLedgerSnapshotBytes, l.MaxLedgerScanRecords,
 		l.MaxRequestBodyBytes, l.MaxResponseHeaderBytes, l.MaxLinkHeaderBytes, l.MaxRequestIDBytes,
-		l.MaxCompressedResponseBodyBytes, l.MaxDecompressedResponseBodyBytes, l.MaxPreSubmitHTTPCalls,
+		l.MaxCompressedResponseBodyBytes, l.MaxDecompressedResponseBodyBytes, l.MaxTargetResponseEnvelopeBytes, l.MaxPreSubmitHTTPCalls,
 		l.MaxCommitObjectCreationSubmissions, l.MaxTargetRefUpdateSubmissions, l.MaxPostMergeHTTPCalls,
 		l.MaxReconciliationRounds, l.MaxReconciliationCallsPerRound, l.MaxPrincipalValidationCalls, l.MaxHTTPCalls,
 		l.MaxCumulativeRequestBytes, l.MaxCumulativeResponseHeaderBytes, l.MaxCumulativeCompressedResponseBytes,
@@ -258,4 +266,92 @@ func requireCanonicalObjectSize(data []byte, limit int, object string) error {
 		return errors.New(object + " canonical object exceeds its governed byte limit")
 	}
 	return nil
+}
+
+const (
+	retainedCanonicalRecordSchemaV1 = "retained-canonical-record-reference-v1"
+	retainedCanonicalInlineBytesV1  = 32 * 1024
+)
+
+// CanonicalRecordSetV1 is a network-free recovery input for content-addressed
+// records retained outside a bounded canonical container. It deliberately has
+// no filesystem, provider, or callback behavior; Task 2 owns durable storage.
+type CanonicalRecordSetV1 struct {
+	records map[string][]byte
+}
+
+// NewCanonicalRecordSetV1 copies exact retained bytes into an immutable,
+// content-addressed in-memory set suitable for strict contract parsing.
+func NewCanonicalRecordSetV1(records ...[]byte) (CanonicalRecordSetV1, error) {
+	set := CanonicalRecordSetV1{records: make(map[string][]byte, len(records))}
+	for _, record := range records {
+		if len(record) == 0 {
+			return CanonicalRecordSetV1{}, errors.New("retained canonical record is empty")
+		}
+		reference := retainedCanonicalReference(record)
+		if existing, ok := set.records[reference]; ok && !bytes.Equal(existing, record) {
+			return CanonicalRecordSetV1{}, errors.New("retained canonical record reference is ambiguous")
+		}
+		set.records[reference] = append([]byte(nil), record...)
+	}
+	return set, nil
+}
+
+type retainedCanonicalRecordV1 struct {
+	Schema         string `json:"schema"`
+	Kind           string `json:"kind"`
+	Reference      string `json:"reference"`
+	SHA256         string `json:"sha256"`
+	CanonicalBytes int    `json:"canonical_bytes"`
+	InlineBytes    []byte `json:"inline_bytes,omitempty"`
+}
+
+func retainedCanonicalReference(record []byte) string {
+	return "sha256:" + digestBytes(record)
+}
+
+func newRetainedCanonicalRecordV1(kind string, record []byte, maxBytes int, limits Limits) (retainedCanonicalRecordV1, error) {
+	if !validOpaqueID(kind, 256) || len(record) == 0 || maxBytes <= 0 || len(record) > maxBytes {
+		return retainedCanonicalRecordV1{}, errors.New("retained canonical record identity or stage bound is invalid")
+	}
+	return makeRetainedCanonicalRecordV1(kind, record), nil
+}
+
+func makeRetainedCanonicalRecordV1(kind string, record []byte) retainedCanonicalRecordV1 {
+	digest := digestBytes(record)
+	value := retainedCanonicalRecordV1{
+		Schema: retainedCanonicalRecordSchemaV1, Kind: kind, Reference: "sha256:" + digest,
+		SHA256: digest, CanonicalBytes: len(record),
+	}
+	if len(record) <= retainedCanonicalInlineBytesV1 {
+		value.InlineBytes = append([]byte(nil), record...)
+	}
+	return value
+}
+
+func resolveRetainedCanonicalRecordV1(binding retainedCanonicalRecordV1, expectedKind string, maxBytes int, limits Limits, sets []CanonicalRecordSetV1) ([]byte, error) {
+	if binding.Schema != retainedCanonicalRecordSchemaV1 || binding.Kind != expectedKind ||
+		!validSHA256(binding.SHA256) || binding.Reference != "sha256:"+binding.SHA256 ||
+		binding.CanonicalBytes <= 0 || maxBytes <= 0 || binding.CanonicalBytes > maxBytes {
+		return nil, errors.New("retained canonical record reference identity is invalid")
+	}
+	inline := retainedCanonicalInlineBytesV1
+	if len(binding.InlineBytes) > 0 {
+		if binding.CanonicalBytes > inline || len(binding.InlineBytes) != binding.CanonicalBytes ||
+			digestBytes(binding.InlineBytes) != binding.SHA256 {
+			return nil, errors.New("inline retained canonical record disagrees with its reference")
+		}
+		return binding.InlineBytes, nil
+	}
+	if binding.CanonicalBytes <= inline || len(sets) != 1 || sets[0].records == nil {
+		return nil, errors.New("referenced canonical record is missing")
+	}
+	record, ok := sets[0].records[binding.Reference]
+	if !ok {
+		return nil, errors.New("referenced canonical record is missing")
+	}
+	if len(record) != binding.CanonicalBytes || digestBytes(record) != binding.SHA256 {
+		return nil, errors.New("referenced canonical record is substituted or digest-mismatched")
+	}
+	return record, nil
 }

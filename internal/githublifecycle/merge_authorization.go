@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -16,12 +17,21 @@ import (
 )
 
 const (
-	MergeCommitRecipeSchemaV1        = "merge-commit-recipe-v1"
-	GitHubAtomicBaseHeadCapabilityV1 = "github-update-refs-atomic-base-head-v1"
-	ProviderCapabilitySchemaV1       = "provider-capability-v1"
-	AuthorizationSealSchemaV1        = "authorization-seal-v1"
-	SealedMergeAuthorizationSchemaV1 = "sealed-merge-authorization-v1"
-	TargetRefCommitmentSchemaV1      = "target-ref-commitment-v1"
+	MergeCommitRecipeSchemaV1           = "merge-commit-recipe-v1"
+	GitHubAtomicBaseHeadCapabilityV1    = "github-update-refs-atomic-base-head-v1"
+	ProviderCapabilitySchemaV1          = "provider-capability-v1"
+	AuthorizationSealSchemaV1           = "authorization-seal-v1"
+	SealedMergeAuthorizationSchemaV1    = "sealed-merge-authorization-v1"
+	TargetRefCommitmentSchemaV1         = "target-ref-commitment-v1"
+	retainedMergeInitialPRKindV1        = "merge-input-initial-pr-v1"
+	retainedMergeChecksKindV1           = "merge-input-checks-v1"
+	retainedMergeCheckRunsKindV1        = "merge-input-check-runs-closure-v1"
+	retainedMergeStatusesKindV1         = "merge-input-statuses-closure-v1"
+	retainedSealFinalRevalidationKindV1 = "authorization-seal-final-revalidation-v1"
+	retainedSealFinalPRKindV1           = "authorization-seal-final-pr-v1"
+	retainedSealFinalChecksKindV1       = "authorization-seal-final-checks-v1"
+	retainedSealFinalCheckRunsKindV1    = "authorization-seal-check-runs-closure-v1"
+	retainedSealFinalStatusesKindV1     = "authorization-seal-statuses-closure-v1"
 )
 
 type MergeCommitRecipeV1Input struct {
@@ -465,7 +475,11 @@ func NewAuthorizationSealV1(input AuthorizationSealV1Input, limits Limits) (Auth
 		!bytes.Equal(revalidated.CanonicalJSON(), input.FinalRevalidation.CanonicalJSON()) {
 		return AuthorizationSealV1{}, errors.New("authorization seal final revalidation fails independent validation")
 	}
-	canonical, digest, err := canonicalJSON(authorizationSealWire(input, limitsSHA))
+	wire, err := authorizationSealWire(input, limitsSHA, limits)
+	if err != nil {
+		return AuthorizationSealV1{}, err
+	}
+	canonical, digest, err := canonicalJSON(wire)
 	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
@@ -490,55 +504,79 @@ func (s AuthorizationSealV1) valid() bool {
 }
 
 type authorizationSealWireV1 struct {
-	Schema                           string                  `json:"schema"`
-	MergeInputSHA256                 string                  `json:"merge_input_sha256"`
-	Attempt                          writeAttemptWire        `json:"write_attempt"`
-	AuthoritySHA256                  string                  `json:"authority_sha256"`
-	ReadyBindingSHA256               string                  `json:"ready_binding_sha256"`
-	PolicySHA256                     string                  `json:"policy_sha256"`
-	FinalRevalidation                json.RawMessage         `json:"final_revalidation"`
-	FinalRevalidationSHA256          string                  `json:"final_revalidation_sha256"`
-	FinalDecisionSHA256              string                  `json:"final_decision_sha256"`
-	FinalPullRequest                 json.RawMessage         `json:"final_pull_request"`
-	FinalPullRequestSHA256           string                  `json:"final_pull_request_sha256"`
-	FinalChecks                      []checkWire             `json:"final_checks"`
-	FinalCheckRunsClosure            json.RawMessage         `json:"final_check_runs_closure"`
-	FinalCheckRunsClosureSHA256      string                  `json:"final_check_runs_closure_sha256"`
-	FinalCommitStatusesClosure       json.RawMessage         `json:"final_commit_statuses_closure"`
-	FinalCommitStatusesClosureSHA256 string                  `json:"final_commit_statuses_closure_sha256"`
-	PolicyDecisionSHA256             string                  `json:"policy_decision_sha256"`
-	Verdict                          string                  `json:"verdict"`
-	PREligible                       bool                    `json:"pr_eligible"`
-	Capability                       json.RawMessage         `json:"provider_capability"`
-	CapabilitySHA256                 string                  `json:"provider_capability_sha256"`
-	Recipe                           json.RawMessage         `json:"recipe"`
-	RecipeSHA256                     string                  `json:"recipe_sha256"`
-	ExpectedResultSHA                string                  `json:"expected_result_sha"`
-	BaseRef                          string                  `json:"base_ref"`
-	BaseOID                          string                  `json:"base_oid"`
-	HeadRef                          string                  `json:"head_ref"`
-	HeadOID                          string                  `json:"head_oid"`
-	Counters                         AuthorizationCountersV1 `json:"counters"`
-	NoTargetRequestAttempted         bool                    `json:"no_target_request_attempted"`
-	EvidenceRefs                     []ledger.EvidenceRef    `json:"evidence_refs"`
-	LimitsSHA256                     string                  `json:"limits_sha256"`
+	Schema                           string                    `json:"schema"`
+	MergeInputSHA256                 string                    `json:"merge_input_sha256"`
+	Attempt                          writeAttemptWire          `json:"write_attempt"`
+	AuthoritySHA256                  string                    `json:"authority_sha256"`
+	ReadyBindingSHA256               string                    `json:"ready_binding_sha256"`
+	PolicySHA256                     string                    `json:"policy_sha256"`
+	FinalRevalidation                retainedCanonicalRecordV1 `json:"final_revalidation"`
+	FinalRevalidationSHA256          string                    `json:"final_revalidation_sha256"`
+	FinalDecisionSHA256              string                    `json:"final_decision_sha256"`
+	FinalPullRequest                 retainedCanonicalRecordV1 `json:"final_pull_request"`
+	FinalPullRequestSHA256           string                    `json:"final_pull_request_sha256"`
+	FinalChecks                      retainedCanonicalRecordV1 `json:"final_checks"`
+	FinalCheckRunsClosure            retainedCanonicalRecordV1 `json:"final_check_runs_closure"`
+	FinalCheckRunsClosureSHA256      string                    `json:"final_check_runs_closure_sha256"`
+	FinalCommitStatusesClosure       retainedCanonicalRecordV1 `json:"final_commit_statuses_closure"`
+	FinalCommitStatusesClosureSHA256 string                    `json:"final_commit_statuses_closure_sha256"`
+	PolicyDecisionSHA256             string                    `json:"policy_decision_sha256"`
+	Verdict                          string                    `json:"verdict"`
+	PREligible                       bool                      `json:"pr_eligible"`
+	Capability                       json.RawMessage           `json:"provider_capability"`
+	CapabilitySHA256                 string                    `json:"provider_capability_sha256"`
+	Recipe                           json.RawMessage           `json:"recipe"`
+	RecipeSHA256                     string                    `json:"recipe_sha256"`
+	ExpectedResultSHA                string                    `json:"expected_result_sha"`
+	BaseRef                          string                    `json:"base_ref"`
+	BaseOID                          string                    `json:"base_oid"`
+	HeadRef                          string                    `json:"head_ref"`
+	HeadOID                          string                    `json:"head_oid"`
+	Counters                         AuthorizationCountersV1   `json:"counters"`
+	NoTargetRequestAttempted         bool                      `json:"no_target_request_attempted"`
+	EvidenceRefs                     []ledger.EvidenceRef      `json:"evidence_refs"`
+	LimitsSHA256                     string                    `json:"limits_sha256"`
 }
 
-func authorizationSealWire(i AuthorizationSealV1Input, limitsSHA string) authorizationSealWireV1 {
+func authorizationSealWire(i AuthorizationSealV1Input, limitsSHA string, limits Limits) (authorizationSealWireV1, error) {
 	authoritySHA, _ := i.MergeInput.authority.SHA256()
 	final := i.FinalRevalidation.input
 	checks := checkWires(final.Checks)
+	checkBytes, _, err := canonicalJSON(checks)
+	if err != nil {
+		return authorizationSealWireV1{}, err
+	}
+	finalRecord, err := newRetainedCanonicalRecordV1(retainedSealFinalRevalidationKindV1, i.FinalRevalidation.CanonicalJSON(), limits.MaxCanonicalObjectBytes, limits)
+	if err != nil {
+		return authorizationSealWireV1{}, err
+	}
+	prRecord, err := newRetainedCanonicalRecordV1(retainedSealFinalPRKindV1, final.PullRequest.CanonicalJSON(), limits.MaxCanonicalObjectBytes, limits)
+	if err != nil {
+		return authorizationSealWireV1{}, err
+	}
+	checksRecord, err := newRetainedCanonicalRecordV1(retainedSealFinalChecksKindV1, checkBytes, limits.MaxCumulativePaginationClosureBytes, limits)
+	if err != nil {
+		return authorizationSealWireV1{}, err
+	}
+	checkRunsRecord, err := newRetainedCanonicalRecordV1(retainedSealFinalCheckRunsKindV1, final.CheckRunsClosure.CanonicalJSON(), limits.MaxPaginationClosureBytes, limits)
+	if err != nil {
+		return authorizationSealWireV1{}, err
+	}
+	statusesRecord, err := newRetainedCanonicalRecordV1(retainedSealFinalStatusesKindV1, final.CommitStatusesClosure.CanonicalJSON(), limits.MaxPaginationClosureBytes, limits)
+	if err != nil {
+		return authorizationSealWireV1{}, err
+	}
 	return authorizationSealWireV1{AuthorizationSealSchemaV1, i.MergeInput.SHA256(), attemptWire(i.MergeInput.attempt), authoritySHA, i.MergeInput.authority.ReadyBinding().SHA256(), i.MergeInput.authority.MergePolicy().SHA256(),
-		i.FinalRevalidation.CanonicalJSON(), i.FinalRevalidation.SHA256(), i.FinalRevalidation.FinalDecisionSHA256(),
-		final.PullRequest.CanonicalJSON(), final.PullRequest.SHA256(), checks, final.CheckRunsClosure.CanonicalJSON(), final.CheckRunsClosure.SHA256(),
-		final.CommitStatusesClosure.CanonicalJSON(), final.CommitStatusesClosure.SHA256(), i.FinalRevalidation.FinalDecisionSHA256(), "authorized", true,
+		finalRecord, i.FinalRevalidation.SHA256(), i.FinalRevalidation.FinalDecisionSHA256(),
+		prRecord, final.PullRequest.SHA256(), checksRecord, checkRunsRecord, final.CheckRunsClosure.SHA256(),
+		statusesRecord, final.CommitStatusesClosure.SHA256(), i.FinalRevalidation.FinalDecisionSHA256(), "authorized", true,
 		final.Capability.CanonicalJSON(), final.Capability.SHA256(), final.Recipe.CanonicalJSON(), final.Recipe.SHA256(), final.Recipe.ExpectedResultSHA().String(),
 		"refs/heads/" + i.MergeInput.authority.BaseBranch().String(), i.MergeInput.authority.ExpectedBaseTipSHA().String(),
 		"refs/heads/" + i.MergeInput.authority.HeadBranch().String(), i.MergeInput.authority.HeadSHA().String(), final.Counters,
-		final.NoTargetRequestAttempted, final.EvidenceRefs, limitsSHA}
+		final.NoTargetRequestAttempted, final.EvidenceRefs, limitsSHA}, nil
 }
 
-func ParseCanonicalAuthorizationSealV1(data []byte, input MergeInput, limits Limits) (AuthorizationSealV1, error) {
+func ParseCanonicalAuthorizationSealV1(data []byte, input MergeInput, limits Limits, records ...CanonicalRecordSetV1) (AuthorizationSealV1, error) {
 	if err := limits.Validate(); err != nil {
 		return AuthorizationSealV1{}, err
 	}
@@ -555,27 +593,51 @@ func ParseCanonicalAuthorizationSealV1(data []byte, input MergeInput, limits Lim
 	if err := validateMergeInput(input, limits); err != nil {
 		return AuthorizationSealV1{}, err
 	}
-	final, err := ParseCanonicalFinalRevalidationV1(wire.FinalRevalidation, input, limits)
+	finalBytes, err := resolveRetainedCanonicalRecordV1(wire.FinalRevalidation, retainedSealFinalRevalidationKindV1, limits.MaxCanonicalObjectBytes, limits, records)
 	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
-	pr, err := ParseCanonicalAuthoritativePullRequestSnapshotV1(wire.FinalPullRequest, limits)
+	final, err := ParseCanonicalFinalRevalidationV1(finalBytes, input, limits, records...)
 	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
-	checks := make([]Check, len(wire.FinalChecks))
-	for index, item := range wire.FinalChecks {
+	prBytes, err := resolveRetainedCanonicalRecordV1(wire.FinalPullRequest, retainedSealFinalPRKindV1, limits.MaxCanonicalObjectBytes, limits, records)
+	if err != nil {
+		return AuthorizationSealV1{}, err
+	}
+	pr, err := ParseCanonicalAuthoritativePullRequestSnapshotV1(prBytes, limits, records...)
+	if err != nil {
+		return AuthorizationSealV1{}, err
+	}
+	checkBytes, err := resolveRetainedCanonicalRecordV1(wire.FinalChecks, retainedSealFinalChecksKindV1, limits.MaxCumulativePaginationClosureBytes, limits, records)
+	if err != nil {
+		return AuthorizationSealV1{}, err
+	}
+	var finalCheckWires []checkWire
+	if err := strictDecode(checkBytes, &finalCheckWires); err != nil {
+		return AuthorizationSealV1{}, err
+	}
+	checks := make([]Check, len(finalCheckWires))
+	for index, item := range finalCheckWires {
 		head, err := NewGitSHA(item.HeadSHA)
 		if err != nil {
 			return AuthorizationSealV1{}, err
 		}
 		checks[index] = Check{item.NodeID, item.Name, item.Identity, item.Status, item.Conclusion, head, append([]ledger.EvidenceRef(nil), item.EvidenceRefs...)}
 	}
-	checkRuns, err := ParseCanonicalPaginationClosureV1(wire.FinalCheckRunsClosure, limits)
+	checkRunsBytes, err := resolveRetainedCanonicalRecordV1(wire.FinalCheckRunsClosure, retainedSealFinalCheckRunsKindV1, limits.MaxPaginationClosureBytes, limits, records)
 	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
-	statuses, err := ParseCanonicalPaginationClosureV1(wire.FinalCommitStatusesClosure, limits)
+	checkRuns, err := ParseCanonicalPaginationClosureV1(checkRunsBytes, limits)
+	if err != nil {
+		return AuthorizationSealV1{}, err
+	}
+	statusesBytes, err := resolveRetainedCanonicalRecordV1(wire.FinalCommitStatusesClosure, retainedSealFinalStatusesKindV1, limits.MaxPaginationClosureBytes, limits, records)
+	if err != nil {
+		return AuthorizationSealV1{}, err
+	}
+	statuses, err := ParseCanonicalPaginationClosureV1(statusesBytes, limits)
 	if err != nil {
 		return AuthorizationSealV1{}, err
 	}
@@ -716,7 +778,11 @@ func NewSealedMergeAuthorizationV1(input SealedMergeAuthorizationV1Input, limits
 	if !input.Seal.valid() || input.Seal.input.MergeInput.SHA256() != input.MergeInput.SHA256() || !input.Commitment.valid() || input.Commitment.sealSHA != input.Seal.SHA256() || input.Commitment.capabilitySHA != input.MergeInput.capability.SHA256() {
 		return SealedMergeAuthorizationV1{}, errors.New("sealed authorization chain is inconsistent")
 	}
-	wire := sealedMergeAuthorizationWireV1{SealedMergeAuthorizationSchemaV1, input.MergeInput.CanonicalPayload(), input.MergeInput.SHA256(), input.Seal.CanonicalJSON(), input.Seal.SHA256(), input.Commitment.CanonicalJSON(), input.Commitment.SHA256(), limitsSHA}
+	bundles, err := retainedCanonicalBundlesForSealedAuthorizationV1(input)
+	if err != nil {
+		return SealedMergeAuthorizationV1{}, err
+	}
+	wire := sealedMergeAuthorizationWireV1{SealedMergeAuthorizationSchemaV1, input.MergeInput.CanonicalPayload(), input.MergeInput.SHA256(), input.Seal.CanonicalJSON(), input.Seal.SHA256(), input.Commitment.CanonicalJSON(), input.Commitment.SHA256(), bundles, limitsSHA}
 	canonical, digest, err := canonicalJSON(wire)
 	if err != nil {
 		return SealedMergeAuthorizationV1{}, err
@@ -725,17 +791,26 @@ func NewSealedMergeAuthorizationV1(input SealedMergeAuthorizationV1Input, limits
 }
 
 type sealedMergeAuthorizationWireV1 struct {
-	Schema           string          `json:"schema"`
-	MergeInput       json.RawMessage `json:"merge_input"`
-	MergeInputSHA256 string          `json:"merge_input_sha256"`
-	Seal             json.RawMessage `json:"authorization_seal"`
-	SealSHA256       string          `json:"authorization_seal_sha256"`
-	Commitment       json.RawMessage `json:"target_ref_commitment"`
-	CommitmentSHA256 string          `json:"target_ref_commitment_sha256"`
-	LimitsSHA256     string          `json:"limits_sha256"`
+	Schema                   string                            `json:"schema"`
+	MergeInput               json.RawMessage                   `json:"merge_input"`
+	MergeInputSHA256         string                            `json:"merge_input_sha256"`
+	Seal                     json.RawMessage                   `json:"authorization_seal"`
+	SealSHA256               string                            `json:"authorization_seal_sha256"`
+	Commitment               json.RawMessage                   `json:"target_ref_commitment"`
+	CommitmentSHA256         string                            `json:"target_ref_commitment_sha256"`
+	RetainedCanonicalRecords []retainedCanonicalRecordBundleV1 `json:"retained_canonical_records"`
+	LimitsSHA256             string                            `json:"limits_sha256"`
 }
 
-func ParseCanonicalSealedMergeAuthorizationV1(data []byte, limits Limits) (SealedMergeAuthorizationV1, error) {
+type retainedCanonicalRecordBundleV1 struct {
+	Schema         string `json:"schema"`
+	Reference      string `json:"reference"`
+	SHA256         string `json:"sha256"`
+	CanonicalBytes int    `json:"canonical_bytes"`
+	Bytes          []byte `json:"bytes"`
+}
+
+func ParseCanonicalSealedMergeAuthorizationV1(data []byte, limits Limits, records ...CanonicalRecordSetV1) (SealedMergeAuthorizationV1, error) {
 	var wire sealedMergeAuthorizationWireV1
 	if err := strictDecode(data, &wire); err != nil {
 		return SealedMergeAuthorizationV1{}, err
@@ -743,11 +818,19 @@ func ParseCanonicalSealedMergeAuthorizationV1(data []byte, limits Limits) (Seale
 	if wire.Schema != SealedMergeAuthorizationSchemaV1 {
 		return SealedMergeAuthorizationV1{}, errors.New("unsupported sealed authorization schema")
 	}
-	input, err := ParseCanonicalMergeInput(wire.MergeInput, limits)
+	bundleSet, err := canonicalRecordSetFromBundlesV1(wire.RetainedCanonicalRecords)
 	if err != nil {
 		return SealedMergeAuthorizationV1{}, err
 	}
-	seal, err := ParseCanonicalAuthorizationSealV1(wire.Seal, input, limits)
+	resolvedRecords := records
+	if len(wire.RetainedCanonicalRecords) > 0 {
+		resolvedRecords = []CanonicalRecordSetV1{bundleSet}
+	}
+	input, err := ParseCanonicalMergeInput(wire.MergeInput, limits, resolvedRecords...)
+	if err != nil {
+		return SealedMergeAuthorizationV1{}, err
+	}
+	seal, err := ParseCanonicalAuthorizationSealV1(wire.Seal, input, limits, resolvedRecords...)
 	if err != nil {
 		return SealedMergeAuthorizationV1{}, err
 	}
@@ -841,31 +924,138 @@ func cloneSealedInput(i SealedMergeAuthorizationV1Input) SealedMergeAuthorizatio
 	return i
 }
 
+func retainedCanonicalRecordsForSealedAuthorizationV1(sealed SealedMergeAuthorizationV1Input) ([][]byte, error) {
+	input := sealed.MergeInput
+	final := sealed.Seal.input.FinalRevalidation
+	records := [][]byte{
+		input.initialPullRequest.CanonicalJSON(),
+		input.checkRunsClosure.CanonicalJSON(),
+		input.commitStatusesClosure.CanonicalJSON(),
+		final.CanonicalJSON(),
+		final.input.CurrentReadyProof.CanonicalJSON(),
+		final.input.CurrentReadyProof.input.ObservedLedgerJSONL,
+		final.input.PullRequest.CanonicalJSON(),
+		final.input.CheckRunsClosure.CanonicalJSON(),
+		final.input.CommitStatusesClosure.CanonicalJSON(),
+	}
+	for _, pr := range []AuthoritativePullRequestSnapshotV1{input.initialPullRequest, final.input.PullRequest} {
+		reviews, err := canonicalAuthoritativePRReviews(pr.input.Reviews)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, reviews, pr.input.ReviewsClosure.CanonicalJSON())
+	}
+	for _, checks := range [][]Check{input.checks, final.input.Checks} {
+		canonical, _, err := canonicalJSON(checkWires(checks))
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, canonical)
+	}
+	return records, nil
+}
+
+func retainedCanonicalBundlesForSealedAuthorizationV1(sealed SealedMergeAuthorizationV1Input) ([]retainedCanonicalRecordBundleV1, error) {
+	records, err := retainedCanonicalRecordsForSealedAuthorizationV1(sealed)
+	if err != nil {
+		return nil, err
+	}
+	byReference := make(map[string][]byte)
+	for _, record := range records {
+		if len(record) <= retainedCanonicalInlineBytesV1 {
+			continue
+		}
+		byReference[retainedCanonicalReference(record)] = record
+	}
+	references := make([]string, 0, len(byReference))
+	for reference := range byReference {
+		references = append(references, reference)
+	}
+	sort.Strings(references)
+	bundles := make([]retainedCanonicalRecordBundleV1, len(references))
+	for index, reference := range references {
+		record := byReference[reference]
+		bundles[index] = retainedCanonicalRecordBundleV1{
+			Schema: retainedCanonicalRecordSchemaV1, Reference: reference, SHA256: digestBytes(record),
+			CanonicalBytes: len(record), Bytes: append([]byte(nil), record...),
+		}
+	}
+	return bundles, nil
+}
+
+func canonicalRecordSetFromBundlesV1(bundles []retainedCanonicalRecordBundleV1) (CanonicalRecordSetV1, error) {
+	set := CanonicalRecordSetV1{records: make(map[string][]byte, len(bundles))}
+	previous := ""
+	for index, bundle := range bundles {
+		if bundle.Schema != retainedCanonicalRecordSchemaV1 || !validSHA256(bundle.SHA256) ||
+			bundle.Reference != "sha256:"+bundle.SHA256 || bundle.CanonicalBytes <= retainedCanonicalInlineBytesV1 ||
+			len(bundle.Bytes) != bundle.CanonicalBytes || digestBytes(bundle.Bytes) != bundle.SHA256 ||
+			(index > 0 && bundle.Reference <= previous) {
+			return CanonicalRecordSetV1{}, errors.New("sealed retained canonical record bundle is invalid, duplicated, or unordered")
+		}
+		previous = bundle.Reference
+		set.records[bundle.Reference] = bundle.Bytes
+	}
+	return set, nil
+}
+
 type mergeInputWireV1 struct {
-	Authority                   json.RawMessage      `json:"authority"`
-	PolicyDecisionSHA256        string               `json:"policy_decision_sha256"`
-	InitialPullRequest          json.RawMessage      `json:"initial_pull_request"`
-	InitialPullRequestSHA256    string               `json:"initial_pull_request_sha256"`
-	Checks                      []checkWire          `json:"checks"`
-	CheckRunsClosure            json.RawMessage      `json:"check_runs_closure"`
-	CheckRunsClosureSHA256      string               `json:"check_runs_closure_sha256"`
-	CommitStatusesClosure       json.RawMessage      `json:"commit_statuses_closure"`
-	CommitStatusesClosureSHA256 string               `json:"commit_statuses_closure_sha256"`
-	Capability                  json.RawMessage      `json:"provider_capability"`
-	CapabilitySHA256            string               `json:"provider_capability_sha256"`
-	Recipe                      json.RawMessage      `json:"merge_commit_recipe"`
-	RecipeSHA256                string               `json:"merge_commit_recipe_sha256"`
-	ExpectedResultSHA           string               `json:"expected_result_sha"`
-	EvidenceRefs                []ledger.EvidenceRef `json:"approval_evidence"`
-	LimitsSHA256                string               `json:"limits_sha256"`
+	Authority                   json.RawMessage           `json:"authority"`
+	PolicyDecisionSHA256        string                    `json:"policy_decision_sha256"`
+	InitialPullRequest          retainedCanonicalRecordV1 `json:"initial_pull_request"`
+	InitialPullRequestSHA256    string                    `json:"initial_pull_request_sha256"`
+	Checks                      retainedCanonicalRecordV1 `json:"checks"`
+	CheckRunsClosure            retainedCanonicalRecordV1 `json:"check_runs_closure"`
+	CheckRunsClosureSHA256      string                    `json:"check_runs_closure_sha256"`
+	CommitStatusesClosure       retainedCanonicalRecordV1 `json:"commit_statuses_closure"`
+	CommitStatusesClosureSHA256 string                    `json:"commit_statuses_closure_sha256"`
+	Capability                  json.RawMessage           `json:"provider_capability"`
+	CapabilitySHA256            string                    `json:"provider_capability_sha256"`
+	Recipe                      json.RawMessage           `json:"merge_commit_recipe"`
+	RecipeSHA256                string                    `json:"merge_commit_recipe_sha256"`
+	ExpectedResultSHA           string                    `json:"expected_result_sha"`
+	EvidenceRefs                []ledger.EvidenceRef      `json:"approval_evidence"`
+	LimitsSHA256                string                    `json:"limits_sha256"`
 }
 
 func mergeAuthorizationPayloadWire(input MergeAuthorizationInputV1, authority Authority, limitsSHA string) mergeInputWireV1 {
 	authorityJSON, _ := authority.CanonicalJSON()
-	return mergeInputWireV1{authorityJSON, input.PolicyDecisionSHA256, input.InitialPullRequest.CanonicalJSON(), input.InitialPullRequest.SHA256(), checkWires(input.Checks), input.CheckRunsClosure.CanonicalJSON(), input.CheckRunsClosure.SHA256(), input.CommitStatusesClosure.CanonicalJSON(), input.CommitStatusesClosure.SHA256(), input.Capability.CanonicalJSON(), input.Capability.SHA256(), input.Recipe.CanonicalJSON(), input.Recipe.SHA256(), input.Recipe.ExpectedResultSHA().String(), input.EvidenceRefs, limitsSHA}
+	checks, _, _ := canonicalJSON(checkWires(input.Checks))
+	return mergeInputWireV1{authorityJSON, input.PolicyDecisionSHA256,
+		makeRetainedCanonicalRecordV1(retainedMergeInitialPRKindV1, input.InitialPullRequest.CanonicalJSON()), input.InitialPullRequest.SHA256(),
+		makeRetainedCanonicalRecordV1(retainedMergeChecksKindV1, checks),
+		makeRetainedCanonicalRecordV1(retainedMergeCheckRunsKindV1, input.CheckRunsClosure.CanonicalJSON()), input.CheckRunsClosure.SHA256(),
+		makeRetainedCanonicalRecordV1(retainedMergeStatusesKindV1, input.CommitStatusesClosure.CanonicalJSON()), input.CommitStatusesClosure.SHA256(),
+		input.Capability.CanonicalJSON(), input.Capability.SHA256(), input.Recipe.CanonicalJSON(), input.Recipe.SHA256(),
+		input.Recipe.ExpectedResultSHA().String(), input.EvidenceRefs, limitsSHA}
 }
 
-func ParseCanonicalMergeInput(data []byte, limits Limits) (MergeInput, error) {
+func checkedMergeAuthorizationPayloadWire(input MergeAuthorizationInputV1, authority Authority, limitsSHA string, limits Limits) (mergeInputWireV1, error) {
+	authorityJSON, _ := authority.CanonicalJSON()
+	checks, _, err := canonicalJSON(checkWires(input.Checks))
+	if err != nil {
+		return mergeInputWireV1{}, err
+	}
+	prRecord, err := newRetainedCanonicalRecordV1(retainedMergeInitialPRKindV1, input.InitialPullRequest.CanonicalJSON(), limits.MaxCanonicalObjectBytes, limits)
+	if err != nil {
+		return mergeInputWireV1{}, err
+	}
+	checksRecord, err := newRetainedCanonicalRecordV1(retainedMergeChecksKindV1, checks, limits.MaxCumulativePaginationClosureBytes, limits)
+	if err != nil {
+		return mergeInputWireV1{}, err
+	}
+	checkRunsRecord, err := newRetainedCanonicalRecordV1(retainedMergeCheckRunsKindV1, input.CheckRunsClosure.CanonicalJSON(), limits.MaxPaginationClosureBytes, limits)
+	if err != nil {
+		return mergeInputWireV1{}, err
+	}
+	statusesRecord, err := newRetainedCanonicalRecordV1(retainedMergeStatusesKindV1, input.CommitStatusesClosure.CanonicalJSON(), limits.MaxPaginationClosureBytes, limits)
+	if err != nil {
+		return mergeInputWireV1{}, err
+	}
+	return mergeInputWireV1{authorityJSON, input.PolicyDecisionSHA256, prRecord, input.InitialPullRequest.SHA256(), checksRecord, checkRunsRecord, input.CheckRunsClosure.SHA256(), statusesRecord, input.CommitStatusesClosure.SHA256(), input.Capability.CanonicalJSON(), input.Capability.SHA256(), input.Recipe.CanonicalJSON(), input.Recipe.SHA256(), input.Recipe.ExpectedResultSHA().String(), input.EvidenceRefs, limitsSHA}, nil
+}
+
+func ParseCanonicalMergeInput(data []byte, limits Limits, records ...CanonicalRecordSetV1) (MergeInput, error) {
 	if err := limits.Validate(); err != nil {
 		return MergeInput{}, err
 	}
@@ -880,23 +1070,43 @@ func ParseCanonicalMergeInput(data []byte, limits Limits) (MergeInput, error) {
 	if err != nil {
 		return MergeInput{}, err
 	}
-	pr, err := ParseCanonicalAuthoritativePullRequestSnapshotV1(wire.InitialPullRequest, limits)
+	prBytes, err := resolveRetainedCanonicalRecordV1(wire.InitialPullRequest, retainedMergeInitialPRKindV1, limits.MaxCanonicalObjectBytes, limits, records)
 	if err != nil {
 		return MergeInput{}, err
 	}
-	checks := make([]Check, len(wire.Checks))
-	for index, item := range wire.Checks {
+	pr, err := ParseCanonicalAuthoritativePullRequestSnapshotV1(prBytes, limits, records...)
+	if err != nil {
+		return MergeInput{}, err
+	}
+	checkBytes, err := resolveRetainedCanonicalRecordV1(wire.Checks, retainedMergeChecksKindV1, limits.MaxCumulativePaginationClosureBytes, limits, records)
+	if err != nil {
+		return MergeInput{}, err
+	}
+	var checkWireValues []checkWire
+	if err := strictDecode(checkBytes, &checkWireValues); err != nil {
+		return MergeInput{}, err
+	}
+	checks := make([]Check, len(checkWireValues))
+	for index, item := range checkWireValues {
 		head, err := NewGitSHA(item.HeadSHA)
 		if err != nil {
 			return MergeInput{}, err
 		}
 		checks[index] = Check{item.NodeID, item.Name, item.Identity, item.Status, item.Conclusion, head, append([]ledger.EvidenceRef(nil), item.EvidenceRefs...)}
 	}
-	checkRuns, err := ParseCanonicalPaginationClosureV1(wire.CheckRunsClosure, limits)
+	checkRunsBytes, err := resolveRetainedCanonicalRecordV1(wire.CheckRunsClosure, retainedMergeCheckRunsKindV1, limits.MaxPaginationClosureBytes, limits, records)
 	if err != nil {
 		return MergeInput{}, err
 	}
-	statuses, err := ParseCanonicalPaginationClosureV1(wire.CommitStatusesClosure, limits)
+	checkRuns, err := ParseCanonicalPaginationClosureV1(checkRunsBytes, limits)
+	if err != nil {
+		return MergeInput{}, err
+	}
+	statusesBytes, err := resolveRetainedCanonicalRecordV1(wire.CommitStatusesClosure, retainedMergeStatusesKindV1, limits.MaxPaginationClosureBytes, limits, records)
+	if err != nil {
+		return MergeInput{}, err
+	}
+	statuses, err := ParseCanonicalPaginationClosureV1(statusesBytes, limits)
 	if err != nil {
 		return MergeInput{}, err
 	}

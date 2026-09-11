@@ -40,6 +40,7 @@ func TestProductionLimitsUseStageSpecificNumericBudgets(t *testing.T) {
 		{"ledger scan records", int64(limits.MaxLedgerScanRecords), 262144},
 		{"request body", int64(limits.MaxRequestBodyBytes), 16 * 1024},
 		{"decompressed response body", int64(limits.MaxDecompressedResponseBodyBytes), 4 * 1024 * 1024},
+		{"target response envelope", int64(limits.MaxTargetResponseEnvelopeBytes), 4*1024*1024 + 64*1024},
 	}
 	for _, value := range values {
 		t.Run(value.name, func(t *testing.T) {
@@ -47,6 +48,16 @@ func TestProductionLimitsUseStageSpecificNumericBudgets(t *testing.T) {
 				t.Fatalf("got %d, want %d", value.got, value.want)
 			}
 		})
+	}
+	baseSHA, err := limits.SHA256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := limits
+	changed.MaxTargetResponseEnvelopeBytes++
+	changedSHA, err := changed.SHA256()
+	if err != nil || changedSHA == baseSHA {
+		t.Fatalf("target response envelope limit is absent from canonical limits identity: %v", err)
 	}
 }
 
@@ -365,6 +376,364 @@ func TestMergeInputCanonicalObjectExactLimitAndLimitPlusOne(t *testing.T) {
 	}
 }
 
+func TestExactPaginationClosureComposesThroughMergeInputFinalRevalidationAndSeal(t *testing.T) {
+	f := newFixture(t, MergeMethodMerge)
+	runChecks, runClosure := makeExactChecksClosure(t, f, PaginationCheckRuns, CheckSourceCheckRun, 250, f.limits.MaxPaginationClosureBytes, "admission-runs", f.snapshot.ObservedUnixNano())
+	statusChecks, statusClosure := makeExactChecksClosure(t, f, PaginationCommitStatuses, CheckSourceCommitStatus, 250, f.limits.MaxPaginationClosureBytes, "admission-statuses", f.snapshot.ObservedUnixNano())
+	reviews, reviewsClosure := makeExactReviewsClosure(t, f, f.pr, 250, f.limits.MaxPaginationClosureBytes, "admission-reviews", f.snapshot.ObservedUnixNano())
+	initialPRInput := f.prAuth.Input()
+	initialPRInput.Reviews = reviews
+	initialPRInput.ReviewsClosure = reviewsClosure
+	initialPR, err := NewAuthoritativePullRequestSnapshotV1(initialPRInput, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := append(runChecks, statusChecks...)
+	input := mergeAuthorizationInputFromFixture(f)
+	input.InitialPullRequest = initialPR
+	input.Checks = checks
+	input.CheckRunsClosure = runClosure
+	input.CommitStatusesClosure = statusClosure
+
+	mergeInput, err := NewMergeInput(input, f.mergeWrite.Attempt().WriteID(), f.limits)
+	if err != nil {
+		t.Fatalf("exact-limit pagination closure did not compose through MergeInput: %v", err)
+	}
+	closureBytes := len(reviewsClosure.CanonicalJSON()) + len(runClosure.CanonicalJSON()) + len(statusClosure.CanonicalJSON())
+	if closureBytes != f.limits.MaxCumulativePaginationClosureBytes || len(mergeInput.CanonicalPayload()) > f.limits.MaxCanonicalObjectBytes {
+		t.Fatalf("closure/input bytes = %d/%d", closureBytes, len(mergeInput.CanonicalPayload()))
+	}
+	checkBytes, _, err := canonicalJSON(checkWires(checks))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewBytes, err := canonicalAuthoritativePRReviews(reviews)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := NewCanonicalRecordSetV1(checkBytes, reviewBytes, reviewsClosure.CanonicalJSON(), runClosure.CanonicalJSON(), statusClosure.CanonicalJSON())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseCanonicalMergeInput(mergeInput.CanonicalPayload(), f.limits, records)
+	if err != nil || parsed.SHA256() != mergeInput.SHA256() || parsed.Attempt() != mergeInput.Attempt() {
+		t.Fatalf("exact-limit MergeInput strict recovery failed: %v", err)
+	}
+	if _, err := ParseCanonicalMergeInput(mergeInput.CanonicalPayload(), f.limits); err == nil {
+		t.Fatal("MergeInput parser accepted missing retained records")
+	}
+	missing, err := NewCanonicalRecordSetV1(reviewsClosure.CanonicalJSON(), runClosure.CanonicalJSON(), statusClosure.CanonicalJSON())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseCanonicalMergeInput(mergeInput.CanonicalPayload(), f.limits, missing); err == nil {
+		t.Fatal("MergeInput parser accepted a missing referenced check record")
+	}
+	substituted, err := NewCanonicalRecordSetV1(checkBytes, reviewBytes, reviewsClosure.CanonicalJSON(), runClosure.CanonicalJSON(), statusClosure.CanonicalJSON())
+	if err != nil {
+		t.Fatal(err)
+	}
+	substituted.records[retainedCanonicalReference(checkBytes)] = []byte("[]")
+	if _, err := ParseCanonicalMergeInput(mergeInput.CanonicalPayload(), f.limits, substituted); err == nil {
+		t.Fatal("MergeInput parser accepted a substituted referenced check record")
+	}
+	var mismatched mergeInputWireV1
+	if err := strictDecode(mergeInput.CanonicalPayload(), &mismatched); err != nil {
+		t.Fatal(err)
+	}
+	mismatched.CheckRunsClosure.SHA256 = strings.Repeat("f", 64)
+	mismatchJSON, err := json.Marshal(mismatched)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseCanonicalMergeInput(mismatchJSON, f.limits, records); err == nil {
+		t.Fatal("MergeInput parser accepted a digest-mismatched closure reference")
+	}
+
+	finalInput := f.sealed.Seal().input.FinalRevalidation.Input()
+	finalInput.MergeInput = mergeInput
+	finalRunChecks, finalRunClosure := makeExactChecksClosure(t, f, PaginationCheckRuns, CheckSourceCheckRun, 250, f.limits.MaxPaginationClosureBytes, "final-runs", finalInput.StartedUnixNano+1)
+	finalStatusChecks, finalStatusClosure := makeExactChecksClosure(t, f, PaginationCommitStatuses, CheckSourceCommitStatus, 250, f.limits.MaxPaginationClosureBytes, "final-statuses", finalInput.StartedUnixNano+1)
+	finalReviews, finalReviewsClosure := makeExactReviewsClosure(t, f, f.pr, 250, f.limits.MaxPaginationClosureBytes, "final-reviews", finalInput.StartedUnixNano+1)
+	finalPRInput := finalInput.PullRequest.Input()
+	finalPRInput.Reviews = finalReviews
+	finalPRInput.ReviewsClosure = finalReviewsClosure
+	finalPR, err := NewAuthoritativePullRequestSnapshotV1(finalPRInput, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalChecks := append(finalRunChecks, finalStatusChecks...)
+	finalInput.PullRequest = finalPR
+	finalInput.Checks = finalChecks
+	finalInput.CheckRunsClosure = finalRunClosure
+	finalInput.CommitStatusesClosure = finalStatusClosure
+	finalInput.EvidenceRefs = append(finalInput.EvidenceRefs, finalReviewsClosure.input.EvidenceRefs...)
+	finalInput.EvidenceRefs = append(finalInput.EvidenceRefs, finalRunClosure.input.EvidenceRefs...)
+	finalInput.EvidenceRefs = append(finalInput.EvidenceRefs, finalStatusClosure.input.EvidenceRefs...)
+	admission, err := validatePaginationBoundaryV1(reviewsClosure, runClosure, statusClosure, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalInput.Counters.AdmissionObservedChecks = len(checks)
+	finalInput.Counters.AdmissionObservedReviews = len(mergeInput.initialPullRequest.input.Reviews)
+	finalInput.Counters.AdmissionPaginationSources = admission.Sources
+	finalInput.Counters.AdmissionPaginationPages = admission.Pages
+	finalInput.Counters.AdmissionPaginationItems = admission.Items
+	finalInput.Counters.AdmissionPaginationClosureBytes = admission.ClosureBytes
+	finalInput.Counters.AdmissionHTTPCalls = admission.Pages + 1
+	finalInput.Counters.PreSubmitHTTPCalls = finalInput.Counters.AdmissionHTTPCalls + finalInput.Counters.FinalRevalidationHTTPCalls
+	finalInput.Counters.TotalHTTPCalls = finalInput.Counters.PreSubmitHTTPCalls
+	finalStats, err := validatePaginationBoundaryV1(finalReviewsClosure, finalRunClosure, finalStatusClosure, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalInput.Counters.FinalObservedChecks = len(finalChecks)
+	finalInput.Counters.FinalObservedReviews = len(finalReviews)
+	finalInput.Counters.FinalPaginationSources = finalStats.Sources
+	finalInput.Counters.FinalPaginationPages = finalStats.Pages
+	finalInput.Counters.FinalPaginationItems = finalStats.Items
+	finalInput.Counters.FinalPaginationClosureBytes = finalStats.ClosureBytes
+	finalInput.Counters.FinalRevalidationHTTPCalls = finalStats.Pages + 1
+	finalInput.Counters.PreSubmitHTTPCalls = finalInput.Counters.AdmissionHTTPCalls + finalInput.Counters.FinalRevalidationHTTPCalls
+	finalInput.Counters.TotalHTTPCalls = finalInput.Counters.PreSubmitHTTPCalls
+	final, err := NewFinalRevalidationV1(finalInput, f.limits)
+	if err != nil {
+		t.Fatalf("exact-limit pagination closure did not compose through final revalidation: %v", err)
+	}
+	seal, err := NewAuthorizationSealV1(AuthorizationSealV1Input{MergeInput: mergeInput, FinalRevalidation: final}, f.limits)
+	if err != nil {
+		t.Fatalf("exact-limit pagination closure did not compose through authorization seal: %v", err)
+	}
+	if len(final.CanonicalJSON()) > f.limits.MaxCanonicalObjectBytes || len(seal.CanonicalJSON()) > f.limits.MaxCanonicalObjectBytes {
+		t.Fatalf("final/seal bytes = %d/%d", len(final.CanonicalJSON()), len(seal.CanonicalJSON()))
+	}
+	finalCheckBytes, _, err := canonicalJSON(checkWires(finalChecks))
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalReviewBytes, err := canonicalAuthoritativePRReviews(finalReviews)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allRecords, err := NewCanonicalRecordSetV1(
+		checkBytes, reviewBytes, reviewsClosure.CanonicalJSON(), runClosure.CanonicalJSON(), statusClosure.CanonicalJSON(),
+		finalCheckBytes, finalReviewBytes, finalReviewsClosure.CanonicalJSON(), finalRunClosure.CanonicalJSON(), finalStatusClosure.CanonicalJSON(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseCanonicalFinalRevalidationV1(final.CanonicalJSON(), mergeInput, f.limits, allRecords); err != nil {
+		t.Fatalf("exact-limit final pagination strict recovery failed: %v", err)
+	}
+	if _, err := ParseCanonicalAuthorizationSealV1(seal.CanonicalJSON(), mergeInput, f.limits, allRecords); err != nil {
+		t.Fatalf("exact-limit pagination seal strict recovery failed: %v", err)
+	}
+	if _, err := ParseCanonicalFinalRevalidationV1(final.CanonicalJSON(), mergeInput, f.limits); err == nil {
+		t.Fatal("final revalidation parser accepted missing retained pagination records")
+	}
+	if _, err := ParseCanonicalAuthorizationSealV1(seal.CanonicalJSON(), mergeInput, f.limits); err == nil {
+		t.Fatal("authorization seal parser accepted missing retained pagination records")
+	}
+	commitment, err := NewTargetRefCommitmentV1(mergeInput, seal, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := NewSealedMergeAuthorizationV1(SealedMergeAuthorizationV1Input{MergeInput: mergeInput, Seal: seal, Commitment: commitment}, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewTargetSubmissionV1("exact-pagination-target", sealed, f.limits); err != nil {
+		t.Fatalf("exact-limit pagination authorization could not reach target submission: %v", err)
+	}
+
+	overClosure := clonePaginationClosure(runClosure)
+	overClosure.canonical = append(overClosure.canonical, 'x')
+	overClosure.digest = digestBytes(overClosure.canonical)
+	overInput := input
+	overInput.CheckRunsClosure = overClosure
+	if _, err := NewMergeInput(overInput, f.mergeWrite.Attempt().WriteID(), f.limits); err == nil {
+		t.Fatal("MergeInput accepted a pagination closure at limit+1")
+	}
+	forgedMerge := cloneLifecycleMergeInput(mergeInput)
+	forgedMerge.checkRunsClosure = overClosure
+	finalInput.MergeInput = forgedMerge
+	if _, err := NewFinalRevalidationV1(finalInput, f.limits); err == nil {
+		t.Fatal("final revalidation accepted a nested pagination closure at limit+1")
+	}
+	overFinalClosure := clonePaginationClosure(finalRunClosure)
+	overFinalClosure.canonical = append(overFinalClosure.canonical, 'x')
+	overFinalClosure.digest = digestBytes(overFinalClosure.canonical)
+	overFinalInput := final.Input()
+	overFinalInput.CheckRunsClosure = overFinalClosure
+	if _, err := NewFinalRevalidationV1(overFinalInput, f.limits); err == nil {
+		t.Fatal("final revalidation accepted a final pagination closure at limit+1")
+	}
+	forgedFinal := cloneFinalRevalidation(final)
+	forgedFinal.input.CheckRunsClosure = overFinalClosure
+	if _, err := NewAuthorizationSealV1(AuthorizationSealV1Input{MergeInput: mergeInput, FinalRevalidation: forgedFinal}, f.limits); err == nil {
+		t.Fatal("authorization seal accepted a nested pagination closure at limit+1")
+	}
+}
+
+func TestExactReadyLedgerComposesThroughFinalRevalidationAndSeal(t *testing.T) {
+	f := newFixture(t, MergeMethodMerge)
+	ledgerJSONL := makeExactReadyLedgerJSONL(t, f.readyProof.input.ObservedLedgerJSONL, f.limits.MaxReadyLedgerSnapshotBytes, f.limits.MaxLedgerLineBytes)
+	proofInput := f.readyProof.Input()
+	proofInput.ObservedLedgerJSONL = ledgerJSONL
+	proofInput.ObservedLedgerLength = int64(len(ledgerJSONL))
+	proofInput.ObservedLedgerSHA256 = digestBytes(ledgerJSONL)
+	proofInput.EvidenceRefs = []ledger.EvidenceRef{{
+		URI: "evidence/current-ready-ledger-exact", Kind: CurrentReadyLedgerEvidenceKindV1, SHA256: proofInput.ObservedLedgerSHA256,
+	}}
+	proof, err := NewCurrentReadyProofV1(proofInput, f.limits)
+	if err != nil {
+		t.Fatalf("exact-limit READY ledger proof failed: %v", err)
+	}
+	if len(ledgerJSONL) != f.limits.MaxReadyLedgerSnapshotBytes || len(proof.CanonicalJSON()) > f.limits.MaxCanonicalObjectBytes {
+		t.Fatalf("ledger/proof bytes = %d/%d", len(ledgerJSONL), len(proof.CanonicalJSON()))
+	}
+
+	finalInput := f.sealed.Seal().input.FinalRevalidation.Input()
+	finalInput.CurrentReadyProof = proof
+	finalInput.Counters.ReadyLedgerBytes = int64(len(ledgerJSONL))
+	finalInput.Counters.ReadyLedgerRecords = bytes.Count(ledgerJSONL, []byte{'\n'})
+	for index := range finalInput.EvidenceRefs {
+		if finalInput.EvidenceRefs[index].Kind == CurrentReadyLedgerEvidenceKindV1 {
+			finalInput.EvidenceRefs[index] = proofInput.EvidenceRefs[0]
+		}
+	}
+	final, err := NewFinalRevalidationV1(finalInput, f.limits)
+	if err != nil {
+		t.Fatalf("exact-limit READY ledger did not compose through final revalidation: %v", err)
+	}
+	seal, err := NewAuthorizationSealV1(AuthorizationSealV1Input{MergeInput: f.mergeWrite, FinalRevalidation: final}, f.limits)
+	if err != nil {
+		t.Fatalf("exact-limit READY ledger did not compose through authorization seal: %v", err)
+	}
+	if len(final.CanonicalJSON()) > f.limits.MaxCanonicalObjectBytes || len(seal.CanonicalJSON()) > f.limits.MaxCanonicalObjectBytes {
+		t.Fatalf("READY final/seal bytes = %d/%d", len(final.CanonicalJSON()), len(seal.CanonicalJSON()))
+	}
+	records, err := NewCanonicalRecordSetV1(ledgerJSONL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseCanonicalFinalRevalidationV1(final.CanonicalJSON(), f.mergeWrite, f.limits, records); err != nil {
+		t.Fatalf("exact-limit final revalidation strict recovery failed: %v", err)
+	}
+	if _, err := ParseCanonicalAuthorizationSealV1(seal.CanonicalJSON(), f.mergeWrite, f.limits, records); err != nil {
+		t.Fatalf("exact-limit seal strict recovery failed: %v", err)
+	}
+	if _, err := ParseCanonicalFinalRevalidationV1(final.CanonicalJSON(), f.mergeWrite, f.limits); err == nil {
+		t.Fatal("final revalidation parser accepted a missing READY ledger record")
+	}
+	substituted, err := NewCanonicalRecordSetV1(ledgerJSONL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	substituted.records[retainedCanonicalReference(ledgerJSONL)] = []byte("{}\n")
+	if _, err := ParseCanonicalAuthorizationSealV1(seal.CanonicalJSON(), f.mergeWrite, f.limits, substituted); err == nil {
+		t.Fatal("authorization seal parser accepted a substituted READY ledger record")
+	}
+
+	overProof := cloneCurrentReadyProof(proof)
+	overProof.input.ObservedLedgerJSONL = append(append([]byte(nil), ledgerJSONL...), 'x')
+	overProof.input.ObservedLedgerLength++
+	overProof.input.ObservedLedgerSHA256 = digestBytes(overProof.input.ObservedLedgerJSONL)
+	overProof.input.EvidenceRefs[0].SHA256 = overProof.input.ObservedLedgerSHA256
+	overFinalInput := finalInput
+	overFinalInput.CurrentReadyProof = overProof
+	overFinalInput.Counters.ReadyLedgerBytes++
+	if _, err := NewFinalRevalidationV1(overFinalInput, f.limits); err == nil {
+		t.Fatal("final revalidation accepted READY ledger bytes at limit+1")
+	}
+	forgedFinal := cloneFinalRevalidation(final)
+	forgedFinal.input.CurrentReadyProof = overProof
+	forgedFinal.input.Counters.ReadyLedgerBytes++
+	if _, err := NewAuthorizationSealV1(AuthorizationSealV1Input{MergeInput: f.mergeWrite, FinalRevalidation: forgedFinal}, f.limits); err == nil {
+		t.Fatal("authorization seal accepted READY ledger bytes at limit+1")
+	}
+}
+
+func TestTargetResponseBodyAndEnvelopeIndependentExactLimits(t *testing.T) {
+	f := newFixture(t, MergeMethodMerge)
+	invocationID := strings.Repeat("<", f.limits.MaxTextBytes)
+	submission := newTargetSubmission(t, f, invocationID)
+	response, err := NewSnapshotIdentity("github", "response-exact-envelope", f.sealed.Seal().input.FinalRevalidation.input.CompletedUnixNano+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("\"" + strings.Repeat("x", f.limits.MaxDecompressedResponseBodyBytes-2) + "\"")
+	bodyEvidence := ledger.EvidenceRef{
+		URI: strings.Repeat("<", f.limits.MaxTextBytes), Kind: GitHubTargetResponseBodyEvidenceKindV1, SHA256: digestBytes(body),
+	}
+	input := TargetResponseEnvelopeV1Input{
+		Response: response, HTTPStatus: 200, ResponseBody: body, BodyEvidence: bodyEvidence, EnvelopeURI: "e",
+	}
+	limitsSHA, err := f.limits.SHA256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseWire := targetResponseEnvelopeWireV1{
+		Schema: TargetResponseEnvelopeSchemaV1, TargetSubmissionSHA256: submission.SHA256(), InvocationID: submission.invocationID,
+		Response: snapshotWire(response), HTTPStatus: input.HTTPStatus, ResponseBody: append(json.RawMessage(nil), body...),
+		ResponseBodySHA256: digestBytes(body), BodyEvidence: bodyEvidence, EnvelopeURI: input.EnvelopeURI, LimitsSHA256: limitsSHA,
+	}
+	baseJSON, err := json.Marshal(baseWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := f.limits.MaxTargetResponseEnvelopeBytes - len(baseJSON)
+	if remaining <= 0 {
+		t.Fatalf("bounded metadata already exceeds independent envelope limit by %d", -remaining)
+	}
+	available := f.limits.MaxTextBytes - len(input.EnvelopeURI)
+	escaped := min(remaining/6, available)
+	plain := remaining - escaped*6
+	if escaped+plain > available {
+		escaped--
+		plain = remaining - escaped*6
+	}
+	if escaped < 0 || plain < 0 || escaped+plain > available {
+		t.Fatalf("cannot fill independent envelope bound: remaining=%d capacity=%d", remaining, available)
+	}
+	input.EnvelopeURI += strings.Repeat("<", escaped) + strings.Repeat("x", plain)
+	envelope, err := NewTargetResponseEnvelopeV1(input, submission, f.limits)
+	if err != nil {
+		t.Fatalf("exact 4-MiB body plus bounded metadata failed: %v", err)
+	}
+	if len(body) != f.limits.MaxDecompressedResponseBodyBytes || len(envelope.CanonicalJSON()) != f.limits.MaxTargetResponseEnvelopeBytes {
+		t.Fatalf("body/envelope bytes = %d/%d", len(body), len(envelope.CanonicalJSON()))
+	}
+	if _, err := ParseCanonicalTargetResponseEnvelopeV1(envelope.CanonicalJSON(), submission, f.limits); err != nil {
+		t.Fatalf("exact outer-limit envelope parse failed: %v", err)
+	}
+
+	overInput := input
+	overInput.EnvelopeURI += "x"
+	if _, err := NewTargetResponseEnvelopeV1(overInput, submission, f.limits); err == nil {
+		t.Fatal("target response constructor accepted outer-limit+1")
+	}
+	overWire := baseWire
+	overWire.EnvelopeURI = overInput.EnvelopeURI
+	overJSON, err := json.Marshal(overWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overJSON) != f.limits.MaxTargetResponseEnvelopeBytes+1 {
+		t.Fatalf("outer over-limit bytes = %d", len(overJSON))
+	}
+	if _, err := ParseCanonicalTargetResponseEnvelopeV1(overJSON, submission, f.limits); err == nil {
+		t.Fatal("target response parser accepted outer-limit+1")
+	}
+	overBodyInput := input
+	overBodyInput.EnvelopeURI = "evidence/over-body"
+	overBodyInput.ResponseBody = []byte("\"" + strings.Repeat("x", f.limits.MaxDecompressedResponseBodyBytes-1) + "\"")
+	overBodyInput.BodyEvidence = ledger.EvidenceRef{URI: "evidence/over-body", Kind: GitHubTargetResponseBodyEvidenceKindV1, SHA256: digestBytes(overBodyInput.ResponseBody)}
+	if _, err := NewTargetResponseEnvelopeV1(overBodyInput, submission, f.limits); err == nil {
+		t.Fatal("target response constructor accepted body-limit+1")
+	}
+}
+
 func TestAuthorizationCountersExactLimitsAndRelationships(t *testing.T) {
 	limits := DefaultLimits()
 	base := func() AuthorizationCountersV1 {
@@ -601,7 +970,165 @@ func makeSizedPaginationClosure(f fixture, source PaginationSourceKind, pr *Pull
 	return makePaginationClosure(f, source, pr, limits, items)
 }
 
+func makeExactChecksClosure(t *testing.T, f fixture, paginationSource PaginationSourceKind, checkSource CheckSourceKind, count, target int, requestPrefix string, observedUnixNano int64) ([]Check, PaginationClosureV1) {
+	t.Helper()
+	checks := make([]Check, count)
+	for index := range checks {
+		name := fmt.Sprintf("composed-check-%03d", index)
+		checks[index] = Check{
+			NodeID: fmt.Sprintf("composed-check-node-%03d", index), Name: name,
+			Identity: TrustedCheckIdentityV1{
+				Context: name, Source: checkSource,
+				Producer: StableIdentityV1{DatabaseID: int64(index + 1000), NodeID: fmt.Sprintf("composed-producer-%03d", index)},
+			},
+			Status: CheckCompleted, Conclusion: ConclusionSuccess, HeadSHA: f.headSHA,
+		}
+	}
+	items := paginationItemsFromChecks(t, checks)
+	closure, err := makePaginationClosureAt(f, paginationSource, nil, f.limits, items, requestPrefix, observedUnixNano)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := target - len(closure.CanonicalJSON())
+	if remaining < 0 {
+		t.Fatalf("base composed closure is %d bytes", len(closure.CanonicalJSON()))
+	}
+	for index := range checks {
+		capacity := f.limits.MaxTextBytes - len(checks[index].NodeID)
+		add := min(remaining, capacity)
+		checks[index].NodeID += strings.Repeat("x", add)
+		remaining -= add
+	}
+	if remaining != 0 {
+		t.Fatalf("could not fill composed closure; %d bytes remain", remaining)
+	}
+	items = paginationItemsFromChecks(t, checks)
+	closure, err = makePaginationClosureAt(f, paginationSource, nil, f.limits, items, requestPrefix, observedUnixNano)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closure.CanonicalJSON()) != target {
+		t.Fatalf("composed closure bytes = %d, want %d", len(closure.CanonicalJSON()), target)
+	}
+	return checks, closure
+}
+
+func makeExactReviewsClosure(t *testing.T, f fixture, pr PullRequestIdentity, count, target int, requestPrefix string, observedUnixNano int64) ([]Review, PaginationClosureV1) {
+	t.Helper()
+	reviews := make([]Review, count)
+	for index := range reviews {
+		reviews[index] = Review{
+			NodeID: fmt.Sprintf("composed-review-node-%03d", index), DatabaseID: int64(index + 1000),
+			Reviewer: StableIdentityV1{DatabaseID: int64(index + 2000), NodeID: fmt.Sprintf("composed-reviewer-%03d", index)},
+			State:    ReviewApproved, CommitSHA: f.headSHA,
+		}
+	}
+	items := paginationItemsFromReviews(t, reviews)
+	closure, err := makePaginationClosureAt(f, PaginationReviews, &pr, f.limits, items, requestPrefix, observedUnixNano)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := target - len(closure.CanonicalJSON())
+	if remaining < 0 {
+		t.Fatalf("base composed review closure is %d bytes", len(closure.CanonicalJSON()))
+	}
+	for index := range reviews {
+		keyPrefix := fmt.Sprintf("%d/", reviews[index].DatabaseID)
+		capacity := f.limits.MaxTextBytes - len(keyPrefix) - len(reviews[index].NodeID)
+		add := min(remaining, capacity)
+		reviews[index].NodeID += strings.Repeat("x", add)
+		remaining -= add
+	}
+	if remaining != 0 {
+		t.Fatalf("could not fill composed review closure; %d bytes remain", remaining)
+	}
+	items = paginationItemsFromReviews(t, reviews)
+	closure, err = makePaginationClosureAt(f, PaginationReviews, &pr, f.limits, items, requestPrefix, observedUnixNano)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closure.CanonicalJSON()) != target {
+		t.Fatalf("composed review closure bytes = %d, want %d", len(closure.CanonicalJSON()), target)
+	}
+	return reviews, closure
+}
+
+func paginationItemsFromChecks(t *testing.T, checks []Check) []CanonicalPaginationItemV1 {
+	t.Helper()
+	items := make([]CanonicalPaginationItemV1, len(checks))
+	for index, check := range checks {
+		raw, err := json.Marshal(checkWire{check.NodeID, check.Name, check.Identity, check.Status, check.Conclusion, check.HeadSHA.String(), check.EvidenceRefs})
+		if err != nil {
+			t.Fatal(err)
+		}
+		items[index] = CanonicalPaginationItemV1{Key: check.NodeID, SHA256: digestBytes(raw)}
+	}
+	return items
+}
+
+func paginationItemsFromReviews(t *testing.T, reviews []Review) []CanonicalPaginationItemV1 {
+	t.Helper()
+	items := make([]CanonicalPaginationItemV1, len(reviews))
+	for index, review := range reviews {
+		raw, err := json.Marshal(reviewWire{review.NodeID, review.DatabaseID, review.Reviewer, review.State, review.CommitSHA.String()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		items[index] = CanonicalPaginationItemV1{Key: fmt.Sprintf("%d/%s", review.DatabaseID, review.NodeID), SHA256: digestBytes(raw)}
+	}
+	return items
+}
+
+func makeExactReadyLedgerJSONL(t *testing.T, prefix []byte, target, maxLine int) []byte {
+	t.Helper()
+	if len(prefix) >= target {
+		t.Fatalf("READY prefix is %d bytes for target %d", len(prefix), target)
+	}
+	result := make([]byte, len(prefix), target)
+	copy(result, prefix)
+	remaining := target - len(result)
+	records := (remaining + maxLine) / (maxLine + 1)
+	for index := 0; index < records; index++ {
+		recordsLeft := records - index
+		recordBytes := remaining / recordsLeft
+		lineBytes := recordBytes - 1
+		event := ledger.Event{
+			SchemaVersion: 1, EventID: fmt.Sprintf("unrelated-padding-%06d", index),
+			Timestamp: time.Unix(1700000100+int64(index), 0).UTC(), RunID: fmt.Sprintf("unrelated-run-%06d", index),
+			EventType: "OBSERVATION", Actor: "controller", Source: "resource-limit-fixture",
+			Payload: map[string]any{"padding": ""},
+		}
+		base, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		padding := lineBytes - len(base)
+		if padding < 0 || lineBytes > maxLine {
+			t.Fatalf("cannot size READY ledger record to %d bytes", lineBytes)
+		}
+		event.Payload["padding"] = strings.Repeat("x", padding)
+		line, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(line) != lineBytes {
+			t.Fatalf("READY ledger line bytes = %d, want %d", len(line), lineBytes)
+		}
+		result = append(result, line...)
+		result = append(result, '\n')
+		remaining -= recordBytes
+	}
+	if len(result) != target || remaining != 0 {
+		t.Fatalf("READY ledger bytes = %d, want %d", len(result), target)
+	}
+	return result
+}
+
 func makePaginationClosure(f fixture, source PaginationSourceKind, pr *PullRequestIdentity, limits Limits, items []CanonicalPaginationItemV1) (PaginationClosureV1, error) {
+	return makePaginationClosureAt(f, source, pr, limits, items, "sized", f.snapshot.ObservedUnixNano())
+}
+
+func makePaginationClosureAt(f fixture, source PaginationSourceKind, pr *PullRequestIdentity, limits Limits, items []CanonicalPaginationItemV1, requestPrefix string, observedUnixNano int64) (PaginationClosureV1, error) {
 	query, err := DerivePaginationQueryV1(PaginationQueryScopeV1{
 		Source: source, Repository: f.repository, RepositoryNodeID: "R_repo", PullRequest: pr, HeadSHA: f.headSHA,
 	}, limits)
@@ -613,12 +1140,12 @@ func makePaginationClosure(f fixture, source PaginationSourceKind, pr *PullReque
 	evidence := make([]ledger.EvidenceRef, 0, len(pages)*2)
 	for index := range pages {
 		start, end := index*query.PerPage, min((index+1)*query.PerPage, len(items))
-		response, err := NewSnapshotIdentity("github", fmt.Sprintf("sized-%s-%02d", source, index), f.snapshot.ObservedUnixNano()+int64(index))
+		response, err := NewSnapshotIdentity("github", fmt.Sprintf("%s-%s-%02d", requestPrefix, source, index), observedUnixNano+int64(index))
 		if err != nil {
 			return PaginationClosureV1{}, err
 		}
 		bodyEvidence := ledger.EvidenceRef{
-			URI: fmt.Sprintf("evidence/sized-%s-%02d", source, index), Kind: GitHubPaginationBodyEvidenceKindV1,
+			URI: fmt.Sprintf("evidence/%s-%s-%02d", requestPrefix, source, index), Kind: GitHubPaginationBodyEvidenceKindV1,
 			SHA256: fmt.Sprintf("%064x", index+1000),
 		}
 		pageInput := PaginationPageV1Input{
@@ -633,7 +1160,7 @@ func makePaginationClosure(f fixture, source PaginationSourceKind, pr *PullReque
 			}
 			pageInput.RESTLinkHeader = "<https://api.github.com" + query.PathOrDocumentSHA256 + "?" + values.Encode() + ">; rel=\"next\""
 		}
-		pageInput.EnvelopeEvidence, err = NewPaginationEnvelopeEvidenceV1(fmt.Sprintf("evidence/sized-envelope-%s-%02d", source, index), pageInput, limits)
+		pageInput.EnvelopeEvidence, err = NewPaginationEnvelopeEvidenceV1(fmt.Sprintf("evidence/%s-envelope-%s-%02d", requestPrefix, source, index), pageInput, limits)
 		if err != nil {
 			return PaginationClosureV1{}, err
 		}
