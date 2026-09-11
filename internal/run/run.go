@@ -23,6 +23,7 @@ import (
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
+	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
@@ -46,6 +47,28 @@ type CommandRunner interface {
 	Run(context.Context, supervisor.Command) (supervisor.Result, error)
 }
 
+// ContainedCommandRunner is the mandatory V3 Linux handoff. Implementations
+// must create the scope before spawn, place every descendant in it, and prove
+// the scope empty before returning.
+type ContainedCommandRunner interface {
+	RunContained(context.Context, supervisor.Command, ContainmentRequestV1) (supervisor.Result, ContainmentEvidenceV1, error)
+}
+
+// ContainmentRequestV1 is the controller-selected, non-reusable scope request.
+type ContainmentRequestV1 struct {
+	Identity         string `json:"identity"`
+	WallClockTimeout string `json:"wall_clock_timeout"`
+}
+
+// ContainmentEvidenceV1 proves membership and verified empty-scope teardown.
+type ContainmentEvidenceV1 struct {
+	Kind               string `json:"kind"`
+	ScopeIdentity      string `json:"scope_identity"`
+	Primitive          string `json:"primitive"`
+	MembershipVerified bool   `json:"membership_verified"`
+	EmptyScopeVerified bool   `json:"empty_scope_verified"`
+}
+
 // Result is the terminal EP-002 conclusion and its controller-owned evidence.
 type Result struct {
 	State                 domain.State
@@ -55,6 +78,7 @@ type Result struct {
 	AuthorityEvidenceRef  ledger.EvidenceRef
 	ValidationEvidenceRef ledger.EvidenceRef
 	CandidateEvidenceRef  ledger.EvidenceRef
+	MutationReceiptRef    ledger.EvidenceRef
 	FailureReason         string
 }
 
@@ -66,16 +90,27 @@ func (r Result) Accepted() bool {
 
 // Runner owns the state transitions for one validated authority.
 type Runner struct {
-	governed  authority.Authority
-	capsule   authority.ContextCapsuleManifest
-	events    EventAppender
-	artifacts supervisor.ArtifactWriter
-	processes CommandRunner
+	governed      authority.Authority
+	capsule       authority.ContextCapsuleManifest
+	events        EventAppender
+	artifacts     supervisor.ArtifactWriter
+	processes     CommandRunner
+	controller    *governancev3.ControllerV1
+	parsedCapsule contextcapsule.Capsule
 }
 
 // New constructs an EP-002 runner from validated authority and explicit
 // ledger, evidence, and subprocess dependencies.
 func New(governed authority.Authority, events EventAppender, artifacts supervisor.ArtifactWriter, processes CommandRunner) (*Runner, error) {
+	return newRunner(governed, events, artifacts, processes, nil)
+}
+
+// NewWithController constructs the mandatory durable V3 execution path.
+func NewWithController(governed authority.Authority, events EventAppender, artifacts supervisor.ArtifactWriter, processes CommandRunner, controller *governancev3.ControllerV1) (*Runner, error) {
+	return newRunner(governed, events, artifacts, processes, controller)
+}
+
+func newRunner(governed authority.Authority, events EventAppender, artifacts supervisor.ArtifactWriter, processes CommandRunner, controller *governancev3.ControllerV1) (*Runner, error) {
 	if governed.RunID() == "" || governed.SHA256() == "" {
 		return nil, errors.New("validated authority is required")
 	}
@@ -92,7 +127,47 @@ func New(governed authority.Authority, events EventAppender, artifacts superviso
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{governed: governed, capsule: capsule, events: events, artifacts: artifacts, processes: processes}, nil
+	capsuleData, err := os.ReadFile(capsule.Path)
+	if err != nil {
+		return nil, fmt.Errorf("read admitted context capsule: %w", err)
+	}
+	parsedCapsule, err := contextcapsule.Parse(capsuleData)
+	if err != nil {
+		return nil, fmt.Errorf("parse admitted context capsule: %w", err)
+	}
+	if autonomousDevelopmentCapsule(parsedCapsule) {
+		if controller == nil || !governed.ControllerAdmitted() || governed.ControllerIdentity() == "" || governed.ControllerIdentity() != controller.ControllerIdentity() {
+			return nil, errors.New("CAPSULE_LINEAGE_INVALID: exact repository governance controller admission is required")
+		}
+		if err := controller.AdmitWorkflowAuthority(governed.Repository().Path, governed.Repository().Identity, parsedCapsule.PolicyVersion, governed.SHA256()); err != nil {
+			return nil, fmt.Errorf("revalidate repository governance controller admission: %w", err)
+		}
+	}
+	if parsedCapsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
+		if _, ok := processes.(ContainedCommandRunner); !ok {
+			return nil, errors.New("EXECUTION_BOUNDS_INVALID: Linux containment handoff is unavailable")
+		}
+	}
+	return &Runner{governed: governed, capsule: capsule, events: events, artifacts: artifacts, processes: processes, controller: controller, parsedCapsule: parsedCapsule}, nil
+}
+
+func autonomousDevelopmentCapsule(capsule contextcapsule.Capsule) bool {
+	if capsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
+		return true
+	}
+	if capsule.PolicyVersion != contextcapsule.PolicyVersionV2 || capsule.OperationContext == nil {
+		return false
+	}
+	switch capsule.OperationContext.Kind {
+	case contextcapsule.OperationDesignPlanning, contextcapsule.OperationDesignReview,
+		contextcapsule.OperationImplementation, contextcapsule.OperationImplementationReview,
+		contextcapsule.OperationAcceptance, contextcapsule.OperationFinalReview,
+		contextcapsule.OperationPRPublication, contextcapsule.OperationMergeAuthorization,
+		contextcapsule.OperationPostMergeAcceptance:
+		return true
+	default:
+		return false
+	}
 }
 
 // Run executes exactly one governed implementation and branch-acceptance
@@ -166,23 +241,62 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	}
 	result.State = domain.StateImplementing
 
-	process, processErr := r.processes.Run(ctx, supervisor.Command{
+	command := supervisor.Command{
 		Argv:    argv,
 		Cwd:     r.governed.Repository().Path,
 		Env:     ralphexEnvironment(r.governed.Executor().Executor, r.capsule),
 		Timeout: ralphexTimeout,
 		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stdout.log", Kind: "ralphex-stdout"},
 		Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stderr.log", Kind: "ralphex-stderr"},
-	})
+	}
+	var reservation governancev3.InvocationReservationV1
+	if invocation.Bounds != nil {
+		admission, _ := r.governed.Governance()
+		reservation, err = r.controller.ReserveRalphexInvocationV1(r.parsedCapsule, admission.Operation, admission.Mutation, admission.LeaseSHA256)
+		if err != nil {
+			return r.fail(result, domain.StateImplementing, "governance-controller", err, nil)
+		}
+	}
+	var process supervisor.Result
+	var processErr error
+	var containment *ContainmentEvidenceV1
+	if invocation.Bounds != nil {
+		contained, ok := r.processes.(ContainedCommandRunner)
+		if !ok {
+			return r.fail(result, domain.StateImplementing, "ralphex-adapter", errors.New("EXECUTION_BOUNDS_INVALID: Linux containment handoff is unavailable"), nil)
+		}
+		evidence, containedErr := ContainmentEvidenceV1{}, error(nil)
+		process, evidence, containedErr = contained.RunContained(ctx, command, ContainmentRequestV1{
+			Identity: r.governed.RunID(), WallClockTimeout: invocation.Bounds.WallClockTimeout,
+		})
+		processErr = containedErr
+		containment = &evidence
+		if processErr == nil && (evidence.Kind != "ContainmentEvidenceV1" || evidence.ScopeIdentity == "" || evidence.Primitive != "cgroup-v2" || !evidence.MembershipVerified || !evidence.EmptyScopeVerified) {
+			processErr = errors.New("EXECUTION_BOUNDS_INVALID: containment membership or empty-scope proof is invalid")
+		}
+	} else {
+		process, processErr = r.processes.Run(ctx, command)
+	}
+	if invocation.Bounds != nil {
+		if finishErr := r.controller.FinishRalphexInvocationV1(reservation); finishErr != nil {
+			processErr = errors.Join(processErr, finishErr)
+		}
+	}
+	if invocation.Mode == ralphex.ModeReview {
+		if reviewErr := validateReadOnlyReviewRepositoryV1(ctx, r.governed.Repository().Path, r.governed.Repository().StartSHA); reviewErr != nil {
+			processErr = errors.Join(processErr, reviewErr)
+		}
+	}
 	result.Ralphex = process
 	if processErr != nil {
 		return r.fail(result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
 	}
 	metadataRef, err := r.writeJSON("ralphex-process.json", "ralphex-process-metadata", struct {
-		Process           supervisor.Result    `json:"process"`
-		EnvironmentPolicy string               `json:"environment_policy"`
-		EvidenceRefs      []ledger.EvidenceRef `json:"evidence_refs"`
-	}{Process: process, EnvironmentPolicy: ralphexEnvironmentPolicy, EvidenceRefs: processRefs(process)})
+		Process           supervisor.Result      `json:"process"`
+		EnvironmentPolicy string                 `json:"environment_policy"`
+		EvidenceRefs      []ledger.EvidenceRef   `json:"evidence_refs"`
+		Containment       *ContainmentEvidenceV1 `json:"containment,omitempty"`
+	}{Process: process, EnvironmentPolicy: ralphexEnvironmentPolicy, EvidenceRefs: processRefs(process), Containment: containment})
 	if err != nil {
 		return r.fail(result, domain.StateImplementing, "ralphex-adapter", err, processRefs(process))
 	}
@@ -204,6 +318,25 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		}
 		return result, nil
 	}
+	if invocation.Bounds != nil {
+		admission, _ := r.governed.Governance()
+		if admission.Operation == contextcapsule.OperationImplementationReview && admission.Mutation {
+			candidateSHA, headErr := gitOutput(ctx, r.governed.Repository().Path, "rev-parse", "--verify", "HEAD^{commit}")
+			if headErr != nil {
+				return r.fail(result, domain.StateImplementing, "governance-controller", fmt.Errorf("resolve mutation result HEAD: %w", headErr), implementationRefs)
+			}
+			receipt, receiptErr := r.controller.CompleteMutationReceiptV1(r.governed.Repository().Path, r.parsedCapsule, admission.LeaseSHA256, candidateSHA)
+			if receiptErr != nil {
+				return r.fail(result, domain.StateImplementing, "governance-controller", receiptErr, implementationRefs)
+			}
+			receiptRef, writeErr := r.writeJSON("mutation-receipt.json", "mutation-receipt", receipt)
+			if writeErr != nil {
+				return r.fail(result, domain.StateImplementing, "governance-controller", writeErr, implementationRefs)
+			}
+			result.MutationReceiptRef = receiptRef
+			implementationRefs = append(implementationRefs, receiptRef)
+		}
+	}
 
 	if err := r.transition(domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter", map[string]any{
 		"outcome": process.Outcome, "exit_code": process.ExitCode,
@@ -211,6 +344,11 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		return result, err
 	}
 	result.State = domain.StateImplementationCompleted
+	if invocation.Bounds != nil {
+		// B can produce implementation/review evidence only. Acceptance and
+		// BRANCH_ACCEPTED-equivalent authority require a derived exact-head C.
+		return result, nil
+	}
 	target, cleanup, err := r.prepareAcceptanceTarget(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -281,13 +419,25 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	return result, nil
 }
 
+func validateReadOnlyReviewRepositoryV1(ctx context.Context, repository, expectedHEAD string) error {
+	head, err := gitOutput(ctx, repository, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil || head != expectedHEAD {
+		return errors.New("FINAL_REVIEW_INVALIDATED: read-only review changed the exact repository HEAD")
+	}
+	status, err := gitOutput(ctx, repository, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil || status != "" {
+		return errors.New("FINAL_REVIEW_INVALIDATED: read-only review left repository content dirty")
+	}
+	return nil
+}
+
 func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
 	policy := r.governed.Executor()
 	executor := strings.ToLower(strings.TrimSpace(policy.Executor))
 	if executor != "" && executor != "claude" && executor != "codex" {
 		return ralphex.Invocation{}, fmt.Errorf("unsupported executor %q", executor)
 	}
-	return ralphex.Invocation{
+	invocation := ralphex.Invocation{
 		BinaryPath:   r.governed.Ralphex().BinaryPath,
 		PlanPath:     r.governed.Plan().Path,
 		ConfigDir:    configDir,
@@ -300,7 +450,27 @@ func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
 		ReviewModel:  policy.ReviewModel,
 		ReviewEffort: policy.ReviewEffort,
 		WaitOnLimit:  r.governed.Ralphex().WaitOnLimit,
-	}, nil
+	}
+	data, err := os.ReadFile(r.capsule.Path)
+	if err != nil {
+		return ralphex.Invocation{}, fmt.Errorf("read context capsule for invocation: %w", err)
+	}
+	capsule, err := contextcapsule.Parse(data)
+	if err != nil {
+		return ralphex.Invocation{}, fmt.Errorf("parse context capsule for invocation: %w", err)
+	}
+	if capsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
+		if capsule.PhaseAuthority == nil || capsule.PhaseAuthority.ExecutionBounds == nil {
+			return ralphex.Invocation{}, errors.New("EXECUTION_BOUNDS_INVALID: B V3 execution bounds are absent")
+		}
+		runtime := r.governed.Ralphex()
+		invocation.BaseRef = r.governed.Repository().StartSHA
+		invocation.Bounds = capsule.PhaseAuthority.ExecutionBounds
+		invocation.Capability = runtime.Capability
+		invocation.BinarySHA256 = runtime.BinarySHA256
+		invocation.SourceSHA = runtime.SourceSHA
+	}
+	return invocation, nil
 }
 
 func (r *Runner) appendCreated(authorityRef ledger.EvidenceRef) error {
@@ -424,7 +594,7 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 	if validation.ContextCapsuleSHA256 != capsule.SHA256 {
 		return validation, errors.New("context capsule SHA256 changed after authority validation")
 	}
-	if verified.PolicyVersion != contextcapsule.PolicyVersionV2 {
+	if verified.PolicyVersion != contextcapsule.PolicyVersionV2 && verified.PolicyVersion != contextcapsule.PolicyVersionV3 {
 		return validation, fmt.Errorf("context capsule policy version changed to %q after authority validation", verified.PolicyVersion)
 	}
 	repositoryRoot, err := gitOutput(ctx, repository.Path, "rev-parse", "--show-toplevel")
@@ -585,24 +755,44 @@ func ralphexEnvironment(executor string, capsule authority.ContextCapsuleManifes
 func validateOperationAuthority(governed authority.Authority) (authority.ContextCapsuleManifest, error) {
 	capsule, present := governed.ContextCapsule()
 	if !present {
-		return authority.ContextCapsuleManifest{}, errors.New("verified v2 context capsule is required for governed execution")
+		return authority.ContextCapsuleManifest{}, errors.New("verified v2 context capsule is required for legacy execution; V3 successor is required after activation")
 	}
 	verified, err := contextcapsule.VerifyFile(governed.Repository().Path, capsule.Path)
 	if err != nil {
-		return authority.ContextCapsuleManifest{}, fmt.Errorf("verify v2 operation context capsule: %w", err)
+		return authority.ContextCapsuleManifest{}, fmt.Errorf("verify operation context capsule: %w", err)
 	}
 	if verified.SHA256 != capsule.SHA256 {
 		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule SHA256 mismatch: authority binds %s, verified exact bytes are %s", capsule.SHA256, verified.SHA256)
 	}
-	if verified.PolicyVersion != contextcapsule.PolicyVersionV2 {
-		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule policy version %q cannot authorize new governed execution; %s is required", verified.PolicyVersion, contextcapsule.PolicyVersionV2)
-	}
-	if verified.BaseSHA != governed.Repository().StartSHA {
-		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule base SHA %s does not match governed start SHA %s", verified.BaseSHA, governed.Repository().StartSHA)
-	}
 	mode := governed.Ralphex().Mode
-	if err := validateOperationMode(verified.OperationKind, mode); err != nil {
-		return authority.ContextCapsuleManifest{}, err
+	if verified.PolicyVersion == contextcapsule.PolicyVersionV2 {
+		if verified.BaseSHA != governed.Repository().StartSHA {
+			return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule base SHA %s does not match governed start SHA %s", verified.BaseSHA, governed.Repository().StartSHA)
+		}
+		if err := validateOperationMode(verified.OperationKind, mode, false); err != nil {
+			return authority.ContextCapsuleManifest{}, err
+		}
+	} else if verified.PolicyVersion == contextcapsule.PolicyVersionV3 {
+		admission, present := governed.Governance()
+		if !present {
+			return authority.ContextCapsuleManifest{}, errors.New("CAPSULE_USAGE_INVALID: V3 governance admission is required")
+		}
+		capsuleData, err := os.ReadFile(capsule.Path)
+		if err != nil {
+			return authority.ContextCapsuleManifest{}, fmt.Errorf("read V3 operation capsule: %w", err)
+		}
+		parsed, err := contextcapsule.Parse(capsuleData)
+		if err != nil {
+			return authority.ContextCapsuleManifest{}, fmt.Errorf("parse V3 operation capsule: %w", err)
+		}
+		if _, err := governancev3.ValidateCandidateV1(governed.Repository().Path, parsed, governed.Repository().StartSHA); err != nil {
+			return authority.ContextCapsuleManifest{}, fmt.Errorf("validate V3 invocation candidate: %w", err)
+		}
+		if err := validateOperationMode(admission.Operation, mode, admission.Mutation); err != nil {
+			return authority.ContextCapsuleManifest{}, err
+		}
+	} else {
+		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule policy version %q cannot authorize governed execution; %s or activated %s is required", verified.PolicyVersion, contextcapsule.PolicyVersionV2, contextcapsule.PolicyVersionV3)
 	}
 	policy := governed.Executor()
 	if strings.EqualFold(strings.TrimSpace(policy.Executor), "codex") {
@@ -629,13 +819,23 @@ func validateOperationAuthority(governed authority.Authority) (authority.Context
 	return capsule, nil
 }
 
-func validateOperationMode(kind contextcapsule.OperationKind, mode ralphex.Mode) error {
+func validateOperationMode(kind contextcapsule.OperationKind, mode ralphex.Mode, mutation bool) error {
 	switch mode {
-	case ralphex.ModeFull, ralphex.ModeTasksOnly:
+	case ralphex.ModeFull:
+		if mutation {
+			return fmt.Errorf("Ralphex full mode cannot expose the controller review-to-lease-to-fix boundary")
+		}
 		if kind != contextcapsule.OperationImplementation {
 			return fmt.Errorf("Ralphex mode %q requires operation kind %q, got %q", mode, contextcapsule.OperationImplementation, kind)
 		}
+	case ralphex.ModeTasksOnly:
+		if kind != contextcapsule.OperationImplementation && !(kind == contextcapsule.OperationImplementationReview && mutation) {
+			return fmt.Errorf("Ralphex mode %q requires operation kind %q or a leased %q fix, got %q", mode, contextcapsule.OperationImplementation, contextcapsule.OperationImplementationReview, kind)
+		}
 	case ralphex.ModeReview:
+		if mutation {
+			return fmt.Errorf("Ralphex review mode is read-only and cannot consume a mutation lease")
+		}
 		if kind != contextcapsule.OperationDesignReview && kind != contextcapsule.OperationImplementationReview {
 			return fmt.Errorf("Ralphex mode %q requires operation kind %q or %q, got %q", mode, contextcapsule.OperationDesignReview, contextcapsule.OperationImplementationReview, kind)
 		}

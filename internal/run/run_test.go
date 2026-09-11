@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
+	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
@@ -80,6 +82,163 @@ func TestRunnerSuccessReachesBranchAcceptedWithOrderedEvidence(t *testing.T) {
 	}
 }
 
+func TestAutonomousRunnerRequiresExactRepositoryController(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	artifacts, err := evidence.NewStore(t.TempDir(), "controller-gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := &recordingEventAppender{}
+	if _, err := New(fixture.authority, events, artifacts, supervisor.New()); err == nil || !strings.Contains(err.Error(), "exact repository governance controller") {
+		t.Fatalf("controllerless autonomous runner was admitted: %v", err)
+	}
+	other := newRunFixture(t, 0, commandPath(t, "true"))
+	if _, err := NewWithController(fixture.authority, events, artifacts, supervisor.New(), other.controller); err == nil || !strings.Contains(err.Error(), "exact repository governance controller") {
+		t.Fatalf("mismatched repository controller was admitted: %v", err)
+	}
+}
+
+func TestRunnerRechecksActivationAfterAuthorityConstruction(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	repository := fixture.authority.Repository()
+	activation, err := governancev3.SealGovernanceActivationV1(governancev3.GovernanceActivationV1{
+		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3, PolicySHA256: testHash(t, filepath.Join(repository.Path, governancev3.GovernancePolicyPathV1)),
+		ActivationRepositoryCommit: repository.StartSHA, ActivationSequence: 2, ActivationTime: "2026-09-10T00:00:00Z", GrandfatheredV2Digests: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.controller.InstallActivationV1(repository.Path, repository.Identity, activation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.construct(t, fixture.authority); governancev3.ClassOf(err) != governancev3.CapsuleLineageInvalid {
+		t.Fatalf("post-construction activation bypass class = %q, err=%v", governancev3.ClassOf(err), err)
+	}
+}
+
+func TestV3BReusesCapsuleAtDescendantAndStopsBeforeCAcceptance(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	repository := manifest.Repository.Path
+	base := manifest.Repository.StartSHA
+	writeTestFile(t, manifest.Plan.Path, []byte("### Task 1: bounded\n\n- [ ] implement\n"), 0o600)
+	runGit(t, repository, "add", "plan.md")
+	runGit(t, repository, "commit", "-m", "authorized descendant plan")
+	start := runGit(t, repository, "rev-parse", "HEAD")
+	if start == base {
+		t.Fatal("test did not create a descendant candidate")
+	}
+	manifest.Repository.StartSHA = start
+	manifest.Plan.SHA256 = testHash(t, manifest.Plan.Path)
+	probe := "{\"kind\":\"RalphexCapabilityProbeV1\",\"source_sha\":\"source-test\",\"max_iterations_flag\":true,\"session_timeout_flag\":true,\"idle_timeout_flag\":true,\"skip_finalize_flag\":true,\"base_ref_flag\":true,\"executor_model_effort_flags\":true,\"isolated_config\":true,\"governed_handoff\":\"TASKS_ONLY\",\"linux_containment\":true}"
+	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"--abcp-governance-capability-v1\" ]; then printf '%%s\\n' '%s'; exit 0; fi\nprintf candidate > candidate.txt\ngit add candidate.txt || exit 90\ngit commit -qm candidate || exit 91\n", probe)
+	writeTestFile(t, manifest.Ralphex.BinaryPath, []byte(script), 0o700)
+	manifest.Ralphex.BinarySHA256 = testHash(t, manifest.Ralphex.BinaryPath)
+	bounds := &contextcapsule.ExecutionBoundsV1{
+		MaxIterations: 2, SessionTimeout: "5s", IdleTimeout: "5s", WallClockTimeout: "5s", AggregateWallClockTimeout: "20s",
+		MaxIncompleteTasks: 1, MaxInitialActiveFindings: 2, MaxRalphexInvocations: 2, MaxReviewReports: 2, MaxMutationLeases: 1,
+		MaxTotalFixBatches: 1, MaxChangedFiles: 4, MaxChangedBytes: 10000,
+	}
+	spec := contextcapsule.Spec{
+		PolicyVersion: contextcapsule.PolicyVersionV3, Project: "ABCP", Plan: "v3", RoadmapPhase: "test", ExecutionPack: "test", Task: "Task 1",
+		Repository: manifest.Repository.Identity, BaseSHA: base, Invariants: []string{"Fail closed."}, NonGoals: []string{"No C authority."},
+		PredecessorOutcomes: []contextcapsule.Outcome{}, Sources: []string{"context.md"},
+		PhaseAuthority: &contextcapsule.PhaseAuthorityV3{
+			Stage: contextcapsule.StageBImplementation, AllowedOperations: []contextcapsule.OperationKind{contextcapsule.OperationImplementation, contextcapsule.OperationImplementationReview},
+			Parent:                 &contextcapsule.PhaseParentV1{CapsuleFileSHA256: strings.Repeat("a", 64), CapsuleSHA256: strings.Repeat("b", 64), Stage: contextcapsule.StageADesign, CheckpointSHA256: strings.Repeat("c", 64), CandidateSHA: base, GrantSHA256: strings.Repeat("d", 64)},
+			SemanticRegistrySHA256: strings.Repeat("e", 64), ObservationScopeIDs: []string{"rule.one"}, BlockingScopeIDs: []string{"rule.one"}, MutationScopeIDs: []string{"rule.one"},
+			AuthorizedFindingIDs: []string{}, AuthorizedInvariantIDs: []string{"rule.one"}, AllowedPaths: []string{"candidate.txt", "plan.md"},
+			ReviewProfile: contextcapsule.ReviewProfileInitialImplementation, ExecutionBounds: bounds,
+		},
+	}
+	_, capsuleBytes, err := contextcapsule.Build(repository, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, manifest.ContextCapsule.Path, capsuleBytes, 0o600)
+	manifest.ContextCapsule.SHA256 = testHash(t, manifest.ContextCapsule.Path)
+	manifest.Ralphex.Mode = ralphex.ModeTasksOnly
+	manifest.Ralphex.Timeout = bounds.WallClockTimeout
+	manifest.Ralphex.WaitOnLimit = "0s"
+	manifest.Ralphex.ExecutionState = nil
+	manifest.Ralphex.Capability = &ralphex.CapabilityV1{
+		Kind: "RalphexCapabilityV1", BinarySHA256: manifest.Ralphex.BinarySHA256, SourceSHA: manifest.Ralphex.SourceSHA,
+		MaxIterationsFlag: true, SessionTimeoutFlag: true, IdleTimeoutFlag: true, SkipFinalizeFlag: true, BaseRefFlag: true,
+		ExecutorModelEffortFlags: true, IsolatedConfig: true, GovernedHandoff: ralphex.HandoffTasksOnly, LinuxContainment: true,
+	}
+	manifest.Governance = &authority.GovernanceManifest{Operation: contextcapsule.OperationImplementation, Mutation: true}
+	controller := newRunTestController(t, repository, manifest.Repository.Identity)
+	authorizeRunV3Manifest(t, controller, &manifest)
+	governed, err := authority.NewWithGovernanceController(manifest, controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := ledger.NewJSONLLedger(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := evidence.NewStore(fixture.evidence, governed.RunID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	processes := &testContainedRunner{inner: supervisor.New()}
+	runner, err := NewWithController(governed, events, artifacts, processes, controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.StateImplementationCompleted || result.Accepted() || len(result.Acceptance.Commands()) != 0 {
+		t.Fatalf("B crossed into C-only acceptance: %#v", result)
+	}
+	for _, state := range eventStates(readEvents(t, fixture.ledgerPath)) {
+		if state == domain.StateBranchAcceptancePending || state == domain.StateBranchAccepted {
+			t.Fatalf("B emitted C-only state %s", state)
+		}
+	}
+	snapshot, err := controller.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ExecutionState.RalphexInvocations != 1 || snapshot.ExecutionState.TotalFixBatches != 0 {
+		t.Fatalf("B counters = %#v", snapshot.ExecutionState)
+	}
+}
+
+func TestReadOnlyReviewRejectsPostRunRepositoryMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		script string
+		want   string
+	}{
+		{
+			name:   "head changed",
+			script: "#!/bin/sh\nprintf changed > review-change.txt\ngit add review-change.txt || exit 90\ngit commit -qm review-change || exit 91\n",
+			want:   "changed the exact repository HEAD",
+		},
+		{
+			name:   "working tree dirty",
+			script: "#!/bin/sh\nprintf changed > review-change.txt\n",
+			want:   "left repository content dirty",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRunFixtureWithScript(t, test.script, authority.WorktreePolicy{}, commandPath(t, "true"))
+			manifest := fixture.authority.Manifest()
+			manifest.Ralphex.Mode = ralphex.ModeReview
+			bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementationReview)
+			fixture.authority = fixture.admit(t, manifest)
+			result, err := fixture.runner(t).Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), test.want) || result.State != domain.StateFailed {
+				t.Fatalf("mutating review result=%#v err=%v", result, err)
+			}
+		})
+	}
+}
+
 func TestRunnerRalphexFailureRecordsEvidenceWithoutImplementationCompleted(t *testing.T) {
 	fixture := newRunFixture(t, 17, commandPath(t, "true"))
 	result := fixture.execute(t)
@@ -112,10 +271,7 @@ func TestRunnerAppliesGovernedRalphexTimeout(t *testing.T) {
 	fixture := newRunFixtureWithScript(t, "#!/bin/sh\nwhile :; do sleep 60; done\n", authority.WorktreePolicy{}, commandPath(t, "true"))
 	manifest := fixture.authority.Manifest()
 	manifest.Ralphex.Timeout = "50ms"
-	governed, err := authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	governed := fixture.admit(t, manifest)
 	fixture.authority = governed
 	result := fixture.execute(t)
 	if result.State != domain.StateFailed || result.Ralphex.Outcome != supervisor.OutcomeTimedOut {
@@ -134,7 +290,7 @@ func TestRunnerReverifiesBoundContextCapsuleBeforeRalphexLaunch(t *testing.T) {
 	spec := contextcapsule.Spec{
 		PolicyVersion: contextcapsule.PolicyVersionV2,
 		Project:       "ABCP", Plan: "EP-004", RoadmapPhase: "Phase 3", ExecutionPack: "EP-004",
-		Task: "Task 1", Repository: "example/project", BaseSHA: manifest.Repository.StartSHA,
+		Task: "Task 1", Repository: manifest.Repository.Identity, BaseSHA: manifest.Repository.StartSHA,
 		OperationContext: &contextcapsule.OperationContext{
 			Kind: contextcapsule.OperationImplementation, OwnedScope: []string{"Task 1"},
 			BlockingCriteria: []string{"Current owned-scope Critical or Major findings."},
@@ -149,10 +305,7 @@ func TestRunnerReverifiesBoundContextCapsuleBeforeRalphexLaunch(t *testing.T) {
 	capsulePath := filepath.Join(t.TempDir(), "capsule.json")
 	writeTestFile(t, capsulePath, capsuleJSON, 0o600)
 	manifest.ContextCapsule = &authority.ContextCapsuleManifest{Path: capsulePath, SHA256: testHash(t, capsulePath)}
-	fixture.authority, err = authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture.authority = fixture.admit(t, manifest)
 	runner := fixture.runner(t)
 
 	writeTestFile(t, sourcePath, []byte("drift after authority construction"), 0o600)
@@ -193,10 +346,7 @@ func TestNewRequiresExactOperationBase(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	manifest := fixture.authority.Manifest()
 	manifest.Repository.StartSHA = strings.Repeat("0", 40)
-	governed, err := authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	governed := fixture.admit(t, manifest)
 	if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), "does not match governed start SHA") {
 		t.Fatalf("operation/base mismatch error = %v", err)
 	}
@@ -218,10 +368,7 @@ func TestNewEnforcesCodexXHighEffort(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			manifest := fixture.authority.Manifest()
 			test.mutate(&manifest.Executor)
-			governed, err := authority.New(manifest)
-			if err != nil {
-				t.Fatal(err)
-			}
+			governed := fixture.admit(t, manifest)
 			if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), test.field) {
 				t.Fatalf("effort policy error = %v", err)
 			}
@@ -256,11 +403,8 @@ func TestNewEnforcesOperationKindAndRalphexModeMapping(t *testing.T) {
 			manifest := fixture.authority.Manifest()
 			manifest.Ralphex.Mode = test.mode
 			bindOperationCapsule(t, &manifest, test.kind)
-			governed, err := authority.New(manifest)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, err = fixture.construct(t, governed)
+			governed := fixture.admit(t, manifest)
+			_, err := fixture.construct(t, governed)
 			if test.wantErr {
 				if err == nil || !strings.Contains(err.Error(), "requires operation kind") {
 					t.Fatalf("operation kind %q with mode %q error = %v", test.kind, test.mode, err)
@@ -274,6 +418,18 @@ func TestNewEnforcesOperationKindAndRalphexModeMapping(t *testing.T) {
 	}
 }
 
+func TestV3ReviewFixRequiresSeparateLeasedTasksOnlyBoundary(t *testing.T) {
+	if err := validateOperationMode(contextcapsule.OperationImplementationReview, ralphex.ModeTasksOnly, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOperationMode(contextcapsule.OperationImplementationReview, ralphex.ModeReview, true); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("mutating review invocation was admitted: %v", err)
+	}
+	if err := validateOperationMode(contextcapsule.OperationImplementation, ralphex.ModeFull, true); err == nil || !strings.Contains(err.Error(), "review-to-lease-to-fix") {
+		t.Fatalf("uninterrupted native fix invocation was admitted: %v", err)
+	}
+}
+
 func TestNewRejectsMultipleIncompleteImplementationSectionsInEveryImplementationMode(t *testing.T) {
 	for _, mode := range []ralphex.Mode{ralphex.ModeFull, ralphex.ModeTasksOnly} {
 		t.Run(string(mode), func(t *testing.T) {
@@ -283,10 +439,7 @@ func TestNewRejectsMultipleIncompleteImplementationSectionsInEveryImplementation
 			plan := []byte("### Task 1: first\n\n- [ ] first action\n\n### Task 2: second\n\n- [ ] second action\n")
 			writeTestFile(t, manifest.Plan.Path, plan, 0o600)
 			manifest.Plan.SHA256 = testHash(t, manifest.Plan.Path)
-			governed, err := authority.New(manifest)
-			if err != nil {
-				t.Fatal(err)
-			}
+			governed := fixture.admit(t, manifest)
 			if _, err := fixture.construct(t, governed); err == nil || !strings.Contains(err.Error(), "2 incomplete executable") {
 				t.Fatalf("multiple incomplete task error = %v", err)
 			}
@@ -795,12 +948,151 @@ func TestEP002StateCapExcludesIntegrationAndCompletion(t *testing.T) {
 
 type runFixture struct {
 	authority  authority.Authority
+	controller *governancev3.ControllerV1
 	ledgerPath string
 	evidence   string
 }
 
 type recordingEventAppender struct {
 	events []ledger.Event
+}
+
+type testContainedRunner struct {
+	inner CommandRunner
+}
+
+type runTestBackendRecord struct {
+	data     []byte
+	revision uint64
+}
+
+type runTestBackend struct {
+	mu      sync.Mutex
+	records map[string]runTestBackendRecord
+}
+
+func (b *runTestBackend) AuthorityDomainV1() (string, error) {
+	return strings.Repeat("f", 64), nil
+}
+
+func (b *runTestBackend) LoadWorkflowStateV1(controllerIdentity string) ([]byte, uint64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	record, ok := b.records[controllerIdentity]
+	if !ok {
+		return nil, 0, errors.New("authority state is not initialized")
+	}
+	return append([]byte(nil), record.data...), record.revision, nil
+}
+
+func (b *runTestBackend) CompareAndSwapWorkflowStateV1(controllerIdentity string, expectedRevision uint64, data []byte) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	record, ok := b.records[controllerIdentity]
+	if !ok {
+		return false, errors.New("authority state is not initialized")
+	}
+	if record.revision != expectedRevision {
+		return false, nil
+	}
+	var state governancev3.ControllerStateV1
+	if err := governancev3.ParseCanonical(data, &state); err != nil {
+		return false, err
+	}
+	b.records[controllerIdentity] = runTestBackendRecord{data: append([]byte(nil), data...), revision: state.Revision}
+	return true, nil
+}
+
+func newRunTestController(t *testing.T, repository, repositoryIdentity string) *governancev3.ControllerV1 {
+	t.Helper()
+	backend := &runTestBackend{records: make(map[string]runTestBackendRecord)}
+	controller, err := governancev3.OpenControllerWithAuthorityBackendV1(repository, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := governancev3.ControllerStateV1{
+		Kind: "GovernanceControllerStateV1", ControllerIdentity: controller.ControllerIdentity(), RepositoryIdentity: repositoryIdentity, Revision: 1,
+		IssuedV2Authorities: []governancev3.IssuedAuthorityV1{}, ExecutionState: ralphex.ExecutionStateV1{AggregateElapsed: "0s"}, FindingEvidence: []governancev3.FindingEvidenceV1{},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.records[controller.ControllerIdentity()] = runTestBackendRecord{data: data, revision: state.Revision}
+	return controller
+}
+
+func authorizeRunV3Manifest(t *testing.T, controller *governancev3.ControllerV1, manifest *authority.Manifest) {
+	t.Helper()
+	data, err := os.ReadFile(manifest.ContextCapsule.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := contextcapsule.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phase := child.PhaseAuthority
+	aCapsule := contextcapsule.Capsule{
+		PolicyVersion: contextcapsule.PolicyVersionV3, Repository: child.Repository, BaseSHA: child.BaseSHA, CapsuleSHA256: strings.Repeat("6", 64),
+		PhaseAuthority: &contextcapsule.PhaseAuthorityV3{
+			Stage: contextcapsule.StageADesign, AllowedOperations: []contextcapsule.OperationKind{contextcapsule.OperationDesignPlanning, contextcapsule.OperationDesignReview},
+			SemanticRegistrySHA256: phase.SemanticRegistrySHA256, ObservationScopeIDs: append([]string{}, phase.ObservationScopeIDs...),
+			BlockingScopeIDs: append([]string{}, phase.BlockingScopeIDs...), MutationScopeIDs: append([]string{}, phase.MutationScopeIDs...),
+			AuthorizedFindingIDs: []string{}, AuthorizedInvariantIDs: append([]string{}, phase.AuthorizedInvariantIDs...),
+			AllowedPaths: append([]string{}, phase.AllowedPaths...), ReviewProfile: contextcapsule.ReviewProfileNone,
+		},
+	}
+	bounds := *phase.ExecutionBounds
+	requiredID := phase.BlockingScopeIDs[0]
+	grant := governancev3.NextStageGrantV1{
+		Kind: "NextStageGrantV1", Stage: contextcapsule.StageBImplementation, BaseSHA: child.BaseSHA, SemanticRegistrySHA256: phase.SemanticRegistrySHA256,
+		AllowedOperations: append([]contextcapsule.OperationKind{}, phase.AllowedOperations...), ObservationScopeIDs: append([]string{}, phase.ObservationScopeIDs...),
+		BlockingScopeIDs: append([]string{}, phase.BlockingScopeIDs...), MutationScopeIDs: append([]string{}, phase.MutationScopeIDs...),
+		AuthorizedFindingIDs: append([]string{}, phase.AuthorizedFindingIDs...), AuthorizedInvariantIDs: append([]string{}, phase.AuthorizedInvariantIDs...),
+		AllowedPaths: append([]string{}, phase.AllowedPaths...), ReviewProfile: phase.ReviewProfile, ExecutionBounds: &bounds,
+		RequiredBlockingScopeIDs: []string{requiredID}, RequiredInvariantIDs: []string{requiredID}, RequiredOperations: []contextcapsule.OperationKind{contextcapsule.OperationImplementation}, RequiredFinalReviewIDs: []string{requiredID},
+	}
+	aFile := strings.Repeat("7", 64)
+	design := governancev3.PhaseCheckpointV1{
+		Kind: governancev3.CheckpointDesignAccepted, Repository: child.Repository, CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256,
+		CandidateSHA: child.BaseSHA, Operation: contextcapsule.OperationDesignReview, Verdict: "DESIGN_ACCEPTED",
+		Evidence: []governancev3.EvidenceBindingV1{{Ref: "design/accepted", SHA256: strings.Repeat("8", 64)}}, ControllerPolicyIdentity: "policy-v3",
+		ControllerEventIdentity: "event-design", SemanticRegistrySHA256: phase.SemanticRegistrySHA256,
+	}
+	design, grant, err = governancev3.SealCheckpointWithNextStageGrantV1(design, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.PhaseAuthority.Parent = &contextcapsule.PhaseParentV1{CapsuleFileSHA256: aFile, CapsuleSHA256: aCapsule.CapsuleSHA256, Stage: contextcapsule.StageADesign, CheckpointSHA256: design.CheckpointSHA256, CandidateSHA: design.CandidateSHA, GrantSHA256: grant.GrantSHA256}
+	sources := make([]string, len(child.Sources))
+	for index, source := range child.Sources {
+		sources[index] = source.Path
+	}
+	spec := contextcapsule.Spec{
+		PolicyVersion: child.PolicyVersion, Project: child.Project, Plan: child.Plan, RoadmapPhase: child.RoadmapPhase, ExecutionPack: child.ExecutionPack, Task: child.Task,
+		Repository: child.Repository, BaseSHA: child.BaseSHA, Invariants: append([]string{}, child.Invariants...), NonGoals: append([]string{}, child.NonGoals...),
+		PredecessorOutcomes: append([]contextcapsule.Outcome{}, child.PredecessorOutcomes...), Sources: sources, PhaseAuthority: child.PhaseAuthority,
+	}
+	_, rebuilt, err := contextcapsule.Build(manifest.Repository.Path, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, manifest.ContextCapsule.Path, rebuilt, 0o600)
+	manifest.ContextCapsule.SHA256 = testHash(t, manifest.ContextCapsule.Path)
+	if err := controller.AdvanceCheckpointV1(governancev3.CheckpointAdvanceV1{Repository: manifest.Repository.Path, Capsule: aCapsule, CapsuleFileSHA256: aFile, Checkpoint: design, NextStageGrant: &grant}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (r *testContainedRunner) Run(ctx context.Context, command supervisor.Command) (supervisor.Result, error) {
+	return r.inner.Run(ctx, command)
+}
+
+func (r *testContainedRunner) RunContained(ctx context.Context, command supervisor.Command, request ContainmentRequestV1) (supervisor.Result, ContainmentEvidenceV1, error) {
+	result, err := r.inner.Run(ctx, command)
+	evidence := ContainmentEvidenceV1{Kind: "ContainmentEvidenceV1", ScopeIdentity: "test/" + request.Identity, Primitive: "cgroup-v2", MembershipVerified: true, EmptyScopeVerified: true}
+	return result, evidence, err
 }
 
 func (a *recordingEventAppender) Append(event ledger.Event) error {
@@ -827,11 +1119,18 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 	runGit(t, "", "init", "-b", "main", repository)
 	runGit(t, repository, "config", "user.email", "controller@example.test")
 	runGit(t, repository, "config", "user.name", "Controller Test")
-	runGit(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
+	remoteDigest := sha256.Sum256([]byte(repository))
+	repositoryIdentity := "example/project-" + hex.EncodeToString(remoteDigest[:8])
+	remoteURL := "https://example.test/" + repositoryIdentity + ".git"
+	runGit(t, repository, "remote", "add", "origin", remoteURL)
 	planPath := filepath.Join(repository, "plan.md")
 	writeTestFile(t, planPath, []byte("# governed plan\n"), 0o600)
 	writeTestFile(t, filepath.Join(repository, "context.md"), []byte("governed operation context\n"), 0o600)
-	runGit(t, repository, "add", "plan.md", "context.md")
+	if err := os.MkdirAll(filepath.Join(repository, filepath.Dir(governancev3.GovernancePolicyPathV1)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(repository, governancev3.GovernancePolicyPathV1), []byte("context authority policy v3\n"), 0o600)
+	runGit(t, repository, "add", "plan.md", "context.md", governancev3.GovernancePolicyPathV1)
 	runGit(t, repository, "commit", "-m", "initial plan")
 	startSHA := runGit(t, repository, "rev-parse", "HEAD")
 
@@ -842,8 +1141,8 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 		RunID: "run-fixture",
 		Repository: authority.RepositoryManifest{
 			Path:          repository,
-			Identity:      "example/project",
-			Remotes:       map[string]string{"origin": "https://example.test/example/project.git"},
+			Identity:      repositoryIdentity,
+			Remotes:       map[string]string{"origin": remoteURL},
 			DefaultBranch: "main",
 			StartSHA:      startSHA,
 		},
@@ -862,13 +1161,15 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 		PolicyVersion: "branch-test-v1",
 	}
 	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
-	governed, err := authority.New(manifest)
+	controller := newRunTestController(t, repository, repositoryIdentity)
+	governed, err := authority.NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
 	return runFixture{
 		authority:  governed,
+		controller: controller,
 		ledgerPath: filepath.Join(root, "events", "run.jsonl"),
 		evidence:   filepath.Join(root, "evidence"),
 	}
@@ -931,7 +1232,16 @@ func (f runFixture) construct(t *testing.T, governed authority.Authority) (*Runn
 	if err != nil {
 		return nil, err
 	}
-	return New(governed, events, artifacts, supervisor.New())
+	return NewWithController(governed, events, artifacts, supervisor.New(), f.controller)
+}
+
+func (f runFixture) admit(t *testing.T, manifest authority.Manifest) authority.Authority {
+	t.Helper()
+	governed, err := authority.NewWithGovernanceController(manifest, f.controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return governed
 }
 
 func (f runFixture) execute(t *testing.T) Result {
@@ -948,11 +1258,7 @@ func (f runFixture) atCurrentHead(t *testing.T) runFixture {
 	manifest := f.authority.Manifest()
 	manifest.Repository.StartSHA = runGit(t, manifest.Repository.Path, "rev-parse", "HEAD")
 	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
-	governed, err := authority.New(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.authority = governed
+	f.authority = f.admit(t, manifest)
 	return f
 }
 

@@ -15,15 +15,19 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
+	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
-func TestRunCLIEndToEnd(t *testing.T) {
+func TestRunCLIRejectsAutonomousWorkflowWithoutAuthorityBackend(t *testing.T) {
 	repository := filepath.Join(t.TempDir(), "repository")
 	gitCommand(t, "", "init", "-b", "main", repository)
 	gitCommand(t, repository, "config", "user.email", "cli@example.test")
 	gitCommand(t, repository, "config", "user.name", "CLI Test")
-	gitCommand(t, repository, "remote", "add", "origin", "https://example.test/example/project.git")
+	remoteDigest := sha256.Sum256([]byte(repository))
+	repositoryIdentity := "example/project-" + hex.EncodeToString(remoteDigest[:8])
+	remoteURL := "https://example.test/" + repositoryIdentity + ".git"
+	gitCommand(t, repository, "remote", "add", "origin", remoteURL)
 	planPath := filepath.Join(repository, "plan.md")
 	writeCLIFile(t, planPath, []byte("# CLI plan\n"), 0o600)
 	gitCommand(t, repository, "add", "plan.md")
@@ -39,7 +43,7 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	manifest := authority.Manifest{
 		RunID: "cli-run",
 		Repository: authority.RepositoryManifest{
-			Path: repository, Identity: "example/project", Remotes: map[string]string{"origin": "https://example.test/example/project.git"}, DefaultBranch: "main", StartSHA: startSHA,
+			Path: repository, Identity: repositoryIdentity, Remotes: map[string]string{"origin": remoteURL}, DefaultBranch: "main", StartSHA: startSHA,
 		},
 		Plan:          authority.PlanManifest{Path: planPath, SHA256: cliFileHash(t, planPath)},
 		Ralphex:       authority.RalphexManifest{BinaryPath: binaryPath, BinarySHA256: cliFileHash(t, binaryPath), Mode: ralphex.ModeFull, Timeout: "5s", WaitOnLimit: "0s"},
@@ -49,7 +53,7 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	capsuleSpec := contextcapsule.Spec{
 		PolicyVersion: contextcapsule.PolicyVersionV2,
 		Project:       "ABCP", Plan: "CLI plan", RoadmapPhase: "test", ExecutionPack: "test",
-		Task: "Task 1", Repository: "example/project", BaseSHA: startSHA,
+		Task: "Task 1", Repository: repositoryIdentity, BaseSHA: startSHA,
 		OperationContext: &contextcapsule.OperationContext{
 			Kind: contextcapsule.OperationImplementation, OwnedScope: []string{"CLI plan"},
 			BlockingCriteria: []string{"Current owned-scope Critical or Major findings."},
@@ -79,17 +83,20 @@ func TestRunCLIEndToEnd(t *testing.T) {
 	code := runCLI([]string{
 		"run", "--manifest", manifestPath, "--ledger", ledgerPath, "--evidence-root", evidenceRoot,
 	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("run CLI exited %d: %s", code, stderr.String())
+	if code != 1 {
+		t.Fatalf("run CLI without authority backend exited %d: %s", code, stderr.String())
 	}
-	if strings.TrimSpace(stdout.String()) != "BRANCH_ACCEPTED" {
+	if !strings.Contains(stderr.String(), "workflow-wide authority backend is required") {
+		t.Fatalf("missing fail-closed backend error: %q", stderr.String())
+	}
+	if stdout.Len() != 0 {
 		t.Fatalf("unexpected CLI output %q", stdout.String())
 	}
-	if _, err := os.Stat(ledgerPath); err != nil {
-		t.Fatalf("ledger was not created: %v", err)
+	if _, err := os.Stat(ledgerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backendless admission created a ledger: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(evidenceRoot, "cli-run", "authority.json")); err != nil {
-		t.Fatalf("authority evidence was not created: %v", err)
+	if _, err := os.Stat(filepath.Join(evidenceRoot, "cli-run", "authority.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backendless admission created authority evidence: %v", err)
 	}
 }
 
@@ -181,6 +188,64 @@ func TestContextCommandsRequireStructuredPathArguments(t *testing.T) {
 	stderr.Reset()
 	if code := runCLI([]string{"context-verify", "capsule.json"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("context-verify accepted positional input with exit %d", code)
+	}
+}
+
+func TestGovernanceActivationDiagnosticUsesProductValidator(t *testing.T) {
+	activation, err := governancev3.SealGovernanceActivationV1(governancev3.GovernanceActivationV1{
+		Kind: "GovernanceActivationV1", PolicyVersion: contextcapsule.PolicyVersionV3,
+		PolicySHA256: strings.Repeat("a", 64), ActivationRepositoryCommit: strings.Repeat("b", 40),
+		ActivationSequence: 12, ActivationTime: "2026-09-10T00:00:00Z", GrandfatheredV2Digests: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "activation.json")
+	writeCLIFile(t, path, data, 0o600)
+	var stdout, stderr bytes.Buffer
+	if code := runCLI([]string{"governance-activation-validate", "--input", path}, &stdout, &stderr); code != 0 {
+		t.Fatalf("activation diagnostic exited %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"valid": true`) {
+		t.Fatalf("activation output = %q", stdout.String())
+	}
+	activation.PolicySHA256 = strings.Repeat("c", 64)
+	data, err = json.Marshal(activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCLIFile(t, path, data, 0o600)
+	stdout.Reset()
+	stderr.Reset()
+	if code := runCLI([]string{"governance-activation-validate", "--input", path}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "CAPSULE_LINEAGE_INVALID") {
+		t.Fatalf("tampered activation diagnostic exited %d: %s", code, stderr.String())
+	}
+}
+
+func TestGovernanceDiagnosticRejectsNonCanonicalJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoint.json")
+	writeCLIFile(t, path, []byte("{\n  \"kind\": \"DESIGN_ACCEPTED\"\n}\n"), 0o600)
+	var stdout, stderr bytes.Buffer
+	if code := runCLI([]string{"governance-checkpoint-validate", "--input", path}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "strict canonical") {
+		t.Fatalf("noncanonical diagnostic exited %d: %s", code, stderr.String())
+	}
+}
+
+func TestGovernanceCLIRejectsCallerSelectedStatePaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "input.json")
+	writeCLIFile(t, path, []byte("{}"), 0o600)
+	var stdout, stderr bytes.Buffer
+	if code := runCLI([]string{"governance-review-advance", "--input", path, "--state", filepath.Join(t.TempDir(), "state.json")}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("caller-selected governance state exited %d: %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runCLI([]string{"run", "--manifest", path, "--ledger", "ledger", "--evidence-root", "evidence", "--governance-state", filepath.Join(t.TempDir(), "state.json")}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("caller-selected run state exited %d: %s", code, stderr.String())
 	}
 }
 

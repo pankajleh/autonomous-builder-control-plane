@@ -14,7 +14,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
@@ -25,7 +27,10 @@ const (
 	PolicyVersionV1 = "context-capsule-v1"
 	// PolicyVersionV2 adds purpose-specific operation authority.
 	PolicyVersionV2 = "context-capsule-v2"
-	// PolicyVersion is the current format for newly built operation capsules.
+	// PolicyVersionV3 adds immutable three-stage semantic authority.
+	PolicyVersionV3 = "context-capsule-v3"
+	// PolicyVersion remains the pre-activation default. A/B/C controllers select
+	// V3 explicitly only under GovernanceActivationV1.
 	PolicyVersion = PolicyVersionV2
 
 	// Conservative bounds keep capsules small enough to be fresh-task context.
@@ -46,11 +51,79 @@ const (
 	OperationImplementation       OperationKind = "implementation"
 	OperationImplementationReview OperationKind = "implementation-review"
 	OperationAcceptance           OperationKind = "acceptance"
+	OperationFinalReview          OperationKind = "final-review"
+	OperationPRPublication        OperationKind = "pr-publication"
 	OperationMergeAuthorization   OperationKind = "merge-authorization"
+	OperationPostMergeAcceptance  OperationKind = "post-merge-acceptance"
 	OperationDeployment           OperationKind = "deployment"
 	OperationRecovery             OperationKind = "recovery"
 	OperationMaintenance          OperationKind = "maintenance"
 )
+
+// Stage is one of the three immutable autonomous-development authority stages.
+type Stage string
+
+const (
+	StageADesign          Stage = "A_DESIGN"
+	StageBImplementation  Stage = "B_IMPLEMENTATION"
+	StageCAcceptanceMerge Stage = "C_ACCEPTANCE_MERGE"
+)
+
+// ReviewProfile fixes how blocker authority is established for a B capsule.
+type ReviewProfile string
+
+const (
+	ReviewProfileNone                  ReviewProfile = "NONE"
+	ReviewProfileInitialImplementation ReviewProfile = "INITIAL_IMPLEMENTATION"
+	ReviewProfileCorrection            ReviewProfile = "CORRECTION"
+)
+
+// PhaseParentV1 binds a child capsule to controller-owned predecessor evidence.
+type PhaseParentV1 struct {
+	CapsuleFileSHA256 string `json:"capsule_file_sha256"`
+	CapsuleSHA256     string `json:"capsule_sha256"`
+	Stage             Stage  `json:"stage"`
+	CheckpointSHA256  string `json:"checkpoint_sha256"`
+	CandidateSHA      string `json:"candidate_sha"`
+	GrantSHA256       string `json:"grant_sha256"`
+}
+
+// ExecutionBoundsV1 contains per-invocation and B-lineage cumulative ceilings.
+// Duration values use Go's canonical duration syntax and are canonicalized by
+// Build before they are hashed.
+type ExecutionBoundsV1 struct {
+	MaxIterations             int    `json:"max_iterations"`
+	SessionTimeout            string `json:"session_timeout"`
+	IdleTimeout               string `json:"idle_timeout"`
+	WallClockTimeout          string `json:"wall_clock_timeout"`
+	AggregateWallClockTimeout string `json:"aggregate_wall_clock_timeout"`
+	Finalize                  bool   `json:"finalize"`
+	MaxIncompleteTasks        int    `json:"max_incomplete_tasks"`
+	MaxInitialActiveFindings  int    `json:"max_initial_active_findings"`
+	MaxRalphexInvocations     int    `json:"max_ralphex_invocations"`
+	MaxReviewReports          int    `json:"max_review_reports"`
+	MaxMutationLeases         int    `json:"max_mutation_leases"`
+	MaxTotalFixBatches        int    `json:"max_total_fix_batches"`
+	MaxChangedFiles           int    `json:"max_changed_files"`
+	MaxChangedBytes           int64  `json:"max_changed_bytes"`
+}
+
+// PhaseAuthorityV3 is the immutable semantic and operational authority carried
+// by a V3 capsule. All slices must already be canonical sorted unique arrays.
+type PhaseAuthorityV3 struct {
+	Stage                  Stage              `json:"stage"`
+	AllowedOperations      []OperationKind    `json:"allowed_operations"`
+	Parent                 *PhaseParentV1     `json:"parent,omitempty"`
+	SemanticRegistrySHA256 string             `json:"semantic_registry_sha256"`
+	ObservationScopeIDs    []string           `json:"observation_scope_ids"`
+	BlockingScopeIDs       []string           `json:"blocking_scope_ids"`
+	MutationScopeIDs       []string           `json:"mutation_scope_ids"`
+	AuthorizedFindingIDs   []string           `json:"authorized_finding_ids"`
+	AuthorizedInvariantIDs []string           `json:"authorized_invariant_ids"`
+	AllowedPaths           []string           `json:"allowed_paths"`
+	ReviewProfile          ReviewProfile      `json:"review_profile"`
+	ExecutionBounds        *ExecutionBoundsV1 `json:"execution_bounds,omitempty"`
+}
 
 // OperationContext bounds one governed operation to an explicit purpose,
 // owned scope, and blocking policy.
@@ -70,6 +143,7 @@ type Spec struct {
 	ExecutionPack       string            `json:"execution_pack"`
 	Task                string            `json:"task"`
 	OperationContext    *OperationContext `json:"operation_context,omitempty"`
+	PhaseAuthority      *PhaseAuthorityV3 `json:"phase_authority,omitempty"`
 	Repository          string            `json:"repository"`
 	BaseSHA             string            `json:"base_sha"`
 	Invariants          []string          `json:"invariants"`
@@ -101,6 +175,7 @@ type Capsule struct {
 	ExecutionPack       string            `json:"execution_pack"`
 	Task                string            `json:"task"`
 	OperationContext    *OperationContext `json:"operation_context,omitempty"`
+	PhaseAuthority      *PhaseAuthorityV3 `json:"phase_authority,omitempty"`
 	Repository          string            `json:"repository"`
 	BaseSHA             string            `json:"base_sha"`
 	Invariants          []string          `json:"invariants"`
@@ -128,6 +203,7 @@ type payload struct {
 	ExecutionPack       string            `json:"execution_pack"`
 	Task                string            `json:"task"`
 	OperationContext    *OperationContext `json:"operation_context,omitempty"`
+	PhaseAuthority      *PhaseAuthorityV3 `json:"phase_authority,omitempty"`
 	Repository          string            `json:"repository"`
 	BaseSHA             string            `json:"base_sha"`
 	Invariants          []string          `json:"invariants"`
@@ -137,14 +213,29 @@ type payload struct {
 }
 
 // Build resolves and hashes the explicit sources in spec and returns canonical
-// capsule JSON. The repository must be at the exact base SHA in the spec.
+// capsule JSON. V1/V2 require checkout HEAD at base; V3 reads the immutable
+// base commit tree and does not require current HEAD equality.
 func Build(repository string, spec Spec) (Capsule, []byte, error) {
 	if err := validateSpec(spec); err != nil {
 		return Capsule{}, nil, err
 	}
-	repository, err := verifyRepository(repository, spec.Repository, spec.BaseSHA)
+	var repositoryRoot string
+	var err error
+	if spec.PolicyVersion == PolicyVersionV3 {
+		repositoryRoot, err = verifyRepositoryAtCommit(repository, spec.Repository, spec.BaseSHA)
+	} else {
+		repositoryRoot, err = verifyRepository(repository, spec.Repository, spec.BaseSHA)
+	}
 	if err != nil {
 		return Capsule{}, nil, err
+	}
+	repository = repositoryRoot
+	if spec.PolicyVersion == PolicyVersionV3 {
+		for _, allowed := range spec.PhaseAuthority.AllowedPaths {
+			if err := validateAllowedPathAtCommit(repository, spec.BaseSHA, allowed); err != nil {
+				return Capsule{}, nil, fmt.Errorf("phase_authority.allowed_paths %q: %w", allowed, err)
+			}
+		}
 	}
 
 	paths := append([]string(nil), spec.Sources...)
@@ -158,7 +249,12 @@ func Build(repository string, spec Spec) (Capsule, []byte, error) {
 	sort.Strings(paths)
 	sources := make([]Source, 0, len(paths))
 	for _, path := range paths {
-		hash, err := hashRepositoryFile(repository, path)
+		var hash string
+		if spec.PolicyVersion == PolicyVersionV3 {
+			hash, err = hashRepositoryFileAtCommit(repository, spec.BaseSHA, path)
+		} else {
+			hash, err = hashRepositoryFile(repository, path)
+		}
 		if err != nil {
 			return Capsule{}, nil, fmt.Errorf("source %q: %w", path, err)
 		}
@@ -173,6 +269,7 @@ func Build(repository string, spec Spec) (Capsule, []byte, error) {
 		ExecutionPack:       spec.ExecutionPack,
 		Task:                spec.Task,
 		OperationContext:    cloneOperationContext(spec.OperationContext),
+		PhaseAuthority:      clonePhaseAuthority(spec.PhaseAuthority),
 		Repository:          spec.Repository,
 		BaseSHA:             strings.ToLower(spec.BaseSHA),
 		Invariants:          append([]string{}, spec.Invariants...),
@@ -225,15 +322,28 @@ func Parse(data []byte) (Capsule, error) {
 	return capsule, nil
 }
 
-// Verify checks the capsule hash, bounds, repository HEAD, and every exact
-// source byte hash. Verification fails on duplicates, traversal, or symlinks.
+// Verify checks capsule hash, bounds, repository identity, and every exact
+// source byte hash. V1/V2 use live base checkout bytes; V3 uses base-tree
+// blobs. Verification fails on duplicates, traversal, or symlink modes.
 func Verify(repository string, capsule Capsule) (Verification, error) {
 	if err := validateCapsule(capsule); err != nil {
 		return Verification{}, err
 	}
-	repository, err := verifyRepository(repository, capsule.Repository, capsule.BaseSHA)
+	var err error
+	if capsule.PolicyVersion == PolicyVersionV3 {
+		repository, err = verifyRepositoryAtCommit(repository, capsule.Repository, capsule.BaseSHA)
+	} else {
+		repository, err = verifyRepository(repository, capsule.Repository, capsule.BaseSHA)
+	}
 	if err != nil {
 		return Verification{}, err
+	}
+	if capsule.PolicyVersion == PolicyVersionV3 {
+		for _, allowed := range capsule.PhaseAuthority.AllowedPaths {
+			if err := validateAllowedPathAtCommit(repository, capsule.BaseSHA, allowed); err != nil {
+				return Verification{}, fmt.Errorf("phase_authority.allowed_paths %q: %w", allowed, err)
+			}
+		}
 	}
 	expected, err := payloadHash(capsule)
 	if err != nil {
@@ -252,7 +362,12 @@ func Verify(repository string, capsule Capsule) (Verification, error) {
 			return Verification{}, errors.New("capsule sources are not in canonical path order")
 		}
 		previous = source.Path
-		actual, err := hashRepositoryFile(repository, source.Path)
+		var actual string
+		if capsule.PolicyVersion == PolicyVersionV3 {
+			actual, err = hashRepositoryFileAtCommit(repository, capsule.BaseSHA, source.Path)
+		} else {
+			actual, err = hashRepositoryFile(repository, source.Path)
+		}
 		if err != nil {
 			return Verification{}, fmt.Errorf("source %q: %w", source.Path, err)
 		}
@@ -300,10 +415,13 @@ func VerifyFile(repository, capsulePath string) (Verification, error) {
 func validateSpec(spec Spec) error {
 	switch spec.PolicyVersion {
 	case PolicyVersionV1:
-		if spec.OperationContext != nil {
-			return errors.New("operation_context is not valid for context-capsule-v1")
+		if spec.OperationContext != nil || spec.PhaseAuthority != nil {
+			return errors.New("operation_context and phase_authority are not valid for context-capsule-v1")
 		}
 	case PolicyVersionV2:
+		if spec.PhaseAuthority != nil {
+			return errors.New("phase_authority is not valid for context-capsule-v2")
+		}
 		if spec.OperationContext == nil {
 			return errors.New("operation_context is required for context-capsule-v2")
 		}
@@ -312,6 +430,19 @@ func validateSpec(spec Spec) error {
 		}
 		if spec.PredecessorOutcomes == nil {
 			return errors.New("predecessor_outcomes must be an explicit array for context-capsule-v2")
+		}
+	case PolicyVersionV3:
+		if spec.OperationContext != nil {
+			return errors.New("operation_context is not valid for context-capsule-v3")
+		}
+		if spec.PhaseAuthority == nil {
+			return errors.New("phase_authority is required for context-capsule-v3")
+		}
+		if err := ValidatePhaseAuthorityV3(*spec.PhaseAuthority); err != nil {
+			return err
+		}
+		if spec.PredecessorOutcomes == nil {
+			return errors.New("predecessor_outcomes must be an explicit array for context-capsule-v3")
 		}
 	default:
 		return fmt.Errorf("unsupported context policy version %q", spec.PolicyVersion)
@@ -374,6 +505,7 @@ func validateCapsule(capsule Capsule) error {
 		PolicyVersion: capsule.PolicyVersion, Project: capsule.Project, Plan: capsule.Plan,
 		RoadmapPhase: capsule.RoadmapPhase, ExecutionPack: capsule.ExecutionPack, Task: capsule.Task,
 		OperationContext: capsule.OperationContext,
+		PhaseAuthority:   capsule.PhaseAuthority,
 		Repository:       capsule.Repository, BaseSHA: capsule.BaseSHA, Invariants: capsule.Invariants,
 		NonGoals: capsule.NonGoals, PredecessorOutcomes: capsule.PredecessorOutcomes,
 		Sources: make([]string, len(capsule.Sources)),
@@ -425,6 +557,228 @@ func validateOperationContext(operation OperationContext) error {
 		}
 	}
 	return nil
+}
+
+// ValidatePhaseAuthorityV3 validates the closed V3 stage, operation, semantic,
+// path, review-profile, parent, and execution-bound vocabulary.
+func ValidatePhaseAuthorityV3(authority PhaseAuthorityV3) error {
+	var operations []OperationKind
+	var wantProfile ReviewProfile
+	switch authority.Stage {
+	case StageADesign:
+		operations = []OperationKind{OperationDesignPlanning, OperationDesignReview}
+		wantProfile = ReviewProfileNone
+		if authority.Parent != nil {
+			return errors.New("CAPSULE_STAGE_INVALID: A_DESIGN parent must be absent")
+		}
+		if authority.ExecutionBounds != nil {
+			return errors.New("CAPSULE_STAGE_INVALID: A_DESIGN execution_bounds must be absent")
+		}
+	case StageBImplementation:
+		operations = []OperationKind{OperationImplementation, OperationImplementationReview}
+		if authority.Parent == nil || authority.Parent.Stage != StageADesign {
+			return errors.New("CAPSULE_LINEAGE_INVALID: B_IMPLEMENTATION requires an A_DESIGN parent")
+		}
+		if authority.ReviewProfile != ReviewProfileInitialImplementation && authority.ReviewProfile != ReviewProfileCorrection {
+			return errors.New("CAPSULE_STAGE_INVALID: B_IMPLEMENTATION review_profile is invalid")
+		}
+		if authority.ExecutionBounds == nil {
+			return errors.New("EXECUTION_BOUNDS_INVALID: B_IMPLEMENTATION execution_bounds are required")
+		}
+		if err := ValidateExecutionBoundsV1(*authority.ExecutionBounds); err != nil {
+			return err
+		}
+	case StageCAcceptanceMerge:
+		operations = []OperationKind{OperationAcceptance, OperationFinalReview, OperationMergeAuthorization, OperationPostMergeAcceptance, OperationPRPublication}
+		wantProfile = ReviewProfileNone
+		if authority.Parent == nil || authority.Parent.Stage != StageBImplementation {
+			return errors.New("CAPSULE_LINEAGE_INVALID: C_ACCEPTANCE_MERGE requires a B_IMPLEMENTATION parent")
+		}
+		if authority.ExecutionBounds != nil {
+			return errors.New("CAPSULE_STAGE_INVALID: C_ACCEPTANCE_MERGE execution_bounds must be absent")
+		}
+		if len(authority.MutationScopeIDs) != 0 || len(authority.AuthorizedFindingIDs) != 0 {
+			return errors.New("CAPSULE_STAGE_INVALID: C_ACCEPTANCE_MERGE is read-only")
+		}
+	default:
+		return fmt.Errorf("CAPSULE_STAGE_INVALID: unsupported stage %q", authority.Stage)
+	}
+	if wantProfile != "" && authority.ReviewProfile != wantProfile {
+		return fmt.Errorf("CAPSULE_STAGE_INVALID: stage %s requires review_profile %s", authority.Stage, wantProfile)
+	}
+	if !equalOperations(authority.AllowedOperations, operations) {
+		return fmt.Errorf("CAPSULE_STAGE_INVALID: stage %s requires allowed_operations %v", authority.Stage, operations)
+	}
+	if err := validateSHA256("phase_authority.semantic_registry_sha256", authority.SemanticRegistrySHA256); err != nil {
+		return err
+	}
+	for name, values := range map[string][]string{
+		"observation_scope_ids":    authority.ObservationScopeIDs,
+		"blocking_scope_ids":       authority.BlockingScopeIDs,
+		"mutation_scope_ids":       authority.MutationScopeIDs,
+		"authorized_finding_ids":   authority.AuthorizedFindingIDs,
+		"authorized_invariant_ids": authority.AuthorizedInvariantIDs,
+	} {
+		if err := validateCanonicalIDs("phase_authority."+name, values); err != nil {
+			return err
+		}
+	}
+	if !isSubset(authority.BlockingScopeIDs, authority.ObservationScopeIDs) {
+		return errors.New("CAPSULE_STAGE_INVALID: blocking_scope_ids must be a subset of observation_scope_ids")
+	}
+	if !isSubset(authority.MutationScopeIDs, authority.BlockingScopeIDs) {
+		return errors.New("CAPSULE_STAGE_INVALID: mutation_scope_ids must be a subset of blocking_scope_ids")
+	}
+	if authority.ReviewProfile == ReviewProfileCorrection && len(authority.AuthorizedFindingIDs) == 0 {
+		return errors.New("CAPSULE_STAGE_INVALID: CORRECTION requires authorized_finding_ids")
+	}
+	if authority.ReviewProfile != ReviewProfileCorrection && len(authority.AuthorizedFindingIDs) != 0 {
+		return errors.New("CAPSULE_STAGE_INVALID: authorized_finding_ids require CORRECTION")
+	}
+	if len(authority.AuthorizedInvariantIDs) == 0 {
+		return errors.New("CAPSULE_STAGE_INVALID: authorized_invariant_ids must not be empty")
+	}
+	if len(authority.AllowedPaths) == 0 || len(authority.AllowedPaths) > MaxListItems {
+		return fmt.Errorf("CAPSULE_STAGE_INVALID: allowed_paths count must be between 1 and %d", MaxListItems)
+	}
+	previous := ""
+	for index, path := range authority.AllowedPaths {
+		if err := ValidateAllowedPathV3(path); err != nil {
+			return fmt.Errorf("CAPSULE_STAGE_INVALID: phase_authority.allowed_paths[%d]: %w", index, err)
+		}
+		if path <= previous {
+			return errors.New("CAPSULE_STAGE_INVALID: allowed_paths must be sorted and unique")
+		}
+		previous = path
+	}
+	if authority.Parent != nil {
+		for name, digest := range map[string]string{
+			"capsule_file_sha256": authority.Parent.CapsuleFileSHA256,
+			"capsule_sha256":      authority.Parent.CapsuleSHA256,
+			"checkpoint_sha256":   authority.Parent.CheckpointSHA256,
+			"grant_sha256":        authority.Parent.GrantSHA256,
+		} {
+			if err := validateSHA256("phase_authority.parent."+name, digest); err != nil {
+				return fmt.Errorf("CAPSULE_LINEAGE_INVALID: %w", err)
+			}
+		}
+		if err := validateCommitSHA("phase_authority.parent.candidate_sha", authority.Parent.CandidateSHA); err != nil {
+			return fmt.Errorf("CAPSULE_LINEAGE_INVALID: %w", err)
+		}
+	}
+	return nil
+}
+
+// ValidateExecutionBoundsV1 validates the initial product ceiling profile.
+func ValidateExecutionBoundsV1(bounds ExecutionBoundsV1) error {
+	if bounds.MaxIterations < 1 || bounds.MaxIterations > 10 {
+		return errors.New("EXECUTION_BOUNDS_INVALID: max_iterations must be between 1 and 10")
+	}
+	for _, item := range []struct {
+		name string
+		text string
+		max  time.Duration
+	}{
+		{name: "session_timeout", text: bounds.SessionTimeout, max: 90 * time.Minute},
+		{name: "idle_timeout", text: bounds.IdleTimeout, max: 45 * time.Minute},
+		{name: "wall_clock_timeout", text: bounds.WallClockTimeout, max: 3 * time.Hour},
+		{name: "aggregate_wall_clock_timeout", text: bounds.AggregateWallClockTimeout},
+	} {
+		duration, err := time.ParseDuration(item.text)
+		if err != nil || duration <= 0 || item.max > 0 && duration > item.max || duration.String() != item.text {
+			return fmt.Errorf("EXECUTION_BOUNDS_INVALID: %s must be canonical, positive, and within its product ceiling", item.name)
+		}
+	}
+	wall, _ := time.ParseDuration(bounds.WallClockTimeout)
+	aggregate, _ := time.ParseDuration(bounds.AggregateWallClockTimeout)
+	if wall > aggregate {
+		return errors.New("EXECUTION_BOUNDS_INVALID: wall_clock_timeout exceeds aggregate_wall_clock_timeout")
+	}
+	if bounds.Finalize {
+		return errors.New("EXECUTION_BOUNDS_INVALID: finalize must be false")
+	}
+	if bounds.MaxIncompleteTasks != 1 {
+		return errors.New("EXECUTION_BOUNDS_INVALID: max_incomplete_tasks must equal 1")
+	}
+	for name, value := range map[string]int{
+		"max_initial_active_findings": bounds.MaxInitialActiveFindings,
+		"max_ralphex_invocations":     bounds.MaxRalphexInvocations,
+		"max_review_reports":          bounds.MaxReviewReports,
+		"max_mutation_leases":         bounds.MaxMutationLeases,
+		"max_total_fix_batches":       bounds.MaxTotalFixBatches,
+		"max_changed_files":           bounds.MaxChangedFiles,
+	} {
+		if value < 1 {
+			return fmt.Errorf("EXECUTION_BOUNDS_INVALID: %s must be positive", name)
+		}
+	}
+	if bounds.MaxChangedBytes < 1 {
+		return errors.New("EXECUTION_BOUNDS_INVALID: max_changed_bytes must be positive")
+	}
+	return nil
+}
+
+// ValidateAllowedPathV3 accepts one exact repository path or one directory/**
+// prefix. It deliberately rejects broad roots and all other glob syntax.
+func ValidateAllowedPathV3(path string) error {
+	if path == "*" || path == "**" || path == "**/*" || path == "." || path == "./**" {
+		return errors.New("broad-root patterns are forbidden")
+	}
+	prefix := strings.TrimSuffix(path, "/**")
+	if prefix != path && (prefix == "" || strings.Contains(prefix, "*")) {
+		return errors.New("dir/** must have a concrete directory prefix")
+	}
+	if strings.ContainsAny(prefix, "*?[]{}()|^$") {
+		return errors.New("only an exact path or a dir/** prefix is allowed")
+	}
+	return validateSourcePath(prefix)
+}
+
+func validateCanonicalIDs(field string, values []string) error {
+	if values == nil || len(values) > MaxListItems {
+		return fmt.Errorf("%s must be an explicit array with no more than %d items", field, MaxListItems)
+	}
+	previous := ""
+	for index, value := range values {
+		if len(value) < 1 || len(value) > 128 || value != strings.TrimSpace(value) {
+			return fmt.Errorf("%s[%d] has invalid length or whitespace", field, index)
+		}
+		for _, character := range value {
+			if (character < 'A' || character > 'Z') && (character < 'a' || character > 'z') && (character < '0' || character > '9') && !strings.ContainsRune("._:-", character) {
+				return fmt.Errorf("%s[%d] contains an invalid character", field, index)
+			}
+		}
+		if value <= previous {
+			return fmt.Errorf("%s must be sorted and unique", field)
+		}
+		previous = value
+	}
+	return nil
+}
+
+func equalOperations(actual, expected []OperationKind) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range expected {
+		if actual[index] != expected[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func isSubset(subset, superset []string) bool {
+	allowed := make(map[string]struct{}, len(superset))
+	for _, value := range superset {
+		allowed[value] = struct{}{}
+	}
+	for _, value := range subset {
+		if _, ok := allowed[value]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func validateOutcome(index int, outcome Outcome) error {
@@ -537,6 +891,54 @@ func verifyRepository(repository, identity, baseSHA string) (string, error) {
 	return filepath.Clean(repository), nil
 }
 
+func verifyRepositoryAtCommit(repository, identity, baseSHA string) (string, error) {
+	if err := validateCommitSHA("base_sha", baseSHA); err != nil {
+		return "", err
+	}
+	absolute, err := filepath.Abs(repository)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository path: %w", err)
+	}
+	repository, err = filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository path: %w", err)
+	}
+	info, err := os.Stat(repository)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("repository path must be an existing directory")
+	}
+	root, err := gitOutput(repository, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", fmt.Errorf("resolve Git repository root: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil || filepath.Clean(root) != filepath.Clean(repository) {
+		return "", errors.New("repository path is not the canonical Git root")
+	}
+	commit, err := gitOutput(repository, "rev-parse", "--verify", baseSHA+"^{commit}")
+	if err != nil || commit != baseSHA {
+		return "", fmt.Errorf("base_sha %s is not the exact replacement-resistant commit", baseSHA)
+	}
+	remotes, err := gitOutput(repository, "remote")
+	if err != nil {
+		return "", fmt.Errorf("enumerate repository remotes: %w", err)
+	}
+	matched := false
+	for _, name := range strings.Fields(remotes) {
+		urls, remoteErr := gitOutput(repository, "remote", "get-url", "--all", name)
+		if remoteErr != nil {
+			return "", fmt.Errorf("resolve repository remote %q: %w", name, remoteErr)
+		}
+		for _, remoteURL := range strings.Split(urls, "\n") {
+			matched = matched || remoteIdentity(remoteURL) == identity
+		}
+	}
+	if !matched {
+		return "", fmt.Errorf("capsule repository %q does not match any repository remote", identity)
+	}
+	return filepath.Clean(repository), nil
+}
+
 func remoteIdentity(remoteURL string) string {
 	path := remoteURL
 	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Scheme != "" {
@@ -563,6 +965,86 @@ func hashRepositoryFile(repository, relative string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func hashRepositoryFileAtCommit(repository, commit, relative string) (string, error) {
+	if err := validateSourcePath(relative); err != nil {
+		return "", err
+	}
+	output, err := gitOutputBytes(repository, "ls-tree", "-z", commit, "--", relative)
+	if err != nil {
+		return "", err
+	}
+	if len(output) == 0 {
+		return "", errors.New("source does not exist in immutable base tree")
+	}
+	if output[len(output)-1] != 0 || bytes.Count(output, []byte{0}) != 1 {
+		return "", errors.New("source tree lookup was ambiguous")
+	}
+	record := strings.TrimSuffix(string(output), "\x00")
+	tab := strings.IndexByte(record, '\t')
+	fields := strings.Fields(record[:max(tab, 0)])
+	if tab < 0 || len(fields) != 3 || record[tab+1:] != relative {
+		return "", errors.New("source tree entry is malformed")
+	}
+	if (fields[0] != "100644" && fields[0] != "100755") || fields[1] != "blob" {
+		return "", errors.New("source must be a regular file in immutable base tree")
+	}
+	sizeText, err := gitOutput(repository, "cat-file", "-s", fields[2])
+	if err != nil {
+		return "", err
+	}
+	size, err := strconv.ParseInt(sizeText, 10, 64)
+	if err != nil || size < 0 || size > MaxSourceBytes {
+		return "", fmt.Errorf("source blob size is invalid or exceeds %d", MaxSourceBytes)
+	}
+	data, err := gitOutputBytes(repository, "cat-file", "blob", fields[2])
+	if err != nil {
+		return "", err
+	}
+	if int64(len(data)) != size {
+		return "", errors.New("source blob size changed while reading")
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func validateAllowedPathAtCommit(repository, commit, rule string) error {
+	path, directoryRule := strings.CutSuffix(rule, "/**")
+	components := strings.Split(path, "/")
+	for index := range components {
+		prefix := strings.Join(components[:index+1], "/")
+		output, err := gitOutputBytes(repository, "ls-tree", "-z", commit, "--", prefix)
+		if err != nil {
+			return err
+		}
+		if len(output) == 0 {
+			return nil
+		}
+		if output[len(output)-1] != 0 || bytes.Count(output, []byte{0}) != 1 {
+			return errors.New("tree lookup is ambiguous")
+		}
+		record := strings.TrimSuffix(string(output), "\x00")
+		tab := strings.IndexByte(record, '\t')
+		if tab < 0 || record[tab+1:] != prefix {
+			return errors.New("tree lookup path mismatch")
+		}
+		fields := strings.Fields(record[:tab])
+		if len(fields) != 3 {
+			return errors.New("tree lookup is malformed")
+		}
+		last := index == len(components)-1
+		if !last && (fields[0] != "040000" || fields[1] != "tree") {
+			return errors.New("path is derived through a symlink, submodule, or non-directory")
+		}
+		if last && directoryRule && (fields[0] != "040000" || fields[1] != "tree") {
+			return errors.New("dir/** prefix names a non-directory")
+		}
+		if last && !directoryRule && fields[0] != "100644" && fields[0] != "100755" {
+			return errors.New("exact path names a symlink, submodule, or non-regular file")
+		}
+	}
+	return nil
 }
 
 func openRegularNoSymlinks(path string, maximum int64) (*os.File, error) {
@@ -611,6 +1093,7 @@ func payloadHash(capsule Capsule) (string, error) {
 		PolicyVersion: capsule.PolicyVersion, Project: capsule.Project, Plan: capsule.Plan,
 		RoadmapPhase: capsule.RoadmapPhase, ExecutionPack: capsule.ExecutionPack, Task: capsule.Task,
 		OperationContext: capsule.OperationContext,
+		PhaseAuthority:   capsule.PhaseAuthority,
 		Repository:       capsule.Repository, BaseSHA: capsule.BaseSHA, Invariants: capsule.Invariants,
 		NonGoals: capsule.NonGoals, PredecessorOutcomes: capsule.PredecessorOutcomes, Sources: capsule.Sources,
 	})
@@ -631,13 +1114,37 @@ func cloneOperationContext(operation *OperationContext) *OperationContext {
 	return &clone
 }
 
+func clonePhaseAuthority(authority *PhaseAuthorityV3) *PhaseAuthorityV3 {
+	if authority == nil {
+		return nil
+	}
+	clone := *authority
+	clone.AllowedOperations = append([]OperationKind{}, authority.AllowedOperations...)
+	clone.ObservationScopeIDs = append([]string{}, authority.ObservationScopeIDs...)
+	clone.BlockingScopeIDs = append([]string{}, authority.BlockingScopeIDs...)
+	clone.MutationScopeIDs = append([]string{}, authority.MutationScopeIDs...)
+	clone.AuthorizedFindingIDs = append([]string{}, authority.AuthorizedFindingIDs...)
+	clone.AuthorizedInvariantIDs = append([]string{}, authority.AuthorizedInvariantIDs...)
+	clone.AllowedPaths = append([]string{}, authority.AllowedPaths...)
+	if authority.Parent != nil {
+		parent := *authority.Parent
+		clone.Parent = &parent
+	}
+	if authority.ExecutionBounds != nil {
+		bounds := *authority.ExecutionBounds
+		clone.ExecutionBounds = &bounds
+	}
+	return &clone
+}
+
 func gitOutput(repository string, args ...string) (string, error) {
+	output, err := gitOutputBytes(repository, args...)
+	return strings.TrimSpace(string(output)), err
+}
+
+func gitOutputBytes(repository string, args ...string) ([]byte, error) {
 	command := exec.Command("git", args...)
 	command.Dir = repository
 	command.Env = gitexec.Environment()
-	output, err := command.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(output)), nil
+	return command.Output()
 }

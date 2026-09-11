@@ -18,6 +18,7 @@ import (
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
+	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/recovery"
 	runctl "github.com/pankajleh/autonomous-builder-control-plane/internal/run"
@@ -27,6 +28,9 @@ import (
 const version = "0.1.0-dev"
 
 func main() {
+	if runctl.IsContainmentChildV1(os.Args[1:]) {
+		os.Exit(runctl.RunContainmentChildV1(os.Args[1:]))
+	}
 	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
 }
 
@@ -61,6 +65,11 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		return contextBuildCommand(args[1:], stdout, stderr)
 	case "context-verify":
 		return contextVerifyCommand(args[1:], stdout, stderr)
+	case "governance-usage-validate", "governance-checkpoint-validate", "governance-grant-validate",
+		"governance-derivation-validate", "governance-candidate-validate", "governance-review-validate",
+		"governance-review-advance", "governance-lease-issue", "governance-lease-begin", "governance-receipt-validate",
+		"governance-activation-validate", "governance-activation-install":
+		return governanceCommand(args[0], args[1:], stdout, stderr)
 	case "recovery-inspect":
 		return recoveryInspectCommand(args[1:], stdout, stderr)
 	case "recovery-resume":
@@ -69,6 +78,205 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 2
 	}
+}
+
+type usageValidationRequest struct {
+	Repository  string                       `json:"repository,omitempty"`
+	Capsule     contextcapsule.Capsule       `json:"capsule"`
+	Operation   contextcapsule.OperationKind `json:"operation"`
+	Mutation    bool                         `json:"mutation"`
+	LeaseSHA256 string                       `json:"lease_sha256,omitempty"`
+}
+
+type candidateValidationRequest struct {
+	Repository   string                 `json:"repository"`
+	Capsule      contextcapsule.Capsule `json:"capsule"`
+	CandidateSHA string                 `json:"candidate_sha"`
+}
+
+type reviewValidationRequest struct {
+	Repository        string                                   `json:"repository,omitempty"`
+	Capsule           contextcapsule.Capsule                   `json:"capsule"`
+	CapsuleFileSHA256 string                                   `json:"capsule_file_sha256"`
+	Registry          governancev3.SemanticAuthorityRegistryV1 `json:"registry"`
+	Evidence          []governancev3.FindingEvidenceV1         `json:"evidence"`
+	Previous          *governancev3.ReviewScopeReportV1        `json:"previous,omitempty"`
+	Report            governancev3.ReviewScopeReportV1         `json:"report"`
+}
+
+type leaseIssueRequest struct {
+	Repository string                                   `json:"repository"`
+	Capsule    contextcapsule.Capsule                   `json:"capsule"`
+	Registry   governancev3.SemanticAuthorityRegistryV1 `json:"registry"`
+	Report     governancev3.ReviewScopeReportV1         `json:"report"`
+	Limits     governancev3.MutationLimitsV1            `json:"limits"`
+}
+
+type receiptValidationRequest struct {
+	Repository   string                 `json:"repository"`
+	Capsule      contextcapsule.Capsule `json:"capsule"`
+	LeaseSHA256  string                 `json:"lease_sha256"`
+	CandidateSHA string                 `json:"candidate_sha"`
+}
+
+type leaseBeginRequest struct {
+	Repository  string `json:"repository"`
+	LeaseSHA256 string `json:"lease_sha256"`
+}
+
+type activationInstallRequest struct {
+	Repository         string                              `json:"repository"`
+	RepositoryIdentity string                              `json:"repository_identity"`
+	Activation         governancev3.GovernanceActivationV1 `json:"activation"`
+}
+
+func governanceCommand(name string, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	input := flags.String("input", "", "path to strict canonical governance JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *input == "" {
+		fmt.Fprintf(stderr, "usage: abcp %s --input <path>\n", name)
+		return 2
+	}
+	var result any = struct {
+		Valid bool `json:"valid"`
+	}{Valid: true}
+	var err error
+	switch name {
+	case "governance-usage-validate":
+		request := usageValidationRequest{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			if request.Operation == contextcapsule.OperationImplementationReview && request.Mutation {
+				var controller *governancev3.ControllerV1
+				controller, err = governancev3.OpenControllerV1(request.Repository)
+				if err == nil {
+					err = controller.ValidateCapsuleUsageV3(request.Capsule, request.Operation, request.Mutation, request.LeaseSHA256)
+				}
+			} else {
+				err = governancev3.ValidateCapsuleUsageV3(request.Capsule, request.Operation, request.Mutation, request.LeaseSHA256)
+			}
+		}
+	case "governance-checkpoint-validate":
+		request := governancev3.CheckpointAdvanceV1{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			var controller *governancev3.ControllerV1
+			controller, err = governancev3.OpenControllerV1(request.Repository)
+			if err == nil {
+				err = controller.AdvanceCheckpointV1(request)
+			}
+		}
+	case "governance-grant-validate":
+		request := governancev3.NextStageGrantV1{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			err = governancev3.ValidateNextStageGrantV1(request)
+		}
+	case "governance-derivation-validate":
+		request := governancev3.DerivationV3{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			err = governancev3.ValidateDerivationV3(request)
+		}
+	case "governance-candidate-validate":
+		request := candidateValidationRequest{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			result, err = governancev3.ValidateCandidateV1(request.Repository, request.Capsule, request.CandidateSHA)
+		}
+	case "governance-review-validate":
+		request := reviewValidationRequest{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			err = governancev3.ValidateReviewScopeReportV1(request.Capsule, request.CapsuleFileSHA256, request.Registry, request.Evidence, request.Previous, request.Report)
+		}
+	case "governance-review-advance":
+		request := reviewValidationRequest{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			var controller *governancev3.ControllerV1
+			controller, err = governancev3.OpenControllerV1(request.Repository)
+			if err == nil {
+				err = controller.AdvanceReviewTipV1(request.Repository, request.Capsule, request.CapsuleFileSHA256, request.Registry, request.Report)
+			}
+		}
+	case "governance-lease-issue":
+		request := leaseIssueRequest{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			var controller *governancev3.ControllerV1
+			controller, err = governancev3.OpenControllerV1(request.Repository)
+			if err == nil {
+				result, err = controller.IssueMutationLeaseV1(request.Capsule, request.Registry, request.Report, request.Limits)
+			}
+		}
+	case "governance-lease-begin":
+		request := leaseBeginRequest{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			var controller *governancev3.ControllerV1
+			controller, err = governancev3.OpenControllerV1(request.Repository)
+			if err == nil {
+				err = controller.BeginMutationLeaseV1(request.LeaseSHA256)
+			}
+		}
+	case "governance-receipt-validate":
+		request := receiptValidationRequest{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			var controller *governancev3.ControllerV1
+			controller, err = governancev3.OpenControllerV1(request.Repository)
+			if err == nil {
+				result, err = controller.CompleteMutationReceiptV1(request.Repository, request.Capsule, request.LeaseSHA256, request.CandidateSHA)
+			}
+		}
+	case "governance-activation-validate":
+		request := governancev3.GovernanceActivationV1{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			err = governancev3.ValidateGovernanceActivationV1(request)
+		}
+	case "governance-activation-install":
+		request := activationInstallRequest{}
+		err = loadCanonicalGovernance(*input, &request)
+		if err == nil {
+			var controller *governancev3.ControllerV1
+			controller, err = governancev3.OpenControllerV1(request.Repository)
+			if err == nil {
+				err = controller.InstallActivationV1(request.Repository, request.RepositoryIdentity, request.Activation)
+			}
+		}
+	default:
+		err = errors.New("unsupported governance diagnostic")
+	}
+	if err != nil {
+		class := governancev3.ClassOf(err)
+		if class != "" {
+			fmt.Fprintf(stderr, "%s\n", class)
+		}
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err := writeJSONOutput(stdout, result); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func loadCanonicalGovernance(path string, target any) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read governance input: %w", err)
+	}
+	if err := governancev3.ParseCanonical(data, target); err != nil {
+		return fmt.Errorf("decode strict canonical governance input: %w", err)
+	}
+	return nil
 }
 
 func contextBuildCommand(args []string, stdout, stderr io.Writer) int {
@@ -278,6 +486,7 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	manifestPath := flags.String("manifest", "", "path to the governed authority manifest")
 	ledgerPath := flags.String("ledger", "", "path to the append-only JSONL ledger")
 	evidenceRoot := flags.String("evidence-root", "", "root directory for immutable run evidence")
+	cgroupRoot := flags.String("cgroup-root", "/sys/fs/cgroup", "controller cgroup v2 root")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -291,7 +500,12 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	governed, err := authority.New(manifest)
+	controller, err := governancev3.OpenControllerV1(manifest.Repository.Path)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	governed, err := authority.NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		fmt.Fprintf(stderr, "validate authority: %v\n", err)
 		return 1
@@ -311,7 +525,12 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	runner, err := runctl.New(governed, events, artifacts, supervisor.New())
+	processes, err := runctl.NewLinuxContainedCommandRunner(supervisor.New(), *cgroupRoot)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	runner, err := runctl.NewWithController(governed, events, artifacts, processes, controller)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -325,6 +544,10 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, result.State)
 		}
 		return 1
+	}
+	if result.State == domain.StateImplementationCompleted {
+		fmt.Fprintln(stdout, result.State)
+		return 0
 	}
 	if !result.Accepted() {
 		fmt.Fprintln(stderr, result.State)
@@ -425,5 +648,5 @@ func loadManifest(path string) (authority.Manifest, error) {
 }
 
 func usage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|run|recovery-inspect|recovery-resume>")
+	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|governance-*-validate|governance-lease-issue|run|recovery-inspect|recovery-resume>")
 }
