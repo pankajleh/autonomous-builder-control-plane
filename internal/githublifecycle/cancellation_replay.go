@@ -19,6 +19,15 @@ type CancellationReplayIdentityV1 struct {
 	digest          string
 }
 
+type cancellationReplayIdentityWireV1 struct {
+	Schema          string             `json:"schema"`
+	SourceKind      string             `json:"source_kind"`
+	SourceRequestID string             `json:"source_request_id"`
+	AuthorityID     string             `json:"authority_id"`
+	ReplayKey       string             `json:"replay_key"`
+	IndexEvidence   ledger.EvidenceRef `json:"index_evidence"`
+}
+
 func NewCancellationReplayIdentityV1(authority CancellationAuthorityV1, indexEvidence ledger.EvidenceRef, limits Limits) (CancellationReplayIdentityV1, error) {
 	if !authority.valid() || requireLimitsSHA(limits, authority.limitsSHA) != nil || !validEvidenceRef(indexEvidence) {
 		return CancellationReplayIdentityV1{}, errors.New("cancellation replay identity is invalid")
@@ -32,14 +41,9 @@ func NewCancellationReplayIdentityV1(authority CancellationAuthorityV1, indexEvi
 		return CancellationReplayIdentityV1{}, err
 	}
 	replayKey := digestBytes(keyBytes)
-	canonical, digest, err := canonicalJSON(struct {
-		Schema          string             `json:"schema"`
-		SourceKind      string             `json:"source_kind"`
-		SourceRequestID string             `json:"source_request_id"`
-		AuthorityID     string             `json:"authority_id"`
-		ReplayKey       string             `json:"replay_key"`
-		IndexEvidence   ledger.EvidenceRef `json:"index_evidence"`
-	}{CancellationReplayIdentitySchemaV1, authority.input.SourceKind, authority.input.SourceRequestID, authority.id, replayKey, indexEvidence})
+	canonical, digest, err := canonicalJSON(cancellationReplayIdentityWireV1{
+		CancellationReplayIdentitySchemaV1, authority.input.SourceKind, authority.input.SourceRequestID, authority.id, replayKey, indexEvidence,
+	})
 	if err != nil {
 		return CancellationReplayIdentityV1{}, err
 	}
@@ -68,4 +72,23 @@ func validateCancellationReplayIdentityV1(authority CancellationAuthorityV1, rep
 		return errors.New("cancellation replay identity fails independent source-kind/request-ID validation")
 	}
 	return nil
+}
+
+func ParseCanonicalCancellationReplayIdentityV1(data []byte, authority CancellationAuthorityV1, limits Limits) (CancellationReplayIdentityV1, error) {
+	var wire cancellationReplayIdentityWireV1
+	if err := strictDecode(data, &wire); err != nil {
+		return CancellationReplayIdentityV1{}, err
+	}
+	if wire.Schema != CancellationReplayIdentitySchemaV1 || wire.SourceKind != authority.input.SourceKind ||
+		wire.SourceRequestID != authority.input.SourceRequestID || wire.AuthorityID != authority.id {
+		return CancellationReplayIdentityV1{}, errors.New("cancellation replay identity wire changed its authority or source request")
+	}
+	value, err := NewCancellationReplayIdentityV1(authority, wire.IndexEvidence, limits)
+	if err != nil || value.replayKey != wire.ReplayKey {
+		return CancellationReplayIdentityV1{}, errors.New("cancellation replay identity wire changed its derived replay key")
+	}
+	if err := requireCanonical(data, value.canonical); err != nil {
+		return CancellationReplayIdentityV1{}, err
+	}
+	return value, nil
 }

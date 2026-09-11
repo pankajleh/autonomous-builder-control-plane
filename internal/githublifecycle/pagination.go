@@ -129,6 +129,7 @@ type CanonicalPaginationItemV1 struct {
 }
 
 type PaginationPageV1Input struct {
+	Query              PaginationQueryV1
 	Ordinal            int
 	RequestedPage      int
 	RequestedCursor    string
@@ -154,7 +155,7 @@ func NewPaginationEnvelopeEvidenceV1(uri string, input PaginationPageV1Input, li
 	if err := limits.Validate(); err != nil {
 		return ledger.EvidenceRef{}, err
 	}
-	if !validText(uri, limits.MaxTextBytes, false) || !input.Response.valid() || input.Response.Provider() != "github" ||
+	if !validText(uri, limits.MaxTextBytes, false) || !input.Query.valid(limits) || !input.Response.valid() || input.Response.Provider() != "github" ||
 		!validSHA256(input.RawBodySHA256) || !validEvidenceRef(input.ResponseEvidence) ||
 		input.ResponseEvidence.Kind != GitHubPaginationBodyEvidenceKindV1 || input.ResponseEvidence.SHA256 != input.RawBodySHA256 {
 		return ledger.EvidenceRef{}, errors.New("pagination response envelope evidence identity is invalid")
@@ -171,7 +172,7 @@ func NewPaginationPageV1(input PaginationPageV1Input, limits Limits) (Pagination
 	if err := limits.Validate(); err != nil {
 		return PaginationPageV1{}, err
 	}
-	if input.Ordinal < 0 || !input.Response.valid() || input.Response.Provider() != "github" || !validSHA256(input.RawBodySHA256) ||
+	if !input.Query.valid(limits) || input.Ordinal < 0 || !input.Response.valid() || input.Response.Provider() != "github" || !validSHA256(input.RawBodySHA256) ||
 		!validEvidenceRef(input.ResponseEvidence) || input.ResponseEvidence.Kind != GitHubPaginationBodyEvidenceKindV1 ||
 		input.ResponseEvidence.SHA256 != input.RawBodySHA256 || !validEvidenceRef(input.EnvelopeEvidence) ||
 		input.EnvelopeEvidence.Kind != GitHubPaginationEnvelopeEvidenceKindV1 || len(input.Items) > limits.MaxItemsPerPage {
@@ -239,6 +240,9 @@ func paginationPageWire(i PaginationPageV1Input) paginationPageWireV1 {
 
 type paginationResponseEnvelopeWireV1 struct {
 	Schema             string                      `json:"schema"`
+	Query              PaginationQueryV1           `json:"query"`
+	RequestedPage      int                         `json:"requested_page,omitempty"`
+	RequestedCursor    string                      `json:"requested_cursor,omitempty"`
 	Response           identityWire                `json:"response"`
 	RawBodySHA256      string                      `json:"raw_body_sha256"`
 	Items              []CanonicalPaginationItemV1 `json:"items"`
@@ -249,7 +253,11 @@ type paginationResponseEnvelopeWireV1 struct {
 }
 
 func paginationResponseEnvelopeWire(i PaginationPageV1Input) paginationResponseEnvelopeWireV1 {
-	return paginationResponseEnvelopeWireV1{GitHubPaginationEnvelopeSchemaV1, snapshotWire(i.Response), i.RawBodySHA256, i.Items, i.RESTLinkHeader, i.RESTLinkObserved, i.GraphQLHasNextPage, i.GraphQLEndCursor}
+	return paginationResponseEnvelopeWireV1{
+		GitHubPaginationEnvelopeSchemaV1, clonePaginationQuery(i.Query), i.RequestedPage, i.RequestedCursor,
+		snapshotWire(i.Response), i.RawBodySHA256, i.Items, i.RESTLinkHeader, i.RESTLinkObserved,
+		i.GraphQLHasNextPage, i.GraphQLEndCursor,
+	}
 }
 
 type PaginationClosureV1Input struct {
@@ -289,6 +297,9 @@ func NewPaginationClosureV1(input PaginationClosureV1Input, limits Limits) (Pagi
 			return PaginationClosureV1{}, fmt.Errorf("pagination page %d fails independent validation", index)
 		}
 		p := page.input
+		if !equalPaginationQuery(p.Query, input.Query) {
+			return PaginationClosureV1{}, errors.New("pagination page response envelope changed its exact query identity")
+		}
 		if _, duplicated := requests[p.Response.RequestID()]; duplicated {
 			return PaginationClosureV1{}, errors.New("pagination response request identity is duplicated")
 		}
@@ -476,6 +487,7 @@ func ParseCanonicalPaginationClosureV1(data []byte, limits Limits) (PaginationCl
 			return PaginationClosureV1{}, err
 		}
 		page, err := NewPaginationPageV1(PaginationPageV1Input{
+			Query:   w.Query,
 			Ordinal: pw.Ordinal, RequestedPage: pw.RequestedPage, RequestedCursor: pw.RequestedCursor,
 			Response: response, RawBodySHA256: pw.RawBodySHA256, ResponseEvidence: pw.ResponseEvidence,
 			EnvelopeEvidence: pw.EnvelopeEvidence,
@@ -603,6 +615,7 @@ func equalPaginationQuery(a, b PaginationQueryV1) bool {
 	return bytes.Equal(aa, bb)
 }
 func clonePaginationPageInput(i PaginationPageV1Input) PaginationPageV1Input {
+	i.Query = clonePaginationQuery(i.Query)
 	i.Items = append([]CanonicalPaginationItemV1(nil), i.Items...)
 	if i.GraphQLHasNextPage != nil {
 		v := *i.GraphQLHasNextPage

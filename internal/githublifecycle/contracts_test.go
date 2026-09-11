@@ -155,13 +155,43 @@ func newFixture(t *testing.T, method MergeMethod) fixture {
 	return f
 }
 
-func newTargetSubmission(t *testing.T, f fixture, requestID string) TargetSubmissionV1 {
+func newTargetSubmission(t *testing.T, f fixture, invocationID string) TargetSubmissionV1 {
 	t.Helper()
-	submission, err := NewTargetSubmissionV1(requestID, f.sealed, f.limits)
+	submission, err := NewTargetSubmissionV1(invocationID, f.sealed, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return submission
+}
+
+func newTargetResponseEnvelope(t *testing.T, f fixture, submission TargetSubmissionV1, providerRequestID string, observedUnixNano int64, status int, body []byte) TargetResponseEnvelopeV1 {
+	t.Helper()
+	response, err := NewSnapshotIdentity("github", providerRequestID, observedUnixNano)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyEvidence := ledger.EvidenceRef{
+		URI: "evidence/target-response-body-" + providerRequestID, Kind: GitHubTargetResponseBodyEvidenceKindV1, SHA256: digestBytes(body),
+	}
+	envelope, err := NewTargetResponseEnvelopeV1(TargetResponseEnvelopeV1Input{
+		Response: response, HTTPStatus: status, ResponseBody: body, BodyEvidence: bodyEvidence,
+		EnvelopeURI: "evidence/target-response-envelope-" + providerRequestID,
+	}, submission, f.limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return envelope
+}
+
+func targetSuccessResponseBody(t *testing.T, mutationID string) []byte {
+	t.Helper()
+	response := gitHubUpdateRefsSuccessV1{}
+	response.Data.UpdateRefs.ClientMutationID = mutationID
+	body, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
 }
 
 func emptyPaginationClosure(t *testing.T, f fixture, source PaginationSourceKind, pr *PullRequestIdentity, requestID string, observedUnixNano int64) PaginationClosureV1 {
@@ -175,7 +205,7 @@ func emptyPaginationClosure(t *testing.T, f fixture, source PaginationSourceKind
 		t.Fatal(err)
 	}
 	bodyEvidence := ledger.EvidenceRef{URI: "evidence/response-" + requestID, Kind: GitHubPaginationBodyEvidenceKindV1, SHA256: strings.Repeat("7", 64)}
-	pageInput := PaginationPageV1Input{Ordinal: 0, RequestedPage: 1, Response: response, RawBodySHA256: bodyEvidence.SHA256, ResponseEvidence: bodyEvidence, Items: []CanonicalPaginationItemV1{}, RESTLinkHeader: "", RESTLinkObserved: true}
+	pageInput := PaginationPageV1Input{Query: query, Ordinal: 0, RequestedPage: 1, Response: response, RawBodySHA256: bodyEvidence.SHA256, ResponseEvidence: bodyEvidence, Items: []CanonicalPaginationItemV1{}, RESTLinkHeader: "", RESTLinkObserved: true}
 	pageInput.EnvelopeEvidence, err = NewPaginationEnvelopeEvidenceV1("evidence/response-envelope-"+requestID, pageInput, f.limits)
 	if err != nil {
 		t.Fatal(err)
@@ -452,15 +482,16 @@ func TestSubmittedCancellationAndDeadlineAreAmbiguousAndNotRetried(t *testing.T)
 	}
 
 	evidence := []ledger.EvidenceRef{{URI: "evidence/reconcile.json", Kind: "reconciliation", SHA256: strings.Repeat("a", 64)}}
-	response, _ := NewSnapshotIdentity("github", "target-attempt-2", 1700000004000000000)
+	response, _ := NewSnapshotIdentity("github", "github-response-target-attempt-2", 1700000004000000000)
 	responseBody := atomicRejectionResponseBody(t, 0)
 	proofEvidence := ledger.EvidenceRef{URI: "evidence/not-applied.json", Kind: NotAppliedAtomicRejectionEvidenceKindV1, SHA256: digestBytes(responseBody)}
 	targetSubmission := newTargetSubmission(t, f, "target-attempt-2")
-	proof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicBaseRejected, RequestBytes: 50, Response: &response, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: proofEvidence}, f.sealed, targetSubmission, f.limits)
+	responseEnvelope := newTargetResponseEnvelope(t, f, targetSubmission, response.RequestID(), response.ObservedUnixNano(), 200, responseBody)
+	proof, err := NewNotAppliedProofV1(NotAppliedProofV1Input{Kind: NotAppliedAtomicBaseRejected, RequestBytes: 50, ResponseEnvelope: &responseEnvelope, Response: &response, HTTPStatus: 200, ResponseBodySHA256: digestBytes(responseBody), ResponseBody: responseBody, EvidenceRef: proofEvidence}, f.sealed, targetSubmission, f.limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence = append(evidence, proofEvidence)
+	evidence = append(evidence, proofEvidence, responseEnvelope.input.BodyEvidence, responseEnvelope.EvidenceRef())
 	reconciled, err := NewMergeReconciliationResult(f.sealed, targetSubmission, ReconciliationNotApplied, nil, &proof, evidence, f.limits)
 	if err != nil {
 		t.Fatal(err)

@@ -200,6 +200,9 @@ func validateCurrentReadyLedger(input CurrentReadyProofV1Input, limits Limits) e
 		}
 		if boundRun && event.StateFrom != "" {
 			transitionOrdinal++
+			if transitionOrdinal == 1 && event.StateFrom != domain.StateRunCreated {
+				return errors.New("current READY ledger history does not start from RUN_CREATED")
+			}
 			if currentState != "" && event.StateFrom != currentState {
 				return errors.New("current READY ledger transitions are discontinuous")
 			}

@@ -48,7 +48,8 @@ must be present. `CurrentReadyProofV1` independently re-parses the READY
 binding, requires the freshly observed physical ledger identity, retains the
 exact bounded ledger JSONL bytes and matching evidence, parses every canonical
 event from byte zero, rejects duplicate event IDs and discontinuous bound-run
-transitions, derives the READY offset/sequence/ordinal, recomputes the bound-
+transitions, requires the bound run's first transition to start at
+`RUN_CREATED`, derives the READY offset/sequence/ordinal, recomputes the bound-
 prefix and full-observation digests, and rejects any later transition for the
 same run. A caller-provided no-later-transition summary is never sufficient.
 
@@ -112,7 +113,9 @@ envelopes, stable item keys/digests, closure-wide set digest, evidence, and
 limits. Every page requires a GitHub response identity, binds a retained body
 evidence ref whose digest equals the raw-body digest, and binds a second
 retained response-envelope evidence ref covering the response identity,
-decoded items, and exact REST/GraphQL pagination fields. The closure evidence
+independently derived query, requested page/cursor, decoded items, and exact
+REST/GraphQL pagination fields. A page cannot be transplanted beneath a
+different source, repository, PR, head, or endpoint. The closure evidence
 contains both refs for every page. REST
 termination comes only from an explicitly observed valid final `Link`
 relation set (including an explicitly observed absent header) without
@@ -199,10 +202,16 @@ seal therefore produces byte-identical commitment and mutation identity.
 `SealedMergeAuthorizationV1` owns the original input, seal, and exact
 commitment. `TargetSubmissionV1` deterministically serializes the frozen
 `POST /graphql` `updateRefs` document and exact repository, mutation ID, and
-two ordered ref-update variables; commitment-contract JSON is never mislabeled
-as transport bytes. Merge execution accepts `MergeExecutionInputV1`, which
+two ordered ref-update variables under a pre-transport local invocation ID;
+commitment-contract JSON is never mislabeled as transport bytes. The local
+invocation ID is distinct from GitHub's response-assigned provider request ID.
+`TargetResponseEnvelopeV1` binds both identities, the exact submission digest,
+HTTP status, canonical response body/body evidence, and retained envelope
+evidence. Merge execution accepts `MergeExecutionInputV1`, which
 owns both the sealed value and that pre-published submission. Typed execution
-results and errors retain the identical submission identity. Strict parsers
+results require the response envelope, matching result snapshot, echoed
+client-mutation ID, and closed body/envelope evidence; errors retain the
+identical submission identity. Strict parsers
 recover the seal, commitment, submission, and sealed chain by all nested
 canonical bytes and digests.
 
@@ -212,8 +221,10 @@ Merge reconciliation owns the full `SealedMergeAuthorizationV1`, not an
 attempt alone. `APPLIED` requires the identical materialized and validated
 `MergeResult`. Every disposition also binds the strict-canonical
 `TargetSubmissionV1` published for the one transport invocation: the exact
-sealed authorization, seal, commitment, write/mutation identity, request ID,
-exact method/path, canonical GraphQL request body/digest/length, and limits. The reconciliation or
+sealed authorization, seal, commitment, write/mutation identity, local invocation ID,
+exact method/path, canonical GraphQL request body/digest/length, and limits. Here
+the submission identity is not GitHub's later
+response request ID. The reconciliation or
 cancellation submission proof separately binds the transport-observed request-
 byte count to that exact submission record.
 `NOT_APPLIED` requires strict-canonical
@@ -223,8 +234,9 @@ repository/node identity, both ordered ref updates and OIDs, rejected
 predicate, capability, seal/commitment/write/mutation identities,
 request/response identity and bodies, raw evidence digest/ref, and the fixed
 all-or-nothing disposition. Atomic rejection proof construction requires the
-response request ID to match the submitted request, retains and strict-parses
-the bounded canonical response body, derives the rejected ref-update index
+response envelope to bind the pre-transport invocation to the separately
+assigned GitHub response request ID, retains and strict-parses the bounded
+canonical response body, derives the rejected ref-update index
 from its frozen machine-readable error code, and requires the raw evidence
 digest to equal the response-body digest. Its evidence must also be in reconciliation
 closure. `UNKNOWN`
@@ -269,7 +281,8 @@ boolean, or merge credential is never cancellation authority.
 `CancellationReplayIdentityV1` derives the replay key exclusively from
 `(source_kind, source_request_id)` and binds it to the exact authority ID and
 fsynced index evidence. `DurableCancellationAuthorityV1` owns its canonical
-bytes/digest. Replay identity is independently reconstructed before
+bytes/digest. Both records have strict canonical recovery parsers, and replay
+identity is independently reconstructed before
 `CANCELLED` selection. Only this prior durable form may
 authorize `CANCELLED`; submitted boundaries also need exact typed
 `NOT_APPLIED` proof; `TARGET_NOT_APPLIED` must contain that byte-identical

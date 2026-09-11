@@ -119,6 +119,9 @@ func NewCancellationAuthorityV1(input CancellationAuthorityV1Input, limits Limit
 			return CancellationAuthorityV1{}, errors.New("cancellation evidence closure omits current-READY evidence")
 		}
 	}
+	if proof := input.SubmissionProof.input.NotAppliedProof; proof != nil && !containsNotAppliedEvidence(input.EvidenceRefs, *proof) {
+		return CancellationAuthorityV1{}, errors.New("cancellation evidence closure omits NOT_APPLIED response evidence")
+	}
 	if err := validateCancellationBoundary(input, limits); err != nil {
 		return CancellationAuthorityV1{}, err
 	}
@@ -408,19 +411,24 @@ type DurableCancellationAuthorityV1 struct {
 	digest          string
 }
 
+type durableCancellationAuthorityWireV1 struct {
+	Schema               string             `json:"schema"`
+	Authority            json.RawMessage    `json:"authority"`
+	AuthoritySHA256      string             `json:"authority_sha256"`
+	ChannelEvidence      ledger.EvidenceRef `json:"channel_evidence"`
+	ReplayIdentity       json.RawMessage    `json:"replay_identity"`
+	ReplayIdentitySHA256 string             `json:"replay_identity_sha256"`
+}
+
 func NewDurableCancellationAuthorityV1(authority CancellationAuthorityV1, channelEvidence ledger.EvidenceRef, replayIdentity CancellationReplayIdentityV1, limits Limits) (DurableCancellationAuthorityV1, error) {
 	if !authority.valid() || requireLimitsSHA(limits, authority.limitsSHA) != nil || !validEvidenceRef(channelEvidence) ||
 		validateCancellationReplayIdentityV1(authority, replayIdentity, limits) != nil {
 		return DurableCancellationAuthorityV1{}, errors.New("durable cancellation authority requires validated fsynced channel and replay-index evidence")
 	}
-	wire := struct {
-		Schema               string             `json:"schema"`
-		Authority            json.RawMessage    `json:"authority"`
-		AuthoritySHA256      string             `json:"authority_sha256"`
-		ChannelEvidence      ledger.EvidenceRef `json:"channel_evidence"`
-		ReplayIdentity       json.RawMessage    `json:"replay_identity"`
-		ReplayIdentitySHA256 string             `json:"replay_identity_sha256"`
-	}{DurableCancellationAuthoritySchemaV1, authority.CanonicalJSON(), authority.SHA256(), channelEvidence, replayIdentity.CanonicalJSON(), replayIdentity.SHA256()}
+	wire := durableCancellationAuthorityWireV1{
+		DurableCancellationAuthoritySchemaV1, authority.CanonicalJSON(), authority.SHA256(), channelEvidence,
+		replayIdentity.CanonicalJSON(), replayIdentity.SHA256(),
+	}
 	canonical, digest, err := canonicalJSON(wire)
 	if err != nil {
 		return DurableCancellationAuthorityV1{}, err
@@ -434,8 +442,40 @@ func (d DurableCancellationAuthorityV1) SHA256() string { return d.digest }
 func (d DurableCancellationAuthorityV1) Authority() CancellationAuthorityV1 {
 	return cloneCancellationAuthority(d.authority)
 }
+func (d DurableCancellationAuthorityV1) valid() bool {
+	return d.authority.valid() && d.replayIdentity.valid() && validEvidenceRef(d.channelEvidence) &&
+		validSHA256(d.digest) && digestBytes(d.canonical) == d.digest
+}
+
+func ParseCanonicalDurableCancellationAuthorityV1(data []byte, limits Limits) (DurableCancellationAuthorityV1, error) {
+	var wire durableCancellationAuthorityWireV1
+	if err := strictDecode(data, &wire); err != nil {
+		return DurableCancellationAuthorityV1{}, err
+	}
+	if wire.Schema != DurableCancellationAuthoritySchemaV1 {
+		return DurableCancellationAuthorityV1{}, errors.New("unsupported durable cancellation authority schema")
+	}
+	authority, err := ParseCanonicalCancellationAuthorityV1(wire.Authority, limits)
+	if err != nil || authority.SHA256() != wire.AuthoritySHA256 {
+		return DurableCancellationAuthorityV1{}, errors.New("durable cancellation authority identity disagrees")
+	}
+	replay, err := ParseCanonicalCancellationReplayIdentityV1(wire.ReplayIdentity, authority, limits)
+	if err != nil || replay.SHA256() != wire.ReplayIdentitySHA256 {
+		return DurableCancellationAuthorityV1{}, errors.New("durable cancellation replay identity disagrees")
+	}
+	value, err := NewDurableCancellationAuthorityV1(authority, wire.ChannelEvidence, replay, limits)
+	if err != nil {
+		return DurableCancellationAuthorityV1{}, err
+	}
+	if err := requireCanonical(data, value.canonical); err != nil {
+		return DurableCancellationAuthorityV1{}, err
+	}
+	return value, nil
+}
+
 func AuthorizeCancelledV1(durable DurableCancellationAuthorityV1, expected CancellationAuthorityExpectationV1, disposition ReconciliationDisposition, limits Limits, notAppliedProof ...NotAppliedProofV1) error {
-	if len(durable.canonical) == 0 || digestBytes(durable.canonical) != durable.digest || !validEvidenceRef(durable.channelEvidence) ||
+	recovered, err := ParseCanonicalDurableCancellationAuthorityV1(durable.CanonicalJSON(), limits)
+	if !durable.valid() || err != nil || recovered.SHA256() != durable.SHA256() ||
 		validateCancellationReplayIdentityV1(durable.authority, durable.replayIdentity, limits) != nil {
 		return errors.New("CANCELLED requires a prior durable cancellation authority")
 	}

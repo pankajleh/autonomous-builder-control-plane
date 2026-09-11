@@ -222,13 +222,24 @@ func parseUnboundNotAppliedProof(data []byte, limits Limits) (NotAppliedProofV1,
 	if err != nil || submission.SHA256() != wire.TargetSubmissionSHA256 {
 		return NotAppliedProofV1{}, errors.New("nested NOT_APPLIED target submission identity disagrees")
 	}
+	var responseEnvelope *TargetResponseEnvelopeV1
+	if len(wire.ResponseEnvelope) > 0 {
+		value, err := ParseCanonicalTargetResponseEnvelopeV1(wire.ResponseEnvelope, submission, limits)
+		if err != nil || value.SHA256() != wire.ResponseEnvelopeSHA256 {
+			return NotAppliedProofV1{}, errors.New("nested NOT_APPLIED response envelope identity disagrees")
+		}
+		responseEnvelope = &value
+	} else if wire.ResponseEnvelopeSHA256 != "" {
+		return NotAppliedProofV1{}, errors.New("nested NOT_APPLIED response envelope digest lacks a record")
+	}
 	canonical, err := json.Marshal(wire)
 	if err != nil || !bytes.Equal(canonical, data) {
 		return NotAppliedProofV1{}, errors.New("nested NOT_APPLIED proof is not canonical")
 	}
 	input := NotAppliedProofV1Input{
 		Kind: wire.Kind, RequestBytes: wire.RequestBytes,
-		Response: response, HTTPStatus: wire.HTTPStatus, ResponseBodySHA256: wire.ResponseBodySHA256, ResponseBody: wire.ResponseBody, EvidenceRef: wire.EvidenceRef,
+		ResponseEnvelope: responseEnvelope, Response: response, HTTPStatus: wire.HTTPStatus,
+		ResponseBodySHA256: wire.ResponseBodySHA256, ResponseBody: wire.ResponseBody, EvidenceRef: wire.EvidenceRef,
 	}
 	return NotAppliedProofV1{input: input, submission: submission, canonical: append([]byte(nil), data...), digest: digestBytes(data), limitsSHA: wire.LimitsSHA256}, nil
 }

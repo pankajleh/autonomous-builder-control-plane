@@ -525,7 +525,7 @@ func NewMergeReconciliationResult(sealed SealedMergeAuthorizationV1, submission 
 		result.mergeResult = &copy
 	case ReconciliationNotApplied:
 		if mergeResult != nil || notAppliedProof == nil || ValidateNotAppliedProofV1(sealed, submission, *notAppliedProof, limits) != nil ||
-			!containsEvidence(evidence, notAppliedProof.input.EvidenceRef) {
+			!containsNotAppliedEvidence(evidence, *notAppliedProof) {
 			return ReconciliationResult{}, errors.New("NOT_APPLIED reconciliation requires exact typed authenticated proof")
 		}
 		copy := cloneNotAppliedProof(*notAppliedProof)
@@ -674,11 +674,14 @@ func CanRetry(failure *OperationError, attempts int, limits Limits, expected *Wr
 	if failure == nil || attempts < 0 || limits.Validate() != nil {
 		return false
 	}
+	// A merge authorization permits exactly one target invocation. Neither a
+	// caller-supplied pre-submit classification nor reconciliation creates
+	// retry authority for that mutation.
+	if failure.hasAttempt && failure.attempt.operation == OperationMerge {
+		return false
+	}
 	switch failure.class {
 	case FailureAmbiguousWrite:
-		if failure.hasAttempt && failure.attempt.operation == OperationMerge {
-			return false
-		}
 		if expected == nil || reconciliation == nil || !failure.hasAttempt || failure.attempt != *expected || !failure.attempt.valid(limits) ||
 			reconciliation.disposition != ReconciliationNotApplied || reconciliation.attempt != failure.attempt ||
 			requireLimitsSHA(limits, reconciliation.limitsSHA) != nil || canonicalizeEvidenceCopy(reconciliation.evidence, limits) != nil {
