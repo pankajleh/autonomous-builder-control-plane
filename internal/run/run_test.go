@@ -71,7 +71,11 @@ func TestRunnerSuccessReachesBranchAcceptedWithOrderedEvidence(t *testing.T) {
 		t.Fatalf("event state order mismatch\nwant: %#v\n got: %#v", wantStates, got)
 	}
 	assertEventEvidence(t, events)
+	wantProvenance := DerivedTransitionProvenance(fixture.authority)
 	for _, event := range events {
+		if event.ProjectID != wantProvenance.ProjectID || event.PlanID != wantProvenance.PlanID || event.AttemptID != wantProvenance.AttemptID {
+			t.Fatalf("transition lost governed provenance: %+v", event)
+		}
 		if event.StateTo == domain.StateIntegrationPending || event.StateTo == domain.StateReadyForMerge ||
 			event.StateTo == domain.StateMerged || event.StateTo == domain.StateCompleted {
 			t.Fatalf("EP-002 emitted prohibited state %s", event.StateTo)

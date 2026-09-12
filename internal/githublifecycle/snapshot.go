@@ -30,10 +30,11 @@ const (
 )
 
 type Review struct {
-	NodeID     string      `json:"node_id"`
-	ReviewerID string      `json:"reviewer_id"`
-	State      ReviewState `json:"state"`
-	CommitSHA  GitSHA      `json:"-"`
+	NodeID     string           `json:"node_id"`
+	DatabaseID int64            `json:"database_id"`
+	Reviewer   StableIdentityV1 `json:"reviewer"`
+	State      ReviewState      `json:"state"`
+	CommitSHA  GitSHA           `json:"-"`
 }
 
 type PullRequestSnapshotInput struct {
@@ -64,7 +65,7 @@ func NewPullRequestSnapshot(input PullRequestSnapshotInput, limits Limits) (Pull
 		return PullRequestSnapshot{}, err
 	}
 	input.LimitsSHA256 = limitsSHA
-	if !input.Snapshot.valid() || !input.Repository.valid() || !input.PullRequest.valid() ||
+	if !input.Snapshot.valid() || len(input.Snapshot.RequestID()) > limits.MaxRequestIDBytes || !input.Repository.valid() || !input.PullRequest.valid() ||
 		!input.BaseBranch.valid() || !input.BaseTipSHA.valid() || !input.HeadBranch.valid() || !input.HeadSHA.valid() {
 		return PullRequestSnapshot{}, errors.New("pull request snapshot contains an invalid identity")
 	}
@@ -74,12 +75,12 @@ func NewPullRequestSnapshot(input PullRequestSnapshotInput, limits Limits) (Pull
 	if input.MergeMethod != "" && !input.MergeMethod.Valid() {
 		return PullRequestSnapshot{}, errors.New("pull request merge method is unsupported")
 	}
-	if len(input.Reviews) > limits.MaxTotalItems {
+	if len(input.Reviews) > limits.MaxObservedReviews {
 		return PullRequestSnapshot{}, errors.New("pull request reviews exceed item limit")
 	}
 	seen := make(map[string]struct{}, len(input.Reviews))
 	for index, review := range input.Reviews {
-		if !validOpaqueID(review.NodeID, limits.MaxTextBytes) || !validOpaqueID(review.ReviewerID, limits.MaxTextBytes) || !review.CommitSHA.valid() ||
+		if !validOpaqueID(review.NodeID, limits.MaxTextBytes) || review.DatabaseID <= 0 || !review.Reviewer.valid() || !review.CommitSHA.valid() ||
 			(review.State != ReviewApproved && review.State != ReviewChangesRequested && review.State != ReviewCommented && review.State != ReviewDismissed) {
 			return PullRequestSnapshot{}, fmt.Errorf("review %d is invalid", index)
 		}
@@ -94,6 +95,9 @@ func NewPullRequestSnapshot(input PullRequestSnapshotInput, limits Limits) (Pull
 	}
 	canonical, digest, err := canonicalJSON(prWire(input))
 	if err != nil {
+		return PullRequestSnapshot{}, err
+	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "pull request observation"); err != nil {
 		return PullRequestSnapshot{}, err
 	}
 	return PullRequestSnapshot{immutableRecord[PullRequestSnapshotInput]{data: input, canonical: canonical, digest: digest}}, nil
@@ -129,12 +133,13 @@ const (
 )
 
 type Check struct {
-	NodeID       string               `json:"node_id"`
-	Name         string               `json:"name"`
-	Status       CheckStatus          `json:"status"`
-	Conclusion   CheckConclusion      `json:"conclusion,omitempty"`
-	HeadSHA      GitSHA               `json:"-"`
-	EvidenceRefs []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
+	NodeID       string                 `json:"node_id"`
+	Name         string                 `json:"name"`
+	Identity     TrustedCheckIdentityV1 `json:"identity"`
+	Status       CheckStatus            `json:"status"`
+	Conclusion   CheckConclusion        `json:"conclusion,omitempty"`
+	HeadSHA      GitSHA                 `json:"-"`
+	EvidenceRefs []ledger.EvidenceRef   `json:"evidence_refs,omitempty"`
 }
 
 type CISnapshotInput struct {
@@ -159,33 +164,22 @@ func NewCISnapshot(input CISnapshotInput, limits Limits) (CISnapshot, error) {
 		return CISnapshot{}, err
 	}
 	input.LimitsSHA256 = limitsSHA
-	if !input.Snapshot.valid() || !input.Repository.valid() || !input.HeadSHA.valid() {
+	if !input.Snapshot.valid() || len(input.Snapshot.RequestID()) > limits.MaxRequestIDBytes || !input.Repository.valid() || !input.HeadSHA.valid() {
 		return CISnapshot{}, errors.New("CI snapshot contains an invalid identity")
 	}
-	if len(input.Checks) > limits.MaxTotalItems {
+	if len(input.Checks) > limits.MaxObservedChecks {
 		return CISnapshot{}, errors.New("CI checks exceed item limit")
 	}
 	seen := make(map[string]struct{}, len(input.Checks))
 	for index := range input.Checks {
 		check := &input.Checks[index]
-		if !validOpaqueID(check.NodeID, limits.MaxTextBytes) || !validText(check.Name, limits.MaxTextBytes, false) || !check.HeadSHA.valid() || check.HeadSHA != input.HeadSHA ||
-			(check.Status != CheckQueued && check.Status != CheckInProgress && check.Status != CheckCompleted) {
-			return CISnapshot{}, fmt.Errorf("check %d is invalid or tied to a different head SHA", index)
-		}
-		if check.Status == CheckCompleted {
-			if check.Conclusion != ConclusionSuccess && check.Conclusion != ConclusionFailure && check.Conclusion != ConclusionCancelled && check.Conclusion != ConclusionNeutral && check.Conclusion != ConclusionSkipped && check.Conclusion != ConclusionTimedOut {
-				return CISnapshot{}, fmt.Errorf("check %d has invalid conclusion", index)
-			}
-		} else if check.Conclusion != "" {
-			return CISnapshot{}, fmt.Errorf("check %d has a conclusion before completion", index)
+		if err := validateCheck(check, input.HeadSHA, limits); err != nil {
+			return CISnapshot{}, fmt.Errorf("check %d: %w", index, err)
 		}
 		if _, exists := seen[check.NodeID]; exists {
 			return CISnapshot{}, fmt.Errorf("check %d duplicates node identity", index)
 		}
 		seen[check.NodeID] = struct{}{}
-		if err := canonicalizeEvidence(&check.EvidenceRefs, limits); err != nil {
-			return CISnapshot{}, fmt.Errorf("check %d: %w", index, err)
-		}
 	}
 	sort.Slice(input.Checks, func(i, j int) bool { return checkKey(input.Checks[i]) < checkKey(input.Checks[j]) })
 	if err := canonicalizeCommon(&input.EvidenceRefs, input.Metadata, limits); err != nil {
@@ -195,7 +189,51 @@ func NewCISnapshot(input CISnapshotInput, limits Limits) (CISnapshot, error) {
 	if err != nil {
 		return CISnapshot{}, err
 	}
+	if err := requireCanonicalObjectSize(canonical, limits.MaxCanonicalObjectBytes, "CI observation"); err != nil {
+		return CISnapshot{}, err
+	}
 	return CISnapshot{immutableRecord[CISnapshotInput]{data: input, canonical: canonical, digest: digest}}, nil
+}
+
+func validateCheck(check *Check, expectedHead GitSHA, limits Limits) error {
+	if !validOpaqueID(check.NodeID, limits.MaxTextBytes) || !validText(check.Name, limits.MaxTextBytes, false) ||
+		!check.Identity.valid(limits) || check.Name != check.Identity.Context || !check.HeadSHA.valid() || check.HeadSHA != expectedHead ||
+		(check.Status != CheckQueued && check.Status != CheckInProgress && check.Status != CheckCompleted) {
+		return errors.New("identity, provenance, status, or exact head is invalid")
+	}
+	if check.Status == CheckCompleted {
+		if check.Conclusion != ConclusionSuccess && check.Conclusion != ConclusionFailure && check.Conclusion != ConclusionCancelled &&
+			check.Conclusion != ConclusionNeutral && check.Conclusion != ConclusionSkipped && check.Conclusion != ConclusionTimedOut {
+			return errors.New("completed check has an invalid conclusion")
+		}
+	} else if check.Conclusion != "" {
+		return errors.New("check has a conclusion before completion")
+	}
+	if err := canonicalizeEvidence(&check.EvidenceRefs, limits); err != nil {
+		return err
+	}
+	return nil
+}
+
+func canonicalizeChecksForHead(checks []Check, expectedHead GitSHA, limits Limits) ([]Check, error) {
+	checks = cloneChecks(checks)
+	if len(checks) > limits.MaxObservedChecks {
+		return nil, errors.New("checks exceed the governed total-item limit")
+	}
+	seen := make(map[string]struct{}, len(checks))
+	for index := range checks {
+		check := &checks[index]
+		if err := validateCheck(check, expectedHead, limits); err != nil {
+			return nil, fmt.Errorf("check %d: %w", index, err)
+		}
+		identity := string(check.Identity.Source) + "\x00" + check.NodeID
+		if _, exists := seen[identity]; exists {
+			return nil, errors.New("check node identity is duplicated within its provider source")
+		}
+		seen[identity] = struct{}{}
+	}
+	sort.Slice(checks, func(i, j int) bool { return checkKey(checks[i]) < checkKey(checks[j]) })
+	return checks, nil
 }
 
 func (s CISnapshot) Input() CISnapshotInput       { return cloneCIInput(s.immutable.data) }
@@ -307,7 +345,15 @@ func canonicalizeCommon(evidence *[]ledger.EvidenceRef, metadata map[string]stri
 }
 
 func canonicalizeEvidence(refs *[]ledger.EvidenceRef, limits Limits) error {
-	if len(*refs) > limits.MaxEvidenceRefs {
+	return canonicalizeEvidenceWithLimit(refs, limits, limits.MaxEvidenceRefs)
+}
+
+func canonicalizeReadyEvidenceClosure(refs *[]ledger.EvidenceRef, limits Limits) error {
+	return canonicalizeEvidenceWithLimit(refs, limits, limits.MaxReadyEvidenceClosureRefs)
+}
+
+func canonicalizeEvidenceWithLimit(refs *[]ledger.EvidenceRef, limits Limits, maxRefs int) error {
+	if len(*refs) > maxRefs {
 		return errors.New("evidence references exceed limit")
 	}
 	seen := make(map[string]struct{}, len(*refs))
@@ -329,10 +375,10 @@ func evidenceKey(ref ledger.EvidenceRef) string {
 	return strings.Join([]string{ref.URI, ref.SHA256, ref.Kind}, "\x00")
 }
 func reviewKey(review Review) string {
-	return strings.Join([]string{review.NodeID, review.ReviewerID, string(review.State), review.CommitSHA.String()}, "\x00")
+	return strings.Join([]string{stableIdentityKey(review.Reviewer), review.NodeID, string(review.State), review.CommitSHA.String()}, "\x00")
 }
 func checkKey(check Check) string {
-	return strings.Join([]string{check.NodeID, check.Name, check.HeadSHA.String()}, "\x00")
+	return strings.Join([]string{checkIdentityKey(check.Identity), check.NodeID, check.HeadSHA.String()}, "\x00")
 }
 
 func clonePRInput(input PullRequestSnapshotInput) PullRequestSnapshotInput {
@@ -377,18 +423,20 @@ type prIdentityWire struct {
 	NodeID string `json:"node_id"`
 }
 type reviewWire struct {
-	NodeID     string      `json:"node_id"`
-	ReviewerID string      `json:"reviewer_id"`
-	State      ReviewState `json:"state"`
-	CommitSHA  string      `json:"commit_sha"`
+	NodeID     string           `json:"node_id"`
+	DatabaseID int64            `json:"database_id"`
+	Reviewer   StableIdentityV1 `json:"reviewer"`
+	State      ReviewState      `json:"state"`
+	CommitSHA  string           `json:"commit_sha"`
 }
 type checkWire struct {
-	NodeID       string               `json:"node_id"`
-	Name         string               `json:"name"`
-	Status       CheckStatus          `json:"status"`
-	Conclusion   CheckConclusion      `json:"conclusion,omitempty"`
-	HeadSHA      string               `json:"head_sha"`
-	EvidenceRefs []ledger.EvidenceRef `json:"evidence_refs,omitempty"`
+	NodeID       string                 `json:"node_id"`
+	Name         string                 `json:"name"`
+	Identity     TrustedCheckIdentityV1 `json:"identity"`
+	Status       CheckStatus            `json:"status"`
+	Conclusion   CheckConclusion        `json:"conclusion,omitempty"`
+	HeadSHA      string                 `json:"head_sha"`
+	EvidenceRefs []ledger.EvidenceRef   `json:"evidence_refs,omitempty"`
 }
 
 func snapshotWire(s SnapshotIdentity) identityWire {
@@ -401,7 +449,7 @@ func pullRequestWire(p PullRequestIdentity) prIdentityWire {
 func prWire(input PullRequestSnapshotInput) any {
 	reviews := make([]reviewWire, len(input.Reviews))
 	for i, r := range input.Reviews {
-		reviews[i] = reviewWire{r.NodeID, r.ReviewerID, r.State, r.CommitSHA.String()}
+		reviews[i] = reviewWire{r.NodeID, r.DatabaseID, r.Reviewer, r.State, r.CommitSHA.String()}
 	}
 	return struct {
 		Snapshot     identityWire         `json:"snapshot"`
@@ -422,7 +470,7 @@ func prWire(input PullRequestSnapshotInput) any {
 func ciWire(input CISnapshotInput) any {
 	checks := make([]checkWire, len(input.Checks))
 	for i, c := range input.Checks {
-		checks[i] = checkWire{c.NodeID, c.Name, c.Status, c.Conclusion, c.HeadSHA.String(), c.EvidenceRefs}
+		checks[i] = checkWire{c.NodeID, c.Name, c.Identity, c.Status, c.Conclusion, c.HeadSHA.String(), c.EvidenceRefs}
 	}
 	return struct {
 		Snapshot     identityWire         `json:"snapshot"`
