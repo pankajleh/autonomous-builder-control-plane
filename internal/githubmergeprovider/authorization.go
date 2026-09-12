@@ -68,7 +68,10 @@ type observedPR struct {
 }
 
 func (p *Provider) ObserveAuthorization(ctx context.Context, phase mergelifecycle.ObservationPhase, authority githublifecycle.Authority) (out mergelifecycle.AuthorizationObservation, returnedErr error) {
-	meter := p.startMeter(ctx)
+	meter, err := p.startMeter(ctx)
+	if err != nil {
+		return out, err
+	}
 	defer func() { out.Accounting = p.finishMeter(meter) }()
 	started := p.now().UnixNano()
 	if phase != mergelifecycle.ObservationInitial && phase != mergelifecycle.ObservationFinal {
@@ -154,7 +157,7 @@ func (p *Provider) readAuthorizationSnapshot(ctx context.Context, meter *callMet
 	if err != nil {
 		return observedPR{}, errors.New("authorization query encoding failed")
 	}
-	result, err := p.readJSON(ctx, meter, http.MethodPost, githublifecycle.GitHubGraphQLPathV1, body)
+	result, err := p.readJSON(ctx, meter, mergelifecycle.ProviderCallPreSubmitV1, http.MethodPost, githublifecycle.GitHubGraphQLPathV1, body)
 	if err != nil {
 		return observedPR{}, err
 	}
@@ -231,7 +234,7 @@ func (p *Provider) collectRESTPages(ctx context.Context, meter *callMeter, scope
 			parameters.Set(key, value)
 		}
 		path := query.PathOrDocumentSHA256 + "?" + parameters.Encode()
-		response, err := p.readJSON(ctx, meter, http.MethodGet, path, nil)
+		response, err := p.readJSON(ctx, meter, mergelifecycle.ProviderCallPreSubmitV1, http.MethodGet, path, nil)
 		if err != nil {
 			return githublifecycle.PaginationClosureV1{}, err
 		}

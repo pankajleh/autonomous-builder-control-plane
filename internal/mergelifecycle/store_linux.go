@@ -604,9 +604,6 @@ func (a *attemptStore) reserveCounter(category string) (Counters, error) {
 	if last.ProviderAccountingPending {
 		return Counters{}, errors.New("prior provider operation is missing durable accounting")
 	}
-	if category != "reconciliation-round" && !providerBudgetAvailable(last, a.store.limits) {
-		return Counters{}, errors.New("provider cumulative budget exhausted before operation")
-	}
 	last, ok := nextCounters(last, category)
 	if !ok {
 		return Counters{}, errors.New("unknown provider counter category")
@@ -640,12 +637,118 @@ func providerBudgetAvailable(c Counters, limits Limits) bool {
 		c.CumulativeDecompressedBytes < limits.cumulativeDecompressedBytes && time.Duration(c.CumulativeCallNanos) < limits.cumulativeProviderTime
 }
 
-// accountProvider durably records the exact bytes and elapsed time observed
-// for one already-reserved operation. The next operation cannot be reserved
-// after any cumulative limit is reached.
-func (a *attemptStore) accountProvider(accounting ProviderAccountingV1) (Counters, error) {
-	if a == nil || a.closed || accounting.validate() != nil {
-		return Counters{}, errors.New("valid provider accounting and open attempt are required")
+func httpCallCategory(class ProviderCallClassV1) string { return "http-" + string(class) }
+
+type providerHTTPCallAudit struct {
+	commit                int
+	target                int
+	reconciliationInRound int
+	pending               ProviderCallClassV1
+}
+
+func readProviderHTTPCallAudit(file *os.File, attemptID string) (providerHTTPCallAudit, error) {
+	var audit providerHTTPCallAudit
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return audit, err
+	}
+	scanner := bufio.NewScanner(io.LimitReader(file, MaxTerminalChannelBytes+1))
+	scanner.Buffer(make([]byte, 4096), MaxTerminalRecordBytes)
+	for scanner.Scan() {
+		var record counterReservation
+		if err := strictCanonical(scanner.Bytes(), &record); err != nil || record.AttemptID != attemptID {
+			return audit, errors.New("provider HTTP-call audit is invalid")
+		}
+		switch record.Category {
+		case httpCallCategory(ProviderCallCommitSubmissionV1):
+			audit.commit++
+			audit.pending = ProviderCallCommitSubmissionV1
+		case httpCallCategory(ProviderCallTargetV1):
+			audit.target++
+			audit.pending = ProviderCallTargetV1
+		case httpCallCategory(ProviderCallPreSubmitV1):
+			audit.pending = ProviderCallPreSubmitV1
+		case httpCallCategory(ProviderCallPostMergeV1):
+			audit.pending = ProviderCallPostMergeV1
+		case httpCallCategory(ProviderCallReconciliationV1):
+			audit.reconciliationInRound++
+			audit.pending = ProviderCallReconciliationV1
+		case "reconciliation-round":
+			audit.reconciliationInRound = 0
+		case "http-accounting":
+			audit.pending = ""
+		}
+	}
+	return audit, scanner.Err()
+}
+
+// reserveHTTPCall increments the exact classified and aggregate call counters
+// and makes the pending request durable before transport can begin.
+func (a *attemptStore) reserveHTTPCall(class ProviderCallClassV1) (Counters, ProviderBudgetV1, error) {
+	if a == nil || a.closed || !class.valid() {
+		return Counters{}, ProviderBudgetV1{}, errors.New("valid provider call class and open attempt are required")
+	}
+	if err := a.checkIdentity(); err != nil {
+		return Counters{}, ProviderBudgetV1{}, err
+	}
+	path := filepath.Join(a.root, "counters.jsonl")
+	file, err := openOrCreateRegular(path, 0o600)
+	if err != nil {
+		return Counters{}, ProviderBudgetV1{}, err
+	}
+	defer file.Close()
+	last, err := readCounters(file, a.id, a.store.limits)
+	if err != nil {
+		return Counters{}, ProviderBudgetV1{}, err
+	}
+	if last.ProviderAccountingPending {
+		return Counters{}, ProviderBudgetV1{}, errors.New("prior provider HTTP call is missing durable accounting")
+	}
+	if !providerBudgetAvailable(last, a.store.limits) {
+		return Counters{}, ProviderBudgetV1{}, errors.New("provider cumulative budget exhausted before HTTP call")
+	}
+	audit, err := readProviderHTTPCallAudit(file, a.id)
+	if err != nil {
+		return Counters{}, ProviderBudgetV1{}, err
+	}
+	if class == ProviderCallCommitSubmissionV1 && (audit.commit >= 1 || last.CommitSubmissions != audit.commit+1) ||
+		class == ProviderCallTargetV1 && (audit.target >= 1 || last.TargetSubmissions != audit.target+1) ||
+		class == ProviderCallReconciliationV1 && (last.ReconciliationRounds == 0 || audit.reconciliationInRound >= 3) {
+		return Counters{}, ProviderBudgetV1{}, errors.New("provider HTTP call lacks its durable operation or round reservation")
+	}
+	next, ok := nextCounters(last, httpCallCategory(class))
+	if !ok {
+		return Counters{}, ProviderBudgetV1{}, errors.New("provider HTTP call class is not permitted")
+	}
+	if err := next.validate(a.store.limits); err != nil {
+		return Counters{}, ProviderBudgetV1{}, err
+	}
+	record, err := json.Marshal(counterReservation{a.id, httpCallCategory(class), next})
+	if err != nil {
+		return Counters{}, ProviderBudgetV1{}, err
+	}
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		return Counters{}, ProviderBudgetV1{}, err
+	}
+	if err := writeFullStore(file, append(record, '\n')); err != nil {
+		return Counters{}, ProviderBudgetV1{}, err
+	}
+	if err := a.store.syncFile(file); err != nil {
+		return Counters{}, ProviderBudgetV1{}, err
+	}
+	confirmed, err := readCounters(file, a.id, a.store.limits)
+	if err != nil || confirmed != next {
+		return Counters{}, ProviderBudgetV1{}, errors.Join(errors.New("provider HTTP call reservation did not verify"), err)
+	}
+	budget := providerBudgetAfterCounters(confirmed, a.store.limits)
+	budget.HTTPCalls = 1
+	return confirmed, budget, nil
+}
+
+// accountHTTPCall closes exactly one matching reservation and durably records
+// all bytes and active time before another reservation can be made.
+func (a *attemptStore) accountHTTPCall(class ProviderCallClassV1, accounting ProviderCallAccountingV1) (Counters, error) {
+	if a == nil || a.closed || !class.valid() || accounting.validate() != nil {
+		return Counters{}, errors.New("valid provider call accounting and open attempt are required")
 	}
 	if err := a.checkIdentity(); err != nil {
 		return Counters{}, err
@@ -660,8 +763,12 @@ func (a *attemptStore) accountProvider(accounting ProviderAccountingV1) (Counter
 	if err != nil {
 		return Counters{}, err
 	}
-	if !last.ProviderAccountingPending {
-		return Counters{}, errors.New("provider accounting has no matching operation reservation")
+	audit, auditErr := readProviderHTTPCallAudit(file, a.id)
+	if auditErr != nil {
+		return Counters{}, auditErr
+	}
+	if !last.ProviderAccountingPending || audit.pending != class {
+		return Counters{}, errors.New("provider call accounting has no matching reservation")
 	}
 	next := last
 	next.Sequence++
@@ -671,11 +778,10 @@ func (a *attemptStore) accountProvider(accounting ProviderAccountingV1) (Counter
 	next.CumulativeCompressedBytes += accounting.CompressedResponseBytes
 	next.CumulativeDecompressedBytes += accounting.DecompressedResponseBytes
 	next.CumulativeCallNanos += accounting.ActiveNanos
-	next.LastInvocationNanos = accounting.InvocationNanos
 	if err := next.validate(a.store.limits); err != nil {
 		return Counters{}, err
 	}
-	record, err := json.Marshal(counterReservation{a.id, "provider-accounting", next})
+	record, err := json.Marshal(counterReservation{a.id, "http-accounting", next})
 	if err != nil {
 		return Counters{}, err
 	}
@@ -690,7 +796,7 @@ func (a *attemptStore) accountProvider(accounting ProviderAccountingV1) (Counter
 	}
 	confirmed, err := readCounters(file, a.id, a.store.limits)
 	if err != nil || confirmed != next {
-		return Counters{}, errors.Join(errors.New("provider accounting did not verify"), err)
+		return Counters{}, errors.Join(errors.New("provider HTTP call accounting did not verify"), err)
 	}
 	return next, nil
 }
@@ -770,18 +876,26 @@ func (a *attemptStore) providerBudget() (ProviderBudgetV1, error) {
 	if err != nil {
 		return ProviderBudgetV1{}, err
 	}
-	budget := ProviderBudgetV1{
-		RequestBytes:              a.store.limits.cumulativeRequestBytes - counters.CumulativeRequestBytes,
-		HeaderBytes:               a.store.limits.cumulativeHeaderBytes - counters.CumulativeHeaderBytes,
-		CompressedResponseBytes:   a.store.limits.cumulativeCompressedBytes - counters.CumulativeCompressedBytes,
-		DecompressedResponseBytes: a.store.limits.cumulativeDecompressedBytes - counters.CumulativeDecompressedBytes,
-		ActiveNanos:               int64(a.store.limits.cumulativeProviderTime) - counters.CumulativeCallNanos,
+	if counters.ProviderAccountingPending {
+		return ProviderBudgetV1{}, errors.New("provider HTTP call accounting continuation is unresolved")
 	}
-	if budget.RequestBytes <= 0 || budget.HeaderBytes <= 0 || budget.CompressedResponseBytes <= 0 ||
+	budget := providerBudgetAfterCounters(counters, a.store.limits)
+	if budget.HTTPCalls <= 0 || budget.RequestBytes <= 0 || budget.HeaderBytes <= 0 || budget.CompressedResponseBytes <= 0 ||
 		budget.DecompressedResponseBytes <= 0 || budget.ActiveNanos <= 0 {
 		return ProviderBudgetV1{}, errors.New("provider cumulative budget exhausted")
 	}
 	return budget, nil
+}
+
+func providerBudgetAfterCounters(counters Counters, limits Limits) ProviderBudgetV1 {
+	return ProviderBudgetV1{
+		HTTPCalls:                 limits.providerCalls - counters.TotalProviderCalls,
+		RequestBytes:              limits.cumulativeRequestBytes - counters.CumulativeRequestBytes,
+		HeaderBytes:               limits.cumulativeHeaderBytes - counters.CumulativeHeaderBytes,
+		CompressedResponseBytes:   limits.cumulativeCompressedBytes - counters.CumulativeCompressedBytes,
+		DecompressedResponseBytes: limits.cumulativeDecompressedBytes - counters.CumulativeDecompressedBytes,
+		ActiveNanos:               int64(limits.cumulativeProviderTime) - counters.CumulativeCallNanos,
+	}
 }
 
 func readCounters(file *os.File, attemptID string, limits Limits) (Counters, error) {
@@ -810,24 +924,31 @@ func readCounters(file *os.File, attemptID string, limits Limits) (Counters, err
 func nextCounters(previous Counters, category string) (Counters, bool) {
 	next := previous
 	next.Sequence++
-	next.TotalProviderCalls++
-	next.ProviderAccountingPending = true
 	switch category {
-	case "pre-submit":
-		next.PreSubmitCalls++
 	case "commit-submission":
-		next.PreSubmitCalls++
 		next.CommitSubmissions++
 	case "target-submission":
 		next.TargetSubmissions++
-	case "post-merge":
+	case httpCallCategory(ProviderCallPreSubmitV1):
+		next.PreSubmitCalls++
+		next.TotalProviderCalls++
+		next.ProviderAccountingPending = true
+	case httpCallCategory(ProviderCallCommitSubmissionV1):
+		next.TotalProviderCalls++
+		next.ProviderAccountingPending = true
+	case httpCallCategory(ProviderCallTargetV1):
+		next.TotalProviderCalls++
+		next.ProviderAccountingPending = true
+	case httpCallCategory(ProviderCallPostMergeV1):
 		next.PostMergeCalls++
+		next.TotalProviderCalls++
+		next.ProviderAccountingPending = true
 	case "reconciliation-round":
 		next.ReconciliationRounds++
-		next.TotalProviderCalls--
-		next.ProviderAccountingPending = false
-	case "reconciliation-call":
+	case httpCallCategory(ProviderCallReconciliationV1):
 		next.ReconciliationCalls++
+		next.TotalProviderCalls++
+		next.ProviderAccountingPending = true
 	default:
 		return Counters{}, false
 	}
@@ -835,13 +956,13 @@ func nextCounters(previous Counters, category string) (Counters, bool) {
 }
 
 func validCounterStep(previous Counters, category string, observed Counters, limits Limits) bool {
-	if category == "provider-accounting" {
+	if category == "http-accounting" {
 		return observed.Sequence == previous.Sequence+1 && observed.PreSubmitCalls == previous.PreSubmitCalls &&
 			observed.CommitSubmissions == previous.CommitSubmissions && observed.TargetSubmissions == previous.TargetSubmissions &&
 			observed.PostMergeCalls == previous.PostMergeCalls && observed.ReconciliationRounds == previous.ReconciliationRounds &&
 			observed.ReconciliationCalls == previous.ReconciliationCalls && observed.TotalProviderCalls == previous.TotalProviderCalls &&
 			previous.ProviderAccountingPending && !observed.ProviderAccountingPending &&
-			observed.LastReconciliationUnixNano == previous.LastReconciliationUnixNano &&
+			observed.LastInvocationNanos == previous.LastInvocationNanos && observed.LastReconciliationUnixNano == previous.LastReconciliationUnixNano &&
 			observed.CumulativeRequestBytes >= previous.CumulativeRequestBytes && observed.CumulativeHeaderBytes >= previous.CumulativeHeaderBytes &&
 			observed.CumulativeCompressedBytes >= previous.CumulativeCompressedBytes && observed.CumulativeDecompressedBytes >= previous.CumulativeDecompressedBytes &&
 			observed.CumulativeCallNanos >= previous.CumulativeCallNanos && observed.validate(limits) == nil
@@ -856,7 +977,9 @@ func validCounterStep(previous Counters, category string, observed Counters, lim
 		expected.LastReconciliationUnixNano = observed.LastReconciliationUnixNano
 		return observed.LastReconciliationUnixNano > previous.LastReconciliationUnixNano && expected == observed
 	}
-	for _, candidate := range []string{"pre-submit", "commit-submission", "target-submission", "post-merge", "reconciliation-call"} {
+	for _, candidate := range []string{"commit-submission", "target-submission", httpCallCategory(ProviderCallPreSubmitV1),
+		httpCallCategory(ProviderCallCommitSubmissionV1), httpCallCategory(ProviderCallTargetV1),
+		httpCallCategory(ProviderCallPostMergeV1), httpCallCategory(ProviderCallReconciliationV1)} {
 		if candidate == category {
 			if previous.ProviderAccountingPending {
 				return false

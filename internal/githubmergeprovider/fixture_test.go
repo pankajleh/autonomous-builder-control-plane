@@ -15,6 +15,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/mergelifecycle"
 )
 
 type providerFixture struct {
@@ -223,6 +224,28 @@ func mustValue[T any](value T, err error) T {
 	return value
 }
 
+type testCallHandoff struct{}
+type testCallReservation struct {
+	budget mergelifecycle.ProviderBudgetV1
+}
+
+func (testCallHandoff) ReserveHTTPCall(mergelifecycle.ProviderCallClassV1) (mergelifecycle.ProviderHTTPCallReservationV1, error) {
+	return testCallReservation{budget: providerTestBudget()}, nil
+}
+func (r testCallReservation) Budget() mergelifecycle.ProviderBudgetV1              { return r.budget }
+func (testCallReservation) Complete(mergelifecycle.ProviderCallAccountingV1) error { return nil }
+
+func providerTestBudget() mergelifecycle.ProviderBudgetV1 {
+	limits := githublifecycle.DefaultLimits()
+	return mergelifecycle.ProviderBudgetV1{HTTPCalls: limits.MaxHTTPCalls, RequestBytes: limits.MaxCumulativeRequestBytes,
+		HeaderBytes: limits.MaxCumulativeResponseHeaderBytes, CompressedResponseBytes: limits.MaxCumulativeCompressedResponseBytes,
+		DecompressedResponseBytes: limits.MaxCumulativeDecompressedResponseBytes, ActiveNanos: int64(limits.MaxCumulativeActiveProviderCallTime)}
+}
+
+func providerTestContext() context.Context {
+	return mergelifecycle.WithProviderHTTPCallHandoffV1(context.Background(), providerTestBudget(), testCallHandoff{})
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
@@ -375,25 +398,129 @@ func appliedTargetScript(t *testing.T, f providerFixture, transport *scriptTrans
 	transport.handler = func(call recordedRequest) (*http.Response, error) {
 		switch {
 		case call.Method == http.MethodPost && strings.HasSuffix(call.URL, "/graphql"):
+			var request struct {
+				Query string `json:"query"`
+			}
+			if json.Unmarshal(call.Body, &request) == nil && request.Query == targetVerificationQueryV1 {
+				return githubResponse(200, "target-verification", targetVerificationBody(t, f, f.recipe.ExpectedResultSHA().String(), true)), nil
+			}
 			return githubResponse(200, "target-request", []byte(`{"data":{"updateRefs":{"clientMutationId":"merge-write-1"}}}`)), nil
-		case strings.Contains(call.URL, "/git/ref/heads/main"):
-			body, _ := json.Marshal(gitRefResponse{Ref: "refs/heads/main", Object: struct {
-				SHA  string `json:"sha"`
-				Type string `json:"type"`
-			}{f.recipe.ExpectedResultSHA().String(), "commit"}})
-			return githubResponse(200, "base-ref-request", body), nil
-		case strings.Contains(call.URL, "/git/ref/heads/feature/exact-head"):
-			body, _ := json.Marshal(gitRefResponse{Ref: "refs/heads/feature/exact-head", Object: struct {
-				SHA  string `json:"sha"`
-				Type string `json:"type"`
-			}{f.headSHA.String(), "commit"}})
-			return githubResponse(200, "head-ref-request", body), nil
-		case strings.Contains(call.URL, "/git/commits/"):
-			return githubResponse(200, "result-object-request", remoteCommitBody(t, f.recipe)), nil
+		case strings.Contains(call.URL, "/compare/"):
+			comparison := compareResponse{Status: "identical"}
+			comparison.BaseCommit.SHA = f.recipe.ExpectedResultSHA().String()
+			comparison.MergeBaseCommit.SHA = f.recipe.ExpectedResultSHA().String()
+			return githubResponse(200, "target-compare", mustValue(json.Marshal(comparison))), nil
 		default:
 			return nil, fmt.Errorf("unexpected request %s %s", call.Method, call.URL)
 		}
 	}
+}
+
+func targetVerificationBody(t *testing.T, f providerFixture, baseTip string, merged bool) []byte {
+	t.Helper()
+	var response targetVerificationResponse
+	response.Data.Viewer.ID = f.actor.Subject()
+	response.Data.Repository = &struct {
+		ID          string `json:"id"`
+		DatabaseID  int64  `json:"databaseId"`
+		PullRequest *struct {
+			ID             string  `json:"id"`
+			DatabaseID     int64   `json:"databaseId"`
+			Number         int64   `json:"number"`
+			State          string  `json:"state"`
+			IsDraft        *bool   `json:"isDraft"`
+			Merged         *bool   `json:"merged"`
+			MergedAt       *string `json:"mergedAt"`
+			BaseRefName    string  `json:"baseRefName"`
+			BaseRefOID     string  `json:"baseRefOid"`
+			BaseRepository *struct {
+				ID string `json:"id"`
+			} `json:"baseRepository"`
+			HeadRefName    string `json:"headRefName"`
+			HeadRefOID     string `json:"headRefOid"`
+			HeadRepository *struct {
+				ID string `json:"id"`
+			} `json:"headRepository"`
+		} `json:"pullRequest"`
+		Base *struct {
+			Name   string `json:"name"`
+			Target *struct {
+				OID string `json:"oid"`
+			} `json:"target"`
+		} `json:"base"`
+		Head *struct {
+			Name   string `json:"name"`
+			Target *struct {
+				OID string `json:"oid"`
+			} `json:"target"`
+		} `json:"head"`
+		Object *graphQLCommitObject `json:"object"`
+	}{}
+	repository := response.Data.Repository
+	repository.ID, repository.DatabaseID = "R_repo", 99
+	repository.PullRequest = &struct {
+		ID             string  `json:"id"`
+		DatabaseID     int64   `json:"databaseId"`
+		Number         int64   `json:"number"`
+		State          string  `json:"state"`
+		IsDraft        *bool   `json:"isDraft"`
+		Merged         *bool   `json:"merged"`
+		MergedAt       *string `json:"mergedAt"`
+		BaseRefName    string  `json:"baseRefName"`
+		BaseRefOID     string  `json:"baseRefOid"`
+		BaseRepository *struct {
+			ID string `json:"id"`
+		} `json:"baseRepository"`
+		HeadRefName    string `json:"headRefName"`
+		HeadRefOID     string `json:"headRefOid"`
+		HeadRepository *struct {
+			ID string `json:"id"`
+		} `json:"headRepository"`
+	}{ID: f.pr.NodeID(), DatabaseID: 17, Number: f.pr.Number(), State: "OPEN", BaseRefName: f.base.String(), BaseRefOID: baseTip,
+		HeadRefName: f.head.String(), HeadRefOID: f.headSHA.String()}
+	no := false
+	repository.PullRequest.IsDraft = &no
+	repository.PullRequest.Merged = &merged
+	if merged {
+		repository.PullRequest.State = "MERGED"
+		mergedAt := "2024-01-01T00:00:00Z"
+		repository.PullRequest.MergedAt = &mergedAt
+	}
+	repository.PullRequest.BaseRepository = &struct {
+		ID string `json:"id"`
+	}{ID: "R_repo"}
+	repository.PullRequest.HeadRepository = &struct {
+		ID string `json:"id"`
+	}{ID: "R_repo"}
+	repository.Base = &struct {
+		Name   string `json:"name"`
+		Target *struct {
+			OID string `json:"oid"`
+		} `json:"target"`
+	}{Name: "refs/heads/" + f.base.String(), Target: &struct {
+		OID string `json:"oid"`
+	}{OID: baseTip}}
+	repository.Head = &struct {
+		Name   string `json:"name"`
+		Target *struct {
+			OID string `json:"oid"`
+		} `json:"target"`
+	}{Name: "refs/heads/" + f.head.String(), Target: &struct {
+		OID string `json:"oid"`
+	}{OID: f.headSHA.String()}}
+	input := f.recipe.Input()
+	repository.Object = &graphQLCommitObject{OID: input.ExpectedResultSHA.String(), Message: input.Message}
+	repository.Object.Tree.OID = input.ExpectedResultTree.String()
+	for _, parent := range input.Parents {
+		repository.Object.Parents.Nodes = append(repository.Object.Parents.Nodes, struct {
+			OID string `json:"oid"`
+		}{OID: parent.String()})
+	}
+	repository.Object.Author.Name, repository.Object.Author.Email = input.Author.Name, input.Author.Email
+	repository.Object.Author.Date = mustValue(githubDate(input.AuthorUnix, input.Author.Timezone))
+	repository.Object.Committer.Name, repository.Object.Committer.Email = input.Committer.Name, input.Committer.Email
+	repository.Object.Committer.Date = mustValue(githubDate(input.CommitterUnix, input.Committer.Timezone))
+	return mustValue(json.Marshal(response))
 }
 
 func observeAppliedResult(t *testing.T, f providerFixture) githublifecycle.MergeResult {
@@ -401,7 +528,7 @@ func observeAppliedResult(t *testing.T, f providerFixture) githublifecycle.Merge
 	transport := &scriptTransport{}
 	appliedTargetScript(t, f, transport)
 	provider := mustValue(newTestProvider(f.auth, f.limits, transport))
-	outcome := mustValue(provider.SubmitTarget(context.Background(), targetExecution(t, f)))
+	outcome := mustValue(provider.SubmitTarget(providerTestContext(), targetExecution(t, f)))
 	if outcome.Disposition != githublifecycle.ReconciliationApplied {
 		t.Fatalf("target disposition = %s", outcome.Disposition)
 	}

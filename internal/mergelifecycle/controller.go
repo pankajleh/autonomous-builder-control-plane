@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
@@ -134,9 +135,6 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 		return Result{}, wrap(CodeLocalStorageIntegrityFailure, false, writeID, err)
 	}
 	if !found {
-		if _, err := attempt.reserveCounter("pre-submit"); err != nil {
-			return c.failBeforeSubmission(lease, assembled, attempt, writeID, CodeAuthorizationFailed, err)
-		}
 		initial, err := c.observe(ctx, attempt, ObservationInitial, assembled.authority)
 		if err != nil {
 			return c.failBeforeSubmission(lease, assembled, attempt, writeID, classifyAuthorizationFailure(err), err)
@@ -186,7 +184,7 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 		if err != nil {
 			return c.failBeforeSubmission(lease, assembled, attempt, writeID, CodeAuthorizationFailed, err)
 		}
-		callContext, callCancel, budgetErr := c.providerCallContext(ctx, attempt)
+		callContext, callCancel, session, budgetErr := c.providerCallContext(ctx, attempt, providerTargetPolicy())
 		if budgetErr != nil {
 			return Result{State: domain.StateReadyForMerge, AttemptID: writeID, Unresolved: true}, wrap(CodeTargetUnknown, true, writeID, budgetErr)
 		}
@@ -199,7 +197,7 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 		if err := c.validateTargetOutcome(sealed, submission, outcome); err != nil {
 			outcome = unknownTargetOutcome(outcome.Accounting, submission.RequestBodyBytes(), fallbackEvidence)
 		}
-		if accountErr := c.accountProvider(attempt, outcome.Accounting); accountErr != nil {
+		if accountErr := c.accountProvider(session, outcome.Accounting); accountErr != nil {
 			return Result{State: domain.StateReadyForMerge, AttemptID: writeID, Unresolved: true}, wrap(CodeTargetUnknown, true, writeID, accountErr)
 		}
 		if err := c.persistTargetOutcome(attempt, "target-outcome.json", outcome); err != nil {
@@ -218,21 +216,17 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 		return c.terminalize(lease, assembled, attempt, terminalSelection{sealed: sealed, submission: submission, mergeResult: mergeResult,
 			postMerge: postMerge, destination: domain.StateMerged, reason: CodeMergeAppliedAccepted, barrier: &barrier})
 	} else if resultFound {
-		if _, err := attempt.reserveCounter("post-merge"); err != nil {
-			return c.terminalize(lease, assembled, attempt, terminalSelection{sealed: sealed, submission: submission, mergeResult: mergeResult,
-				destination: domain.StateFailed, reason: CodePostMergeAcceptanceFailed, barrier: &barrier})
-		}
 		observeInput, err := githublifecycle.NewObservePostMergeInput(sealed, mergeResult, c.contracts)
 		if err != nil {
 			return Result{}, err
 		}
-		callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+		callContext, cancel, session, budgetErr := c.providerCallContext(ctx, attempt, providerPostMergePolicy())
 		if budgetErr != nil {
 			return Result{}, budgetErr
 		}
 		postOutcome, observeErr := c.provider.ObservePostMerge(callContext, observeInput)
 		cancel()
-		if accountErr := c.accountProvider(attempt, postOutcome.Accounting); accountErr != nil {
+		if accountErr := c.accountProvider(session, postOutcome.Accounting); accountErr != nil {
 			return Result{}, accountErr
 		}
 		postMerge, err = postOutcome.Observation, observeErr
@@ -298,13 +292,13 @@ func (c *Controller) recoverIndexedCancellation(ctx context.Context, lease *ledg
 }
 
 func (c *Controller) observe(ctx context.Context, attempt *attemptStore, phase ObservationPhase, authority githublifecycle.Authority) (AuthorizationObservation, error) {
-	callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+	callContext, cancel, session, budgetErr := c.providerCallContext(ctx, attempt, providerAuthorizationPolicy())
 	if budgetErr != nil {
 		return AuthorizationObservation{}, typedTerminalFailure(CodeResourceLimitExhausted, budgetErr)
 	}
 	defer cancel()
 	observation, err := c.provider.ObserveAuthorization(callContext, phase, authority)
-	if accountErr := c.accountProvider(attempt, observation.Accounting); accountErr != nil {
+	if accountErr := c.accountProvider(session, observation.Accounting); accountErr != nil {
 		return observation, typedTerminalFailure(CodeResourceLimitExhausted, accountErr)
 	}
 	if err != nil {
@@ -355,43 +349,37 @@ func (c *Controller) ensureCommitPreparation(ctx context.Context, attempt *attem
 		return errors.New("commit preparation marker is not durable")
 	}
 	if markerFound {
-		if _, reserveErr := attempt.reserveCounter("reconciliation-call"); reserveErr != nil {
-			return reserveErr
-		}
-		callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+		callContext, cancel, session, budgetErr := c.providerCallContext(ctx, attempt, providerCommitReconciliationPolicy())
 		if budgetErr != nil {
 			return budgetErr
 		}
 		preparation, err = c.provider.ReconcileResultCommit(callContext, input.Recipe())
 		cancel()
-		if accountErr := c.accountProvider(attempt, preparation.Accounting); accountErr != nil {
+		if accountErr := c.accountProvider(session, preparation.Accounting); accountErr != nil {
 			return accountErr
 		}
 	} else {
 		if _, err := attempt.reserveCounter("commit-submission"); err != nil {
 			return err
 		}
-		callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+		callContext, cancel, session, budgetErr := c.providerCallContext(ctx, attempt, providerCommitPreparationPolicy())
 		if budgetErr != nil {
 			return budgetErr
 		}
 		preparation, err = c.provider.PrepareResultCommit(callContext, input.Recipe())
 		cancel()
-		if accountErr := c.accountProvider(attempt, preparation.Accounting); accountErr != nil {
+		if accountErr := c.accountProvider(session, preparation.Accounting); accountErr != nil {
 			return accountErr
 		}
 		if err != nil {
 			// The marker removes retry authority. Reconciliation is read-only.
-			if _, reserveErr := attempt.reserveCounter("reconciliation-call"); reserveErr != nil {
-				return errors.Join(err, reserveErr)
-			}
-			callContext, cancel, budgetErr = c.providerCallContext(ctx, attempt)
+			callContext, cancel, session, budgetErr = c.providerCallContext(ctx, attempt, providerCommitReconciliationPolicy())
 			if budgetErr != nil {
 				return budgetErr
 			}
 			preparation, err = c.provider.ReconcileResultCommit(callContext, input.Recipe())
 			cancel()
-			if accountErr := c.accountProvider(attempt, preparation.Accounting); accountErr != nil {
+			if accountErr := c.accountProvider(session, preparation.Accounting); accountErr != nil {
 				return accountErr
 			}
 		}
@@ -425,9 +413,6 @@ func (c *Controller) ensureSealedSubmission(ctx context.Context, assembled assem
 		now := c.now().UnixNano()
 		proof, err := currentReadyProof(assembled, ledgerBytes, now, 1, c.contracts)
 		if err != nil {
-			return sealed, submission, false, ledger.TransitionBarrier{}, err
-		}
-		if _, err := attempt.reserveCounter("pre-submit"); err != nil {
 			return sealed, submission, false, ledger.TransitionBarrier{}, err
 		}
 		final, err := c.observe(ctx, attempt, ObservationFinal, assembled.authority)
@@ -501,15 +486,12 @@ func (c *Controller) reconcile(ctx context.Context, lease *ledger.RunTransitionL
 	if _, err := attempt.reserveReconciliation(c.now().UnixNano()); err != nil {
 		return Result{State: domain.StateReadyForMerge, AttemptID: submission.InvocationID(), Unresolved: true}, wrap(CodeTargetUnknown, true, submission.InvocationID(), err)
 	}
-	if _, err := attempt.reserveCounter("reconciliation-call"); err != nil {
-		return Result{State: domain.StateReadyForMerge, AttemptID: submission.InvocationID(), Unresolved: true}, wrap(CodeTargetUnknown, true, submission.InvocationID(), err)
-	}
 	evidence := []ledger.EvidenceRef{localEvidence(attempt, "target-submission.json", submission.CanonicalJSON(), "target-submission")}
 	input, err := githublifecycle.NewMergeReconcileWriteInput(sealed, submission, evidence, c.contracts)
 	if err != nil {
 		return Result{}, err
 	}
-	callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+	callContext, cancel, session, budgetErr := c.providerCallContext(ctx, attempt, providerTargetReconciliationPolicy())
 	if budgetErr != nil {
 		return Result{State: domain.StateReadyForMerge, AttemptID: submission.InvocationID(), Unresolved: true}, wrap(CodeTargetUnknown, true, submission.InvocationID(), budgetErr)
 	}
@@ -521,7 +503,7 @@ func (c *Controller) reconcile(ctx context.Context, lease *ledger.RunTransitionL
 	if err := c.validateTargetOutcome(sealed, submission, outcome); err != nil {
 		outcome = unknownTargetOutcome(outcome.Accounting, submission.RequestBodyBytes(), evidence)
 	}
-	if accountErr := c.accountProvider(attempt, outcome.Accounting); accountErr != nil {
+	if accountErr := c.accountProvider(session, outcome.Accounting); accountErr != nil {
 		return Result{State: domain.StateReadyForMerge, AttemptID: submission.InvocationID(), Unresolved: true}, wrap(CodeTargetUnknown, true, submission.InvocationID(), accountErr)
 	}
 	reconciliation, err := githublifecycle.NewMergeReconciliationResult(sealed, submission, outcome.Disposition, resultPointer(outcome), proofPointer(outcome), outcome.EvidenceRefs, c.contracts)
@@ -589,21 +571,17 @@ func (c *Controller) settle(ctx context.Context, lease *ledger.RunTransitionLeas
 		if _, _, err := attempt.publish("merge-result.json", result.CanonicalJSON()); err != nil {
 			return Result{}, err
 		}
-		if _, err := attempt.reserveCounter("post-merge"); err != nil {
-			return c.terminalize(lease, assembled, attempt, terminalSelection{sealed: sealed, submission: submission, mergeResult: result,
-				destination: domain.StateFailed, reason: CodePostMergeAcceptanceFailed, barrier: &barrier})
-		}
 		observeInput, err := githublifecycle.NewObservePostMergeInput(sealed, result, c.contracts)
 		if err != nil {
 			return Result{}, err
 		}
-		callContext, cancel, budgetErr := c.providerCallContext(ctx, attempt)
+		callContext, cancel, session, budgetErr := c.providerCallContext(ctx, attempt, providerPostMergePolicy())
 		if budgetErr != nil {
 			return Result{}, budgetErr
 		}
 		postOutcome, observeErr := c.provider.ObservePostMerge(callContext, observeInput)
 		cancel()
-		if accountErr := c.accountProvider(attempt, postOutcome.Accounting); accountErr != nil {
+		if accountErr := c.accountProvider(session, postOutcome.Accounting); accountErr != nil {
 			return Result{}, accountErr
 		}
 		post, err := postOutcome.Observation, observeErr
@@ -840,21 +818,143 @@ func proofPointer(outcome TargetOutcome) *githublifecycle.NotAppliedProofV1 {
 	}
 	return &outcome.NotAppliedProof
 }
-func (c *Controller) accountProvider(attempt *attemptStore, accounting ProviderAccountingV1) error {
-	if accounting.InvocationNanos == 0 {
-		accounting.InvocationNanos = accounting.ActiveNanos
-	}
-	_, err := attempt.accountProvider(accounting)
-	return err
+
+type providerCallSession struct {
+	mu        sync.Mutex
+	attempt   *attemptStore
+	permitted []ProviderCallClassV1
+	next      int
+	active    bool
+	aggregate ProviderAccountingV1
+	limit     time.Duration
 }
 
-func (c *Controller) providerCallContext(parent context.Context, attempt *attemptStore) (context.Context, context.CancelFunc, error) {
+type providerCallReservation struct {
+	session   *providerCallSession
+	class     ProviderCallClassV1
+	budget    ProviderBudgetV1
+	completed bool
+}
+
+func (s *providerCallSession) ReserveHTTPCall(class ProviderCallClassV1) (ProviderHTTPCallReservationV1, error) {
+	if s == nil || s.attempt == nil || !class.valid() {
+		return nil, errors.New("provider HTTP-call handoff is unusable")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		return nil, errors.New("prior provider HTTP call has not completed durable accounting")
+	}
+	if s.next >= len(s.permitted) || s.permitted[s.next] != class {
+		return nil, errors.New("provider HTTP call class is outside the method policy")
+	}
+	_, budget, err := s.attempt.reserveHTTPCall(class)
+	if err != nil {
+		return nil, err
+	}
+	s.next++
+	s.active = true
+	return &providerCallReservation{session: s, class: class, budget: budget}, nil
+}
+
+func (r *providerCallReservation) Budget() ProviderBudgetV1 {
+	if r == nil {
+		return ProviderBudgetV1{}
+	}
+	return r.budget
+}
+
+func (r *providerCallReservation) Complete(accounting ProviderCallAccountingV1) error {
+	if r == nil || r.session == nil || accounting.validate() != nil {
+		return errors.New("provider HTTP-call completion is invalid")
+	}
+	r.session.mu.Lock()
+	defer r.session.mu.Unlock()
+	if r.completed || !r.session.active {
+		return errors.New("provider HTTP-call reservation was already completed")
+	}
+	if _, err := r.session.attempt.accountHTTPCall(r.class, accounting); err != nil {
+		return err
+	}
+	r.completed = true
+	r.session.active = false
+	r.session.aggregate.HTTPCalls++
+	r.session.aggregate.RequestBytes += accounting.RequestBytes
+	r.session.aggregate.HeaderBytes += accounting.HeaderBytes
+	r.session.aggregate.CompressedResponseBytes += accounting.CompressedResponseBytes
+	r.session.aggregate.DecompressedResponseBytes += accounting.DecompressedResponseBytes
+	r.session.aggregate.ActiveNanos += accounting.ActiveNanos
+	return nil
+}
+
+func (s *providerCallSession) verify(accounting ProviderAccountingV1) error {
+	if s == nil || accounting.validate() != nil {
+		return errors.New("provider aggregate accounting is invalid")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		return errors.New("provider returned with an unclosed HTTP-call reservation")
+	}
+	want := s.aggregate
+	if accounting.HTTPCalls != want.HTTPCalls || accounting.RequestBytes != want.RequestBytes ||
+		accounting.HeaderBytes != want.HeaderBytes || accounting.CompressedResponseBytes != want.CompressedResponseBytes ||
+		accounting.DecompressedResponseBytes != want.DecompressedResponseBytes || accounting.ActiveNanos != want.ActiveNanos {
+		return errors.New("provider aggregate accounting disagrees with durable per-call records")
+	}
+	if accounting.InvocationNanos < accounting.ActiveNanos || time.Duration(accounting.InvocationNanos) > s.limit {
+		return errors.New("provider invocation time is invalid")
+	}
+	return nil
+}
+
+func (c *Controller) accountProvider(session *providerCallSession, accounting ProviderAccountingV1) error {
+	return session.verify(accounting)
+}
+
+func repeatedProviderPolicy(class ProviderCallClassV1, count int) []ProviderCallClassV1 {
+	policy := make([]ProviderCallClassV1, count)
+	for index := range policy {
+		policy[index] = class
+	}
+	return policy
+}
+
+func providerAuthorizationPolicy() []ProviderCallClassV1 {
+	return repeatedProviderPolicy(ProviderCallPreSubmitV1, MaxPreSubmitCalls)
+}
+func providerCommitPreparationPolicy() []ProviderCallClassV1 {
+	return []ProviderCallClassV1{ProviderCallCommitSubmissionV1, ProviderCallPreSubmitV1}
+}
+func providerCommitReconciliationPolicy() []ProviderCallClassV1 {
+	return []ProviderCallClassV1{ProviderCallPreSubmitV1}
+}
+func providerTargetPolicy() []ProviderCallClassV1 {
+	return []ProviderCallClassV1{ProviderCallTargetV1, ProviderCallPostMergeV1}
+}
+func providerTargetReconciliationPolicy() []ProviderCallClassV1 {
+	return repeatedProviderPolicy(ProviderCallReconciliationV1, 3)
+}
+func providerPostMergePolicy() []ProviderCallClassV1 {
+	return repeatedProviderPolicy(ProviderCallPostMergeV1, MaxPostMergeCalls)
+}
+
+func (c *Controller) providerCallContext(parent context.Context, attempt *attemptStore, permitted []ProviderCallClassV1) (context.Context, context.CancelFunc, *providerCallSession, error) {
 	budget, err := attempt.providerBudget()
 	if err != nil {
-		return nil, func() {}, err
+		return nil, func() {}, nil, err
 	}
-	callContext, cancel := context.WithTimeout(parent, c.limits.providerCallTimeout)
-	return context.WithValue(callContext, providerBudgetContextKey{}, budget), cancel, nil
+	if len(permitted) == 0 {
+		return nil, func() {}, nil, errors.New("provider method call policy is empty")
+	}
+	for _, class := range permitted {
+		if !class.valid() {
+			return nil, func() {}, nil, errors.New("provider method call policy is malformed")
+		}
+	}
+	callContext, cancel := context.WithCancel(parent)
+	session := &providerCallSession{attempt: attempt, permitted: append([]ProviderCallClassV1(nil), permitted...), limit: c.limits.invocationTimeout}
+	return WithProviderHTTPCallHandoffV1(callContext, budget, session), cancel, session, nil
 }
 
 func existingTerminal(state readyLedgerState) (Result, bool) {

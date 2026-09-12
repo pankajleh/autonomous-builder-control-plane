@@ -30,7 +30,10 @@ type compareResponse struct {
 }
 
 func (p *Provider) ObservePostMerge(ctx context.Context, input githublifecycle.ObservePostMergeInput) (out mergelifecycle.PostMergeOutcome, returnedErr error) {
-	meter := p.startMeter(ctx)
+	meter, err := p.startMeter(ctx)
+	if err != nil {
+		return out, err
+	}
 	defer func() { out.Accounting = p.finishMeter(meter) }()
 	result := input.Merge()
 	resultInput := result.Input()
@@ -43,7 +46,7 @@ func (p *Provider) ObservePostMerge(ctx context.Context, input githublifecycle.O
 	}
 	authority := input.Authority()
 	recipe := resultInput.Recipe
-	objectResponse, err := p.readJSON(ctx, meter, http.MethodGet,
+	objectResponse, err := p.readJSON(ctx, meter, mergelifecycle.ProviderCallPostMergeV1, http.MethodGet,
 		repoPath(authority.Repository())+"/git/commits/"+escapedSegment(resultInput.ResultSHA.String()), nil)
 	if err != nil {
 		return out, err
@@ -65,12 +68,12 @@ func (p *Provider) ObservePostMerge(ctx context.Context, input githublifecycle.O
 	if err != nil {
 		return out, err
 	}
-	tip, _, refEvidence, err := p.observeRef(ctx, meter, authority.Repository(), authority.BaseBranch())
+	tip, _, refEvidence, err := p.observeRef(ctx, meter, mergelifecycle.ProviderCallPostMergeV1, authority.Repository(), authority.BaseBranch())
 	if err != nil {
 		return out, err
 	}
 	comparePath := repoPath(authority.Repository()) + "/compare/" + escapedSegment(resultInput.ResultSHA.String()) + "..." + escapedSegment(tip.String())
-	comparisonResponse, err := p.readJSON(ctx, meter, http.MethodGet, comparePath, nil)
+	comparisonResponse, err := p.readJSON(ctx, meter, mergelifecycle.ProviderCallPostMergeV1, http.MethodGet, comparePath, nil)
 	if err != nil {
 		return out, err
 	}

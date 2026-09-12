@@ -656,13 +656,13 @@ func TestCorrectionM05CumulativeProviderBudgets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := callAttempt.reserveCounter("pre-submit"); err != nil {
+	if _, _, err := callAttempt.reserveHTTPCall(ProviderCallPreSubmitV1); err != nil {
 		t.Fatalf("exact provider-call limit failed: %v", err)
 	}
-	if _, err := callAttempt.accountProvider(ProviderAccountingV1{}); err != nil {
+	if _, err := callAttempt.accountHTTPCall(ProviderCallPreSubmitV1, ProviderCallAccountingV1{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := callAttempt.reserveCounter("pre-submit"); err == nil {
+	if _, _, err := callAttempt.reserveHTTPCall(ProviderCallPreSubmitV1); err == nil {
 		t.Fatal("provider call limit+1 was accepted")
 	}
 	_ = callAttempt.close()
@@ -692,7 +692,7 @@ func TestCorrectionM05CumulativeProviderBudgets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pendingAttempt.reserveCounter("pre-submit"); err != nil {
+	if _, _, err := pendingAttempt.reserveHTTPCall(ProviderCallPreSubmitV1); err != nil {
 		t.Fatal(err)
 	}
 	_ = pendingAttempt.close()
@@ -710,7 +710,7 @@ func TestCorrectionM05CumulativeProviderBudgets(t *testing.T) {
 	if counters, err := pendingAttempt.currentCounters(); err != nil || !counters.ProviderAccountingPending {
 		t.Fatalf("restart lost pending provider reservation: %+v, %v", counters, err)
 	}
-	if _, err := pendingAttempt.reserveCounter("pre-submit"); err == nil {
+	if _, _, err := pendingAttempt.reserveHTTPCall(ProviderCallPreSubmitV1); err == nil {
 		t.Fatal("restart allowed a new call before pending provider accounting was resolved")
 	}
 
@@ -727,13 +727,13 @@ func TestCorrectionM05CumulativeProviderBudgets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := attempt.reserveCounter("pre-submit"); err != nil {
+	if _, _, err := attempt.reserveHTTPCall(ProviderCallPreSubmitV1); err != nil {
 		t.Fatal(err)
 	}
-	exact := ProviderAccountingV1{RequestBytes: MaxCumulativeRequestBytes, HeaderBytes: MaxCumulativeHeaderBytes,
+	exact := ProviderCallAccountingV1{RequestBytes: MaxCumulativeRequestBytes, HeaderBytes: MaxCumulativeHeaderBytes,
 		CompressedResponseBytes: MaxCumulativeCompressedBytes, DecompressedResponseBytes: MaxCumulativeDecompressedBytes,
-		ActiveNanos: int64(MaxCumulativeProviderCallTime), InvocationNanos: int64(ControllerInvocationTimeout)}
-	if _, err := attempt.accountProvider(exact); err != nil {
+		ActiveNanos: int64(MaxCumulativeProviderCallTime)}
+	if _, err := attempt.accountHTTPCall(ProviderCallPreSubmitV1, exact); err != nil {
 		t.Fatalf("exact cumulative limits failed: %v", err)
 	}
 	_ = attempt.close()
@@ -751,27 +751,26 @@ func TestCorrectionM05CumulativeProviderBudgets(t *testing.T) {
 	counters, err := attempt.currentCounters()
 	if err != nil || counters.CumulativeRequestBytes != MaxCumulativeRequestBytes || counters.CumulativeHeaderBytes != MaxCumulativeHeaderBytes ||
 		counters.CumulativeCompressedBytes != MaxCumulativeCompressedBytes || counters.CumulativeDecompressedBytes != MaxCumulativeDecompressedBytes ||
-		counters.CumulativeCallNanos != int64(MaxCumulativeProviderCallTime) || counters.LastInvocationNanos != int64(ControllerInvocationTimeout) ||
+		counters.CumulativeCallNanos != int64(MaxCumulativeProviderCallTime) ||
 		counters.ProviderAccountingPending {
 		t.Fatalf("restart lost provider counters: %+v, %v", counters, err)
 	}
-	if _, err := attempt.accountProvider(ProviderAccountingV1{RequestBytes: 1}); err == nil {
+	if _, err := attempt.accountHTTPCall(ProviderCallPreSubmitV1, ProviderCallAccountingV1{RequestBytes: 1}); err == nil {
 		t.Fatal("limit+1 provider bytes were accepted")
 	}
-	if _, err := attempt.reserveCounter("pre-submit"); err == nil {
+	if _, _, err := attempt.reserveHTTPCall(ProviderCallPreSubmitV1); err == nil {
 		t.Fatal("a provider call was reserved after a cumulative byte/time limit was reached")
 	}
 
 	for _, test := range []struct {
 		name   string
-		metric ProviderAccountingV1
+		metric ProviderCallAccountingV1
 	}{
-		{"request", ProviderAccountingV1{RequestBytes: MaxCumulativeRequestBytes + 1}},
-		{"headers", ProviderAccountingV1{HeaderBytes: MaxCumulativeHeaderBytes + 1}},
-		{"compressed", ProviderAccountingV1{CompressedResponseBytes: MaxCumulativeCompressedBytes + 1}},
-		{"decompressed", ProviderAccountingV1{DecompressedResponseBytes: MaxCumulativeDecompressedBytes + 1}},
-		{"active time", ProviderAccountingV1{ActiveNanos: int64(MaxCumulativeProviderCallTime) + 1}},
-		{"invocation time", ProviderAccountingV1{InvocationNanos: int64(ControllerInvocationTimeout) + 1}},
+		{"request", ProviderCallAccountingV1{RequestBytes: MaxCumulativeRequestBytes + 1}},
+		{"headers", ProviderCallAccountingV1{HeaderBytes: MaxCumulativeHeaderBytes + 1}},
+		{"compressed", ProviderCallAccountingV1{CompressedResponseBytes: MaxCumulativeCompressedBytes + 1}},
+		{"decompressed", ProviderCallAccountingV1{DecompressedResponseBytes: MaxCumulativeDecompressedBytes + 1}},
+		{"active time", ProviderCallAccountingV1{ActiveNanos: int64(MaxCumulativeProviderCallTime) + 1}},
 	} {
 		t.Run(test.name+" limit+1", func(t *testing.T) {
 			testRoot := t.TempDir()
@@ -786,10 +785,10 @@ func TestCorrectionM05CumulativeProviderBudgets(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer testAttempt.close()
-			if _, err := testAttempt.reserveCounter("pre-submit"); err != nil {
+			if _, _, err := testAttempt.reserveHTTPCall(ProviderCallPreSubmitV1); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := testAttempt.accountProvider(test.metric); err == nil {
+			if _, err := testAttempt.accountHTTPCall(ProviderCallPreSubmitV1, test.metric); err == nil {
 				t.Fatal("limit+1 accounting was accepted")
 			}
 		})

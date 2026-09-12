@@ -42,7 +42,10 @@ func (*attemptStore) cleanupTemporary() error           { return errUnsupportedD
 func (*attemptStore) reserveCounter(string) (Counters, error) {
 	return Counters{}, errUnsupportedDurability
 }
-func (*attemptStore) accountProvider(ProviderAccountingV1) (Counters, error) {
+func (*attemptStore) reserveHTTPCall(ProviderCallClassV1) (Counters, ProviderBudgetV1, error) {
+	return Counters{}, ProviderBudgetV1{}, errUnsupportedDurability
+}
+func (*attemptStore) accountHTTPCall(ProviderCallClassV1, ProviderCallAccountingV1) (Counters, error) {
 	return Counters{}, errUnsupportedDurability
 }
 func (*attemptStore) reserveReconciliation(int64) (Counters, error) {

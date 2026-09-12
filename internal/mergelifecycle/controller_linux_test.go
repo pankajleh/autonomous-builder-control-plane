@@ -569,7 +569,7 @@ type fakeProvider struct {
 }
 
 func (p *fakeProvider) ObserveAuthorization(ctx context.Context, phase ObservationPhase, auth githublifecycle.Authority) (AuthorizationObservation, error) {
-	checkProviderBudget(p.t, ctx, providerAccounting(100))
+	checkProviderBudget(p.t, ctx, ProviderCallPreSubmitV1, providerAccounting(100))
 	p.mu.Lock()
 	p.observeCalls++
 	call := p.observeCalls
@@ -582,7 +582,7 @@ func (p *fakeProvider) ObserveAuthorization(ctx context.Context, phase Observati
 }
 
 func (p *fakeProvider) PrepareResultCommit(ctx context.Context, recipe githublifecycle.MergeCommitRecipeV1) (CommitPreparation, error) {
-	checkProviderBudget(p.t, ctx, providerAccounting(100))
+	checkProviderBudget(p.t, ctx, ProviderCallCommitSubmissionV1, providerAccounting(100))
 	p.mu.Lock()
 	p.prepareCalls++
 	p.mu.Unlock()
@@ -596,21 +596,21 @@ func (p *fakeProvider) PrepareResultCommit(ctx context.Context, recipe githublif
 	return preparation, nil
 }
 func (p *fakeProvider) ReconcileResultCommit(ctx context.Context, recipe githublifecycle.MergeCommitRecipeV1) (CommitPreparation, error) {
-	checkProviderBudget(p.t, ctx, providerAccounting(100))
+	checkProviderBudget(p.t, ctx, ProviderCallPreSubmitV1, providerAccounting(100))
 	p.mu.Lock()
 	p.prepareReconcileCalls++
 	p.mu.Unlock()
 	return exactCommitPreparation(recipe, "prepare-reconcile", "2"), nil
 }
 func (p *fakeProvider) SubmitTarget(ctx context.Context, input githublifecycle.MergeExecutionInputV1) (TargetOutcome, error) {
-	checkProviderBudget(p.t, ctx, providerAccounting(100))
+	checkProviderBudget(p.t, ctx, ProviderCallTargetV1, providerAccounting(100))
 	p.mu.Lock()
 	p.submitCalls++
 	p.mu.Unlock()
 	return p.outcome(input.SealedAuthorization(), input.TargetSubmission(), p.disposition)
 }
 func (p *fakeProvider) ReconcileTarget(ctx context.Context, input githublifecycle.ReconcileWriteInput) (TargetOutcome, error) {
-	checkProviderBudget(p.t, ctx, providerAccounting(100))
+	checkProviderBudget(p.t, ctx, ProviderCallReconciliationV1, providerAccounting(100))
 	p.mu.Lock()
 	p.reconcileCalls++
 	p.mu.Unlock()
@@ -663,7 +663,7 @@ func (p *fakeProvider) outcome(sealed githublifecycle.SealedMergeAuthorizationV1
 	return result, nil
 }
 func (p *fakeProvider) ObservePostMerge(ctx context.Context, input githublifecycle.ObservePostMergeInput) (PostMergeOutcome, error) {
-	checkProviderBudget(p.t, ctx, providerAccounting(100))
+	checkProviderBudget(p.t, ctx, ProviderCallPostMergeV1, providerAccounting(100))
 	p.mu.Lock()
 	p.postMergeCalls++
 	p.mu.Unlock()
@@ -758,17 +758,28 @@ func exactCommitPreparation(recipe githublifecycle.MergeCommitRecipeV1, kind, fi
 }
 
 func providerAccounting(request int64) ProviderAccountingV1 {
-	return ProviderAccountingV1{RequestBytes: request, HeaderBytes: 64, CompressedResponseBytes: 128,
+	return ProviderAccountingV1{HTTPCalls: 1, RequestBytes: request, HeaderBytes: 64, CompressedResponseBytes: 128,
 		DecompressedResponseBytes: 128, ActiveNanos: int64(time.Millisecond), InvocationNanos: int64(time.Second)}
 }
 
-func checkProviderBudget(t *testing.T, ctx context.Context, accounting ProviderAccountingV1) {
+func checkProviderBudget(t *testing.T, ctx context.Context, class ProviderCallClassV1, accounting ProviderAccountingV1) {
 	t.Helper()
 	budget, ok := ProviderBudgetFromContext(ctx)
-	if !ok || accounting.RequestBytes > budget.RequestBytes || accounting.HeaderBytes > budget.HeaderBytes ||
+	handoff, handoffOK := ProviderHTTPCallHandoffFromContext(ctx)
+	if !ok || !handoffOK || budget.HTTPCalls <= 0 || accounting.RequestBytes > budget.RequestBytes || accounting.HeaderBytes > budget.HeaderBytes ||
 		accounting.CompressedResponseBytes > budget.CompressedResponseBytes || accounting.DecompressedResponseBytes > budget.DecompressedResponseBytes ||
 		accounting.ActiveNanos > budget.ActiveNanos {
 		t.Fatalf("provider operation lacks an enforceable cumulative budget: %+v, present=%v", budget, ok)
+	}
+	reservation, err := handoff.ReserveHTTPCall(class)
+	if err != nil {
+		t.Fatalf("provider operation could not reserve its actual HTTP call: %v", err)
+	}
+	err = reservation.Complete(ProviderCallAccountingV1{RequestBytes: accounting.RequestBytes, HeaderBytes: accounting.HeaderBytes,
+		CompressedResponseBytes: accounting.CompressedResponseBytes, DecompressedResponseBytes: accounting.DecompressedResponseBytes,
+		ActiveNanos: accounting.ActiveNanos})
+	if err != nil {
+		t.Fatalf("provider operation could not complete its actual HTTP call: %v", err)
 	}
 }
 

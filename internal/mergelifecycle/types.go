@@ -239,9 +239,10 @@ func equalStringSlices(left, right []string) bool {
 	return true
 }
 
-// ProviderAccountingV1 is the exact post-operation observation consumed by
-// the controller's durable cumulative accounting channel.
+// ProviderAccountingV1 is the aggregate method-return observation checked
+// against the controller's independently durable per-call accounting.
 type ProviderAccountingV1 struct {
+	HTTPCalls                 int   `json:"http_calls"`
 	RequestBytes              int64 `json:"request_bytes"`
 	HeaderBytes               int64 `json:"header_bytes"`
 	CompressedResponseBytes   int64 `json:"compressed_response_bytes"`
@@ -251,6 +252,7 @@ type ProviderAccountingV1 struct {
 }
 
 type ProviderBudgetV1 struct {
+	HTTPCalls                 int
 	RequestBytes              int64
 	HeaderBytes               int64
 	CompressedResponseBytes   int64
@@ -258,7 +260,72 @@ type ProviderBudgetV1 struct {
 	ActiveNanos               int64
 }
 
+// ProviderCallClassV1 is the controller-owned accounting row consumed by one
+// actual outbound provider request.
+type ProviderCallClassV1 string
+
+const (
+	ProviderCallPreSubmitV1        ProviderCallClassV1 = "pre-submit"
+	ProviderCallCommitSubmissionV1 ProviderCallClassV1 = "commit-submission"
+	ProviderCallTargetV1           ProviderCallClassV1 = "target"
+	ProviderCallPostMergeV1        ProviderCallClassV1 = "post-merge"
+	ProviderCallReconciliationV1   ProviderCallClassV1 = "reconciliation"
+)
+
+func (c ProviderCallClassV1) valid() bool {
+	switch c {
+	case ProviderCallPreSubmitV1, ProviderCallCommitSubmissionV1, ProviderCallTargetV1,
+		ProviderCallPostMergeV1, ProviderCallReconciliationV1:
+		return true
+	default:
+		return false
+	}
+}
+
+// ProviderCallAccountingV1 is durably applied once for the matching request
+// reservation. InvocationNanos deliberately remains method-aggregate data.
+type ProviderCallAccountingV1 struct {
+	RequestBytes              int64
+	HeaderBytes               int64
+	CompressedResponseBytes   int64
+	DecompressedResponseBytes int64
+	ActiveNanos               int64
+}
+
+func (a ProviderCallAccountingV1) validate() error {
+	if a.RequestBytes < 0 || a.HeaderBytes < 0 || a.CompressedResponseBytes < 0 ||
+		a.DecompressedResponseBytes < 0 || a.ActiveNanos < 0 {
+		return errors.New("provider call accounting contains a negative value")
+	}
+	return nil
+}
+
+// ProviderHTTPCallReservationV1 represents exactly one durable reservation.
+// Complete must finish the reservation before another call may be reserved.
+type ProviderHTTPCallReservationV1 interface {
+	Budget() ProviderBudgetV1
+	Complete(ProviderCallAccountingV1) error
+}
+
+// ProviderHTTPCallHandoffV1 is bound by the controller to one provider method
+// invocation and enforces that invocation's exact call-class sequence.
+type ProviderHTTPCallHandoffV1 interface {
+	ReserveHTTPCall(ProviderCallClassV1) (ProviderHTTPCallReservationV1, error)
+}
+
 type providerBudgetContextKey struct{}
+type providerHTTPCallHandoffContextKey struct{}
+
+// WithProviderHTTPCallHandoffV1 binds the two inseparable pieces of the
+// controller/provider request-budget seam. It is exported for provider
+// conformance tests; production callers use Controller's durable session.
+func WithProviderHTTPCallHandoffV1(ctx context.Context, budget ProviderBudgetV1, handoff ProviderHTTPCallHandoffV1) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	ctx = context.WithValue(ctx, providerBudgetContextKey{}, budget)
+	return context.WithValue(ctx, providerHTTPCallHandoffContextKey{}, handoff)
+}
 
 func ProviderBudgetFromContext(ctx context.Context) (ProviderBudgetV1, bool) {
 	if ctx == nil {
@@ -268,8 +335,16 @@ func ProviderBudgetFromContext(ctx context.Context) (ProviderBudgetV1, bool) {
 	return budget, ok
 }
 
+func ProviderHTTPCallHandoffFromContext(ctx context.Context) (ProviderHTTPCallHandoffV1, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	handoff, ok := ctx.Value(providerHTTPCallHandoffContextKey{}).(ProviderHTTPCallHandoffV1)
+	return handoff, ok && handoff != nil
+}
+
 func (a ProviderAccountingV1) validate() error {
-	if a.RequestBytes < 0 || a.HeaderBytes < 0 || a.CompressedResponseBytes < 0 ||
+	if a.HTTPCalls < 0 || a.RequestBytes < 0 || a.HeaderBytes < 0 || a.CompressedResponseBytes < 0 ||
 		a.DecompressedResponseBytes < 0 || a.ActiveNanos < 0 || a.InvocationNanos < 0 {
 		return errors.New("provider accounting contains a negative value")
 	}

@@ -16,6 +16,31 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 )
 
+type liveAtomicityStep struct {
+	Name       string
+	BaseBefore string
+	BaseAfter  string
+	HeadBefore string
+	HeadAfter  string
+	MustReject bool
+}
+
+func controlledLiveAtomicitySteps(baseBefore, baseAfter, headOID, wrong string) []liveAtomicityStep {
+	return []liveAtomicityStep{
+		{Name: "wrong-base", BaseBefore: wrong, BaseAfter: baseAfter, HeadBefore: headOID, HeadAfter: headOID, MustReject: true},
+		{Name: "wrong-head", BaseBefore: baseBefore, BaseAfter: baseAfter, HeadBefore: wrong, HeadAfter: headOID, MustReject: true},
+		{Name: "accepted", BaseBefore: baseBefore, BaseAfter: baseAfter, HeadBefore: headOID, HeadAfter: headOID},
+	}
+}
+
+func TestTask3ClosureM04LiveAtomicityOrdering(t *testing.T) {
+	steps := controlledLiveAtomicitySteps("base-before", "base-after", "head", "wrong")
+	if len(steps) != 3 || steps[0].Name != "wrong-base" || !steps[0].MustReject || steps[1].Name != "wrong-head" || !steps[1].MustReject ||
+		steps[1].BaseBefore != "base-before" || steps[1].BaseAfter != "base-after" || steps[2].Name != "accepted" || steps[2].MustReject {
+		t.Fatalf("live atomicity ordering is not negative, negative, positive with a material wrong-head base update: %+v", steps)
+	}
+}
+
 // TestTask3ControlledLiveConformance is acceptance-only. It cannot run from
 // ordinary implementation gates: both an explicit destructive-test phrase
 // and a complete disposable-ref fixture are required.
@@ -53,7 +78,7 @@ func TestTask3ControlledLiveConformance(t *testing.T) {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Timeout:       30 * time.Second,
 	}
-	doGraphQL := func(baseBefore, headBefore string) error {
+	doGraphQL := func(baseBefore, baseAfter, headBefore, headAfter string) error {
 		body, _ := json.Marshal(struct {
 			Query     string `json:"query"`
 			Variables struct {
@@ -74,8 +99,8 @@ func TestTask3ControlledLiveConformance(t *testing.T) {
 		requestBody["variables"] = map[string]any{"input": map[string]any{
 			"clientMutationId": "abcp-live-conformance", "repositoryId": fixture.RepositoryID,
 			"refUpdates": []map[string]any{
-				{"name": fixture.BaseRef, "beforeOid": baseBefore, "afterOid": fixture.BaseAfter, "force": false},
-				{"name": fixture.HeadRef, "beforeOid": headBefore, "afterOid": fixture.HeadOID, "force": false},
+				{"name": fixture.BaseRef, "beforeOid": baseBefore, "afterOid": baseAfter, "force": false},
+				{"name": fixture.HeadRef, "beforeOid": headBefore, "afterOid": headAfter, "force": false},
 			},
 		}}
 		body, _ = json.Marshal(requestBody)
@@ -126,26 +151,42 @@ func TestTask3ControlledLiveConformance(t *testing.T) {
 		}
 		return value.Object.SHA
 	}
-	if err := doGraphQL(fixture.BaseBefore, fixture.HeadOID); err != nil {
-		t.Fatalf("accepted two-ref conformance mutation failed: %v", err)
+	if readRef(fixture.BaseRef) != fixture.BaseBefore || readRef(fixture.HeadRef) != fixture.HeadOID {
+		t.Fatal("disposable refs are not at the declared initial boundary")
 	}
-	if readRef(fixture.BaseRef) != fixture.BaseAfter || readRef(fixture.HeadRef) != fixture.HeadOID {
-		t.Fatal("accepted two-ref mutation did not produce the exact base/head result")
-	}
+	defer func() {
+		base := readRef(fixture.BaseRef)
+		head := readRef(fixture.HeadRef)
+		if base != fixture.BaseBefore || head != fixture.HeadOID {
+			if err := doGraphQL(base, fixture.BaseBefore, head, fixture.HeadOID); err != nil {
+				t.Errorf("mandatory disposable-ref cleanup failed: %v", err)
+				return
+			}
+		}
+		if readRef(fixture.BaseRef) != fixture.BaseBefore || readRef(fixture.HeadRef) != fixture.HeadOID {
+			t.Error("mandatory disposable-ref cleanup did not restore the fixture")
+		}
+	}()
 	wrong := strings.Repeat("f", len(fixture.BaseAfter))
 	if wrong == fixture.BaseAfter || wrong == fixture.HeadOID {
 		wrong = strings.Repeat("e", len(fixture.BaseAfter))
 	}
-	if err := doGraphQL(wrong, fixture.HeadOID); err == nil {
-		t.Fatal("wrong-base atomic boundary unexpectedly succeeded")
-	}
-	if readRef(fixture.BaseRef) != fixture.BaseAfter || readRef(fixture.HeadRef) != fixture.HeadOID {
-		t.Fatal("wrong-base rejection modified a disposable ref")
-	}
-	if err := doGraphQL(fixture.BaseAfter, wrong); err == nil {
-		t.Fatal("wrong-head atomic boundary unexpectedly succeeded")
-	}
-	if readRef(fixture.BaseRef) != fixture.BaseAfter || readRef(fixture.HeadRef) != fixture.HeadOID {
-		t.Fatal("wrong-head rejection modified a disposable ref")
+	for _, step := range controlledLiveAtomicitySteps(fixture.BaseBefore, fixture.BaseAfter, fixture.HeadOID, wrong) {
+		err := doGraphQL(step.BaseBefore, step.BaseAfter, step.HeadBefore, step.HeadAfter)
+		if step.MustReject {
+			if err == nil {
+				t.Fatalf("%s atomic boundary unexpectedly succeeded", step.Name)
+			}
+			if readRef(fixture.BaseRef) != fixture.BaseBefore || readRef(fixture.HeadRef) != fixture.HeadOID {
+				t.Fatalf("%s rejection modified a disposable ref", step.Name)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("accepted two-ref conformance mutation failed: %v", err)
+		}
+		if readRef(fixture.BaseRef) != fixture.BaseAfter || readRef(fixture.HeadRef) != fixture.HeadOID {
+			t.Fatal("accepted two-ref mutation did not produce the exact base/head result")
+		}
 	}
 }

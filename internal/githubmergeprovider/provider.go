@@ -29,9 +29,9 @@ const (
 	maxReadAttempts               = 2
 	defaultUserAgent              = "abcp-github-merge-provider/1"
 	contractSchemaSHA256          = "5bdd74993318c503f1fce94cfe098aa3f013df8e1741af7b5fd3f2348cf331fe"
-	conformanceFixtureSHA256      = "cbfee2f3f21b871c30880072d5a2bee5f7eab4c25d7133c012becaceeeaa2c85"
+	conformanceFixtureSHA256      = "0a4980ca73acfc1ecb949b80225656aff2b595513a671812913b2a675cf4323c"
 	contractSchemaCanonicalV1     = "UpdateRefsInput{clientMutationId:String,refUpdates:[RefUpdate!]!,repositoryId:ID!};RefUpdate{afterOid:GitObjectID!,beforeOid:GitObjectID!,force:Boolean,name:GitRefname!};atomic=true;all_or_nothing=true"
-	conformanceFixtureCanonicalV1 = "accepted:base(before->result,false),head(head->head,false);wrong-base:no-change;wrong-head:no-change;refs=disposable"
+	conformanceFixtureCanonicalV1 = "wrong-base:no-change;wrong-head:no-change;accepted:base(before->result,false),head(head->head,false);refs=disposable"
 	officialUpdateRefsDocument    = "https://docs.github.com/en/graphql/reference/git#updaterefs"
 	capabilityRecordSchema        = "github-update-refs-capability-record-v1"
 	productionDeploymentIdentity  = "github.com"
@@ -134,11 +134,10 @@ func NewUserAuthenticator(token, stableNodeID string) (*Authenticator, error) {
 }
 
 func NewAppInstallationAuthenticator(token, stableNodeID string, installationID int64) (*Authenticator, error) {
-	identity, err := githublifecycle.NewAppInstallationIdentity(stableNodeID, installationID)
-	if err != nil {
+	if _, err := githublifecycle.NewAppInstallationIdentity(stableNodeID, installationID); err != nil {
 		return nil, err
 	}
-	return newAuthenticator(token, identity)
+	return nil, errors.New("app-installation credentials require independently authenticated remote installation identity")
 }
 
 func newAuthenticator(token string, identity githublifecycle.ActingIdentity) (*Authenticator, error) {
@@ -175,7 +174,7 @@ type Provider struct {
 }
 
 func New(auth *Authenticator) (*Provider, error) {
-	if auth == nil || len(auth.token) == 0 {
+	if auth == nil || len(auth.token) == 0 || auth.kind != githublifecycle.ActingKindUser {
 		return nil, errors.New("sealed authenticator is required")
 	}
 	limits := githublifecycle.DefaultLimits()
@@ -186,7 +185,7 @@ func New(auth *Authenticator) (*Provider, error) {
 }
 
 func newProvider(auth *Authenticator, limits githublifecycle.Limits, readClient *http.Client, mutationClient func(*submissionTracker) *http.Client) (*Provider, error) {
-	if auth == nil || len(auth.token) == 0 || limits.Validate() != nil || readClient == nil || mutationClient == nil {
+	if auth == nil || len(auth.token) == 0 || auth.kind != githublifecycle.ActingKindUser || limits.Validate() != nil || readClient == nil || mutationClient == nil {
 		return nil, errors.New("valid sealed provider dependencies are required")
 	}
 	if _, _, err := validateCapabilityRecord(embeddedCapabilityRecord); err != nil {
@@ -249,17 +248,25 @@ func (p *Provider) validateSealedCapability(sealed githublifecycle.SealedMergeAu
 	return nil
 }
 
-func (p *Provider) startMeter(ctx context.Context) *callMeter {
-	budget, ok := mergelifecycle.ProviderBudgetFromContext(ctx)
-	if !ok {
-		budget = mergelifecycle.ProviderBudgetV1{
-			RequestBytes: p.limits.MaxCumulativeRequestBytes, HeaderBytes: p.limits.MaxCumulativeResponseHeaderBytes,
-			CompressedResponseBytes:   p.limits.MaxCumulativeCompressedResponseBytes,
-			DecompressedResponseBytes: p.limits.MaxCumulativeDecompressedResponseBytes,
-			ActiveNanos:               int64(p.limits.MaxCumulativeActiveProviderCallTime),
-		}
+func (p *Provider) startMeter(ctx context.Context) (*callMeter, error) {
+	if p == nil || p.now == nil {
+		return nil, errors.New("provider is unavailable")
 	}
-	return &callMeter{budget: budget, started: p.now()}
+	budget, budgetOK := mergelifecycle.ProviderBudgetFromContext(ctx)
+	handoff, handoffOK := mergelifecycle.ProviderHTTPCallHandoffFromContext(ctx)
+	if !budgetOK || !handoffOK || !validControllerBudget(budget, p.limits) {
+		return nil, errors.New("controller HTTP-call budget handoff is missing, malformed, or exhausted")
+	}
+	return &callMeter{budget: budget, handoff: handoff, started: p.now()}, nil
+}
+
+func validControllerBudget(budget mergelifecycle.ProviderBudgetV1, limits githublifecycle.Limits) bool {
+	return budget.HTTPCalls > 0 && budget.HTTPCalls <= limits.MaxHTTPCalls &&
+		budget.RequestBytes > 0 && budget.RequestBytes <= limits.MaxCumulativeRequestBytes &&
+		budget.HeaderBytes > 0 && budget.HeaderBytes <= limits.MaxCumulativeResponseHeaderBytes &&
+		budget.CompressedResponseBytes > 0 && budget.CompressedResponseBytes <= limits.MaxCumulativeCompressedResponseBytes &&
+		budget.DecompressedResponseBytes > 0 && budget.DecompressedResponseBytes <= limits.MaxCumulativeDecompressedResponseBytes &&
+		budget.ActiveNanos > 0 && budget.ActiveNanos <= int64(limits.MaxCumulativeActiveProviderCallTime)
 }
 
 func (p *Provider) finishMeter(meter *callMeter) mergelifecycle.ProviderAccountingV1 {

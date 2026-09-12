@@ -94,10 +94,10 @@ Implementation phase remains live-mutation-free. The corrected live harness is e
 
 ### Task 1: Close the exact five Task-3 review findings
 
-- [ ] Implement only F1-F5 and the narrow controller/provider budget seam described above.
-- [ ] Add the five exact regression entrypoints and any bounded controller/store tests necessary for durable HTTP-call reservation/restart proof.
-- [ ] Run the full regression floor and prove no scope escape.
-- [ ] Move this plan to `docs/plans/completed/` and create exactly one correction implementation commit.
+- [x] Implement only F1-F5 and the narrow controller/provider budget seam described above.
+- [x] Add the five exact regression entrypoints and any bounded controller/store tests necessary for durable HTTP-call reservation/restart proof.
+- [x] Run the full regression floor and prove no scope escape.
+- [x] Move this plan to `docs/plans/completed/` and create exactly one correction implementation commit.
 
 ## Closure boundary
 

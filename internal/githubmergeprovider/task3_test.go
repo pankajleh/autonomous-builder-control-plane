@@ -3,7 +3,6 @@ package githubmergeprovider
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,7 +62,7 @@ func TestTask3SealedTransportAndCredentialBoundary(t *testing.T) {
 func TestTask3ResponseAndBodyResourceLimits(t *testing.T) {
 	limits := githublifecycle.DefaultLimits()
 	provider := &Provider{limits: limits, now: time.Now}
-	budget := mergelifecycle.ProviderBudgetV1{RequestBytes: limits.MaxCumulativeRequestBytes, HeaderBytes: limits.MaxCumulativeResponseHeaderBytes,
+	budget := mergelifecycle.ProviderBudgetV1{HTTPCalls: limits.MaxHTTPCalls, RequestBytes: limits.MaxCumulativeRequestBytes, HeaderBytes: limits.MaxCumulativeResponseHeaderBytes,
 		CompressedResponseBytes: limits.MaxCumulativeCompressedResponseBytes, DecompressedResponseBytes: limits.MaxCumulativeDecompressedResponseBytes,
 		ActiveNanos: int64(limits.MaxCumulativeActiveProviderCallTime)}
 	jsonAtLimit := append([]byte{'"'}, bytes.Repeat([]byte{'a'}, limits.MaxDecompressedResponseBodyBytes-2)...)
@@ -153,7 +152,7 @@ func TestTask3FrozenCapabilityValidation(t *testing.T) {
 func TestTask3PullRequestEligibilityAndForkRejection(t *testing.T) {
 	fixture := newProviderFixture(t, nil)
 	provider, transport := authorizationProvider(t, fixture, nil, []byte(`[]`))
-	observation, err := provider.ObserveAuthorization(context.Background(), mergelifecycle.ObservationInitial, fixture.authority)
+	observation, err := provider.ObserveAuthorization(providerTestContext(), mergelifecycle.ObservationInitial, fixture.authority)
 	if err != nil || githublifecycle.ValidateAuthoritativePullRequestSnapshotV1(fixture.authority, observation.PullRequest, fixture.limits) != nil {
 		t.Fatalf("eligible authorization observation failed: %v", err)
 	}
@@ -178,14 +177,14 @@ func TestTask3PullRequestEligibilityAndForkRejection(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			provider, _ := authorizationProvider(t, fixture, mutate, []byte(`[]`))
-			if _, err := provider.ObserveAuthorization(context.Background(), mergelifecycle.ObservationInitial, fixture.authority); err == nil {
+			if _, err := provider.ObserveAuthorization(providerTestContext(), mergelifecycle.ObservationInitial, fixture.authority); err == nil {
 				t.Fatal("ineligible PR/repository/principal was accepted")
 			}
 		})
 	}
 	provider, _ = authorizationProvider(t, fixture, nil, []byte(`[]`))
-	initial := mustValue(provider.ObserveAuthorization(context.Background(), mergelifecycle.ObservationInitial, fixture.authority))
-	final := mustValue(provider.ObserveAuthorization(context.Background(), mergelifecycle.ObservationFinal, fixture.authority))
+	initial := mustValue(provider.ObserveAuthorization(providerTestContext(), mergelifecycle.ObservationInitial, fixture.authority))
+	final := mustValue(provider.ObserveAuthorization(providerTestContext(), mergelifecycle.ObservationFinal, fixture.authority))
 	initialIDs := observationRequestIDs(initial)
 	for id := range observationRequestIDs(final) {
 		if initialIDs[id] {
@@ -205,7 +204,7 @@ func TestTask3PaginationClosureAndDismissedReview(t *testing.T) {
 		NodeID string `json:"node_id"`
 	}{ID: reviewer.DatabaseID, NodeID: reviewer.NodeID}}})
 	provider, _ := authorizationProvider(t, fixture, nil, reviewBody)
-	observation, err := provider.ObserveAuthorization(context.Background(), mergelifecycle.ObservationInitial, fixture.authority)
+	observation, err := provider.ObserveAuthorization(providerTestContext(), mergelifecycle.ObservationInitial, fixture.authority)
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "review") {
 		t.Fatalf("dismissed exact-head review did not block: err=%v reviews=%+v eligible=%+v policy=%v", err,
 			observation.PullRequest.Input().Reviews, fixture.authority.MergePolicy().Input().EligibleReviewers,
@@ -234,7 +233,7 @@ func TestTask3PaginationClosureAndDismissedReview(t *testing.T) {
 		}{1, "U1"}},
 	})
 	provider, _ = authorizationProvider(t, fixture, nil, duplicateBody)
-	if _, err := provider.ObserveAuthorization(context.Background(), mergelifecycle.ObservationInitial, fixture.authority); err == nil {
+	if _, err := provider.ObserveAuthorization(providerTestContext(), mergelifecycle.ObservationInitial, fixture.authority); err == nil {
 		t.Fatal("duplicate pagination item identity was accepted")
 	}
 }
@@ -257,7 +256,7 @@ func TestTask3ExactCommitPreparationObservation(t *testing.T) {
 		}
 	}
 	provider := mustValue(newTestProvider(fixture.auth, fixture.limits, transport))
-	preparation, err := provider.PrepareResultCommit(context.Background(), fixture.recipe)
+	preparation, err := provider.PrepareResultCommit(providerTestContext(), fixture.recipe)
 	if err != nil || preparation.ResultSHA != fixture.recipe.ExpectedResultSHA().String() ||
 		!bytes.Equal(preparation.Observation.ObjectBytes, fixture.recipe.CommitBytes()) || len(transport.snapshot()) != 2 {
 		t.Fatalf("exact commit preparation = %+v, %v, calls=%d", preparation, err, len(transport.snapshot()))
@@ -270,7 +269,7 @@ func TestTask3ExactCommitPreparationObservation(t *testing.T) {
 				return githubResponse(status, "commit-class", []byte(`{"message":"classified"}`)), nil
 			}}
 			provider := mustValue(newTestProvider(fixture.auth, fixture.limits, transport))
-			if _, err := provider.PrepareResultCommit(context.Background(), fixture.recipe); err == nil || calls.Load() != 1 {
+			if _, err := provider.PrepareResultCommit(providerTestContext(), fixture.recipe); err == nil || calls.Load() != 1 {
 				t.Fatalf("commit response class status=%d, calls=%d, err=%v", status, calls.Load(), err)
 			}
 		})
@@ -279,7 +278,7 @@ func TestTask3ExactCommitPreparationObservation(t *testing.T) {
 		return githubResponse(200, "commit-reconcile", remoteCommitBody(t, fixture.recipe)), nil
 	}}
 	provider = mustValue(newTestProvider(fixture.auth, fixture.limits, transport))
-	if _, err := provider.ReconcileResultCommit(context.Background(), fixture.recipe); err != nil || len(transport.snapshot()) != 1 || transport.snapshot()[0].Method != http.MethodGet {
+	if _, err := provider.ReconcileResultCommit(providerTestContext(), fixture.recipe); err != nil || len(transport.snapshot()) != 1 || transport.snapshot()[0].Method != http.MethodGet {
 		t.Fatalf("commit reconciliation mutated or failed: %v", err)
 	}
 }
@@ -289,14 +288,14 @@ func TestTask3AtomicUpdateRefsWireAndForbiddenEndpoints(t *testing.T) {
 	transport := &scriptTransport{}
 	appliedTargetScript(t, fixture, transport)
 	provider := mustValue(newTestProvider(fixture.auth, fixture.limits, transport))
-	outcome, err := provider.SubmitTarget(context.Background(), targetExecution(t, fixture))
+	outcome, err := provider.SubmitTarget(providerTestContext(), targetExecution(t, fixture))
 	if err != nil || outcome.Disposition != githublifecycle.ReconciliationApplied || githublifecycle.ValidateMergeResult(fixture.sealed, outcome.Result, fixture.limits) != nil {
 		t.Fatalf("atomic target result = %s, %v", outcome.Disposition, err)
 	}
 	calls := transport.snapshot()
 	mutations := 0
 	for _, call := range calls {
-		if call.Method == http.MethodPost {
+		if call.Method == http.MethodPost && bytes.Equal(call.Body, fixture.submission.RequestBody()) {
 			mutations++
 			if call.URL != apiOrigin+githublifecycle.GitHubGraphQLPathV1 || !bytes.Equal(call.Body, fixture.submission.RequestBody()) {
 				t.Fatal("target mutation did not transmit the published submission bytes")
@@ -306,7 +305,7 @@ func TestTask3AtomicUpdateRefsWireAndForbiddenEndpoints(t *testing.T) {
 			t.Fatalf("forbidden mutation endpoint became reachable: %s %s", call.Method, call.URL)
 		}
 	}
-	if mutations != 1 || len(calls) != 4 {
+	if mutations != 1 || len(calls) != 2 {
 		t.Fatalf("mutation calls=%d total=%d", mutations, len(calls))
 	}
 	var request struct {
@@ -342,7 +341,7 @@ func TestTask3SubmissionByteBoundaryNoRetry(t *testing.T) {
 		return nil, errors.New("timeout after possible bytes")
 	})
 	provider := mustValue(newTestProvider(fixture.auth, fixture.limits, transport))
-	outcome, err := provider.SubmitTarget(context.Background(), targetExecution(t, fixture))
+	outcome, err := provider.SubmitTarget(providerTestContext(), targetExecution(t, fixture))
 	if err != nil || outcome.Disposition != githublifecycle.ReconciliationUnknown || calls.Load() != 1 || outcome.Accounting.RequestBytes != fixture.submission.RequestBodyBytes() {
 		t.Fatalf("possible-byte classification = %s, calls=%d, bytes=%d, err=%v", outcome.Disposition, calls.Load(), outcome.Accounting.RequestBytes, err)
 	}
@@ -355,7 +354,7 @@ func TestTask3SubmissionByteBoundaryNoRetry(t *testing.T) {
 	provider = mustValue(newProvider(fixture.auth, fixture.limits, readClient, func(*submissionTracker) *http.Client {
 		return &http.Client{Transport: sealedRoundTripper{auth: fixture.auth, base: zeroBase}}
 	}))
-	outcome, err = provider.SubmitTarget(context.Background(), targetExecution(t, fixture))
+	outcome, err = provider.SubmitTarget(providerTestContext(), targetExecution(t, fixture))
 	if err != nil || outcome.Disposition != githublifecycle.ReconciliationNotApplied || outcome.NotAppliedProof.Input().Kind != githublifecycle.NotAppliedZeroRequestBytes ||
 		outcome.Accounting.RequestBytes != 0 || zeroCalls.Load() != 1 {
 		t.Fatalf("zero-byte classification = %s, calls=%d, bytes=%d, err=%v", outcome.Disposition, zeroCalls.Load(), outcome.Accounting.RequestBytes, err)
@@ -364,7 +363,7 @@ func TestTask3SubmissionByteBoundaryNoRetry(t *testing.T) {
 	provider = mustValue(newTestProvider(fixture.auth, fixture.limits, roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, Header: http.Header{"X-Github-Request-Id": []string{"close-target"}}, Body: closeBody}, nil
 	})))
-	outcome, err = provider.SubmitTarget(context.Background(), targetExecution(t, fixture))
+	outcome, err = provider.SubmitTarget(providerTestContext(), targetExecution(t, fixture))
 	if err != nil || outcome.Disposition != githublifecycle.ReconciliationUnknown || !closeBody.wasClosed() {
 		t.Fatalf("body-close ambiguity = %s, %v", outcome.Disposition, err)
 	}
@@ -377,30 +376,38 @@ func TestTask3ReconciliationDispositions(t *testing.T) {
 	transport := &scriptTransport{}
 	appliedTargetScript(t, fixture, transport)
 	provider := mustValue(newTestProvider(fixture.auth, fixture.limits, transport))
-	outcome, err := provider.ReconcileTarget(context.Background(), reconcileInput)
+	outcome, err := provider.ReconcileTarget(providerTestContext(), reconcileInput)
 	if err != nil || outcome.Disposition != githublifecycle.ReconciliationApplied {
 		t.Fatalf("applied reconciliation = %s, %v", outcome.Disposition, err)
 	}
 	for _, call := range transport.snapshot() {
-		if call.Method != http.MethodGet {
-			t.Fatalf("reconciliation performed mutation: %s", call.Method)
+		if call.Method == http.MethodPost {
+			var request struct {
+				Query string `json:"query"`
+			}
+			if json.Unmarshal(call.Body, &request) != nil || request.Query != targetVerificationQueryV1 {
+				t.Fatalf("reconciliation performed mutation: %s", call.Method)
+			}
+		} else if call.Method != http.MethodGet {
+			t.Fatalf("reconciliation used an unsupported method: %s", call.Method)
 		}
 	}
 	transport = &scriptTransport{}
 	appliedTargetScript(t, fixture, transport)
 	original := transport.handler
 	transport.handler = func(call recordedRequest) (*http.Response, error) {
-		if strings.Contains(call.URL, "/git/ref/heads/main") {
-			body, _ := json.Marshal(gitRefResponse{Ref: "refs/heads/main", Object: struct {
-				SHA  string `json:"sha"`
-				Type string `json:"type"`
-			}{fixture.baseSHA.String(), "commit"}})
-			return githubResponse(200, "old-base", body), nil
+		if call.Method == http.MethodPost && strings.HasSuffix(call.URL, "/graphql") {
+			var request struct {
+				Query string `json:"query"`
+			}
+			if json.Unmarshal(call.Body, &request) == nil && request.Query == targetVerificationQueryV1 {
+				return githubResponse(200, "old-base", targetVerificationBody(t, fixture, fixture.baseSHA.String(), true)), nil
+			}
 		}
 		return original(call)
 	}
 	provider = mustValue(newTestProvider(fixture.auth, fixture.limits, transport))
-	outcome = mustValue(provider.ReconcileTarget(context.Background(), reconcileInput))
+	outcome = mustValue(provider.ReconcileTarget(providerTestContext(), reconcileInput))
 	if outcome.Disposition != githublifecycle.ReconciliationUnknown {
 		t.Fatalf("old target incorrectly proved non-application: %s", outcome.Disposition)
 	}
@@ -408,14 +415,14 @@ func TestTask3ReconciliationDispositions(t *testing.T) {
 	provider = mustValue(newTestProvider(fixture.auth, fixture.limits, roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return githubResponse(200, "atomic-rejection", rejectionBody), nil
 	})))
-	outcome = mustValue(provider.SubmitTarget(context.Background(), targetExecution(t, fixture)))
+	outcome = mustValue(provider.SubmitTarget(providerTestContext(), targetExecution(t, fixture)))
 	if outcome.Disposition != githublifecycle.ReconciliationNotApplied || outcome.NotAppliedProof.Input().Kind != githublifecycle.NotAppliedAtomicBaseRejected {
 		t.Fatalf("typed rejection = %s, %s", outcome.Disposition, outcome.NotAppliedProof.Input().Kind)
 	}
 	provider = mustValue(newTestProvider(fixture.auth, fixture.limits, roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return githubResponse(200, "generic-error", []byte(`{"data":{"updateRefs":null},"errors":[{"message":"before oid changed"}]}`)), nil
 	})))
-	outcome = mustValue(provider.SubmitTarget(context.Background(), targetExecution(t, fixture)))
+	outcome = mustValue(provider.SubmitTarget(providerTestContext(), targetExecution(t, fixture)))
 	if outcome.Disposition != githublifecycle.ReconciliationUnknown {
 		t.Fatalf("generic error text proved non-application: %s", outcome.Disposition)
 	}
@@ -440,7 +447,7 @@ func TestTask3PostMergeContainment(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			transport := postMergeTransport(t, fixture, test.tip, test.status, test.mergeBase, test.ahead, test.behind)
 			provider := mustValue(newTestProvider(fixture.auth, fixture.limits, transport))
-			outcome, err := provider.ObservePostMerge(context.Background(), observeInput)
+			outcome, err := provider.ObservePostMerge(providerTestContext(), observeInput)
 			if test.wantOK {
 				if err != nil || githublifecycle.VerifyPostMerge(fixture.sealed, result, outcome.Observation, fixture.limits) != nil {
 					t.Fatalf("post-merge proof failed: %v calls=%+v", err, transport.snapshot())
@@ -454,7 +461,7 @@ func TestTask3PostMergeContainment(t *testing.T) {
 
 func TestTask3CumulativeProviderBudgets(t *testing.T) {
 	limits := githublifecycle.DefaultLimits()
-	budget := mergelifecycle.ProviderBudgetV1{RequestBytes: int64(limits.MaxRequestBodyBytes), HeaderBytes: 100,
+	budget := mergelifecycle.ProviderBudgetV1{HTTPCalls: limits.MaxHTTPCalls, RequestBytes: int64(limits.MaxRequestBodyBytes), HeaderBytes: 100,
 		CompressedResponseBytes: 100, DecompressedResponseBytes: 100, ActiveNanos: 100}
 	meter := &callMeter{budget: budget, started: time.Now()}
 	if err := meter.beforeRequest(int64(limits.MaxRequestBodyBytes), limits); err != nil {
@@ -475,7 +482,7 @@ func TestTask3CumulativeProviderBudgets(t *testing.T) {
 			}
 		})
 	}
-	meter = &callMeter{budget: mergelifecycle.ProviderBudgetV1{RequestBytes: 1 << 20, HeaderBytes: 1 << 20, CompressedResponseBytes: 1 << 20, DecompressedResponseBytes: 1 << 20, ActiveNanos: 1 << 20}}
+	meter = &callMeter{budget: mergelifecycle.ProviderBudgetV1{HTTPCalls: limits.MaxHTTPCalls, RequestBytes: 1 << 20, HeaderBytes: 1 << 20, CompressedResponseBytes: 1 << 20, DecompressedResponseBytes: 1 << 20, ActiveNanos: 1 << 20}}
 	meter.calls = limits.MaxHTTPCalls
 	if err := meter.beforeRequest(0, limits); err == nil {
 		t.Fatal("cumulative call limit+1 was accepted")
@@ -520,7 +527,7 @@ func TestTask3ConcurrentMutationCeilings(t *testing.T) {
 	var wait sync.WaitGroup
 	for index := 0; index < 20; index++ {
 		wait.Add(1)
-		go func() { defer wait.Done(); _, _ = provider.PrepareResultCommit(context.Background(), fixture.recipe) }()
+		go func() { defer wait.Done(); _, _ = provider.PrepareResultCommit(providerTestContext(), fixture.recipe) }()
 	}
 	wait.Wait()
 	commitWrites := 0
@@ -539,13 +546,13 @@ func TestTask3ConcurrentMutationCeilings(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			_, _ = provider.SubmitTarget(context.Background(), targetExecution(t, fixture))
+			_, _ = provider.SubmitTarget(providerTestContext(), targetExecution(t, fixture))
 		}()
 	}
 	wait.Wait()
 	targetWrites := 0
 	for _, call := range transport.snapshot() {
-		if call.Method == http.MethodPost && strings.HasSuffix(call.URL, "/graphql") {
+		if call.Method == http.MethodPost && strings.HasSuffix(call.URL, "/graphql") && bytes.Equal(call.Body, fixture.submission.RequestBody()) {
 			targetWrites++
 		}
 	}

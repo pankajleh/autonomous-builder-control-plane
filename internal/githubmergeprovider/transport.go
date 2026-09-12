@@ -23,6 +23,7 @@ import (
 
 type callMeter struct {
 	budget     mergelifecycle.ProviderBudgetV1
+	handoff    mergelifecycle.ProviderHTTPCallHandoffV1
 	accounting mergelifecycle.ProviderAccountingV1
 	started    time.Time
 	calls      int
@@ -32,7 +33,7 @@ func (m *callMeter) beforeRequest(bodyBytes int64, limits githublifecycle.Limits
 	if bodyBytes < 0 || bodyBytes > int64(limits.MaxRequestBodyBytes) {
 		return errors.New("request body exceeds the fixed provider limit")
 	}
-	if m.calls >= limits.MaxHTTPCalls || m.accounting.RequestBytes+bodyBytes > m.budget.RequestBytes ||
+	if m.calls >= limits.MaxHTTPCalls || m.calls >= m.budget.HTTPCalls || m.accounting.RequestBytes+bodyBytes > m.budget.RequestBytes ||
 		m.accounting.HeaderBytes >= m.budget.HeaderBytes || m.accounting.CompressedResponseBytes >= m.budget.CompressedResponseBytes ||
 		m.accounting.DecompressedResponseBytes >= m.budget.DecompressedResponseBytes || m.accounting.ActiveNanos >= m.budget.ActiveNanos {
 		return errors.New("remaining controller provider budget is exhausted")
@@ -217,10 +218,10 @@ func (e *responseStatusError) Error() string {
 	return "GitHub returned HTTP status " + strconv.Itoa(e.status)
 }
 
-func (p *Provider) readJSON(ctx context.Context, meter *callMeter, method, path string, body []byte) (httpResult, error) {
+func (p *Provider) readJSON(ctx context.Context, meter *callMeter, class mergelifecycle.ProviderCallClassV1, method, path string, body []byte) (httpResult, error) {
 	var last httpResult
 	for attempt := 0; attempt < maxReadAttempts; attempt++ {
-		result, err := p.requestJSON(ctx, meter, p.readClient, nil, method, path, body)
+		result, err := p.requestJSON(ctx, meter, class, p.readClient, nil, method, path, body)
 		last = result
 		if err == nil {
 			if result.Status == http.StatusOK {
@@ -235,12 +236,23 @@ func (p *Provider) readJSON(ctx context.Context, meter *callMeter, method, path 
 	return last, errors.New("bounded read attempts exhausted")
 }
 
+func (p *Provider) readJSONOnce(ctx context.Context, meter *callMeter, class mergelifecycle.ProviderCallClassV1, method, path string, body []byte) (httpResult, error) {
+	result, err := p.requestJSON(ctx, meter, class, p.readClient, nil, method, path, body)
+	if err != nil {
+		return result, sanitizeTransportError(err)
+	}
+	if result.Status != http.StatusOK {
+		return result, sanitizeTransportError(&responseStatusError{status: result.Status})
+	}
+	return result, nil
+}
+
 func retryableReadStatus(status int) bool {
 	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500 && status <= 599
 }
 
-func (p *Provider) requestJSON(ctx context.Context, meter *callMeter, client *http.Client, tracker *submissionTracker, method, path string, body []byte) (httpResult, error) {
-	if ctx == nil || meter == nil || client == nil {
+func (p *Provider) requestJSON(ctx context.Context, meter *callMeter, class mergelifecycle.ProviderCallClassV1, client *http.Client, tracker *submissionTracker, method, path string, body []byte) (httpResult, error) {
+	if ctx == nil || meter == nil || meter.handoff == nil || client == nil {
 		return httpResult{}, errors.New("request context and owned client are required")
 	}
 	if method != http.MethodGet && method != http.MethodPost {
@@ -249,36 +261,80 @@ func (p *Provider) requestJSON(ctx context.Context, meter *callMeter, client *ht
 	if !validClosedRoute(method, path) {
 		return httpResult{}, errors.New("request path is outside the provider route set")
 	}
-	if err := meter.beforeRequest(int64(len(body)), p.limits); err != nil {
-		return httpResult{}, err
+	if int64(len(body)) > int64(p.limits.MaxRequestBodyBytes) {
+		return httpResult{}, errors.New("request body exceeds the fixed provider limit")
 	}
 	requestURL := apiOrigin + path
 	request, err := http.NewRequestWithContext(ctx, method, requestURL, bytes.NewReader(body))
 	if err != nil {
-		meter.rollbackUnwrittenBody(int64(len(body)))
 		return httpResult{}, errors.New("request construction failed")
 	}
 	if len(body) > 0 {
 		request.Header.Set("Content-Type", "application/json")
 	}
+	reservation, err := meter.handoff.ReserveHTTPCall(class)
+	if err != nil || reservation == nil {
+		return httpResult{}, errors.Join(errors.New("controller HTTP-call reservation failed"), err)
+	}
+	budget := reservation.Budget()
+	if !validControllerBudget(budget, p.limits) || budget.RequestBytes < int64(len(body)) {
+		return httpResult{}, errors.New("controller HTTP-call reservation returned an unusable budget")
+	}
+	requestTimeout := p.limits.CallTimeout
+	if remaining := time.Duration(budget.ActiveNanos); remaining < requestTimeout {
+		requestTimeout = remaining
+	}
+	if requestTimeout <= 0 {
+		return httpResult{}, errors.New("controller active-time budget is exhausted")
+	}
+	requestContext, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	request = request.WithContext(requestContext)
+	accounting := mergelifecycle.ProviderCallAccountingV1{RequestBytes: int64(len(body))}
 	started := p.now()
 	response, doErr := client.Do(request)
-	active := p.now().Sub(started).Nanoseconds()
-	activeErr := meter.addActive(active)
 	if doErr != nil {
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
 		if tracker != nil && !tracker.possible() {
-			meter.rollbackUnwrittenBody(int64(len(body)))
+			accounting.RequestBytes = 0
 		}
-		return httpResult{}, errors.Join(sanitizeTransportError(doErr), activeErr)
+		accounting.ActiveNanos = maxInt64(0, p.now().Sub(started).Nanoseconds())
+		completeErr := reservation.Complete(accounting)
+		if completeErr == nil {
+			meter.addCompleted(accounting)
+		}
+		return httpResult{}, errors.Join(sanitizeTransportError(doErr), completeErr)
 	}
 	if response == nil || response.Body == nil {
-		return httpResult{}, errors.Join(errors.New("GitHub response has no body"), activeErr)
+		accounting.ActiveNanos = maxInt64(0, p.now().Sub(started).Nanoseconds())
+		completeErr := reservation.Complete(accounting)
+		if completeErr == nil {
+			meter.addCompleted(accounting)
+		}
+		return httpResult{}, errors.Join(errors.New("GitHub response has no body"), completeErr)
 	}
-	result, readErr := p.consumeResponse(response, meter)
-	return result, errors.Join(readErr, activeErr)
+	result, readErr := p.consumeResponseBounded(response, budget, &accounting)
+	accounting.ActiveNanos = maxInt64(0, p.now().Sub(started).Nanoseconds())
+	if accounting.ActiveNanos > budget.ActiveNanos {
+		readErr = errors.Join(readErr, errors.New("cumulative active provider time budget exceeded"))
+	}
+	completeErr := reservation.Complete(accounting)
+	if completeErr == nil {
+		meter.addCompleted(accounting)
+	}
+	return result, errors.Join(readErr, completeErr)
+}
+
+func (m *callMeter) addCompleted(value mergelifecycle.ProviderCallAccountingV1) {
+	m.calls++
+	m.accounting.HTTPCalls++
+	m.accounting.RequestBytes += value.RequestBytes
+	m.accounting.HeaderBytes += value.HeaderBytes
+	m.accounting.CompressedResponseBytes += value.CompressedResponseBytes
+	m.accounting.DecompressedResponseBytes += value.DecompressedResponseBytes
+	m.accounting.ActiveNanos += value.ActiveNanos
 }
 
 var (
@@ -327,7 +383,22 @@ func hasTraversalComponent(path string) bool {
 	return false
 }
 
-func (p *Provider) consumeResponse(response *http.Response, meter *callMeter) (result httpResult, returnedErr error) {
+func (p *Provider) consumeResponse(response *http.Response, meter *callMeter) (httpResult, error) {
+	accounting := mergelifecycle.ProviderCallAccountingV1{}
+	result, err := p.consumeResponseBounded(response, meter.budget, &accounting)
+	if addErr := meter.addHeaders(accounting.HeaderBytes); addErr != nil {
+		return result, errors.Join(err, addErr)
+	}
+	if addErr := meter.addCompressed(accounting.CompressedResponseBytes); addErr != nil {
+		return result, errors.Join(err, addErr)
+	}
+	if addErr := meter.addDecompressed(accounting.DecompressedResponseBytes); addErr != nil {
+		return result, errors.Join(err, addErr)
+	}
+	return result, err
+}
+
+func (p *Provider) consumeResponseBounded(response *http.Response, budget mergelifecycle.ProviderBudgetV1, accounting *mergelifecycle.ProviderCallAccountingV1) (result httpResult, returnedErr error) {
 	defer func() {
 		if err := response.Body.Close(); err != nil {
 			returnedErr = errors.Join(returnedErr, errors.New("response body close failed"))
@@ -336,7 +407,13 @@ func (p *Provider) consumeResponse(response *http.Response, meter *callMeter) (r
 	result.Status = response.StatusCode
 	result.ObservedNano = p.now().UnixNano()
 	result.LinkObserved = true
-	result.Link = response.Header.Get("Link")
+	links := headerFieldValues(response.Header, "Link")
+	if len(links) > 1 {
+		return result, errors.New("repeated Link response header is not permitted")
+	}
+	if len(links) == 1 {
+		result.Link = links[0]
+	}
 	if len(result.Link) > p.limits.MaxLinkHeaderBytes {
 		return result, errors.New("Link response header exceeds the fixed provider limit")
 	}
@@ -344,23 +421,30 @@ func (p *Provider) consumeResponse(response *http.Response, meter *callMeter) (r
 	if headerBytes > int64(p.limits.MaxResponseHeaderBytes) {
 		return result, errors.New("response headers exceed the fixed provider limit")
 	}
-	if err := meter.addHeaders(headerBytes); err != nil {
-		return result, err
+	if headerBytes > budget.HeaderBytes {
+		return result, errors.New("cumulative response header budget exceeded")
 	}
-	ids := response.Header.Values("X-GitHub-Request-Id")
+	accounting.HeaderBytes = headerBytes
+	ids := headerFieldValues(response.Header, "X-GitHub-Request-Id")
 	if len(ids) != 1 || !validRequestID(ids[0], p.limits.MaxRequestIDBytes) {
 		return result, errors.New("GitHub request identity is missing, duplicated, or unsafe")
 	}
 	result.RequestID = ids[0]
-	encoding := strings.TrimSpace(strings.ToLower(response.Header.Get("Content-Encoding")))
+	encodings := headerFieldValues(response.Header, "Content-Encoding")
+	if len(encodings) > 1 {
+		return result, errors.New("repeated Content-Encoding response header is not permitted")
+	}
+	encoding := ""
+	if len(encodings) == 1 {
+		encoding = strings.TrimSpace(strings.ToLower(encodings[0]))
+	}
 	if encoding == "" {
 		encoding = "identity"
 	}
 	if encoding != "identity" && encoding != "gzip" || strings.Contains(encoding, ",") {
 		return result, errors.New("unsupported or multiple content encodings")
 	}
-	compressedRemaining := meter.budget.CompressedResponseBytes - meter.accounting.CompressedResponseBytes
-	compressedLimit := minInt64(int64(p.limits.MaxCompressedResponseBodyBytes), compressedRemaining)
+	compressedLimit := minInt64(int64(p.limits.MaxCompressedResponseBodyBytes), budget.CompressedResponseBytes)
 	if compressedLimit <= 0 {
 		return result, errors.New("compressed response budget is exhausted")
 	}
@@ -368,9 +452,7 @@ func (p *Provider) consumeResponse(response *http.Response, meter *callMeter) (r
 	if int64(len(raw)) > compressedLimit {
 		return result, errors.New("compressed response body exceeds its limit")
 	}
-	if addErr := meter.addCompressed(int64(len(raw))); addErr != nil {
-		return result, addErr
-	}
+	accounting.CompressedResponseBytes = int64(len(raw))
 	if err != nil {
 		return result, errors.New("response body read failed")
 	}
@@ -380,8 +462,7 @@ func (p *Provider) consumeResponse(response *http.Response, meter *callMeter) (r
 		if gzipErr != nil {
 			return result, errors.New("gzip response cannot be decoded")
 		}
-		decompressedRemaining := meter.budget.DecompressedResponseBytes - meter.accounting.DecompressedResponseBytes
-		decompressedLimit := minInt64(int64(p.limits.MaxDecompressedResponseBodyBytes), decompressedRemaining)
+		decompressedLimit := minInt64(int64(p.limits.MaxDecompressedResponseBodyBytes), budget.DecompressedResponseBytes)
 		decoded, err = io.ReadAll(io.LimitReader(reader, decompressedLimit+1))
 		closeErr := reader.Close()
 		if int64(len(decoded)) > decompressedLimit {
@@ -394,9 +475,10 @@ func (p *Provider) consumeResponse(response *http.Response, meter *callMeter) (r
 	if int64(len(decoded)) > int64(p.limits.MaxDecompressedResponseBodyBytes) {
 		return result, errors.New("decompressed response body exceeds the fixed provider limit")
 	}
-	if err := meter.addDecompressed(int64(len(decoded))); err != nil {
-		return result, err
+	if int64(len(decoded)) > budget.DecompressedResponseBytes {
+		return result, errors.New("cumulative decompressed response budget exceeded")
 	}
+	accounting.DecompressedResponseBytes = int64(len(decoded))
 	if len(decoded) == 0 {
 		return result, errors.New("GitHub response body is empty")
 	}
@@ -410,6 +492,23 @@ func (p *Provider) consumeResponse(response *http.Response, meter *callMeter) (r
 	}
 	result.Body = append([]byte(nil), decoded...)
 	return result, nil
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func headerFieldValues(header http.Header, name string) []string {
+	var values []string
+	for key, fields := range header {
+		if strings.EqualFold(key, name) {
+			values = append(values, fields...)
+		}
+	}
+	return values
 }
 
 func jsonDecoder(data []byte) *json.Decoder {

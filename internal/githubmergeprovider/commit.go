@@ -54,7 +54,10 @@ type gitCommitResponse struct {
 }
 
 func (p *Provider) PrepareResultCommit(ctx context.Context, recipe githublifecycle.MergeCommitRecipeV1) (out mergelifecycle.CommitPreparation, returnedErr error) {
-	meter := p.startMeter(ctx)
+	meter, err := p.startMeter(ctx)
+	if err != nil {
+		return out, err
+	}
 	defer func() { out.Accounting = p.finishMeter(meter) }()
 	input := recipe.Input()
 	if err := validateRecipeForProvider(recipe); err != nil {
@@ -68,7 +71,7 @@ func (p *Provider) PrepareResultCommit(ctx context.Context, recipe githublifecyc
 		return out, err
 	}
 	tracker := &submissionTracker{}
-	response, requestErr := p.requestJSON(ctx, meter, p.mutationClient(tracker), tracker, http.MethodPost,
+	response, requestErr := p.requestJSON(ctx, meter, mergelifecycle.ProviderCallCommitSubmissionV1, p.mutationClient(tracker), tracker, http.MethodPost,
 		repoPath(input.Repository)+"/git/commits", body)
 	if requestErr != nil {
 		return out, requestErr
@@ -93,7 +96,10 @@ func (p *Provider) PrepareResultCommit(ctx context.Context, recipe githublifecyc
 }
 
 func (p *Provider) ReconcileResultCommit(ctx context.Context, recipe githublifecycle.MergeCommitRecipeV1) (out mergelifecycle.CommitPreparation, returnedErr error) {
-	meter := p.startMeter(ctx)
+	meter, err := p.startMeter(ctx)
+	if err != nil {
+		return out, err
+	}
 	defer func() { out.Accounting = p.finishMeter(meter) }()
 	return p.reconcileResultCommit(ctx, meter, recipe)
 }
@@ -161,7 +167,7 @@ func timezoneOffset(value string) (int, error) {
 
 func (p *Provider) observePreparedCommit(ctx context.Context, meter *callMeter, recipe githublifecycle.MergeCommitRecipeV1) (mergelifecycle.CommitPreparation, error) {
 	input := recipe.Input()
-	response, err := p.readJSON(ctx, meter, http.MethodGet,
+	response, err := p.readJSONOnce(ctx, meter, mergelifecycle.ProviderCallPreSubmitV1, http.MethodGet,
 		repoPath(input.Repository)+"/git/commits/"+escapedSegment(input.ExpectedResultSHA.String()), nil)
 	if err != nil {
 		return mergelifecycle.CommitPreparation{}, err
