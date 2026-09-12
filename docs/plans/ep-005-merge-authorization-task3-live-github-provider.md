@@ -35,17 +35,18 @@ If the provider cannot implement the frozen interfaces/contracts without changin
 
 - Production supports `merge` only. Squash/rebase and fork-head PRs fail closed before mutation.
 - Production origin is exactly `https://api.github.com`; GraphQL endpoint exactly `/graphql`; REST paths are closed templates with escaped components.
-- The provider owns the HTTP client, origin, API version, headers, redirect policy, connection policy, limits, and request construction. Callers cannot select URLs, transports, headers, queries, methods, policy, merge method, refs, or credentials.
+- The provider owns the HTTP client, origin, API version, headers, redirect policy, connection policy, limits, and all read/preparation request construction. Callers cannot select URLs, transports, headers, queries, methods, policy, merge method, refs, or credentials. The target mutation is the exception: its method/path/canonical GraphQL body bytes are already fixed by the controller-published `TargetSubmissionV1` and the provider must transmit those exact bytes rather than reconstructing an equivalent body.
+- Target request method/path/body bytes, SHA-256 and encoded length must equal the pre-published `TargetSubmissionV1` byte-for-byte before transport; request-byte/zero-byte instrumentation is bound to that exact submission identity. Any divergence fails closed before transport.
 - Authentication is injected by a sealed authenticator only after request identity is fixed; credentials never enter logs/evidence/errors.
 - `github-update-refs-atomic-base-head-v1` is frozen in a reviewed embedded canonical capability record and validated both at provider construction/startup and before target admission/execution.
-- Target mutation is exactly one GraphQL `updateRefs` request containing exactly two distinct same-repository refs in base-then-head order: base CAS to expected result OID plus head no-op CAS, exact `beforeOid`/`afterOid`, `force=false` for both.
+- Target mutation is exactly one GraphQL `updateRefs` request containing exactly two distinct same-repository refs in base-then-head order: base CAS to expected result OID plus head no-op CAS, exact `beforeOid`/`afterOid`, `force=false` for both. `APPLIED` from the submission path additionally requires HTTP 200, no GraphQL errors, exact echoed `clientMutationId`, and independent observation of both refs plus the exact result object; mutation-payload success alone is never sufficient.
 - The provider never calls GitHub's ordinary PR merge endpoint and never uses REST ref-update mutation as a fallback.
 - Commit preparation creates only the exact deterministic commit object and then independently observes/reconstructs exact object bytes/fields before reporting success.
-- Authorization observation independently obtains the exact PR/repository/principal facts plus complete check-run, commit-status, and review pagination closures required by the frozen contracts.
+- Authorization observation independently obtains the exact PR/repository/principal facts plus complete check-run, commit-status, and review pagination closures required by the frozen contracts. Each `ObserveAuthorization` call is phase-fresh: final revalidation performs new PR/review/check-run/status requests, reuses no admission request identity, binds every response time inside its reported start/completion interval, and attributes counters to that phase only.
 - Every eligible exact-head dismissed review blocks as `REVIEW_HISTORY_UNPROVEN`; production v1 supplies no authenticated review-history bypass.
 - Submission classification is byte-boundary conservative: only local pre-transport failure or proved zero plaintext HTTP request bytes may be `submitted=false`; otherwise ambiguity is `UNKNOWN` and only read-only reconciliation follows.
 - Mutation transport has no automatic retry, keep-alive, HTTP/2, proxy, redirect, caller-selected origin, or hidden second target write.
-- Response header, Link, request-ID, request-body, compressed/decompressed body, cumulative byte/call/time budgets are enforced from controller-provided remaining budgets without exceeding production maxima.
+- Response header, Link, request-ID, request-body, compressed/decompressed body, cumulative byte/call/time budgets are enforced from controller-provided remaining budgets without exceeding production maxima. Read/observation and commit-preparation status classes follow the master-design table exactly: only documented read 200 is accepted; read auth/not-found/unavailable/invalid-evidence classes remain distinct with bounded read retries; commit creation accepts only documented 201 plus exact object proof, treats well-formed 4xx as rejected preparation with zero ref write, and routes every possibly-submitted ambiguous preparation class to exact-object reconciliation only.
 - Every non-nil response body is closed on every success/error/limit/decode/cancel path; one bounded JSON value plus EOF is required.
 - Reconciliation is merge-only and read-only. `APPLIED` materializes the exact validated result, `NOT_APPLIED` requires the frozen typed proof, and all unproved cases remain `UNKNOWN`.
 - Post-merge observation proves the exact result object plus target equal-or-descendant containment under `github-compare-v1`; it never infers success from PR `merged=true` alone.
@@ -84,11 +85,11 @@ Every row below is mandatory. A passing test that does not exercise the named pr
 | T3-01 | sealed origin/auth/request identity; redirect/proxy/credential non-forwarding | local transport tests with malicious origins/paths/headers/authenticator mutation |
 | T3-02 | exact header/body/request-ID/compression/body-close limits | exact-limit and limit+1 local HTTP tests; body-close assertions on every response class |
 | T3-03 | canonical frozen capability record matches compiled provider | startup + pre-target validation tests; digest mismatch/unsupported no-op/all-or-nothing fail closed |
-| T3-04 | exact PR/repository/principal eligibility and same-repository head | open/non-draft/unmerged positive; closed/draft/converted/merged/fork/identity mismatch negatives |
-| T3-05 | complete independent reviews/check-runs/status pagination | page/cursor chain, duplicate, truncation, malformed Link/pageInfo, exact-limit/limit+1 tests |
+| T3-04 | exact PR/repository/principal eligibility, same-repository head, and phase freshness | open/non-draft/unmerged positive; closed/draft/converted/merged/fork/identity mismatch negatives; final phase uses fresh disjoint request identities and bounded response times |
+| T3-05 | complete independent reviews/check-runs/status pagination with initial/final freshness | page/cursor chain, duplicate, truncation, malformed Link/pageInfo, exact-limit/limit+1 tests; final closures reuse no admission request identity and counters belong to the current phase |
 | T3-06 | dismissed current-head eligible review blocks | explicit `REVIEW_HISTORY_UNPROVEN` regression; no production bypass |
 | T3-07 | exact deterministic commit preparation/observation | exact recipe/OID/bytes/tree/parents/message/author/committer positive and mismatch/ambiguous negatives |
-| T3-08 | exactly one two-entry GraphQL `updateRefs` mutation | wire test proves base-then-head, exact before/after, same-repo head no-op, both `force=false` |
+| T3-08 | exactly one two-entry GraphQL `updateRefs` mutation bound to the published submission and independently verified success | transmitted method/path/body equal `TargetSubmissionV1` bytes/digest/length; base-then-head exact OIDs/head no-op/both `force=false`; HTTP 200 + no errors + exact mutation-ID echo + independent base/head/result observation required for APPLIED |
 | T3-09 | forbidden mutation endpoints are unreachable | tests assert zero ordinary PR-merge and REST ref-update calls/strings in production request routing |
 | T3-10 | byte-boundary submission classification | pre-transport zero-byte positive plus possible-byte timeout/error/cancel/body-close => UNKNOWN; no retry |
 | T3-11 | typed NOT_APPLIED vs UNKNOWN mapping | stable machine code proof only; generic errors/message text/open PR/old target remain UNKNOWN |
@@ -99,6 +100,7 @@ Every row below is mandatory. A passing test that does not exercise the named pr
 | T3-16 | concurrency and cancellation do not duplicate writes | deterministic race/fault tests prove <=1 commit creation and <=1 target submission per exact attempt/provider instance |
 | T3-17 | interface compatibility without Task-1/2 changes | provider satisfies `mergelifecycle.Provider`; frozen package diffs empty; Task-1/2 regressions pass |
 | T3-18 | opt-in controlled live conformance harness is bounded | test code requires explicit fixture and verifies accepted two-ref update plus wrong-base/wrong-head all-or-nothing boundaries; skipped by default |
+| T3-19 | deterministic read and commit-preparation response classes | table-driven §6 mapping: read 200/auth/not-found/unavailable/invalid-evidence + bounded retry; commit 201 exact proof, well-formed 4xx rejected with zero ref write, ambiguous classes reconcile exact object only |
 
 ## Required named regression entrypoints
 
