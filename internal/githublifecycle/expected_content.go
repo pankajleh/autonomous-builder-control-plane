@@ -78,6 +78,51 @@ func (e ExpectedMergeContent) valid() bool {
 	return err == nil && bytes.Equal(canonical, e.canonical) && digest == e.digest
 }
 
+// ParseCanonicalExpectedMergeContent strictly rehydrates controller-owned
+// expected content for durable merge-input recovery.
+func ParseCanonicalExpectedMergeContent(data []byte) (ExpectedMergeContent, error) {
+	var wire struct {
+		DerivationPolicy string             `json:"derivation_policy"`
+		SourceHead       string             `json:"source_integrated_head_sha"`
+		SourceBase       string             `json:"source_baseline_sha"`
+		SourceEvidence   ledger.EvidenceRef `json:"source_integration_evidence"`
+		Git              struct {
+			Path         string `json:"path"`
+			Version      string `json:"version"`
+			BinarySHA256 string `json:"binary_sha256"`
+		} `json:"pinned_git"`
+		ExpectedTree string `json:"expected_result_tree_sha"`
+	}
+	if err := strictDecode(data, &wire); err != nil {
+		return ExpectedMergeContent{}, fmt.Errorf("decode expected merge content: %w", err)
+	}
+	head, err := NewGitSHA(wire.SourceHead)
+	if err != nil {
+		return ExpectedMergeContent{}, err
+	}
+	base, err := NewGitSHA(wire.SourceBase)
+	if err != nil {
+		return ExpectedMergeContent{}, err
+	}
+	tree, err := NewGitSHA(wire.ExpectedTree)
+	if err != nil {
+		return ExpectedMergeContent{}, err
+	}
+	git := PinnedGitIdentity{wire.Git.Path, wire.Git.Version, wire.Git.BinarySHA256}
+	canonical, digest, err := canonicalExpectedContent(wire.DerivationPolicy, head, base, wire.SourceEvidence, git, tree)
+	if err != nil {
+		return ExpectedMergeContent{}, err
+	}
+	value := ExpectedMergeContent{wire.DerivationPolicy, head, base, wire.SourceEvidence, git, tree, canonical, digest}
+	if !value.valid() {
+		return ExpectedMergeContent{}, errors.New("expected merge content is invalid")
+	}
+	if err := requireCanonical(data, canonical); err != nil {
+		return ExpectedMergeContent{}, err
+	}
+	return value, nil
+}
+
 // DeriveExpectedMergeContent verifies the immutable Phase 3 decision, pins the
 // exact Git executable, and resolves only the exact accepted integrated commit
 // under the controller's replacement-ref-resistant Git environment.

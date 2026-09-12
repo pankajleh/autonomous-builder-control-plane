@@ -1,0 +1,67 @@
+# EP-005 Task 2 — Exact Nine-Finding Correction Matrix
+
+## Authority and immutable inputs
+
+This is a bounded correction of the exact Task-2 candidate `d0673f6165acb0b27c52518417e99153ff8c33b1` only. It is authorized solely by the exact-head review verdict SHA-256 `61f560d45dfb6fca6cd3c506658b21c6c5b399d356d02b58746cbd626dc11696` and recovered deterministic-acceptance seal SHA-256 `0910ba33f08461b6303bc04abcdb63510c1218d6be3732bf553b6f2503950d4d`.
+
+The accepted master design `docs/plans/ep-005-merge-authorization-and-post-merge.md` remains authoritative. No design semantics are reopened. These nine rows are pre-existing Task-2 obligations, not scope expansion.
+
+## Mutation ceiling
+
+Permitted implementation changes are only:
+
+- `internal/mergelifecycle/**`
+- `internal/ledger/jsonl.go`
+- `internal/ledger/jsonl_test.go`
+- `internal/ledger/transition_barrier.go`
+- `internal/ledger/transition_barrier_test.go`
+- this correction plan, only to mark completion and move it to `docs/plans/completed/`
+
+`internal/githublifecycle/**`, `internal/run/**`, `internal/integrationgate/**`, Task 3 provider/network code, roadmap/status docs, publication, deployment, and Phase 5+ are frozen.
+
+## Exact correction matrix
+
+| ID | Review finding / accepted-design obligation | Root cause to remove | Required correction | Mandatory deterministic evidence before completion |
+|---|---|---|---|---|
+| T2-CORR-C01 | **C-01 Durable terminal selection can be ignored after restart.** Master design §§8 and crash matrix: durable `TerminalCoreV1` is the terminal-selection linearization point; restart must finish only that destination. | Startup discovers terminal state from ledger event, but not a core-only terminal selected before event fsync. | Add durable terminal-core discovery/indexing keyed to the run/attempt boundary. Under the run lock, before any provider call, strict-parse and independently validate any selected core and finish its exact event/final-terminal protocol. Never make a provider call after discovering a durable core. | Crash after durable `MERGED`, `FAILED`, and `CANCELLED` core but before event append/fsync; restart emits exactly the predetermined event, zero provider calls/mutations, no alternate terminal. Include pre-admission cancellation core case. |
+| T2-CORR-M01 | **M-01 READY/repository/policy evidence not verified by bytes.** Master design §1: controller authority must bounded-read canonical evidence and verify the full READY closure by bytes/digest. | Authority source copies structurally valid refs without resolving controller-owned evidence bytes. | Add controller-owned bounded no-follow evidence resolution. Verify repository/policy/READY authority-bearing artifact bytes, SHA-256, canonical identity, and closure membership before constructing authority. Caller cannot substitute paths or bytes. | Missing artifact, digest mismatch, symlink/hard-link/non-regular file, over-limit bytes, wrong repository/policy/READY artifact, omitted closure member, and valid exact bytes. All invalid cases make zero provider calls and cannot grant authority. |
+| T2-CORR-M02 | **M-02 Commit preparation accepts provider assertion instead of exact-object proof.** Master design §3 requires exact tree, ordered parents, message, identities, object format and expected OID proof before target-ref update. | `CommitPreparation` validates claimed recipe/OID/evidence refs but not an independently observed exact commit object. | Persist a typed preparation observation/proof and independently validate exact result object against the canonical recipe and expected OID before final seal. Ambiguous preparation reconciliation must use the identical proof path. | Exact object passes; wrong tree, parent order, one parent, message/trailer, author, committer, timestamp/object bytes/OID, malformed/absent observation all fail before target submission. Ambiguous preparation recovery never retries object creation when submission may have occurred. |
+| T2-CORR-M03 | **M-03 Settled negative outcomes lack exact canonical reasons.** Master design §8 exact legal dispositions. | READY identification and later authority assembly are conflated; failure mapping collapses distinct causes. | Separate proof of unique current READY from later authority/policy/provider/storage boundaries. Introduce typed failure classification and route every settled READY outcome through generic terminalization with exactly one legal canonical reason. Distinguish stale base/head/both for `NOT_APPLIED`. | Table-driven coverage for every Section-8 negative reason. Each proved-READY settled case produces exactly one `READY_FOR_MERGE -> FAILED`/authorized `CANCELLED` event with exact reason; only true target `UNKNOWN` remains READY. |
+| T2-CORR-M04 | **M-04 Cancellation recovery not independently bound to current authority.** Master design §4 requires byte-identical durable cancellation authority independently revalidated against fresh controller state/replay evidence. | Recovery expectations are derived from the recovered authority itself; pending cancellation can be missed across crash boundaries. | Durably index pending cancellation authority before it can be lost. On recovery reconstruct expected READY/scope/policy/requester/attempt/submission boundary from independent current controller state and durable records, then validate the identical cancellation authority/replay entry through the accepted validator. | Crash after cancellation channel fsync before pending marker; restart discovers it. Forged/wrong READY, policy, requester, attempt/write, seal/commitment, boundary, replay/source request, and late-after-APPLIED all fail closed. APPLIED wins; exact NOT_APPLIED may cancel. |
+| T2-CORR-M05 | **M-05 Cumulative provider budgets declarative rather than enforced.** Master design §6/§7 resource limits require cumulative bytes/time/calls and reconciliation rate across restart. | Controller increments high-level calls but does not durably reserve/account request/header/compressed/decompressed bytes, elapsed active provider time, request bytes, or reconciliation interval. | Add durable pre-operation reservations and post-observation accounting for every provider operation. Persist all phase/aggregate counters and reconciliation timestamps, enforce limits before the next operation, and reconcile counters after restart. | Exact-limit success and limit+1 rejection for calls, request bytes, headers, compressed/decompressed response bytes, active provider time and invocation time; restart preserves counters; reconciliation before minimum interval is rejected; no over-budget provider call occurs. |
+| T2-CORR-M06 | **M-06 Storage reservations and cleanup-recovery limits absent.** Master design §7 requires reservation-before-create, global/per-attempt accounting, monotone cleanup sequences, and 32-attempt/incident exhaustion. | Publication inventories but does not durably reserve capacity; cleanup sequence/counters are not advanced durably. | Add serialized durable per-attempt/global file+byte reservations before create/append. Reconcile reservations with inventory after restart. Persist monotone cleanup-attempt and incident sequences and enforce exhaustion. | Concurrent attempts cannot oversubscribe. Exact per-attempt/global file/byte limits pass; limit+1 fails before creation. Crash/restart preserves reservations. Cleanup incidents sequence monotonically; 32nd exhaustion records `LOCAL_CLEANUP_RECOVERY_EXHAUSTED`; 33rd automatic cleanup does not run. |
+| T2-CORR-M07 | **M-07 Linux state/ledger vulnerable to path replacement.** Master design §§1,5,7 require descriptor-relative no-follow/no-replace filesystem operations and stable physical ledger/state identity. | Durable store and ledger reopen path names and use replace-capable path operations; physical identity is only cleaned path text. | Retain trusted directory/file descriptors; perform traversal/read/create/publication with descriptor-relative no-follow operations; verify regular type/owner/link count; use no-replace publication; bind stable device/inode identity and reject replacement across snapshots/recovery. | Parent/path replacement, symlink/hard-link/device/socket, same-name substitution, destination race, and replaced ledger inode all fail closed. Byte-identical create-or-verify remains idempotent; no unsafe entry is followed, replaced or deleted. |
+| T2-CORR-M08 | **M-08 Required repository/base lock absent.** Master design §§1–3 requires run-transition plus repository/base lock across final revalidation, sealing, target submission and settlement/barrier persistence. | Only run-transition lease exists, so distinct READY runs for the same repository/base can interleave. | Add durable repository/base lease keyed by authority-bound stable repository identity plus full base ref. Acquire in a fixed documented order with the run lease and retain it through final revalidation/seal/submission/settlement or unresolved-barrier persistence. | Two runs same repository/base serialize deterministically; different bases may proceed independently; wrong repository/ref cannot alias. Crash/restart cannot create two mutation rights. Lock-order test proves no inversion/deadlock with run transition and storage locks. |
+
+## Frozen regression entrypoints
+
+The implementation must provide these exact Go test entrypoints; acceptance invokes them by name, so self-authored generic tests cannot substitute for a missing matrix row:
+
+- `internal/mergelifecycle`: `TestCorrectionC01TerminalCoreRecovery`
+- `internal/mergelifecycle`: `TestCorrectionM01AuthorityEvidenceBytes`
+- `internal/mergelifecycle`: `TestCorrectionM02ExactCommitPreparationProof`
+- `internal/mergelifecycle`: `TestCorrectionM03CanonicalTerminalReasons`
+- `internal/mergelifecycle`: `TestCorrectionM04CancellationRecoveryBinding`
+- `internal/mergelifecycle`: `TestCorrectionM05CumulativeProviderBudgets`
+- `internal/mergelifecycle`: `TestCorrectionM06StorageReservationsCleanupLimits`
+- `internal/ledger`: `TestCorrectionM07DescriptorRelativeDurability`
+- `internal/mergelifecycle`: `TestCorrectionM08RepositoryBaseLock`
+
+Each entrypoint must assert the mandatory evidence in its matrix row, including negative/fault/restart boundaries; a placeholder, skipped test, or assertion-free test is a failed matrix row.
+
+## One correction implementation only
+
+There is exactly one implementation task in this plan. It must close all nine rows together. It may not introduce a second correction task, new blocker family, Task-3 behavior, or design rewrite.
+
+### Task 1: Close exact Task-2 review findings C-01 + M-01…M-08
+
+- [x] Implement the root-cause corrections for all nine matrix rows without editing frozen Task-1 contracts.
+- [x] Add deterministic regression tests named/tagged or otherwise directly traceable to every matrix ID.
+- [x] Prove every matrix row's mandatory evidence independently; passing generic package tests alone is insufficient.
+- [x] Run Task-2 focused tests, repeated crash/concurrency tests, race tests, Task-1 regression, full repository tests/vet, smoke with VCS stamping disabled in metadata-free checkout, non-Linux compile-only, scope/frozen-contract/network-free/dependency/diff checks.
+- [x] Emit a correction evidence manifest mapping all 9/9 IDs to exact test commands/results before committing.
+- [x] Commit exactly one correction implementation commit after all 9/9 rows pass; move this plan to `docs/plans/completed/` in that same commit.
+
+## Completion gate
+
+Implementation completion requires **9/9 matrix rows PASS** plus all repository gates. It does not itself claim Task-2 closure. After the one correction commit, a separate deterministic acceptance and one read-only exact-head closure review are still required. If any matrix row cannot be satisfied without changing `internal/githublifecycle/**`, introducing Task-3 transport, or reopening accepted design, stop with `SCOPE_EXPANSION_REQUIRED` and do not partially close the plan.

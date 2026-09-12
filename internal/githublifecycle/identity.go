@@ -183,6 +183,8 @@ type AuthorityInput struct {
 	AllowedMergeMethod MergeMethod
 	Actor              ActingIdentity
 	ExpectedContent    ExpectedMergeContent
+	ReadyBinding       ReadyAuthorityBindingV1
+	MergePolicy        MergePolicyV1
 }
 
 // Authority is immutable and safe to copy.
@@ -202,6 +204,22 @@ func NewAuthority(input AuthorityInput) (Authority, error) {
 	if input.PullRequest != nil && !input.PullRequest.valid() {
 		return Authority{}, errors.New("pull request identity is invalid")
 	}
+	hasReady, hasPolicy := input.ReadyBinding.valid(), input.MergePolicy.valid()
+	if hasReady != hasPolicy {
+		return Authority{}, errors.New("READY and policy authority bindings must be supplied together")
+	}
+	if hasReady {
+		ready := input.ReadyBinding.input
+		repositoryBinding := ready.RepositoryBinding.input
+		policyAuthority := input.MergePolicy.input.AuthorityBinding.input
+		if repositoryBinding.GitHubRepository != input.Repository || ready.IntegratedHeadSHA != input.HeadSHA || ready.BaselineSHA != input.ExpectedBaseTipSHA ||
+			ready.ExpectedTreeSHA != input.ExpectedContent.ExpectedResultTreeSHA() || ready.ReadyDecisionRef != input.ExpectedContent.SourceIntegrationEvidence() ||
+			input.MergePolicy.Method() != input.AllowedMergeMethod || policyAuthority.RequiredActingPrincipal != input.Actor ||
+			policyAuthority.RepositoryBindingSHA256 != input.ReadyBinding.RepositoryBinding().SHA256() || policyAuthority.Phase3AuthoritySHA256 != ready.Phase3AuthoritySHA256 ||
+			policyAuthority.ReadyBindingSHA256 != input.ReadyBinding.SHA256() {
+			return Authority{}, errors.New("READY, repository, policy, actor, head, base, or expected-content authority binding disagrees")
+		}
+	}
 	input = cloneAuthorityInput(input)
 	return Authority{data: input}, nil
 }
@@ -217,6 +235,10 @@ func (a Authority) Actor() ActingIdentity           { return a.data.Actor }
 func (a Authority) ExpectedContent() ExpectedMergeContent {
 	return cloneExpectedContent(a.data.ExpectedContent)
 }
+func (a Authority) ReadyBinding() ReadyAuthorityBindingV1 {
+	return cloneReadyBinding(a.data.ReadyBinding)
+}
+func (a Authority) MergePolicy() MergePolicyV1 { return cloneMergePolicy(a.data.MergePolicy) }
 func (a Authority) PullRequest() (PullRequestIdentity, bool) {
 	if a.data.PullRequest == nil {
 		return PullRequestIdentity{}, false
@@ -239,20 +261,105 @@ func (a Authority) CanonicalJSON() ([]byte, error) {
 		wire := pullRequestWire(*a.data.PullRequest)
 		pullRequest = &wire
 	}
-	return json.Marshal(struct {
-		Repository         repoWire        `json:"repository"`
-		BaseBranch         string          `json:"base_branch"`
-		HeadBranch         string          `json:"head_branch"`
-		HeadSHA            string          `json:"head_sha"`
-		ExpectedBaseTipSHA string          `json:"expected_base_tip_sha"`
-		PullRequest        *prIdentityWire `json:"pull_request,omitempty"`
-		AllowedMergeMethod MergeMethod     `json:"allowed_merge_method"`
-		Actor              actorWire       `json:"actor"`
-		ExpectedContent    json.RawMessage `json:"expected_merge_content"`
-	}{
+	if !a.data.ReadyBinding.valid() && !a.data.MergePolicy.valid() {
+		return json.Marshal(struct {
+			Repository         repoWire        `json:"repository"`
+			BaseBranch         string          `json:"base_branch"`
+			HeadBranch         string          `json:"head_branch"`
+			HeadSHA            string          `json:"head_sha"`
+			ExpectedBaseTipSHA string          `json:"expected_base_tip_sha"`
+			PullRequest        *prIdentityWire `json:"pull_request,omitempty"`
+			AllowedMergeMethod MergeMethod     `json:"allowed_merge_method"`
+			Actor              actorWire       `json:"actor"`
+			ExpectedContent    json.RawMessage `json:"expected_merge_content"`
+		}{repositoryWire(a.data.Repository), a.data.BaseBranch.String(), a.data.HeadBranch.String(), a.data.HeadSHA.String(), a.data.ExpectedBaseTipSHA.String(), pullRequest, a.data.AllowedMergeMethod, actingWire(a.data.Actor), a.data.ExpectedContent.CanonicalJSON()})
+	}
+	return json.Marshal(authorityWireV1{
 		repositoryWire(a.data.Repository), a.data.BaseBranch.String(), a.data.HeadBranch.String(), a.data.HeadSHA.String(),
 		a.data.ExpectedBaseTipSHA.String(), pullRequest, a.data.AllowedMergeMethod, actingWire(a.data.Actor), a.data.ExpectedContent.CanonicalJSON(),
+		a.data.ReadyBinding.CanonicalJSON(), a.data.ReadyBinding.SHA256(), a.data.MergePolicy.CanonicalJSON(), a.data.MergePolicy.SHA256(),
 	})
+}
+
+type authorityWireV1 struct {
+	Repository         repoWire        `json:"repository"`
+	BaseBranch         string          `json:"base_branch"`
+	HeadBranch         string          `json:"head_branch"`
+	HeadSHA            string          `json:"head_sha"`
+	ExpectedBaseTipSHA string          `json:"expected_base_tip_sha"`
+	PullRequest        *prIdentityWire `json:"pull_request,omitempty"`
+	AllowedMergeMethod MergeMethod     `json:"allowed_merge_method"`
+	Actor              actorWire       `json:"actor"`
+	ExpectedContent    json.RawMessage `json:"expected_merge_content"`
+	ReadyBinding       json.RawMessage `json:"ready_authority_binding"`
+	ReadyBindingSHA256 string          `json:"ready_authority_binding_sha256"`
+	MergePolicy        json.RawMessage `json:"merge_policy"`
+	MergePolicySHA256  string          `json:"merge_policy_sha256"`
+}
+
+// ParseCanonicalAuthority rejects every representation that is not the exact
+// output of Authority.CanonicalJSON and re-runs all ordinary constructors.
+func ParseCanonicalAuthority(data []byte, limits Limits) (Authority, error) {
+	var wire authorityWireV1
+	if err := strictDecode(data, &wire); err != nil {
+		return Authority{}, err
+	}
+	repository, err := NewRepository(wire.Repository.Owner, wire.Repository.Name)
+	if err != nil {
+		return Authority{}, err
+	}
+	base, err := NewBranch(wire.BaseBranch)
+	if err != nil {
+		return Authority{}, err
+	}
+	head, err := NewBranch(wire.HeadBranch)
+	if err != nil {
+		return Authority{}, err
+	}
+	headSHA, err := NewGitSHA(wire.HeadSHA)
+	if err != nil {
+		return Authority{}, err
+	}
+	baseSHA, err := NewGitSHA(wire.ExpectedBaseTipSHA)
+	if err != nil {
+		return Authority{}, err
+	}
+	actor, err := actorFromWire(wire.Actor)
+	if err != nil {
+		return Authority{}, err
+	}
+	expected, err := ParseCanonicalExpectedMergeContent(wire.ExpectedContent)
+	if err != nil {
+		return Authority{}, err
+	}
+	ready, err := ParseCanonicalReadyAuthorityBindingV1(wire.ReadyBinding, limits)
+	if err != nil {
+		return Authority{}, err
+	}
+	policy, err := ParseCanonicalMergePolicyV1(wire.MergePolicy, limits)
+	if err != nil {
+		return Authority{}, err
+	}
+	if ready.SHA256() != wire.ReadyBindingSHA256 || policy.SHA256() != wire.MergePolicySHA256 {
+		return Authority{}, errors.New("authority nested digest disagrees")
+	}
+	var pr *PullRequestIdentity
+	if wire.PullRequest != nil {
+		value, err := NewPullRequestIdentity(wire.PullRequest.Number, wire.PullRequest.NodeID)
+		if err != nil {
+			return Authority{}, err
+		}
+		pr = &value
+	}
+	value, err := NewAuthority(AuthorityInput{repository, base, head, headSHA, baseSHA, pr, wire.AllowedMergeMethod, actor, expected, ready, policy})
+	if err != nil {
+		return Authority{}, err
+	}
+	canonical, _ := value.CanonicalJSON()
+	if err := requireCanonical(data, canonical); err != nil {
+		return Authority{}, err
+	}
+	return value, nil
 }
 
 func (a Authority) SHA256() (string, error) {
@@ -272,6 +379,20 @@ func cloneAuthorityInput(input AuthorityInput) AuthorityInput {
 		input.PullRequest = &copy
 	}
 	input.ExpectedContent = cloneExpectedContent(input.ExpectedContent)
+	input.ReadyBinding = cloneReadyBinding(input.ReadyBinding)
+	input.MergePolicy = cloneMergePolicy(input.MergePolicy)
+	return input
+}
+
+func cloneReadyBinding(input ReadyAuthorityBindingV1) ReadyAuthorityBindingV1 {
+	input.input = cloneReadyBindingInput(input.input)
+	input.canonical = append([]byte(nil), input.canonical...)
+	return input
+}
+
+func cloneMergePolicy(input MergePolicyV1) MergePolicyV1 {
+	input.input = cloneMergePolicyInput(input.input)
+	input.canonical = append([]byte(nil), input.canonical...)
 	return input
 }
 

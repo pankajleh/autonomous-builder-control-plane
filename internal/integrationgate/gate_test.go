@@ -39,6 +39,10 @@ func TestCleanGateOwnsProvenanceAndReachesReadyForMerge(t *testing.T) {
 		t.Fatalf("states = %v, want %v", got, want)
 	}
 	for _, event := range fixture.events.events {
+		if event.ProjectID != fixture.request.Authority.Repository().Identity || event.PlanID != fixture.request.Authority.Plan().SHA256 ||
+			event.AttemptID != fixture.request.Authority.RunID() || event.Actor != "controller" || event.Source != "integration-gate" {
+			t.Fatalf("transition lost controller provenance: %+v", event)
+		}
 		if len(event.EvidenceRefs) == 0 {
 			t.Fatalf("transition %s has no evidence", event.StateTo)
 		}

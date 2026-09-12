@@ -41,6 +41,14 @@ type EventAppender interface {
 	Append(ledger.Event) error
 }
 
+// TransitionProvenance is controller-owned identity copied onto every state
+// transition so later lifecycle stages can reconstruct one exact run history.
+type TransitionProvenance struct {
+	ProjectID string
+	PlanID    string
+	AttemptID string
+}
+
 // CommandRunner is the supervised structured-command operation required by a
 // Runner. supervisor.Runner satisfies this interface.
 type CommandRunner interface {
@@ -92,6 +100,7 @@ func (r Result) Accepted() bool {
 type Runner struct {
 	governed      authority.Authority
 	capsule       authority.ContextCapsuleManifest
+	provenance    TransitionProvenance
 	events        EventAppender
 	artifacts     supervisor.ArtifactWriter
 	processes     CommandRunner
@@ -102,15 +111,26 @@ type Runner struct {
 // New constructs an EP-002 runner from validated authority and explicit
 // ledger, evidence, and subprocess dependencies.
 func New(governed authority.Authority, events EventAppender, artifacts supervisor.ArtifactWriter, processes CommandRunner) (*Runner, error) {
-	return newRunner(governed, events, artifacts, processes, nil)
+	return newRunner(governed, DerivedTransitionProvenance(governed), events, artifacts, processes, nil)
 }
 
 // NewWithController constructs the mandatory durable V3 execution path.
 func NewWithController(governed authority.Authority, events EventAppender, artifacts supervisor.ArtifactWriter, processes CommandRunner, controller *governancev3.ControllerV1) (*Runner, error) {
-	return newRunner(governed, events, artifacts, processes, controller)
+	return newRunner(governed, DerivedTransitionProvenance(governed), events, artifacts, processes, controller)
 }
 
-func newRunner(governed authority.Authority, events EventAppender, artifacts supervisor.ArtifactWriter, processes CommandRunner, controller *governancev3.ControllerV1) (*Runner, error) {
+// DerivedTransitionProvenance supplies a stable legacy mapping when an outer
+// controller has not assigned explicit project/plan/attempt identifiers.
+func DerivedTransitionProvenance(governed authority.Authority) TransitionProvenance {
+	return TransitionProvenance{ProjectID: governed.Repository().Identity, PlanID: governed.Plan().SHA256, AttemptID: governed.RunID()}
+}
+
+// NewWithProvenance constructs a runner with explicit controller provenance.
+func NewWithProvenance(governed authority.Authority, provenance TransitionProvenance, events EventAppender, artifacts supervisor.ArtifactWriter, processes CommandRunner) (*Runner, error) {
+	return newRunner(governed, provenance, events, artifacts, processes, nil)
+}
+
+func newRunner(governed authority.Authority, provenance TransitionProvenance, events EventAppender, artifacts supervisor.ArtifactWriter, processes CommandRunner, controller *governancev3.ControllerV1) (*Runner, error) {
 	if governed.RunID() == "" || governed.SHA256() == "" {
 		return nil, errors.New("validated authority is required")
 	}
@@ -122,6 +142,9 @@ func newRunner(governed authority.Authority, events EventAppender, artifacts sup
 	}
 	if processes == nil {
 		return nil, errors.New("process supervisor is required")
+	}
+	if err := validateTransitionProvenance(provenance); err != nil {
+		return nil, err
 	}
 	capsule, err := validateOperationAuthority(governed)
 	if err != nil {
@@ -148,7 +171,7 @@ func newRunner(governed authority.Authority, events EventAppender, artifacts sup
 			return nil, errors.New("EXECUTION_BOUNDS_INVALID: Linux containment handoff is unavailable")
 		}
 	}
-	return &Runner{governed: governed, capsule: capsule, events: events, artifacts: artifacts, processes: processes, controller: controller, parsedCapsule: parsedCapsule}, nil
+	return &Runner{governed: governed, capsule: capsule, provenance: provenance, events: events, artifacts: artifacts, processes: processes, controller: controller, parsedCapsule: parsedCapsule}, nil
 }
 
 func autonomousDevelopmentCapsule(capsule contextcapsule.Capsule) bool {
@@ -480,6 +503,7 @@ func (r *Runner) appendCreated(authorityRef ledger.EvidenceRef) error {
 	}
 	event.Payload = map[string]any{"state": domain.StateRunCreated, "authority_sha256": r.governed.SHA256()}
 	event.EvidenceRefs = []ledger.EvidenceRef{authorityRef}
+	r.applyTransitionProvenance(&event)
 	if err := r.events.Append(event); err != nil {
 		return fmt.Errorf("append RUN_CREATED event: %w", err)
 	}
@@ -499,10 +523,26 @@ func (r *Runner) transition(from, to domain.State, source string, payload map[st
 	}
 	event.StateFrom = from
 	event.StateTo = to
+	r.applyTransitionProvenance(&event)
 	event.Payload = payload
 	event.EvidenceRefs = append([]ledger.EvidenceRef(nil), refs...)
 	if err := r.events.Append(event); err != nil {
 		return fmt.Errorf("append %s transition: %w", to, err)
+	}
+	return nil
+}
+
+func (r *Runner) applyTransitionProvenance(event *ledger.Event) {
+	event.ProjectID = r.provenance.ProjectID
+	event.PlanID = r.provenance.PlanID
+	event.AttemptID = r.provenance.AttemptID
+}
+
+func validateTransitionProvenance(value TransitionProvenance) error {
+	for name, field := range map[string]string{"project": value.ProjectID, "plan": value.PlanID, "attempt": value.AttemptID} {
+		if field == "" || len(field) > 4096 || strings.TrimSpace(field) != field || strings.IndexAny(field, "\r\n\x00") >= 0 {
+			return fmt.Errorf("%s transition provenance is invalid", name)
+		}
 	}
 	return nil
 }
