@@ -13,6 +13,66 @@ contract, not a claim that a live GitHub deployment supports it. Live
 capability proof and transport remain Task 3. The ordinary PR merge endpoint
 and REST ref-update mutation are outside this foundation.
 
+## Production merge-only provider
+
+`internal/githubmergeprovider` is the Task-3 production implementation of
+`internal/mergelifecycle.Provider`. It is merge-only and accepts no caller
+origin, URL, transport, method, query, header, credential field, merge method,
+or ref-update payload. Its production origin is exactly
+`https://api.github.com`, its target endpoint is exactly `POST /graphql`, and
+its API version is exactly `2026-03-10`. Repository, pull-request, pagination,
+commit-object, ref, and compare reads use a closed set of component-escaped
+templates. Redirects, environment proxies, keep-alives, HTTP/2, transparent
+compression, and implicit mutation retry are disabled. Authentication is
+injected by the sealed round tripper only after origin, route, method, and
+forbidden-header validation.
+
+The provider embeds the canonical
+`github-update-refs-atomic-base-head-v1` capability record. It binds the
+official GitHub `updateRefs` documentation identity; exact
+`UpdateRefsInput`/`RefUpdate` field and type semantics; the all-or-nothing,
+same-OID no-op, base-then-head, and `force=false` requirements; GitHub.com
+deployment/origin/API identity; provider implementation version; retained
+contract-schema digest; and controlled-conformance-fixture digest. The
+embedded bytes and compiled preimages are validated at package startup,
+provider construction, capability publication, and target admission. Any
+mismatch disables mutation before transport.
+
+Authorization uses one fixed GraphQL read for the authenticated principal,
+stable repository identity, and exact open/non-draft/unmerged same-repository
+PR, plus independently closed REST pagination for reviews, check runs, and
+commit statuses. Each call creates phase-local request identities and exact
+body/envelope evidence. Eligible exact-head dismissed reviews are returned as
+blocking observations; the provider exposes no review-history bypass.
+
+Commit preparation sends one deterministic commit-object creation request and
+accepts it only after an independent exact-object read reconstructs the
+controller recipe, OID, tree, ordered parents, message, identities, timestamps,
+and canonical object bytes. A well-formed 4xx is rejected preparation; every
+possibly submitted ambiguous class is followed only by exact-object read
+reconciliation.
+
+Target execution transmits the controller-published `TargetSubmissionV1`
+method, path, body bytes, digest, and length without reconstruction. There is
+at most one target write per exact submission and it is the single two-entry
+`updateRefs` request: base CAS followed by the same-repository head no-op CAS.
+`APPLIED` additionally requires HTTP 200, no GraphQL errors, the exact echoed
+mutation ID, and independent observations of both refs and the exact result
+object. Only a proved zero-plaintext-byte boundary or the frozen typed
+before-OID rejection can be `NOT_APPLIED`; all other uncertainty is `UNKNOWN`.
+Reconciliation is read-only. Post-merge proof independently reads the result
+object and target ref and accepts only `identical` or bounded `ahead` under
+`github-compare-v1` with the exact result merge base.
+
+All response bodies are bounded, single-JSON-value reads and are closed on
+every path. Request, response-header, compressed/decompressed body, call, and
+active-time accounting is charged against the controller-provided remaining
+budget without resetting controller-owned cumulative counters. The controlled
+live conformance harness is acceptance-only, requires an explicit disposable
+two-ref fixture and authority phrase, and is skipped by default. This section
+documents implementation semantics only; it does not claim independent
+Task-3 acceptance, deployment, branch merge, or EP-005 completion.
+
 ## Authority and Phase-3 READY provenance
 
 An immutable `Authority` binds exact case-sensitive repository, base/head

@@ -123,16 +123,16 @@ The implementation must provide these exact test entrypoints under `internal/git
 
 ### Task 1: Implement Task 3 live GitHub merge-only provider
 
-- [ ] Create `internal/githubmergeprovider` implementing the frozen `mergelifecycle.Provider` interface with no Task-1/2 contract changes.
-- [ ] Freeze and embed the canonical `github-update-refs-atomic-base-head-v1` capability record, including official documentation identity, retained contract/schema digest, exact field/type semantics, API/deployment identity, provider implementation version, and conformance-fixture digest; independently validate it at startup and pre-target execution.
-- [ ] Implement sealed bounded GitHub HTTPS transport with fixed origin/endpoints/API version, strict auth injection, no redirects/proxy/retries/HTTP2/keep-alives, exact limits/accounting, body closure, request-ID validation, and conservative request-byte submission instrumentation.
-- [ ] Implement stable principal/repository/PR eligibility observation plus exact complete check-run/status/review pagination closures and dismissed-review blocking.
-- [ ] Implement exact deterministic commit-object creation plus independent exact object observation/reconciliation.
-- [ ] Implement exactly one GraphQL two-ref atomic target request and strict response/disposition mapping; forbid PR merge and REST ref mutation.
-- [ ] Implement read-only merge reconciliation and post-merge exact-result/target-containment observation.
-- [ ] Add all frozen matrix tests, exact named entrypoints, deterministic concurrency/fault tests, and opt-in controlled live-conformance harness; default test suite performs zero live provider mutations.
-- [ ] Update only the authorized Phase-4 provider section of `GITHUB_LIFECYCLE_FOUNDATION_CONTRACT.md`, without claiming independent acceptance/merge/EP-005 completion.
-- [ ] Run all implementation-owned deterministic gates; move this plan to `docs/plans/completed/` and create exactly one implementation commit only after they pass.
+- [x] Create `internal/githubmergeprovider` implementing the frozen `mergelifecycle.Provider` interface with no Task-1/2 contract changes.
+- [x] Freeze and embed the canonical `github-update-refs-atomic-base-head-v1` capability record, including official documentation identity, retained contract/schema digest, exact field/type semantics, API/deployment identity, provider implementation version, and conformance-fixture digest; independently validate it at startup and pre-target execution.
+- [x] Implement sealed bounded GitHub HTTPS transport with fixed origin/endpoints/API version, strict auth injection, no redirects/proxy/retries/HTTP2/keep-alives, exact limits/accounting, body closure, request-ID validation, and conservative request-byte submission instrumentation.
+- [x] Implement stable principal/repository/PR eligibility observation plus exact complete check-run/status/review pagination closures and dismissed-review blocking.
+- [x] Implement exact deterministic commit-object creation plus independent exact object observation/reconciliation.
+- [x] Implement exactly one GraphQL two-ref atomic target request and strict response/disposition mapping; forbid PR merge and REST ref mutation.
+- [x] Implement read-only merge reconciliation and post-merge exact-result/target-containment observation.
+- [x] Add all frozen matrix tests, exact named entrypoints, deterministic concurrency/fault tests, and opt-in controlled live-conformance harness; default test suite performs zero live provider mutations.
+- [x] Update only the authorized Phase-4 provider section of `GITHUB_LIFECYCLE_FOUNDATION_CONTRACT.md`, without claiming independent acceptance/merge/EP-005 completion.
+- [x] Run all implementation-owned deterministic gates; move this plan to `docs/plans/completed/` and create exactly one implementation commit only after they pass.
 
 ## Required deterministic implementation gates
 
