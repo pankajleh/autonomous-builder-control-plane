@@ -44,10 +44,10 @@ It must inject failure after pre-target budget exhaustion is known but before te
 - clean final worktree and `git diff --check`
 
 ### Task 1: Close final crash-recovery finding
-- [ ] Add strict durable target-reservation audit/recovery classification.
-- [ ] Add the mandatory M03 regression and negative controls.
-- [ ] Run the complete acceptance floor.
-- [ ] Move this plan to `docs/plans/completed/` and commit exactly one implementation commit.
+- [x] Add strict durable target-reservation audit/recovery classification.
+- [x] Add the mandatory M03 regression and negative controls.
+- [x] Run the complete acceptance floor.
+- [x] Move this plan to `docs/plans/completed/` and commit exactly one implementation commit.
 
 ## Completion boundary
 Implementation acceptance does not close Task 3. A fresh independent exact-head Critical/Major closure review must return 0C/0M afterward.

@@ -4,6 +4,7 @@ package mergelifecycle
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -269,6 +270,274 @@ func TestTask3FinalClosureM02BudgetExhaustionDisposition(t *testing.T) {
 		}
 		assertOneTerminalEvent(t, fixture.ledger.Path(), domain.StateFailed, CodePostMergeAcceptanceFailed)
 	})
+}
+
+func TestTask3FinalClosureM03PreTargetBudgetCrashRecovery(t *testing.T) {
+	t.Run("pre-target exhaustion recovery remains provably unsubmitted", func(t *testing.T) {
+		fixture := newControllerFixture(t)
+		provider := &fakeProvider{t: t, disposition: githublifecycle.ReconciliationApplied}
+		controller := fixture.controller(t, provider)
+		constrainProviderCalls(controller, 3)
+		crashed := false
+		controller.beforeTerminal = func(attempt *attemptStore) error {
+			if _, found, err := attempt.read("target-submission.json"); err != nil || !found {
+				t.Fatalf("budget exhaustion preceded durable target intent: found=%v err=%v", found, err)
+			}
+			audit, err := attempt.targetHTTPReservationAudit()
+			if err != nil || audit.reservationExists || !audit.submissionReserved {
+				t.Fatalf("pre-target audit = %+v, %v", audit, err)
+			}
+			counters, err := attempt.currentCounters()
+			if err != nil || counters.TotalProviderCalls != 3 || counters.ProviderAccountingPending {
+				t.Fatalf("pre-target budget was not durably exhausted: counters=%+v err=%v", counters, err)
+			}
+			crashed = true
+			return errors.New("injected crash before resource-limit terminal intent")
+		}
+
+		first, err := controller.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID})
+		var lifecycleErr *Error
+		if !errors.As(err, &lifecycleErr) || lifecycleErr.Code != CodeResourceLimitExhausted || first.State != "" || !crashed {
+			t.Fatalf("pre-terminal crash = %+v, %v, crashed=%v", first, err, crashed)
+		}
+		if provider.submitCalls != 0 || provider.reconcileCalls != 0 || provider.postMergeCalls != 0 || provider.totalCalls() != 3 {
+			t.Fatalf("pre-terminal crash reached target transport: submit=%d reconcile=%d post=%d total=%d",
+				provider.submitCalls, provider.reconcileCalls, provider.postMergeCalls, provider.totalCalls())
+		}
+		if _, active, barrierErr := fixture.ledger.ActiveTransitionBarrier(fixture.runID); barrierErr != nil || !active {
+			t.Fatalf("crash did not preserve the transition barrier: active=%v err=%v", active, barrierErr)
+		}
+		calls := provider.totalCalls()
+		if err := controller.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		recovery := fixture.controller(t, provider)
+		defer recovery.Close()
+		constrainProviderCalls(recovery, 3)
+		result, err := recovery.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID})
+		lifecycleErr = nil
+		if !errors.As(err, &lifecycleErr) || lifecycleErr.Code != CodeResourceLimitExhausted || lifecycleErr.Submitted ||
+			result.State != domain.StateFailed || result.ReasonCode != CodeResourceLimitExhausted || result.Unresolved {
+			t.Fatalf("pre-target recovery = %+v, %v", result, err)
+		}
+		if provider.totalCalls() != calls || provider.submitCalls != 0 || provider.reconcileCalls != 0 || provider.postMergeCalls != 0 {
+			t.Fatalf("pre-target recovery called provider: calls=%d->%d submit=%d reconcile=%d post=%d", calls,
+				provider.totalCalls(), provider.submitCalls, provider.reconcileCalls, provider.postMergeCalls)
+		}
+		if _, active, barrierErr := fixture.ledger.ActiveTransitionBarrier(fixture.runID); barrierErr != nil || active {
+			t.Fatalf("resource-limit recovery left an unresolved barrier: active=%v err=%v", active, barrierErr)
+		}
+		assertOneTerminalEvent(t, fixture.ledger.Path(), domain.StateFailed, CodeResourceLimitExhausted)
+	})
+
+	t.Run("unreserved durable intent resumes target transport when budget is available", func(t *testing.T) {
+		fixture := newControllerFixture(t)
+		provider := &fakeProvider{t: t, disposition: githublifecycle.ReconciliationApplied}
+		controller := fixture.controller(t, provider)
+		constrainProviderCalls(controller, 3)
+		controller.beforeTerminal = func(*attemptStore) error {
+			return errors.New("injected crash before resource-limit terminal intent")
+		}
+		if _, err := controller.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID}); err == nil {
+			t.Fatal("pre-target crash injection did not fire")
+		}
+		if provider.submitCalls != 0 || provider.reconcileCalls != 0 {
+			t.Fatalf("setup reached target transport: submit=%d reconcile=%d", provider.submitCalls, provider.reconcileCalls)
+		}
+		if err := controller.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		recovery := fixture.controller(t, provider)
+		defer recovery.Close()
+		result, err := recovery.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID})
+		if err != nil || result.State != domain.StateMerged || provider.submitCalls != 1 || provider.reconcileCalls != 0 || provider.postMergeCalls != 1 {
+			t.Fatalf("unreserved intent recovery = %+v, %v, submit=%d reconcile=%d post=%d", result, err,
+				provider.submitCalls, provider.reconcileCalls, provider.postMergeCalls)
+		}
+	})
+
+	t.Run("prior target reservation remains unknown and reconciles", func(t *testing.T) {
+		fixture := newControllerFixture(t)
+		provider := &fakeProvider{t: t, disposition: githublifecycle.ReconciliationUnknown,
+			reconcileDisposition: githublifecycle.ReconciliationApplied}
+		controller := fixture.controller(t, provider)
+
+		first, err := controller.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID})
+		var lifecycleErr *Error
+		if !errors.As(err, &lifecycleErr) || lifecycleErr.Code != CodeTargetUnknown || first.State != domain.StateReadyForMerge || !first.Unresolved {
+			t.Fatalf("reserved target did not remain UNKNOWN: %+v, %v", first, err)
+		}
+		attempt := openOnlyBudgetAttempt(t, controller, fixture.stateRoot)
+		audit, err := attempt.targetHTTPReservationAudit()
+		if closeErr := attempt.close(); err != nil || closeErr != nil || !audit.reservationExists || !audit.submissionReserved {
+			t.Fatalf("accounted target reservation audit = %+v, err=%v close=%v", audit, err, closeErr)
+		}
+		if err := controller.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		recovery := fixture.controller(t, provider)
+		defer recovery.Close()
+		result, err := recovery.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID})
+		if err != nil || result.State != domain.StateMerged || provider.submitCalls != 1 || provider.reconcileCalls != 1 {
+			t.Fatalf("reserved target recovery = %+v, %v, submit=%d reconcile=%d", result, err, provider.submitCalls, provider.reconcileCalls)
+		}
+	})
+
+	t.Run("prior target reservation is not downgraded when budget is exhausted", func(t *testing.T) {
+		fixture := newControllerFixture(t)
+		provider := &fakeProvider{t: t, disposition: githublifecycle.ReconciliationUnknown}
+		controller := fixture.controller(t, provider)
+		constrainProviderCalls(controller, 4)
+		first, err := controller.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID})
+		var lifecycleErr *Error
+		if !errors.As(err, &lifecycleErr) || lifecycleErr.Code != CodeTargetUnknown || first.State != domain.StateReadyForMerge || !first.Unresolved ||
+			provider.submitCalls != 1 || provider.totalCalls() != 4 {
+			t.Fatalf("target reservation setup = %+v, %v, submit=%d total=%d", first, err, provider.submitCalls, provider.totalCalls())
+		}
+		if err := controller.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		recovery := fixture.controller(t, provider)
+		defer recovery.Close()
+		constrainProviderCalls(recovery, 4)
+		result, err := recovery.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID})
+		lifecycleErr = nil
+		if !errors.As(err, &lifecycleErr) || lifecycleErr.Code != CodeTargetUnknown || result.State != domain.StateReadyForMerge || !result.Unresolved {
+			t.Fatalf("exhausted possibly-submitted recovery = %+v, %v", result, err)
+		}
+		if provider.submitCalls != 1 || provider.reconcileCalls != 0 || provider.totalCalls() != 4 {
+			t.Fatalf("exhausted possibly-submitted recovery called provider: submit=%d reconcile=%d total=%d",
+				provider.submitCalls, provider.reconcileCalls, provider.totalCalls())
+		}
+		if _, active, barrierErr := fixture.ledger.ActiveTransitionBarrier(fixture.runID); barrierErr != nil || !active {
+			t.Fatalf("possibly-submitted recovery did not preserve barrier: active=%v err=%v", active, barrierErr)
+		}
+	})
+
+	t.Run("malformed audit fails closed", func(t *testing.T) {
+		fixture := newControllerFixture(t)
+		provider := &fakeProvider{t: t, disposition: githublifecycle.ReconciliationApplied}
+		controller := fixture.controller(t, provider)
+		constrainProviderCalls(controller, 3)
+		controller.beforeTerminal = func(*attemptStore) error {
+			return errors.New("injected crash before resource-limit terminal intent")
+		}
+		if _, err := controller.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID}); err == nil {
+			t.Fatal("pre-target crash injection did not fire")
+		}
+		attemptID := onlyBudgetAttemptID(t, fixture.stateRoot)
+		if err := controller.Close(); err != nil {
+			t.Fatal(err)
+		}
+		journal, err := os.OpenFile(filepath.Join(fixture.stateRoot, "attempts", attemptID, "counters.jsonl"), os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := journal.Write([]byte("{")); err != nil {
+			_ = journal.Close()
+			t.Fatal(err)
+		}
+		if err := journal.Sync(); err != nil {
+			_ = journal.Close()
+			t.Fatal(err)
+		}
+		if err := journal.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		recoveryProvider := &fakeProvider{t: t, disposition: githublifecycle.ReconciliationApplied}
+		recovery := fixture.controller(t, recoveryProvider)
+		defer recovery.Close()
+		result, err := recovery.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID})
+		var lifecycleErr *Error
+		if !errors.As(err, &lifecycleErr) || lifecycleErr.Code != CodeLocalStorageIntegrityFailure || result.State != "" {
+			t.Fatalf("malformed audit recovery = %+v, %v", result, err)
+		}
+		if recoveryProvider.totalCalls() != 0 {
+			t.Fatalf("malformed audit reached provider: calls=%d", recoveryProvider.totalCalls())
+		}
+		if _, active, barrierErr := fixture.ledger.ActiveTransitionBarrier(fixture.runID); barrierErr != nil || !active {
+			t.Fatalf("malformed audit did not fail closed behind the barrier: active=%v err=%v", active, barrierErr)
+		}
+	})
+
+	t.Run("ambiguous duplicate target reservation fails closed", func(t *testing.T) {
+		fixture := newControllerFixture(t)
+		provider := &fakeProvider{t: t, disposition: githublifecycle.ReconciliationUnknown}
+		controller := fixture.controller(t, provider)
+		if _, err := controller.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID}); err == nil {
+			t.Fatal("target UNKNOWN setup unexpectedly settled")
+		}
+		attemptID := onlyBudgetAttemptID(t, fixture.stateRoot)
+		attempt := openOnlyBudgetAttempt(t, controller, fixture.stateRoot)
+		counters, err := attempt.currentCounters()
+		if closeErr := attempt.close(); err != nil || closeErr != nil {
+			t.Fatalf("read target counters: err=%v close=%v", err, closeErr)
+		}
+		duplicate, ok := nextCounters(counters, httpCallCategory(ProviderCallTargetV1))
+		if !ok {
+			t.Fatal("could not construct duplicate target reservation control")
+		}
+		record, err := json.Marshal(counterReservation{AttemptID: attemptID, Category: httpCallCategory(ProviderCallTargetV1), Counters: duplicate})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := controller.Close(); err != nil {
+			t.Fatal(err)
+		}
+		journal, err := os.OpenFile(filepath.Join(fixture.stateRoot, "attempts", attemptID, "counters.jsonl"), os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := journal.Write(append(record, '\n')); err != nil {
+			_ = journal.Close()
+			t.Fatal(err)
+		}
+		if err := journal.Sync(); err != nil {
+			_ = journal.Close()
+			t.Fatal(err)
+		}
+		if err := journal.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		recoveryProvider := &fakeProvider{t: t, disposition: githublifecycle.ReconciliationApplied}
+		recovery := fixture.controller(t, recoveryProvider)
+		defer recovery.Close()
+		result, err := recovery.Execute(context.Background(), ExecuteRequest{RunID: fixture.runID})
+		var lifecycleErr *Error
+		if !errors.As(err, &lifecycleErr) || lifecycleErr.Code != CodeLocalStorageIntegrityFailure || result.State != "" {
+			t.Fatalf("ambiguous audit recovery = %+v, %v", result, err)
+		}
+		if recoveryProvider.totalCalls() != 0 {
+			t.Fatalf("ambiguous audit reached provider: calls=%d", recoveryProvider.totalCalls())
+		}
+		if _, active, barrierErr := fixture.ledger.ActiveTransitionBarrier(fixture.runID); barrierErr != nil || !active {
+			t.Fatalf("ambiguous audit did not fail closed behind the barrier: active=%v err=%v", active, barrierErr)
+		}
+	})
+}
+
+func onlyBudgetAttemptID(t *testing.T, stateRoot string) string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(stateRoot, "attempts"))
+	if err != nil || len(entries) != 1 || !entries[0].IsDir() {
+		t.Fatalf("provider-budget attempt inventory: entries=%v err=%v", entries, err)
+	}
+	return entries[0].Name()
+}
+
+func openOnlyBudgetAttempt(t *testing.T, controller *Controller, stateRoot string) *attemptStore {
+	t.Helper()
+	attempt, err := controller.store.openAttempt(onlyBudgetAttemptID(t, stateRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return attempt
 }
 
 func constrainProviderCalls(controller *Controller, calls int) {

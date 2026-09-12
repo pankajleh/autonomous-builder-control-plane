@@ -41,6 +41,11 @@ type Controller struct {
 
 var errProviderBudgetExhausted = errors.New("provider cumulative budget exhausted")
 
+type targetHTTPReservationStatus struct {
+	reservationExists  bool
+	submissionReserved bool
+}
+
 func New(config Config) (*Controller, error) {
 	if config.Ledger == nil || config.AuthoritySource == nil || config.Provider == nil {
 		return nil, errors.New("ledger, authority source, and network-free provider are required")
@@ -178,9 +183,20 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 		}
 		return c.failBeforeSubmission(lease, assembled, attempt, writeID, CodeAuthorizationFailed, err)
 	}
+	targetSubmissionReserved := false
+	if submitted {
+		audit, auditErr := attempt.targetHTTPReservationAudit()
+		if auditErr != nil {
+			return Result{}, wrap(CodeLocalStorageIntegrityFailure, true, writeID, auditErr)
+		}
+		submitted = audit.reservationExists
+		targetSubmissionReserved = audit.submissionReserved
+	}
 	if !submitted {
-		if _, err := attempt.reserveCounter("target-submission"); err != nil {
-			return c.failBeforeSubmission(lease, assembled, attempt, writeID, CodeAuthorizationFailed, err)
+		if !targetSubmissionReserved {
+			if _, reserveErr := attempt.reserveCounter("target-submission"); reserveErr != nil {
+				return c.failBeforeSubmission(lease, assembled, attempt, writeID, CodeAuthorizationFailed, reserveErr)
+			}
 		}
 		execution, err := githublifecycle.NewMergeExecutionInputV1(sealed, submission, c.contracts)
 		if err != nil {

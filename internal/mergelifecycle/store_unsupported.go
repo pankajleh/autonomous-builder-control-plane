@@ -48,6 +48,9 @@ func (*attemptStore) reserveHTTPCall(ProviderCallClassV1) (Counters, ProviderBud
 func (*attemptStore) accountHTTPCall(ProviderCallClassV1, ProviderCallAccountingV1) (Counters, error) {
 	return Counters{}, errUnsupportedDurability
 }
+func (*attemptStore) targetHTTPReservationAudit() (targetHTTPReservationStatus, error) {
+	return targetHTTPReservationStatus{}, errUnsupportedDurability
+}
 func (*attemptStore) reserveReconciliation(int64) (Counters, error) {
 	return Counters{}, errUnsupportedDurability
 }

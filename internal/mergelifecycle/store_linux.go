@@ -681,6 +681,52 @@ func readProviderHTTPCallAudit(file *os.File, attemptID string) (providerHTTPCal
 	return audit, scanner.Err()
 }
 
+// targetHTTPReservationAudit strictly classifies recovery from the durable
+// provider-call journal. A target submission record is intent, not proof that
+// transport was authorized; only the target HTTP reservation establishes the
+// possibly-submitted boundary.
+func (a *attemptStore) targetHTTPReservationAudit() (targetHTTPReservationStatus, error) {
+	var result targetHTTPReservationStatus
+	if a == nil || a.closed {
+		return result, errors.New("attempt store is closed")
+	}
+	if err := a.checkIdentity(); err != nil {
+		return result, err
+	}
+	file, err := openNoFollow(filepath.Join(a.root, "counters.jsonl"), false, 0o600)
+	if err != nil {
+		return result, errors.Join(errors.New("provider HTTP-call audit journal is unavailable"), err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.Size() <= 0 || info.Size() > a.store.limits.terminalChannelBytes {
+		return result, errors.Join(errors.New("provider HTTP-call audit journal size is invalid"), err)
+	}
+	if _, err := file.Seek(-1, io.SeekEnd); err != nil {
+		return result, err
+	}
+	var final [1]byte
+	if _, err := io.ReadFull(file, final[:]); err != nil || final[0] != '\n' {
+		return result, errors.Join(errors.New("provider HTTP-call audit journal is not durably framed"), err)
+	}
+	counters, err := readCounters(file, a.id, a.store.limits)
+	if err != nil {
+		return result, err
+	}
+	audit, err := readProviderHTTPCallAudit(file, a.id)
+	if err != nil {
+		return result, err
+	}
+	if audit.target > 1 || counters.ProviderAccountingPending != (audit.pending != "") ||
+		audit.target == 1 && counters.TargetSubmissions != 1 ||
+		audit.target == 0 && counters.ProviderAccountingPending {
+		return result, errors.New("provider HTTP-call audit is ambiguous")
+	}
+	result.reservationExists = audit.target == 1
+	result.submissionReserved = counters.TargetSubmissions == 1
+	return result, nil
+}
+
 // reserveHTTPCall increments the exact classified and aggregate call counters
 // and makes the pending request durable before transport can begin.
 func (a *attemptStore) reserveHTTPCall(class ProviderCallClassV1) (Counters, ProviderBudgetV1, error) {
