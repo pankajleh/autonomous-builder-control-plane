@@ -125,6 +125,175 @@ func TestCorrectionC01TerminalCoreRecovery(t *testing.T) {
 	})
 }
 
+func TestClosureCritical01UnresolvedSubmissionAuthorityFailure(t *testing.T) {
+	tests := []struct {
+		name        string
+		disposition githublifecycle.ReconciliationDisposition
+		crash       bool
+	}{
+		{name: "UNKNOWN result then restart", disposition: githublifecycle.ReconciliationUnknown},
+		{name: "post-submit crash then restart", disposition: githublifecycle.ReconciliationApplied, crash: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newControllerFixture(t)
+			provider := &fakeProvider{t: t, disposition: test.disposition, reconcileDisposition: githublifecycle.ReconciliationApplied}
+			controller := f.controller(t, provider)
+			if test.crash {
+				controller.afterTargetOutcome = func(TargetOutcome) error { return errors.New("crash after durable target outcome") }
+			}
+			first, err := controller.Execute(context.Background(), ExecuteRequest{RunID: f.runID})
+			if err == nil || !first.Unresolved || first.State != domain.StateReadyForMerge {
+				t.Fatalf("initial unresolved submission = %+v, %v", first, err)
+			}
+			if provider.submitCalls != 1 {
+				t.Fatalf("target submissions = %d, want 1", provider.submitCalls)
+			}
+			barrier, active, err := f.ledger.ActiveTransitionBarrier(f.runID)
+			if err != nil || !active {
+				t.Fatalf("post-submit barrier: active=%v err=%v", active, err)
+			}
+			assembled := assembleFixture(t, f)
+			if barrier.AttemptID != deterministicWriteID(assembled) {
+				t.Fatalf("barrier attempt = %q, want %q", barrier.AttemptID, deterministicWriteID(assembled))
+			}
+			attempt, err := controller.store.openAttempt(attemptKey(assembled, barrier.AttemptID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, found, readErr := attempt.read("target-submission.json"); readErr != nil || !found {
+				t.Fatalf("durable target-submission boundary: found=%v err=%v", found, readErr)
+			}
+			if err := attempt.close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := controller.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			policyPath := f.governed.Policy.SourceConfiguration.URI
+			policyBytes, err := os.ReadFile(policyPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(policyPath); err != nil {
+				t.Fatal(err)
+			}
+			recovery := f.controller(t, provider)
+			blocked, err := recovery.Execute(context.Background(), ExecuteRequest{RunID: f.runID})
+			var lifecycleErr *Error
+			if !errors.As(err, &lifecycleErr) || lifecycleErr.Code != CodeTargetUnknown || blocked.State != domain.StateReadyForMerge ||
+				blocked.ReasonCode != CodeTargetUnknown || !blocked.Unresolved {
+				t.Fatalf("unreadable-authority recovery = %+v, %v", blocked, err)
+			}
+			if provider.submitCalls != 1 || provider.reconcileCalls != 0 {
+				t.Fatalf("unreadable authority touched provider: submit=%d reconcile=%d", provider.submitCalls, provider.reconcileCalls)
+			}
+			if _, _, _, found, findErr := recovery.store.findTerminalCore(f.runID); findErr != nil || found {
+				t.Fatalf("unresolved submission selected a terminal core: found=%v err=%v", found, findErr)
+			}
+			assertNoTerminalEvent(t, f.ledger.Path())
+			if err := recovery.Close(); err != nil {
+				t.Fatal(err)
+			}
+			cancellation := controllerWithCancellation(t, f, provider, cancellationGrant())
+			alternate, err := cancellation.Cancel(context.Background(), CancelRequest{RunID: f.runID, SourceRequestID: "unreadable-authority-cancel"})
+			lifecycleErr = nil
+			if !errors.As(err, &lifecycleErr) || lifecycleErr.Code != CodeTargetUnknown || alternate.State != domain.StateReadyForMerge ||
+				alternate.ReasonCode != CodeTargetUnknown || !alternate.Unresolved {
+				t.Fatalf("alternate cancellation recovery = %+v, %v", alternate, err)
+			}
+			if _, _, _, found, findErr := cancellation.store.findTerminalCore(f.runID); findErr != nil || found {
+				t.Fatalf("alternate path selected a terminal core: found=%v err=%v", found, findErr)
+			}
+			if err := cancellation.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.WriteFile(policyPath, policyBytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			settlement := f.controller(t, provider)
+			defer settlement.Close()
+			settled, err := settlement.Execute(context.Background(), ExecuteRequest{RunID: f.runID})
+			if err != nil || settled.State != domain.StateMerged {
+				t.Fatalf("reconciliation after authority repair = %+v, %v", settled, err)
+			}
+			if provider.submitCalls != 1 || provider.reconcileCalls != 1 {
+				t.Fatalf("settlement retried submission: submit=%d reconcile=%d", provider.submitCalls, provider.reconcileCalls)
+			}
+			assertOneTerminalEvent(t, f.ledger.Path(), domain.StateMerged, CodeMergeAppliedAccepted)
+		})
+	}
+
+	t.Run("pre-authority settlement holds repository base lease", func(t *testing.T) {
+		f := newControllerFixture(t)
+		if err := os.Remove(f.governed.Policy.SourceConfiguration.URI); err != nil {
+			t.Fatal(err)
+		}
+		controller := f.controller(t, &fakeProvider{t: t})
+		defer controller.Close()
+		selected := make(chan struct{})
+		release := make(chan struct{})
+		controller.afterTerminalCore = func(TerminalCoreV1) error {
+			close(selected)
+			<-release
+			return nil
+		}
+		type executeOutcome struct {
+			result Result
+			err    error
+		}
+		executed := make(chan executeOutcome, 1)
+		go func() {
+			result, err := controller.Execute(context.Background(), ExecuteRequest{RunID: f.runID})
+			executed <- executeOutcome{result: result, err: err}
+		}()
+		select {
+		case <-selected:
+		case <-time.After(2 * time.Second):
+			t.Fatal("pre-authority terminal core was not selected")
+		}
+
+		competingStore, err := newDurableStore(f.stateRoot, productionLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer competingStore.close()
+		acquired := make(chan *repositoryBaseLease, 1)
+		acquireErrors := make(chan error, 1)
+		go func() {
+			lease, acquireErr := competingStore.acquireRepositoryBase(governedRepositoryBaseLockKey(f.governed))
+			if acquireErr != nil {
+				acquireErrors <- acquireErr
+				return
+			}
+			acquired <- lease
+		}()
+		select {
+		case lease := <-acquired:
+			_ = lease.close()
+			t.Fatal("pre-authority settlement released repository/base serialization before terminal selection")
+		case acquireErr := <-acquireErrors:
+			t.Fatal(acquireErr)
+		case <-time.After(75 * time.Millisecond):
+		}
+		close(release)
+		outcome := <-executed
+		if outcome.err == nil || outcome.result.State != domain.StateFailed || outcome.result.ReasonCode != CodeInvalidAuthority {
+			t.Fatalf("pre-authority settlement = %+v, %v", outcome.result, outcome.err)
+		}
+		select {
+		case lease := <-acquired:
+			defer lease.close()
+		case acquireErr := <-acquireErrors:
+			t.Fatal(acquireErr)
+		case <-time.After(2 * time.Second):
+			t.Fatal("repository/base lease did not release after pre-authority settlement")
+		}
+	})
+}
+
 func TestCorrectionM01AuthorityEvidenceBytes(t *testing.T) {
 	makeAuthority := func(t *testing.T) (GovernedAuthority, ledger.EvidenceRef, ledger.EvidenceRef, ledger.EvidenceRef) {
 		t.Helper()
@@ -656,8 +825,6 @@ func TestCorrectionM06StorageReservationsCleanupLimits(t *testing.T) {
 	limits.publishedBytes = 2
 	limits.liveFiles = limits.publishedFiles + limits.temporaryFiles
 	limits.liveBytes = limits.publishedBytes + limits.temporaryBytes
-	limits.publishedFilesTotal = 1
-	limits.publishedBytesTotal = 2
 	root := t.TempDir()
 	_ = os.Chmod(root, 0o700)
 	store, err := newDurableStore(root, limits)
@@ -672,17 +839,9 @@ func TestCorrectionM06StorageReservationsCleanupLimits(t *testing.T) {
 	if _, _, err := first.publish("admission.json", []byte(`{}`)); err != nil {
 		t.Fatalf("exact storage limits failed: %v", err)
 	}
-	_ = first.close()
-	second, err := store.openAttempt(strings.Repeat("9", 64))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.close()
-	if _, _, err := second.publish("admission.json", []byte(`{}`)); err == nil {
-		t.Fatal("concurrent/global limit+1 publication was accepted")
-	}
-	if _, _, err := first.publish("authority.json", []byte(`{}`)); err == nil {
-		t.Fatal("per-attempt file limit+1 publication was accepted")
+	defer first.close()
+	if _, _, err := first.publish("commit-prepare-marker.json", []byte(`{}`)); err == nil || !strings.Contains(err.Error(), "storage reservation capacity exhausted") {
+		t.Fatalf("per-attempt file limit+1 did not reach capacity logic: %v", err)
 	}
 
 	byteLimits := productionLimits()
@@ -704,8 +863,8 @@ func TestCorrectionM06StorageReservationsCleanupLimits(t *testing.T) {
 	if _, _, err := byteAttempt.publish("admission.json", []byte(`{}`)); err != nil {
 		t.Fatalf("exact per-attempt byte limit failed: %v", err)
 	}
-	if _, _, err := byteAttempt.publish("authority.json", []byte(`0`)); err == nil {
-		t.Fatal("per-attempt byte limit+1 publication was accepted")
+	if _, _, err := byteAttempt.publish("commit-prepare-marker.json", []byte(`0`)); err == nil || !strings.Contains(err.Error(), "storage reservation capacity exhausted") {
+		t.Fatalf("per-attempt byte limit+1 did not reach capacity logic: %v", err)
 	}
 
 	concurrentLimits := productionLimits()
@@ -924,6 +1083,15 @@ func assertOneTerminalEvent(t *testing.T, path string, destination domain.State,
 	}
 	if count != 1 {
 		t.Fatalf("terminal event count = %d, want 1", count)
+	}
+}
+
+func assertNoTerminalEvent(t *testing.T, path string) {
+	t.Helper()
+	for _, event := range readLifecycleEvents(t, path) {
+		if event.StateFrom == domain.StateReadyForMerge {
+			t.Fatalf("unexpected terminal event: %+v", event)
+		}
 	}
 }
 

@@ -38,7 +38,7 @@ Forbidden:
 - status-doc reconciliation or Phase-5 work
 - any new blocker family or design reopening
 
-- [ ] Critical-01 corrected with exact regression.
-- [ ] Major-01 test evidence corrected to exercise real capacity logic.
-- [ ] All frozen acceptance evidence passes.
-- [ ] Exactly one correction commit created and worktree clean.
+- [x] Critical-01 corrected with exact regression.
+- [x] Major-01 test evidence corrected to exercise real capacity logic.
+- [x] All frozen acceptance evidence passes.
+- [x] Exactly one correction commit created and worktree clean.

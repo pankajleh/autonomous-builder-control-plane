@@ -42,19 +42,22 @@ func (c *Controller) Cancel(ctx context.Context, request CancelRequest) (Result,
 	if identificationErr != nil {
 		return Result{}, wrap(CodeInvalidAuthority, false, "", identificationErr)
 	}
-	assembled, err := assembleAuthority(governed, ledgerBytes, ledgerID, c.contracts)
-	if err != nil {
-		if identified.current == domain.StateReadyForMerge {
-			result, terminalErr := c.terminalizeIdentifiedAuthorityFailure(lease, governed, identified)
-			return result, errors.Join(wrap(CodeInvalidAuthority, false, result.AttemptID, err), terminalErr)
-		}
-		return Result{}, wrap(CodeInvalidAuthority, false, "", err)
-	}
-	repositoryLease, err := c.store.acquireRepositoryBase(repositoryBaseLockKey(assembled))
+	repositoryLease, err := c.store.acquireRepositoryBase(governedRepositoryBaseLockKey(governed))
 	if err != nil {
 		return Result{}, wrap(CodeLocalStorageIntegrityFailure, false, "", err)
 	}
 	defer repositoryLease.close()
+	assembled, err := assembleAuthority(governed, ledgerBytes, ledgerID, c.contracts)
+	if err != nil {
+		if identified.current == domain.StateReadyForMerge {
+			result, terminalErr := c.terminalizeIdentifiedAuthorityFailure(lease, governed, identified)
+			if result.Unresolved {
+				return result, errors.Join(terminalErr, err)
+			}
+			return result, errors.Join(wrap(CodeInvalidAuthority, false, result.AttemptID, err), terminalErr)
+		}
+		return Result{}, wrap(CodeInvalidAuthority, false, "", err)
+	}
 	if core, coreBytes, coreSHA, found, findErr := c.store.findTerminalCore(request.RunID); findErr != nil {
 		return Result{}, wrap(CodeLocalStorageIntegrityFailure, false, "", findErr)
 	} else if found {

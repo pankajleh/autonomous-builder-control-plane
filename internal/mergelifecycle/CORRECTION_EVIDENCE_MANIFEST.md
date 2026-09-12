@@ -34,3 +34,26 @@ Every command below completed with exit status 0 on the final implementation bef
 - Network-free dependency: `if go list -deps ./internal/mergelifecycle | rg -q '^net/http$'; then exit 1; fi` — PASS.
 - Mutation-ceiling path audit — PASS; only paths authorized by the correction plan are changed.
 - Diff integrity: `git diff --check` — PASS.
+
+## Two-finding closure correction: 2/2 PASS
+
+Candidate corrected: `b018f71d97c6ca2adbd9dead46437dc4af7c254b`
+
+| ID | Deterministic entrypoint | Exact command | Result |
+|---|---|---|---|
+| Critical-01 | `TestClosureCritical01UnresolvedSubmissionAuthorityFailure` | `GOFLAGS=-buildvcs=false go test ./internal/mergelifecycle -run '^TestClosureCritical01UnresolvedSubmissionAuthorityFailure$' -count=10` | PASS: UNKNOWN and equivalent post-submit crash/restart boundaries keep the active barrier and durable submission authoritative when authority evidence becomes unreadable. Execute and Cancel remain unresolved READY, select no terminal core/event, make no provider call, and later reconcile without resubmission. The same entrypoint proves pre-authority failure settlement retains repository/base serialization through terminal selection. |
+| Major-01 | `TestCorrectionM06StorageReservationsCleanupLimits` | `GOFLAGS=-buildvcs=false go test ./internal/mergelifecycle -run '^TestCorrectionM06StorageReservationsCleanupLimits$' -count=1` | PASS: allowlisted records on open attempts pass the exact per-attempt file/byte limits and both limit+1 cases explicitly reject with `durable storage reservation capacity exhausted`. |
+
+### Frozen acceptance evidence: PASS
+
+- Existing correction entrypoints: `GOFLAGS=-buildvcs=false go test ./internal/mergelifecycle -run '^TestCorrection(C01TerminalCoreRecovery|M01AuthorityEvidenceBytes|M02ExactCommitPreparationProof|M03CanonicalTerminalReasons|M04CancellationRecoveryBinding|M05CumulativeProviderBudgets|M06StorageReservationsCleanupLimits|M08RepositoryBaseLock)$' -count=1` and `GOFLAGS=-buildvcs=false go test ./internal/ledger -run '^TestCorrectionM07DescriptorRelativeDurability$' -count=1` — PASS.
+- Repeated crash/concurrency: `GOFLAGS=-buildvcs=false go test -count=10 ./internal/mergelifecycle ./internal/ledger -run '^Test(ClosureCritical01UnresolvedSubmissionAuthorityFailure|Correction(C01TerminalCoreRecovery|M04CancellationRecoveryBinding|M06StorageReservationsCleanupLimits|M07DescriptorRelativeDurability|M08RepositoryBaseLock))$'` — PASS; the strengthened Critical-01 entrypoint also passed its final independent `-count=10` run.
+- Focused race: `GOFLAGS=-buildvcs=false go test -race ./internal/mergelifecycle ./internal/ledger -count=1` and the final exact Critical-01 race command — PASS.
+- Full race: `GOFLAGS=-buildvcs=false go test -race ./... -count=1` — PASS.
+- Frozen Task-1 contracts: `GOFLAGS=-buildvcs=false go test ./internal/githublifecycle -count=1` — PASS.
+- Focused and full repository tests: `GOFLAGS=-buildvcs=false go test ./internal/mergelifecycle ./internal/ledger -count=1` and `GOFLAGS=-buildvcs=false go test ./... -count=1` — PASS.
+- Vet and worktree smoke: `GOFLAGS=-buildvcs=false go vet ./...` and `GOFLAGS=-buildvcs=false make smoke` — PASS.
+- Metadata-free smoke: tracked working-tree contents were copied to a fresh directory without `.git`, then `GOFLAGS=-buildvcs=false make smoke` passed there.
+- Portability compile-only: `GOFLAGS=-buildvcs=false GOOS=darwin GOARCH=amd64 go test -exec=/bin/true ./internal/ledger ./internal/mergelifecycle` — PASS.
+- Network-free source/dependency and module verification: Go-source scan, `go list -deps ./internal/mergelifecycle`, and `go mod verify` — PASS.
+- Frozen contracts, mutation-ceiling path audit, and `git diff --check` — PASS.

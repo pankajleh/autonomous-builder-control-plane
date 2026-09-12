@@ -88,19 +88,22 @@ func (c *Controller) Execute(ctx context.Context, request ExecuteRequest) (Resul
 	if identificationErr != nil {
 		return zero, wrap(CodeInvalidAuthority, false, "", identificationErr)
 	}
-	assembled, err := assembleAuthority(governed, ledgerBytes, ledgerID, c.contracts)
-	if err != nil {
-		if identified.current == domain.StateReadyForMerge {
-			result, terminalErr := c.terminalizeIdentifiedAuthorityFailure(lease, governed, identified)
-			return result, errors.Join(wrap(CodeInvalidAuthority, false, result.AttemptID, err), terminalErr)
-		}
-		return zero, wrap(CodeInvalidAuthority, false, "", err)
-	}
-	repositoryLease, err := c.store.acquireRepositoryBase(repositoryBaseLockKey(assembled))
+	repositoryLease, err := c.store.acquireRepositoryBase(governedRepositoryBaseLockKey(governed))
 	if err != nil {
 		return zero, wrap(CodeLocalStorageIntegrityFailure, false, "", err)
 	}
 	defer repositoryLease.close()
+	assembled, err := assembleAuthority(governed, ledgerBytes, ledgerID, c.contracts)
+	if err != nil {
+		if identified.current == domain.StateReadyForMerge {
+			result, terminalErr := c.terminalizeIdentifiedAuthorityFailure(lease, governed, identified)
+			if result.Unresolved {
+				return result, errors.Join(terminalErr, err)
+			}
+			return result, errors.Join(wrap(CodeInvalidAuthority, false, result.AttemptID, err), terminalErr)
+		}
+		return zero, wrap(CodeInvalidAuthority, false, "", err)
+	}
 	if assembled.ledgerState.current != domain.StateReadyForMerge {
 		if terminal, ok := existingTerminal(assembled.ledgerState); ok {
 			return c.recoverTerminal(invocation, assembled, terminal)

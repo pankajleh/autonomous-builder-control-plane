@@ -147,6 +147,15 @@ type terminalSelection struct {
 // only after the ledger independently proves one unique current READY event.
 // It deliberately carries no fabricated authority/policy digest.
 func (c *Controller) terminalizeIdentifiedAuthorityFailure(lease *ledger.RunTransitionLease, governed GovernedAuthority, state readyLedgerState) (Result, error) {
+	barrier, active, err := c.ledger.ActiveTransitionBarrier(governed.Phase3Authority.RunID())
+	if err != nil {
+		return Result{}, err
+	}
+	if active {
+		cause := errors.New("active target-submission barrier prevents pre-authority terminal selection")
+		return Result{State: domain.StateReadyForMerge, ReasonCode: CodeTargetUnknown, AttemptID: barrier.AttemptID, Unresolved: true},
+			wrap(CodeTargetUnknown, true, barrier.AttemptID, cause)
+	}
 	writeID := digest([]byte("merge-pre-authority-failure-v1\x00" + governed.Phase3Authority.RunID() + "\x00" + state.event.EventID + "\x00" + digest(state.eventJSON)))
 	core := TerminalCoreV1{Schema: "merge-terminal-core-v1", ProjectID: governed.ProjectID, PlanID: governed.PlanID,
 		RunID: governed.Phase3Authority.RunID(), AttemptID: writeID, WriteID: writeID, ReadyEventID: state.event.EventID,

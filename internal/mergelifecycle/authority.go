@@ -303,8 +303,12 @@ func attemptKey(a assembledAuthority, writeID string) string {
 }
 
 func repositoryBaseLockKey(a assembledAuthority) string {
-	input := a.repository.Input()
+	return governedRepositoryBaseLockKey(a.governed)
+}
+
+func governedRepositoryBaseLockKey(governed GovernedAuthority) string {
+	input := governed.RepositoryBinding
 	payload := strings.Join([]string{"merge-repository-base-lock-v1", input.GitHubRepository.String(), input.GitHubRepositoryNodeID,
-		fmt.Sprintf("%d", input.GitHubRepositoryDatabaseID), "refs/heads/" + a.governed.BaseBranch.String()}, "\x00")
+		fmt.Sprintf("%d", input.GitHubRepositoryDatabaseID), "refs/heads/" + governed.BaseBranch.String()}, "\x00")
 	return digest([]byte(payload))
 }
