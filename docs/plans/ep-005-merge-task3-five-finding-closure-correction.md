@@ -92,7 +92,7 @@ Before the correction commit:
 
 Implementation phase remains live-mutation-free. The corrected live harness is executed only afterward under separate acceptance-only disposable-ref authority.
 
-## Task 1: Close the exact five Task-3 review findings
+### Task 1: Close the exact five Task-3 review findings
 
 - [ ] Implement only F1-F5 and the narrow controller/provider budget seam described above.
 - [ ] Add the five exact regression entrypoints and any bounded controller/store tests necessary for durable HTTP-call reservation/restart proof.
