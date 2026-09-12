@@ -735,6 +735,11 @@ func (a *attemptStore) reserveHTTPCall(class ProviderCallClassV1) (Counters, Pro
 	if err := a.store.syncFile(file); err != nil {
 		return Counters{}, ProviderBudgetV1{}, err
 	}
+	if last.TotalProviderCalls == 0 {
+		if err := syncPathDirectory(a.root, a.store.syncDir); err != nil {
+			return Counters{}, ProviderBudgetV1{}, err
+		}
+	}
 	confirmed, err := readCounters(file, a.id, a.store.limits)
 	if err != nil || confirmed != next {
 		return Counters{}, ProviderBudgetV1{}, errors.Join(errors.New("provider HTTP call reservation did not verify"), err)
@@ -882,7 +887,7 @@ func (a *attemptStore) providerBudget() (ProviderBudgetV1, error) {
 	budget := providerBudgetAfterCounters(counters, a.store.limits)
 	if budget.HTTPCalls <= 0 || budget.RequestBytes <= 0 || budget.HeaderBytes <= 0 || budget.CompressedResponseBytes <= 0 ||
 		budget.DecompressedResponseBytes <= 0 || budget.ActiveNanos <= 0 {
-		return ProviderBudgetV1{}, errors.New("provider cumulative budget exhausted")
+		return ProviderBudgetV1{}, errProviderBudgetExhausted
 	}
 	return budget, nil
 }

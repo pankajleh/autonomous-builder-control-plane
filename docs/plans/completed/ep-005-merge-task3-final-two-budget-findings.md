@@ -62,10 +62,10 @@ Before the correction commit:
 
 ### Task 1: Close the final two Task-3 budget findings
 
-- [ ] Implement only F1/F2 and the exact T3-14 semantics above.
-- [ ] Add the two exact regression entrypoints with crash/restart and exact terminal-disposition assertions.
-- [ ] Run the complete regression floor and prove no scope escape or live GitHub mutation.
-- [ ] Move this plan to `docs/plans/completed/` and create exactly one correction implementation commit.
+- [x] Implement only F1/F2 and the exact T3-14 semantics above.
+- [x] Add the two exact regression entrypoints with crash/restart and exact terminal-disposition assertions.
+- [x] Run the complete regression floor and prove no scope escape or live GitHub mutation.
+- [x] Move this plan to `docs/plans/completed/` and create exactly one correction implementation commit.
 
 ## Closure boundary
 

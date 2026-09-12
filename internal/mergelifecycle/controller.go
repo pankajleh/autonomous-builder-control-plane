@@ -39,6 +39,8 @@ type Controller struct {
 	afterTargetOutcome       func(TargetOutcome) error
 }
 
+var errProviderBudgetExhausted = errors.New("provider cumulative budget exhausted")
+
 func New(config Config) (*Controller, error) {
 	if config.Ledger == nil || config.AuthoritySource == nil || config.Provider == nil {
 		return nil, errors.New("ledger, authority source, and network-free provider are required")
@@ -186,6 +188,11 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 		}
 		callContext, callCancel, session, budgetErr := c.providerCallContext(ctx, attempt, providerTargetPolicy())
 		if budgetErr != nil {
+			if errors.Is(budgetErr, errProviderBudgetExhausted) {
+				result, terminalErr := c.terminalize(lease, assembled, attempt, terminalSelection{sealed: sealed, submission: submission,
+					destination: domain.StateFailed, reason: CodeResourceLimitExhausted, barrier: &barrier})
+				return result, errors.Join(wrap(CodeResourceLimitExhausted, false, writeID, budgetErr), terminalErr)
+			}
 			return Result{State: domain.StateReadyForMerge, AttemptID: writeID, Unresolved: true}, wrap(CodeTargetUnknown, true, writeID, budgetErr)
 		}
 		outcome, callErr := c.provider.SubmitTarget(callContext, execution)
@@ -222,6 +229,10 @@ func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransi
 		}
 		callContext, cancel, session, budgetErr := c.providerCallContext(ctx, attempt, providerPostMergePolicy())
 		if budgetErr != nil {
+			if errors.Is(budgetErr, errProviderBudgetExhausted) {
+				return c.terminalize(lease, assembled, attempt, terminalSelection{sealed: sealed, submission: submission, mergeResult: mergeResult,
+					destination: domain.StateFailed, reason: CodePostMergeAcceptanceFailed, barrier: &barrier})
+			}
 			return Result{}, budgetErr
 		}
 		postOutcome, observeErr := c.provider.ObservePostMerge(callContext, observeInput)
@@ -577,6 +588,10 @@ func (c *Controller) settle(ctx context.Context, lease *ledger.RunTransitionLeas
 		}
 		callContext, cancel, session, budgetErr := c.providerCallContext(ctx, attempt, providerPostMergePolicy())
 		if budgetErr != nil {
+			if errors.Is(budgetErr, errProviderBudgetExhausted) {
+				return c.terminalize(lease, assembled, attempt, terminalSelection{sealed: sealed, submission: submission, mergeResult: result,
+					destination: domain.StateFailed, reason: CodePostMergeAcceptanceFailed, barrier: &barrier})
+			}
 			return Result{}, budgetErr
 		}
 		postOutcome, observeErr := c.provider.ObservePostMerge(callContext, observeInput)
