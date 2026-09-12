@@ -39,13 +39,14 @@ Everything else is frozen, including `internal/githublifecycle/**`, `internal/le
 The provider method signatures remain unchanged. The runtime context handoff may be narrowly extended so each actual outbound HTTP request must obtain a controller-owned durable reservation immediately before any network write.
 
 Required semantics:
-- the controller binds an exact call class (`pre-submit`, `target`, `reconciliation`, or `post-merge`) into each provider invocation context;
+- the controller binds an exact call class (`pre-submit`, `target`, `reconciliation`, or `post-merge`) plus a usable controller-owned reservation handle into each provider invocation context; missing, unbound, malformed, or unusable handoff fails closed before any HTTP request and explicitly replaces the provider's current fresh-maxima fallback;
 - the provider must synchronously reserve one actual HTTP request through the controller-owned handoff before transport invocation; reservation failure prevents that request;
 - the durable reservation increments the correct phase counter and the attempt-wide `TotalProviderCalls` before network I/O and survives crash/restart;
 - `ProviderBudgetV1` exposes remaining actual HTTP-call allowance in addition to existing byte/time allowance;
 - `ProviderAccountingV1` reports actual HTTP calls for independent cross-checking but never creates retry authority or replaces the durable pre-call reservation;
 - existing operation/submission reservations continue to own commit-submission, target-submission, reconciliation-round, cancellation, and terminal semantics; do not reinterpret those identities;
-- exact production ceilings remain 28 pre-submit HTTP calls, 3 reconciliation calls per round, 8 post-merge HTTP calls, 64 total HTTP calls, and the existing byte/time limits;
+- exact production call allocation is preserved: at most 28 pre-submit HTTP calls **including the single commit-object-creation submission**, exactly one target-ref-update submission plus at most one target post-mutation verification read (2 target-class calls total), at most 8 post-merge HTTP calls, and at most 3 reconciliation calls per round across 8 rounds; these classified maxima total 62; the aggregate cap remains 64 and the remaining two calls are reserved only for body-safe principal/request-identity validation and may never be consumed by mutation, target verification, post-merge, or reconciliation;
+- the target post-mutation verification read must be one bounded fixed observation that independently proves both governed refs and the exact result object; it may not expand into three separately budgeted reads;
 - active time is measured through complete bounded body read/decompression and body close, not merely through receipt of response headers;
 - each request deadline is capped by the lesser of the per-call timeout and remaining cumulative active-time budget before transport;
 - crash/restart cannot reset call or time budget and a missing/ambiguous accounting continuation fails closed.
@@ -71,7 +72,7 @@ The controlled disposable-ref live harness must execute both wrong-base and wron
 | ID | Required proof | Mandatory entrypoint/evidence |
 | --- | --- | --- |
 | F1 | C-01 fresh identity + exact object + equal/descendant containment before reconciliation `APPLIED` | `TestTask3ClosureC01ReconciliationIdentityContainment` |
-| F2 | M-01 every real HTTP request is durably controller-reserved before network; phase/global call ceilings, restart, deadline, and full-body/close active-time accounting are exact | `TestTask3ClosureM01DurableHTTPCallBudgets` plus controller/store restart proof |
+| F2 | M-01 every real HTTP request is durably controller-reserved before network; missing handoff fails closed; exact 28 pre-submit / 2 target / 3-per-reconciliation-round / 8 post-merge / 62 classified / 64 aggregate allocation, reserved-two non-reassignment, restart, deadline, and full-body/close active-time accounting are exact | `TestTask3ClosureM01DurableHTTPCallBudgets` plus controller/store restart proof |
 | F3 | M-02 repeated Link/encoding fields cannot be collapsed or silently accepted | `TestTask3ClosureM02RepeatedHeaders` |
 | F4 | M-03 app-installation credential cannot reach provider mutation without independent installation proof | `TestTask3ClosureM03AppInstallationIdentity` |
 | F5 | M-04 negative live cases are materially state-changing if partially applied and run before positive mutation | `TestTask3ClosureM04LiveAtomicityOrdering` plus a new separately sealed live run |
