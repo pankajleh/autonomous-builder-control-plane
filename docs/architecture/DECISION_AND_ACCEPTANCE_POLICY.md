@@ -71,7 +71,7 @@ Recommended classes:
 
 Additional assurance classes are `fault_injection`, `race_concurrency`, `crash_restart`, `resource`, `replay_idempotency`, `security_negative`, and `e2e`. `ASSURANCE_MODEL_AND_PROOF_OBLIGATION_POLICY.md` defines their semantics.
 
-The A-frozen proof-obligation matrix selects required classes. Required `smoke` and `integration` classes are mandatory for code-bearing work unless A records a reviewed `not_applicable` rationale. A required class cannot be substituted by a narrower class, and `VALIDATION_UNAVAILABLE` is blocking rather than evidence of PASS.
+The A-frozen proof-obligation matrix selects required classes and assigns every requirement to `B_IMPLEMENTATION`, `C_BRANCH_ACCEPTANCE`, `INTEGRATION_ACCEPTANCE`, `POST_MERGE_ACCEPTANCE`, or `PRODUCTION_ACCEPTANCE`, with an exact candidate/result/deployment subject binding. Required `smoke` and `integration` classes are mandatory for code-bearing work unless A records a reviewed `not_applicable` rationale. A required class cannot be substituted by a narrower class or executed at another lifecycle stage, and `VALIDATION_UNAVAILABLE` is blocking rather than evidence of PASS.
 
 ## 5. Review policy
 
@@ -88,7 +88,7 @@ Risk-triggered addition:
 independent cross-model review
 ```
 
-Cross-model review is never a replacement for deterministic acceptance.
+Cross-model review is never a replacement for deterministic acceptance. For A-stage design/assurance review, the prerequisite deterministic evidence means the exact design head has passed the applicable canonical design/assurance validators; it does not require post-implementation branch acceptance that cannot yet exist.
 
 ### Independent-review provider fallback
 
@@ -104,4 +104,4 @@ A required command failure produces failed acceptance even if Ralphex previously
 
 A required command being unavailable produces `VALIDATION_UNAVAILABLE`, not PASS.
 
-Acceptance is complete only when every required proof-obligation/evidence-class cell for the exact candidate has verified evidence. Deterministic success without that traceability is `ASSURANCE_EVIDENCE_INCOMPLETE`, not branch acceptance.
+A lifecycle acceptance checkpoint is complete only when every proof-obligation/evidence cell assigned to that checkpoint has verified evidence for its exact bound subject and all required predecessor-stage evidence validates. Future-stage cells remain pending rather than being executed early. After successor assurance activation, missing/unavailable required evidence is `ASSURANCE_EVIDENCE_INCOMPLETE`, not acceptance; a validator that actually disproves a sufficient frozen obligation is an implementation failure.

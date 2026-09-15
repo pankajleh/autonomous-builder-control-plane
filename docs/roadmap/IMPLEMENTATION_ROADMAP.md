@@ -81,22 +81,27 @@ This gate applies before ABCP is declared ready to govern new external code-bear
 
 Deliverables:
 
+- successor activation/policy-manifest authority that pins the approved assurance policy/schema and narrowly grandfathers eligible in-flight V3 lineages;
 - durable assurance-policy/model and proof-obligation identity;
-- A-stage completeness validation and A-to-B digest binding;
+- controller-owned code-bearing/documentation-only classification with exact-diff revalidation;
+- A-stage failure-scenario → invariant → proof-obligation → staged-evidence completeness validation and A-to-B digest binding;
 - B-stage proof-obligation/test traceability and evidence completeness checks;
-- C-stage independent execution of the frozen evidence matrix;
+- lifecycle-stage and exact candidate/result/deployment binding for every evidence requirement;
+- C-stage independent execution of only the frozen branch-acceptance matrix plus bounded controller-derived correction-B reentry for implementation findings;
 - mandatory smoke/integration journey enforcement for applicable builds;
-- `ASSURANCE_MODEL_GAP` return-to-A semantics;
-- assurance-escape recording and audit evidence;
+- broad-precedence `ASSURANCE_MODEL_GAP` return-to-A semantics;
+- assurance-escape recording and mandatory A completeness re-review;
 - fresh-session validation that fails closed when required assurance authority is missing.
 
 Exit criteria:
 
 - one ABCP dogfood execution pack is accepted from A through C using the new policy;
-- every required proof-obligation/evidence cell has deterministic evidence;
-- at least one real smoke journey and one integration journey are controller-run independently;
-- injected missing evidence produces `ASSURANCE_EVIDENCE_INCOMPLETE`;
-- an injected missing threat/proof obligation produces `ASSURANCE_MODEL_GAP` and cannot mint B mutation authority;
+- every applicable failure scenario maps to invariant/proof/evidence and every required cell has a lifecycle stage plus exact subject binding;
+- at least one real smoke journey and one integration journey are controller-run independently at their assigned stages;
+- injected missing/wrong-stage evidence produces `ASSURANCE_EVIDENCE_INCOMPLETE`;
+- an injected missing/misclassified threat, unjustified N/A, inadequate proof, or missing boundary produces `ASSURANCE_MODEL_GAP` and cannot mint B mutation authority;
+- an injected C implementation finding can only enter a finite controller-derived correction B without resetting cumulative ceilings;
+- an attempted documentation-only bypass and an unactivated assurance policy/schema both fail closed;
 - exact-head final review verifies the frozen model rather than defining a new one.
 
 ## Phase 5 — Service/API and dashboard

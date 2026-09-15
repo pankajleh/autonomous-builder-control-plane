@@ -39,7 +39,7 @@ roadmap authority
 → exact-head Critical/Major review
 ```
 
-Independent-provider failure before a complete verdict follows the provider-fallback policy in `DECISION_AND_ACCEPTANCE_POLICY.md`. A substantive provider finding is not provider failure and must be corrected.
+Independent-provider failure before a complete verdict follows the provider-fallback policy in `DECISION_AND_ACCEPTANCE_POLICY.md`. At A, a clean fallback requires the exact design head to have passed the canonical design/assurance validators; it does not require post-implementation branch acceptance. A substantive provider finding is not provider failure and must be corrected.
 
 ## 4. Parallel execution rule
 

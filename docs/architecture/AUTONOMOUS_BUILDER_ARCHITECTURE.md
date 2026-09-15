@@ -301,7 +301,7 @@ Implementation + native review complete.
 
 ### Level 3: controller branch acceptance
 
-The exact A-frozen proof-obligation/evidence matrix is rerun independently. Required deterministic commands, smoke/integration journeys, adversarial/failure evidence, and traceability are captured. Missing required evidence blocks acceptance.
+The controller independently executes the exact A-frozen cells assigned to `C_BRANCH_ACCEPTANCE` for the unchanged candidate and validates required predecessor B evidence. Required branch-stage deterministic commands, smoke/integration journeys, adversarial/failure evidence, and traceability are captured. Integration, post-merge, and production cells remain owned by Levels 4–6 and are bound to their own exact result/deployment identities. Missing required evidence for the current level blocks acceptance.
 
 ### Level 4: integration acceptance
 
