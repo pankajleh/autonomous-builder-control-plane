@@ -1,0 +1,58 @@
+# Assurance / Proof-Obligation Governance Enforcement Plan
+
+Status: **planning candidate — implementation forbidden until design/assurance review and `DESIGN_ACCEPTED`**
+
+## Goal
+
+Turn `ASSURANCE_MODEL_AND_PROOF_OBLIGATION_POLICY.md` from normative architecture into fail-closed controller authority before ABCP governs new external code-bearing builds.
+
+The implementation must preserve the three-capsule A/B/C model. Assurance authority is part of A and is inherited through grants/checkpoints; it is not a fourth capsule and not reviewer-authored mutable context.
+
+## Task 1 — immutable assurance contracts
+
+Design strict-canonical records for the assurance policy/model, failure-dimension/scenario classifications, invariants, proof obligations, evidence requirements with lifecycle-stage/subject bindings, critical journeys, code-bearing/documentation-only classification, and cumulative final-review correction-reentry ceiling. Every applicable scenario must map into invariant → proof obligation → evidence. Define canonical digests and compatibility/version rules without retroactively reinterpreting existing V3 bytes.
+
+Also design a successor activation/policy-manifest authority chained to the installed V3 activation. It must pin the approved assurance-policy digest/schema, reject unactivated versions, and exactly grandfather eligible in-flight V3 lineages.
+
+Required proof: reordered/duplicated/unknown/ambiguous records fail deterministically; canonical equivalents hash identically; unactivated policy/schema digests fail; a competing or over-broad grandfather set fails.
+
+## Task 2 — A gate and A-to-B authority
+
+Default every lineage to code-bearing. Permit `documentation_only` only by controller-owned A classification for non-authoritative documentation paths, and revalidate the exact B/C diff before honoring the exemption.
+
+Add controller validation that every applicable failure dimension/scenario maps through invariant → proof obligation → evidence requirement, with reviewed N/A decisions, lifecycle-stage/subject bindings, and named smoke/integration production boundaries before `DESIGN_ACCEPTED`.
+
+A-to-B must bind exact activated assurance digests, mandatory floors, and cumulative correction-reentry ceiling. Missing or malformed assurance authority fails before Ralphex admission.
+
+## Task 3 — B implementation traceability
+
+Bind tasks/tests/evidence to frozen proof-obligation IDs and lifecycle stages. `IMPLEMENTATION_CONVERGED` must fail when a B-stage required evidence cell is missing, unavailable, executed against the wrong subject, or satisfied only by a weaker class; a deterministic test that disproves a valid obligation is an implementation failure.
+
+B must never modify the assurance model. Implement broad `ASSURANCE_MODEL_GAP` precedence for misclassification/N/A, inadequate obligations, wrong evidence/validator/stage/binding, missing production boundary/journey, or broken traceability.
+
+## Task 4 — C acceptance and final review
+
+Make C independently execute only the frozen `C_BRANCH_ACCEPTANCE` cells against one unchanged exact candidate and verify required B evidence. Later integration/post-merge/production controllers execute only their assigned cells against their exact result/deployment subjects.
+
+Final review blockers must classify as `IMPLEMENTATION_FINDING` or broad-precedence `ASSURANCE_MODEL_GAP`. The latter invalidates C and returns to A. For an implementation finding, persist an exact failed-C record and implement a controller-derived correction-B reentry bound to frozen A authority, exact finding IDs/paths, prior failed candidate/evidence, and the non-resetting cumulative reentry ceiling. C/reviewer prose never mints mutation authority.
+
+## Task 5 — assurance escapes and learning evidence
+
+Persist assurance escapes with missed failure dimension/scenario, affected invariants/proof obligations, discovery stage, exact candidate, and corrective A/policy action. Every Critical/Major assurance escape forces an A-level assurance-completeness re-review; no numeric threshold or reviewer discretion bypasses that return.
+
+No learning record may silently change an active lineage's authority.
+
+## Task 6 — dogfood acceptance
+
+Run one non-trivial ABCP feature through A → B → C and the applicable later acceptance stages using the new contracts. Required evidence must include unit/static plus applicable adversarial classes, a controller-run smoke journey, an integration journey, exact-head branch acceptance/review, and correctly staged later evidence where applicable.
+
+Negative acceptance must prove: missing evidence blocks the owning stage; wrong-stage/wrong-subject evidence is rejected; a deliberately omitted/misclassified material failure model returns to A; a C implementation finding can create only bounded controller-derived correction-B authority; documentation-only misclassification is rejected; and the cumulative correction-reentry ceiling cannot be reset.
+
+## Frozen non-goals
+
+- no fourth capsule;
+- no universal requirement to run every evidence class for every task;
+- no reviewer ability to mint proof obligations during B/C;
+- no retroactive mutation of historical V1/V2/V3 evidence;
+- no replacement of deterministic acceptance with model review;
+- no claim of external-build readiness until controller enforcement and dogfood acceptance are complete.

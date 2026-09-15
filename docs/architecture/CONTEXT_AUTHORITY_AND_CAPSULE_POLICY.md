@@ -14,15 +14,15 @@ The autonomous-development workflow has exactly three immutable capsules:
 
 `A_DESIGN -> B_IMPLEMENTATION -> C_ACCEPTANCE_MERGE`
 
-- A permits design planning and read-only design review. Its mutation paths are limited to the named design documents.
-- B permits implementation and implementation review. Review-driven mutation additionally requires a controller-issued, one-use mutation lease.
-- C permits acceptance, read-only exact-head final review, PR publication, merge authorization, and post-merge acceptance. Repository content is read-only throughout C.
+- A permits functional/assurance design planning and read-only design/assurance review. Its mutation paths are limited to the named design and assurance documents.
+- B permits implementation and implementation review against the frozen proof obligations. Review-driven mutation additionally requires a controller-issued, one-use mutation lease.
+- C permits independent execution of the frozen acceptance matrix, read-only exact-head final review, PR publication, merge authorization, and post-merge acceptance. Repository content is read-only throughout C.
 
 Exact candidate commits remain checkpoint evidence rather than mutable capsule fields.
 
 ## V3 phase authority
 
-Every V3 capsule binds the existing project, plan, task, repository, base, source, invariant, non-goal, and predecessor fields plus `phase_authority`. Phase authority fixes the canonical stage and operation set; parent checkpoint and grant; immutable semantic registry digest; observation, blocking, and mutation rule IDs; authorized invariant/finding IDs; exact paths or concrete `dir/**` prefixes; review profile; and, for B, execution bounds.
+Every V3 capsule binds the existing project, plan, task, repository, base, source, invariant, non-goal, and predecessor fields plus `phase_authority`. Phase authority fixes the canonical stage and operation set; parent checkpoint and grant; immutable semantic registry digest; observation, blocking, and mutation rule IDs; authorized invariant/finding IDs; exact paths or concrete `dir/**` prefixes; review profile; and, for B, execution bounds. The next compatible governance schema must additionally bind the assurance-policy/model digest, proof-obligation-set digest, and required-evidence-matrix digest defined by `ASSURANCE_MODEL_AND_PROOF_OBLIGATION_POLICY.md`; current V3 bytes are not retroactively reinterpreted.
 
 All arrays are sorted and unique. Blocking is a subset of observation; mutation is a subset of blocking. Absolute paths, traversal, regex/glob syntax other than `dir/**`, symlink-derived paths, and broad-root patterns fail closed.
 
@@ -42,7 +42,7 @@ Candidate verification is separate. It proves exact lowercase commit identity, b
 
 The A-reviewed `SemanticAuthorityRegistryV1` fixes each rule, predicate, evidence class, correction relation, owner/path family, deterministic validator identity, and whether model-only observation is permitted. A reviewer cannot mint or redefine a rule.
 
-For `INITIAL_IMPLEMENTATION`, report zero establishes a bounded active-finding set. Later reports may retain or remove IDs but never add one. For `CORRECTION`, every blocker is already named by B and the same monotonic rule applies. An unmapped or newly blocking concern returns `SCOPE_EXPANSION_REQUIRED`; a `DESIGN_GAP` returns to a new A lineage.
+For `INITIAL_IMPLEMENTATION`, report zero establishes a bounded active-finding set. Later reports within that B may retain or remove IDs but never add one. For `CORRECTION`, every blocker is already named by that correction B and the same monotonic rule applies. An unmapped or newly blocking B concern returns `SCOPE_EXPANSION_REQUIRED`; a `DESIGN_GAP` or `ASSURANCE_MODEL_GAP` returns to a new A lineage. A C-stage `IMPLEMENTATION_FINDING` first invalidates C; only the controller may derive a new correction-B authority from the frozen A semantic/assurance registry, exact failed-C evidence, finite correction paths, and the A-bound cumulative reentry ceiling. It does not enlarge the active set of the prior B, reset cumulative ceilings, or give the C reviewer mutation authority.
 
 `ReviewScopeReportV1` records one non-forkable report tip. Deferred observations never block and never justify mutation. A validated blocking report is still read-only: the controller deterministically intersects B paths with registry correction paths and issues a single-use `MutationLeaseV1`. The lease must CAS from `ISSUED` to `CONSUMING` before edits. An independently validated `MutationReceiptV1` advances the receipt tip and marks it `CONSUMED`. Replay, fork, crash ambiguity, path escape, dirty exit, or diff-bound violation blocks convergence.
 
