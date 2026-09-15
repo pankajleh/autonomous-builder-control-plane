@@ -69,7 +69,9 @@ Recommended classes:
 - `runtime`
 - `production`
 
-A plan or project policy selects required classes.
+Additional assurance classes are `fault_injection`, `race_concurrency`, `crash_restart`, `resource`, `replay_idempotency`, `security_negative`, and `e2e`. `ASSURANCE_MODEL_AND_PROOF_OBLIGATION_POLICY.md` defines their semantics.
+
+The A-frozen proof-obligation matrix selects required classes. Required `smoke` and `integration` classes are mandatory for code-bearing work unless A records a reviewed `not_applicable` rationale. A required class cannot be substituted by a narrower class, and `VALIDATION_UNAVAILABLE` is blocking rather than evidence of PASS.
 
 ## 5. Review policy
 
@@ -101,3 +103,5 @@ The merge audit must record the exact reviewed SHA, reviewer mode (`cross_model`
 A required command failure produces failed acceptance even if Ralphex previously emitted COMPLETED.
 
 A required command being unavailable produces `VALIDATION_UNAVAILABLE`, not PASS.
+
+Acceptance is complete only when every required proof-obligation/evidence-class cell for the exact candidate has verified evidence. Deterministic success without that traceability is `ASSURANCE_EVIDENCE_INCOMPLETE`, not branch acceptance.

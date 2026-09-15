@@ -75,6 +75,30 @@ Deliverables:
 - expected-head merge protection;
 - post-merge acceptance.
 
+## Cross-cutting gate — Assurance governance enforcement
+
+This gate applies before ABCP is declared ready to govern new external code-bearing software builds under the assurance policy. It does not renumber the roadmap phases.
+
+Deliverables:
+
+- durable assurance-policy/model and proof-obligation identity;
+- A-stage completeness validation and A-to-B digest binding;
+- B-stage proof-obligation/test traceability and evidence completeness checks;
+- C-stage independent execution of the frozen evidence matrix;
+- mandatory smoke/integration journey enforcement for applicable builds;
+- `ASSURANCE_MODEL_GAP` return-to-A semantics;
+- assurance-escape recording and audit evidence;
+- fresh-session validation that fails closed when required assurance authority is missing.
+
+Exit criteria:
+
+- one ABCP dogfood execution pack is accepted from A through C using the new policy;
+- every required proof-obligation/evidence cell has deterministic evidence;
+- at least one real smoke journey and one integration journey are controller-run independently;
+- injected missing evidence produces `ASSURANCE_EVIDENCE_INCOMPLETE`;
+- an injected missing threat/proof obligation produces `ASSURANCE_MODEL_GAP` and cannot mint B mutation authority;
+- exact-head final review verifies the frozen model rather than defining a new one.
+
 ## Phase 5 — Service/API and dashboard
 
 Deliverables:
