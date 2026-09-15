@@ -8,7 +8,11 @@ Turn `ASSURANCE_MODEL_AND_PROOF_OBLIGATION_POLICY.md` from normative architectur
 
 The implementation must preserve the three-capsule A/B/C model. Assurance authority is part of A and is inherited through grants/checkpoints; it is not a fourth capsule and not reviewer-authored mutable context.
 
+A-stage assurance authority for this implementation is defined in `docs/plans/assurance-proof-obligation-governance-enforcement-assurance.md`. No code-bearing task may begin until that artifact and this plan receive a fresh exact-head 0C/0M design/assurance review.
+
 ## Task 1 — immutable assurance contracts
+
+Frozen obligations: `AG-PO-001` through `AG-PO-005`, `AG-PO-017`, `AG-PO-020`.
 
 Design strict-canonical records for the assurance policy/model, failure-dimension/scenario classifications, invariants, proof obligations, evidence requirements with lifecycle-stage/subject bindings, critical journeys, code-bearing/documentation-only classification, and cumulative final-review correction-reentry ceiling. Every applicable scenario must map into invariant → proof obligation → evidence. Define canonical digests and compatibility/version rules without retroactively reinterpreting existing V3 bytes.
 
@@ -18,6 +22,8 @@ Required proof: reordered/duplicated/unknown/ambiguous records fail deterministi
 
 ## Task 2 — A gate and A-to-B authority
 
+Frozen obligations: `AG-PO-003`, `AG-PO-006` through `AG-PO-009`, `AG-PO-018`, `AG-PO-019`.
+
 Default every lineage to code-bearing. Permit `documentation_only` only by controller-owned A classification for non-authoritative documentation paths, and revalidate the exact B/C diff before honoring the exemption.
 
 Add controller validation that every applicable failure dimension/scenario maps through invariant → proof obligation → evidence requirement, with reviewed N/A decisions, lifecycle-stage/subject bindings, and named smoke/integration production boundaries before `DESIGN_ACCEPTED`.
@@ -26,11 +32,15 @@ A-to-B must bind exact activated assurance digests, mandatory floors, and cumula
 
 ## Task 3 — B implementation traceability
 
+Frozen obligations: `AG-PO-009`, `AG-PO-010`, `AG-PO-013`, `AG-PO-018`, `AG-PO-020`.
+
 Bind tasks/tests/evidence to frozen proof-obligation IDs and lifecycle stages. `IMPLEMENTATION_CONVERGED` must fail when a B-stage required evidence cell is missing, unavailable, executed against the wrong subject, or satisfied only by a weaker class; a deterministic test that disproves a valid obligation is an implementation failure.
 
 B must never modify the assurance model. Implement broad `ASSURANCE_MODEL_GAP` precedence for misclassification/N/A, inadequate obligations, wrong evidence/validator/stage/binding, missing production boundary/journey, or broken traceability.
 
 ## Task 4 — C acceptance and final review
+
+Frozen obligations: `AG-PO-011` through `AG-PO-016`, `AG-PO-018`, `AG-PO-020`.
 
 Make C independently execute only the frozen `C_BRANCH_ACCEPTANCE` cells against one unchanged exact candidate and verify required B evidence. Later integration/post-merge/production controllers execute only their assigned cells against their exact result/deployment subjects.
 
@@ -38,11 +48,15 @@ Final review blockers must classify as `IMPLEMENTATION_FINDING` or broad-precede
 
 ## Task 5 — assurance escapes and learning evidence
 
+Frozen obligations: `AG-PO-013`, `AG-PO-021`.
+
 Persist assurance escapes with missed failure dimension/scenario, affected invariants/proof obligations, discovery stage, exact candidate, and corrective A/policy action. Every Critical/Major assurance escape forces an A-level assurance-completeness re-review; no numeric threshold or reviewer discretion bypasses that return.
 
 No learning record may silently change an active lineage's authority.
 
 ## Task 6 — dogfood acceptance
+
+Frozen obligations: `AG-PO-018`, `AG-PO-019`, `AG-PO-022` plus cumulative verification of all prior obligations.
 
 Run one non-trivial ABCP feature through A → B → C and the applicable later acceptance stages using the new contracts. Required evidence must include unit/static plus applicable adversarial classes, a controller-run smoke journey, an integration journey, exact-head branch acceptance/review, and correctly staged later evidence where applicable.
 
