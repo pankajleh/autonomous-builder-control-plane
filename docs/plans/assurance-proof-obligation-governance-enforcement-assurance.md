@@ -15,6 +15,7 @@ This is code-bearing ABCP work. `documentation_only` is forbidden. B mutation au
 - `internal/acceptance/**`
 - `internal/authoritybackend/**`
 - `internal/mergelifecycle/**`
+- `internal/prlifecycle/**`
 - `cmd/abcp/**`
 - `scripts/acceptance/assurance-governance-dogfood.sh`
 - `scripts/acceptance/assurance-governance-postmerge.sh`
@@ -57,7 +58,17 @@ Finite cumulative final-review correction-reentry ceiling: **2 correction-B line
 | AG-I17 | Required integration acceptance is a merge-authorization prerequisite; any C invalidation races atomically with merge authority, and post-merge failure cannot be misreported as completion or silently rolled back. |
 | AG-I18 | The production workflow-authority backend is a specified PostgreSQL linearizable CAS implementation with durable bootstrap, authenticated namespace, and fresh-process composition; backend absence/unavailability is fail-closed. |
 | AG-I19 | Credential-bearing execution is partitioned from retained evidence: secret-capable children cannot expose credential bytes to tool subprocesses or retained raw output, and exact secret-value scanning gates every stage that used credentials. |
-| AG-I20 | V4 lifecycle side effects linearize through explicit controller-owned stage/effect tips; merge submission is authorized only by one unconsumed `MergeEffectLeaseV1`, so invalidation and external effect cannot both win the same pre-submission state. |
+| AG-I20 | V4 lifecycle side effects linearize through controller-owned intent + one-winner effect claims; PR/merge submission is impossible without the exact ephemeral single-consume capability produced only for the winning claim CAS. |
+| AG-I21 | Every remote write effect (PR publication or merge submission) requires a controller CAS that has exactly one winner and yields an ephemeral one-shot capability whose raw token is never durable; after possible submission only read-only reconciliation is authorized. |
+| AG-I22 | PostgreSQL enforces authority-domain isolation in the database itself with forced row-level security, runtime-role predicates derived from `current_user`, non-owner/no-bypass roles, fixed schema/search-path, and exact grants/revocations. |
+| AG-I23 | Every digest-referenced governance/evidence ancestor is retrievable cross-host from a shared immutable content-addressed artifact backend in the same authority domain. |
+| AG-I24 | The append-only run ledger remains operational run-state truth while PostgreSQL owns assurance/governance coordination; every cross-boundary transition binds the exact ledger event digest and is crash-reconcilable without dual-authoritative state. |
+| AG-I25 | V4 activation never migrates a live V3 workflow: activation requires a controller-proven drained predecessor V3 state, preserves its exact final bytes/revision as immutable evidence, and starts V2 at predecessor revision + 1 with an empty grandfather set. |
+| AG-I26 | PR publication is an external effect with the same intent/claim/reconciliation discipline as merge submission and cannot occur before integration acceptance. |
+| AG-I27 | Correction-B paths are controller-derived only from the frozen semantic registry, validated finding rule IDs/affected paths, and the original B scope; reviewer/finding bytes cannot directly supply mutation paths. |
+| AG-I28 | Secret-capable execution is bound in validator authority and every credential-bearing lifecycle stage must pass a complete retained-artifact inventory scan before its stage can pass. |
+| AG-I29 | Resource profile/container capability is frozen in validator authority, not selected by callers; controller reservations cover the full process/container/cache footprint against a worker-wide aggregate capacity. |
+| AG-I30 | J-05 delegation binds a frozen policy floor and exact toy plan/baseline; it authorizes child A only, and the child A must mint its own repository-bound model before any B/C authority exists. |
 
 ## Stable failure-scenario registry
 
@@ -75,7 +86,7 @@ Finite cumulative final-review correction-reentry ceiling: **2 correction-B line
 | AG-S-010 | retry/replay | conflicting duplicate durable record uses same logical identity with different bytes | AG-I08,AG-I10 | AG-PO-004,AG-PO-007 |
 | AG-S-011 | retry/replay | failed-C/correction request is replayed after success/restart | AG-I07,AG-I12 | AG-PO-017,AG-PO-018,AG-PO-019 |
 | AG-S-012 | authority identity | policy/model/matrix/candidate bytes or digest are stale/replaced | AG-I01,AG-I09,AG-I13 | AG-PO-001,AG-PO-009,AG-PO-010,AG-PO-011,AG-PO-023,AG-PO-038 |
-| AG-S-013 | authority identity | predecessor V3 authority is reissued or used after successor activation when not grandfathered | AG-I01,AG-I08,AG-I09 | AG-PO-002,AG-PO-005,AG-PO-023 |
+| AG-S-013 | authority identity | V4 activation is attempted while predecessor V3 is not drained, or historical V3 authority is presented operationally after V4 activation | AG-I01,AG-I08,AG-I09,AG-I25 | AG-PO-002,AG-PO-005,AG-PO-023,AG-PO-049 |
 | AG-S-014 | partial failure | content-addressed child is durable but no controller-state CAS references it | AG-I10 | AG-PO-007,AG-PO-020 |
 | AG-S-015 | partial failure | controller state attempts to reference missing/conflicting child artifact | AG-I09,AG-I10 | AG-PO-007,AG-PO-020,AG-PO-023 |
 | AG-S-016 | cancellation | cancellation occurs before durable child artifact | AG-I14 | AG-PO-021 |
@@ -89,8 +100,8 @@ Finite cumulative final-review correction-reentry ceiling: **2 correction-B line
 | AG-S-024 | filesystem identity | repository/controller path, symlink, or object identity is substituted | AG-I09,AG-I11 | AG-PO-023,AG-PO-024 |
 | AG-S-025 | external dependency | authoritative Git object/ref or PostgreSQL backend is unavailable/delayed | AG-I09,AG-I14,AG-I18 | AG-PO-022,AG-PO-023,AG-PO-034 |
 | AG-S-026 | external dependency | Git/ref/backend observation changes, duplicates, or is inconsistent between observation/use | AG-I09,AG-I14,AG-I18 | AG-PO-022,AG-PO-023,AG-PO-034 |
-| AG-S-027 | compatibility/version skew | eligible pre-successor V3 lineage continues under predecessor policy | AG-I01,AG-I08 | AG-PO-002,AG-PO-005,AG-PO-010 |
-| AG-S-028 | compatibility/version skew | unlisted/post-successor V3 lineage attempts predecessor policy | AG-I01,AG-I08,AG-I09 | AG-PO-002,AG-PO-005,AG-PO-010,AG-PO-023 |
+| AG-S-027 | compatibility/version skew | activation is attempted while predecessor V3 has a nonterminal lineage or unresolved effect | AG-I01,AG-I08,AG-I25 | AG-PO-002,AG-PO-005,AG-PO-049 |
+| AG-S-028 | compatibility/version skew | drained historical V3 authority is replayed operationally after V4 activation | AG-I01,AG-I08,AG-I09,AG-I25 | AG-PO-005,AG-PO-023,AG-PO-049 |
 | AG-S-029 | security boundary | another repository/controller identity reuses assurance/grant/evidence/backend namespace | AG-I09,AG-I11,AG-I18 | AG-PO-012,AG-PO-023,AG-PO-024,AG-PO-034 |
 | AG-S-030 | model mutation | B attempts to change/N-A/weaken model, matrix, stage, validator, or journey | AG-I02,AG-I06 | AG-PO-006,AG-PO-013,AG-PO-027 |
 | AG-S-031 | C authority | C reviewer/finding attempts direct repository mutation | AG-I03,AG-I07 | AG-PO-017,AG-PO-018 |
@@ -110,9 +121,21 @@ Finite cumulative final-review correction-reentry ceiling: **2 correction-B line
 | AG-S-045 | lifecycle ordering | integration fails or C invalidates concurrently with merge authorization/publication/post-merge | AG-I13,AG-I17,AG-I20 | AG-PO-016,AG-PO-017,AG-PO-037,AG-PO-043 |
 | AG-S-046 | secret egress | credential-bearing Codex/PostgreSQL execution prints, copies, or exposes credential bytes to a tool subprocess, diff, or retained evidence | AG-I11,AG-I19 | AG-PO-041 |
 | AG-S-047 | merge effect race | C invalidation races the last controller decision before the provider merge effect, or the provider result is ambiguous after lease issuance | AG-I10,AG-I17,AG-I20 | AG-PO-020,AG-PO-037,AG-PO-043 |
-| AG-S-048 | compatibility/version skew | a grandfathered V3 C fails after V4 activation and attempts to mint a V4 correction descendant | AG-I01,AG-I08,AG-I09 | AG-PO-002,AG-PO-005,AG-PO-042 |
+| AG-S-048 | compatibility/version skew | drained historical V3 bytes are reinterpreted as V4 authority or used to mint a V4 descendant without the successor activation/A chain | AG-I01,AG-I08,AG-I09,AG-I25 | AG-PO-002,AG-PO-005,AG-PO-042,AG-PO-049 |
 | AG-S-049 | structural assurance | syntactically valid registries contain semantically disconnected or duplicate scenario→invariant→proof→cell→validator links | AG-I02,AG-I05 | AG-PO-006,AG-PO-040 |
 | AG-S-050 | dogfood delegated authority | a depth-1 child activation escapes its parent reservation/repository/budget or attempts publication, merge, or nested dogfood | AG-I09,AG-I12,AG-I16 | AG-PO-035,AG-PO-044 |
+
+| AG-S-051 | remote-effect claim | two hosts/processes observe the same merge-authorized tip and both attempt provider submission | AG-I20,AG-I21 | AG-PO-043,AG-PO-045 |
+| AG-S-052 | database isolation | one runtime credential directly selects/updates another authority domain/controller row or artifact | AG-I11,AG-I18,AG-I22 | AG-PO-046 |
+| AG-S-053 | cross-host recovery | fresh controller host has state digests but cannot load predecessor/model/grant/evidence bytes | AG-I09,AG-I23 | AG-PO-050 |
+| AG-S-054 | migration/version skew | V4 activation occurs while predecessor V3 has active invocation/grant/lease/nonterminal checkpoint | AG-I08,AG-I25 | AG-PO-049 |
+| AG-S-055 | PR effect race | C/integration invalidation races PR HTTP submission or process dies after claim | AG-I17,AG-I21,AG-I26 | AG-PO-054 |
+| AG-S-056 | durable-state split | ledger READY/MERGED/FAILED state and PostgreSQL stage tip diverge across crash boundary | AG-I10,AG-I17,AG-I24 | AG-PO-055 |
+| AG-S-057 | resource profile downgrade | caller selects a weaker resource/secret profile or container escapes aggregate reservation | AG-I12,AG-I16,AG-I29 | AG-PO-051 |
+| AG-S-058 | secret inventory | B, integration, post-merge, failed or orphan evidence containing a credential is omitted from later scan | AG-I19,AG-I28 | AG-PO-041,AG-PO-052 |
+| AG-S-059 | child authority | J-05 reuses parent ABCP assurance model for toy repository or runs Ralphex without exact frozen plan/capsule authority | AG-I09,AG-I30 | AG-PO-044,AG-PO-053 |
+| AG-S-060 | correction minting | reviewer/finding packet supplies correction paths not derivable from frozen A semantic registry | AG-I07,AG-I27 | AG-PO-018,AG-PO-048 |
+| AG-S-061 | immutable artifact conflict | same digest/logical artifact identity is absent, cross-domain, oversized, or resolves to conflicting bytes | AG-I08,AG-I10,AG-I23 | AG-PO-007,AG-PO-050 |
 
 All minimum policy dimensions are applicable. No failure-model dimension is `not_applicable` for this controller-governance implementation. Evidence-class applicability is separately frozen below; `runtime` and `production` are explicitly N/A because this execution pack does not deploy a long-running production ABCP service.
 
@@ -121,10 +144,10 @@ All minimum policy dimensions are applicable. No failure-model dimension is `not
 | ID | Falsifiable claim | Invariants |
 |---|---|---|
 | AG-PO-001 | `AssurancePolicyManifestV1` binds exact predecessor activation digest, exact authorized merge-result policy commit/tree, exact protected base branch, authenticated acting principal, successor capsule wire version `context-capsule-v4`, assurance schema `assurance-policy-v1`, and sorted canonical full policy path+SHA256 entries recomputed from that commit; no ambient/caller digest is trusted. | AG-I01,AG-I08,AG-I09 |
-| AG-PO-002 | successor activation grandfather entries are controller-derived exactly from valid nonterminal predecessor-V3 lineage/checkpoint state at the pre-CAS revision; listed entries remain predecessor-policy-only, and unlisted/post-activation V3 lineages cannot use predecessor policy or mint successor children. | AG-I01,AG-I08,AG-I09 |
+| AG-PO-002 | successor activation is permitted only when controller-derived `V3Drained` is true; the eligible in-flight predecessor set is therefore exactly empty. Any nonterminal V3 blocks activation, and after V4 activation all V3 records are historical evidence only. | AG-I01,AG-I08,AG-I09,AG-I25 |
 | AG-PO-003 | successor activation installation is one atomic compare-and-swap over predecessor activation + expected controller revision; exact replay is idempotent and competing/conflicting installation changes no authority. | AG-I01,AG-I08,AG-I10 |
 | AG-PO-004 | every assurance record strict-parses canonically; sorted-set reorder hashes identically while duplicate/unknown/ambiguous/oversized fields fail before authority/evidence allocation. | AG-I08,AG-I12 |
-| AG-PO-005 | historical V1/V2/V3 bytes retain prior meaning; predecessor V3 may continue only through exact grandfather entries and never authorizes successor-schema A. | AG-I01,AG-I08 |
+| AG-PO-005 | historical V1/V2/V3 bytes retain prior meaning and validators; V4 never reinterprets them. Because activation is drain-before-upgrade, no V3 operational continuation exists after V4 activation and historical V3 can never parent successor A/B/C. | AG-I01,AG-I08,AG-I25 |
 | AG-PO-006 | every `AG-S-*`, `AG-I*`, `AG-PO-*`, evidence cell, validator, and journey reference resolves uniquely; every scenario reaches evidence and every proof obligation has ≥1 exact evidence cell. | AG-I02,AG-I05 |
 | AG-PO-007 | every durable assurance artifact is content-addressed and create-or-verify; conflicting bytes for a logical/content identity fail, durable unreferenced artifacts grant no authority, and only atomic controller-state CAS may make a child authoritative. | AG-I08,AG-I10 |
 | AG-PO-008 | work defaults code-bearing; only controller-bound A classification can grant `documentation_only`, authoritative governance/policy is ineligible, and exact B/C diff semantic/path revalidation invalidates a false exemption. | AG-I04,AG-I09 |
@@ -161,218 +184,304 @@ All minimum policy dimensions are applicable. No failure-model dimension is `not
 | AG-PO-039 | Repository static hygiene is independently mandatory: exact candidate diff has no whitespace/error markers and `go vet ./...` succeeds, but these checks satisfy only this static-hygiene claim and never substitute for resource, graph, lifecycle, or integration evidence. | AG-I05 |
 | AG-PO-040 | The assurance graph validator parses the frozen registries, rejects duplicate/undefined/semantically disconnected IDs, proves every scenario invariant is protected by at least one listed proof, every proof has evidence, every validator is used, and J-01..J-05 each have an AG-PO-029 cell. | AG-I02,AG-I05 |
 | AG-PO-041 | Credential-bearing execution satisfies the frozen secret-egress partition: secret bytes are unavailable to Codex tool subprocesses, raw output from secret-capable processes is never retained as assurance evidence, and exact credential-value scanning of candidate diff plus retained evidence returns zero matches before PASS. | AG-I11,AG-I19 |
-| AG-PO-042 | Every successor wire record has the exact frozen canonical schema/digest preimage below; `ControllerStateV1` bytes are retained as immutable predecessor evidence and one atomic V1→V2 state-upgrade CAS makes strict `ControllerStateV2` the sole mutable state without reinterpretation. Grandfathered V3 may only finish its already-issued normal path; any V3 C failure after V4 activation becomes `A_REQUIRED` and cannot mint a V4 correction child. | AG-I01,AG-I08,AG-I09,AG-I10 |
-| AG-PO-043 | V4 lifecycle follows the exact transition graph below; integration precedes PR publication, and the external merge call is impossible until an atomic one-use `MergeEffectLeaseV1` CAS changes the exact lineage tip from `MERGE_AUTHORIZED` to `MERGE_SUBMITTING`. Invalidation and lease issuance are mutually exclusive at that tip; ambiguous submission is reconciliation-only. | AG-I10,AG-I13,AG-I17,AG-I20 |
+| AG-PO-042 | Every successor wire record has the exact frozen canonical schema/digest preimage below; exact drained `ControllerStateV1` bytes/revision are retained as immutable predecessor evidence, `GovernanceActivationV2.grandfathered_v3` is exactly empty, and V2 starts at predecessor revision + 1 without reinterpretation or live-state migration. | AG-I01,AG-I08,AG-I09,AG-I10,AG-I25 |
+| AG-PO-043 | V4 lifecycle follows the exact transition graph below; integration precedes PR publication, and external merge is impossible until the one-winner `MergeEffectClaimV1` CAS changes the exact tip to `MERGE_SUBMITTING` and yields its non-durable single-consume capability. Invalidation and claim issuance are mutually exclusive; ambiguous submission is reconciliation-only. | AG-I10,AG-I13,AG-I17,AG-I20,AG-I21 |
 | AG-PO-044 | J-05 is a deterministic executable fixture with frozen initial files/task/black-box result, exact parent-reserved child ceilings, pinned Ralphex/Codex identities, and parent-issued `DOGFOOD_DELEGATED` V4 activation constrained to one child repository at depth 1 with publication/merge/dogfood disabled. | AG-I09,AG-I12,AG-I16 |
+| AG-PO-045 | Merge submission has one atomic pre-call winner: controller CAS installs `MergeEffectClaimV1` with claimant identity and hash of a random 256-bit ephemeral claim token; only the winning process retains the raw token in a single-consume in-memory capability. No other host can call; loss after claim is reconciliation-only and a new effect requires exact NOT_APPLIED plus new authority. | AG-I20,AG-I21 |
+| AG-PO-046 | PostgreSQL itself prevents cross-domain reads/writes: forced RLS derives domain from authenticated `current_user`, runtime roles are non-owner/non-superuser/non-bypass, PUBLIC is revoked, search path/schema ownership is fixed, domain bindings are runtime-read-only, and workflow/artifact DML is permitted only through matching-domain policies. | AG-I11,AG-I18,AG-I22 |
+| AG-PO-047 | Every V4 authoritative/referenced record has a frozen strict-canonical schema, enum/bounds, digest preimage and canonical vector, including capsule/phase authority/checkpoint/grant/work class/semantic registry/final-review profile/effect claims/evidence/resource/escape/post-merge-failure records. | AG-I02,AG-I08 |
+| AG-PO-048 | The accepted A binds a complete `SemanticAuthorityRegistryV2` and `FinalReviewProfileV1`; each implementation finding carries a frozen rule ID but **no path authority**. The controller publishes `ControllerAffectedPathSetV1` from exact accepted-B base→failed-candidate Git diff paths intersected with frozen rule scope and original-B scope; correction grants may contain only that controller-derived intersection. | AG-I07,AG-I27 |
+| AG-PO-049 | V4 activation is drain-before-upgrade: predecessor V3 must satisfy `V3Drained`, grandfather set is exactly empty, exact terminal V1 bytes/revision are stored immutably, and initial V2 row is revision `v1.revision+1`; otherwise activation fails `V3_DRAIN_REQUIRED`. | AG-I08,AG-I25 |
+| AG-PO-050 | A PostgreSQL immutable artifact table stores every digest-referenced authority/evidence artifact under forced domain isolation with create-or-verify SHA/size/kind rules; state CAS may reference only already durable artifacts, and fresh hosts resolve full ancestor chains by digest. | AG-I09,AG-I10,AG-I23 |
+| AG-PO-051 | Validator authority fixes process profile, secret capability, network/container requirements and maximum resource vector. Reservation cannot weaken it and atomically charges process plus optional container/tmpfs/cache footprint against lineage and worker-wide capacities before launch. | AG-I12,AG-I16,AG-I29 |
+| AG-PO-052 | Every credential-bearing B/C/integration/post-merge stage has an immutable complete retained-artifact inventory and a stage-local exact-secret zero-match scan before PASS. Real upstream/PostgreSQL/Docker credentials are never argv/env and raw secret-capable output is never retained; the sole Codex-parent exception is the short-lived `ABCP_BROKER_SESSION_TOKEN`, which is not an upstream credential, is excluded from tool-shell inheritance, and may exist only after harmless probes prove shell-env, parent-proc and loopback isolation under `CODEX_BROKER_V1`. | AG-I19,AG-I28 |
+| AG-PO-053 | J-05 contains exact plan bytes/hash, deterministic baseline commit/tree and a `DogfoodPolicyFloorV1`; parent delegation authorizes child A only, child A produces its own repository-bound assurance model/capsule/checkpoint, and only that accepted child model may derive B/C. | AG-I09,AG-I30 |
+| AG-PO-054 | PR publication has one-winner `PREffectClaimV1` semantics bound to integration/C tips and exact request digest; ambiguous or lost claim is reconciliation-only, and `internal/prlifecycle` cannot issue the HTTP write without the ephemeral single-consume claim capability. | AG-I17,AG-I21,AG-I26 |
+| AG-PO-055 | Ledger/PostgreSQL composition is explicit: ledger is run-state truth, PostgreSQL is coordination authority, every V4 checkpoint/effect binds exact ledger event digest, merge requires READY event + matching PG claim, terminal ledger event is written before PG settlement, and every crash gap is reconcile-only with `PostMergeFailureV1` for failed acceptance. | AG-I10,AG-I17,AG-I24 |
 
 ## Canonical successor wire contracts and validity predicates
 
-All records in this section use **strict canonical JSON**. The parser rejects duplicate or unknown fields, invalid UTF-8, floats where an integer is specified, non-canonical timestamps, non-lowercase SHA-256 hex, and fields outside their declared cardinality. Object field serialization order is exactly the order listed below. Set arrays are sorted bytewise by their stable ID/path key and reject duplicates; semantic-order arrays retain declared order. Every record digest is SHA-256 over the UTF-8 canonical JSON of exactly its listed fields with its own terminal `*_sha256` field **absent**, never present as an empty string. The sealed form appends that digest as the final field. Optional (`?`) fields are omitted rather than encoded as null.
+All records here use strict canonical JSON: unknown/duplicate fields, invalid UTF-8, floats for integers, invalid enums, non-lowercase SHA-256, invalid full Git OIDs, unsorted/duplicate set arrays, oversized strings/arrays, or non-canonical UTC RFC3339-second timestamps fail. Object serialization order is exactly the listed field order. Optional fields are omitted, never `null`. A record digest is SHA-256 of the canonical UTF-8 JSON with its terminal self-digest field absent; the sealed form appends that field last. IDs/paths are ≤128/1024 bytes unless a smaller bound is stated; text claims/commands are ≤4096 bytes; arrays are ≤256 entries; authority records are ≤1 MiB.
 
-Primitive notation is frozen: `str` = bounded UTF-8 string, `sha256` = 64 lowercase hex, `oid` = repository-native full Git OID, `u64` = JSON non-negative integer, `bool` = JSON boolean, `ts` = UTC RFC3339 seconds, `[]T(set:key)` = bytewise sorted unique set, and `[]T(order)` = semantic order.
+Closed enums: `phase={A_DESIGN,B_IMPLEMENTATION,C_ACCEPTANCE_MERGE}`; evidence stages `{B_IMPLEMENTATION,C_BRANCH_ACCEPTANCE,INTEGRATION_ACCEPTANCE,POST_MERGE_ACCEPTANCE}`; work class `{CODE_BEARING,DOCUMENTATION_ONLY}`; finding class `{IMPLEMENTATION_FINDING,ASSURANCE_MODEL_GAP}`; correction relation `{IMPLEMENTATION_CORRECTABLE,A_REQUIRED}`; secret capability `{NONE,POSTGRES,CODEX_PROVIDER,DOCKER_PASSWORD}`; effect status `{NONE,PR_SUBMITTING,PR_PUBLISHED,MERGE_SUBMITTING,MERGE_APPLIED,MERGE_NOT_APPLIED,RECOVERY_REQUIRED}`.
 
 | Record / schema | Exact field order before self digest |
 |---|---|
-| `PolicyUpgradeAuthorityV1` / `policy-upgrade-authority-v1` | `kind:str, schema_version:str, repository_identity:sha256, base_branch:str, expected_premerge_base_oid:oid, reviewed_head_oid:oid, merge_result_oid:oid, merge_result_tree_oid:oid, merge_method:str, acting_principal:str, merge_authorized_checkpoint_sha256:sha256, post_merge_accepted_checkpoint_sha256:sha256, provider_evidence_sha256:sha256, policy_evidence_sha256:sha256, predecessor_activation_sha256:sha256` |
-| `AssurancePolicyManifestV1` / `assurance-policy-v1` | `kind, schema_version, repository_identity, activation_repository_commit:oid, activation_repository_tree:oid, predecessor_activation_sha256, lifecycle_authority_sha256, acting_principal, capsule_policy_version:str, assurance_schema_version:str, policy_files:[]PolicyFileV1(set:path)` where `PolicyFileV1={path:str,sha256:sha256}` |
-| `GrandfatheredV3LineageV1` | `repository_identity, controller_identity:sha256, accepted_a_capsule_sha256, accepted_a_checkpoint_sha256, stage:str, capsule_file_sha256, checkpoint_tip_sha256?:sha256, next_stage_grant_sha256?:sha256, candidate_oid:oid, policy_version:str, issuance_sequence:u64, source_state_revision:u64` |
-| `GovernanceActivationV2` / `governance-activation-v2` | `kind, schema_version, policy_version="context-capsule-v4", predecessor_activation_sha256, policy_manifest_sha256, policy_upgrade_authority_sha256, activation_repository_commit:oid, activation_repository_tree:oid, activation_sequence:u64, grandfathered_v3:[]GrandfatheredV3LineageV1(set:accepted_a_capsule_sha256)` |
-| `AssuranceModelV1` / `assurance-model-v1` | `kind, schema_version, repository_identity, accepted_a_head:oid, policy_manifest_sha256, failure_scenarios:[]ScenarioV1(set:id), invariants:[]InvariantV1(set:id), proof_obligations:[]ProofV1(set:id), validators:[]ValidatorV1(set:id), evidence_cells:[]CellV1(set:id), journeys:[]JourneyV1(set:id), resource_profile_sha256, correction_reentry_limit:u64, allowed_b_paths:[]str(set:value)`; the nested records contain exactly the columns of the frozen registries below plus their bounded description/command/subject strings. |
-| `IntegrationFailureV1` / `integration-failure-v1` | `kind, schema_version, accepted_a_lineage_sha256, c_stage_tip_sha256, integration_subject_sha256, integration_validator_id:str, classification:str(IMPLEMENTATION_FINDING|ASSURANCE_MODEL_GAP), finding_ids:[]str(set:value), evidence_sha256, created_sequence:u64` |
-| `FailedStageV1` / `failed-stage-v1` | `kind, schema_version, accepted_a_lineage_sha256, stage:str, candidate_oid:oid, candidate_tree_oid:oid, stage_tip_sha256, classification:str(IMPLEMENTATION_FINDING|ASSURANCE_MODEL_GAP), finding_ids:[]str(set:value), correction_paths:[]str(set:value), evidence_sha256, integration_failure_sha256?:sha256, invalidated_tip_sha256, created_sequence:u64`; `integration_failure_sha256` is present iff `stage=INTEGRATION_ACCEPTANCE` and must bind the exact `IntegrationFailureV1`. |
-| `CorrectionBGrantV1` / `correction-b-grant-v1` | `kind, schema_version, accepted_a_lineage_sha256, failed_stage_sha256, prior_c_tip_sha256, correction_generation:u64, correction_reentry_ordinal:u64, finding_ids:[]str(set:value), allowed_paths:[]str(set:value), execution_bounds_sha256, remaining_resource_budget_sha256` |
-| `AssuranceResourceReservationV1` / `assurance-resource-reservation-v1` | `kind, schema_version, accepted_a_lineage_sha256, invocation_ordinal:u64, cell_attempt_ordinal:u64, cell_id:str, proof_id:str, stage:str, subject_sha256, validator_id:str, resource_profile_id:str, predecessor_stage_tip_sha256, reserved_elapsed_ms:u64, reserved_output_bytes:u64, reserved_evidence_bytes:u64, reserved_transient_bytes:u64, reserved_pids:u64, parent_reservation_sha256?:sha256, nesting_depth:u64` |
-| `AssuranceEvidenceCellV1` / `assurance-evidence-cell-v1` | `kind, schema_version, accepted_a_lineage_sha256, reservation_sha256, invocation_ordinal, cell_attempt_ordinal, cell_id, proof_id, evidence_class:str, stage:str, subject_sha256, validator_id, execution_identity_sha256, started_at:ts, ended_at:ts, outcome:str(PASS|FAIL|VALIDATION_UNAVAILABLE), structured_result_sha256, stdout_sha256?:sha256, stderr_sha256?:sha256, resource_evidence_sha256?:sha256, secret_scan_sha256?:sha256` |
-| `StageEvidenceSelectionV1` / `stage-evidence-selection-v1` | `kind, schema_version, accepted_a_lineage_sha256, stage, subject_sha256, predecessor_stage_tip_sha256, selected_cells:[]SelectedCellV1(set:cell_id)` with `SelectedCellV1={cell_id,evidence_sha256,reservation_sha256}`, `remaining_budget_sha256` |
-| `DogfoodChildActivationV1` / `dogfood-child-activation-v1` | `kind, schema_version, activation_mode="DOGFOOD_DELEGATED", parent_lineage_sha256, parent_integration_tip_sha256, parent_reservation_sha256, child_repository_identity, child_baseline_tree_oid:oid, policy_manifest_sha256, assurance_model_sha256, nesting_depth=1, child_resource_budget_sha256, allowed_operations:[]str(set:value)`; `allowed_operations` must equal `{A_DESIGN,B_IMPLEMENTATION,C_BRANCH_ACCEPTANCE}`. |
-| `MergeEffectLeaseV1` / `merge-effect-lease-v1` | `kind, schema_version, accepted_a_lineage_sha256, candidate_oid, candidate_tree_oid, integration_tip_sha256, pr_published_tip_sha256, merge_authorized_tip_sha256, provider_attempt_sha256, effect_ordinal:u64, effect_state="MERGE_SUBMITTING", issued_sequence:u64, consumed:bool=false` |
-| `ControllerStateV2` / `governance-controller-state-v2` | `kind, schema_version, controller_identity, repository_identity, revision:u64, predecessor_state_v1_artifact_sha256, predecessor_state_v1_revision:u64, activation_v2_sha256?:sha256, active_lineage_sha256?:sha256, stage_generation:u64, active_stage:str, active_stage_tip_sha256?:sha256, invalidated_stage_tip_sha256?:sha256, a_required:bool, correction_reentries_used:u64, active_resource_reservations:[]sha256(set:value), selected_stage_evidence_sha256?:sha256, merge_effect_lease_sha256?:sha256, merge_effect_state:str(NONE|MERGE_SUBMITTING|APPLIED|NOT_APPLIED|RECOVERY_REQUIRED), cumulative_resource_counters:ResourceCountersV1, grandfathered_v3:[]GrandfatheredV3LineageV1(set:accepted_a_capsule_sha256)` |
+| `PolicyUpgradeAuthorityV1` / `policy-upgrade-authority-v1` | `kind,schema_version,repository_identity,base_branch,expected_premerge_base_oid,reviewed_head_oid,merge_result_oid,merge_result_tree_oid,merge_method,acting_principal,merge_authorized_checkpoint_sha256,post_merge_accepted_checkpoint_sha256,provider_evidence_sha256,policy_evidence_sha256,predecessor_activation_sha256` |
+| `WorkClassificationV1` / `work-classification-v1` | `kind,schema_version,classification,eligible_paths:[]str(set),rationale,classifier_identity` |
+| `GovernanceActivationV2` / `governance-activation-v2` | `kind,schema_version,policy_version="context-capsule-v4",predecessor_activation_sha256,policy_manifest_sha256,policy_upgrade_authority_sha256,activation_repository_commit,activation_repository_tree,activation_sequence:u64,predecessor_state_v1_artifact_sha256,predecessor_state_v1_revision:u64,grandfathered_v3:[]str(set)`; `grandfathered_v3` must be exactly empty. |
+| `AssurancePolicyManifestV1` / `assurance-policy-v1` | `kind,schema_version,repository_identity,activation_repository_commit,activation_repository_tree,predecessor_activation_sha256,lifecycle_authority_sha256,acting_principal,capsule_policy_version,assurance_schema_version,policy_files:[]PolicyFileV1(set:path)` |
+| `FinalReviewProfileV1` / `final-review-profile-v1` | `kind,schema_version,profile_id,provider,model,reasoning_effort,fresh_session:bool,required_critical:u64,required_major:u64,classification_vocabulary:[]str(order)` |
+| `SemanticAuthorityRegistryV2` / `semantic-authority-registry-v2` | `kind,schema_version,repository_identity,accepted_a_head,component_scopes:[]ComponentScopeV1(set:id),rules:[]SemanticRuleV2(set:rule_id),final_review_profile_sha256` |
+| `AssuranceModelV1` / `assurance-model-v1` | `kind,schema_version,repository_identity,accepted_a_head,policy_manifest_sha256,semantic_registry_sha256,work_classification_sha256,final_review_profile_sha256,proof_obligation_set_sha256,evidence_matrix_sha256,resource_profile_set_sha256,failure_scenarios:[]ScenarioV1(set:id),invariants:[]InvariantV1(set:id),proof_obligations:[]ProofV1(set:id),validators:[]ValidatorV1(set:id),evidence_cells:[]CellV1(set:id),journeys:[]JourneyV1(set:id),resource_profiles:[]ResourceProfileV1(set:id),correction_reentry_limit:u64,allowed_b_paths:[]str(set)`; the three set digests are recomputed from the exact nested canonical projections below and mismatch fails. |
+| `ProofObligationSetV1` / `proof-obligation-set-v1` | `kind,schema_version,repository_identity,accepted_a_head,proof_obligations:[]ProofV1(set:id)` |
+| `EvidenceMatrixV1` / `evidence-matrix-v1` | `kind,schema_version,repository_identity,accepted_a_head,validators:[]ValidatorV1(set:id),evidence_cells:[]CellV1(set:id),journeys:[]JourneyV1(set:id)` |
+| `ResourceProfileSetV1` / `resource-profile-set-v1` | `kind,schema_version,repository_identity,accepted_a_head,resource_profiles:[]ResourceProfileV1(set:id),lineage_budget_sha256,worker_capacity_sha256` |
+| `PhaseAuthorityV4` / `phase-authority-v4` | `stage,allowed_operations:[]str(set),observation_scope_ids:[]str(set),blocking_scope_ids:[]str(set),mutation_scope_ids:[]str(set),authorized_invariant_ids:[]str(set),authorized_finding_ids:[]str(set),allowed_paths:[]str(set),review_profile_id,execution_bounds_sha256?:sha256,correction_reentry_limit:u64` |
+| `ContextCapsuleV4` / `context-capsule-v4` | `kind,schema_version,policy_version="context-capsule-v4",repository_identity,project_id,plan_id,task_id,base_oid,source_oid,phase,operation,predecessor_capsule_sha256?:sha256,predecessor_checkpoint_sha256?:sha256,policy_manifest_sha256,assurance_model_sha256,semantic_registry_sha256,proof_obligation_set_sha256,evidence_matrix_sha256,resource_profile_set_sha256,work_classification_sha256,final_review_profile_sha256,phase_authority:PhaseAuthorityV4` |
+| `PhaseCheckpointV2` / `phase-checkpoint-v2` | `kind,schema_version,repository_identity,accepted_a_lineage_sha256,stage,sequence:u64,predecessor_checkpoint_sha256?:sha256,capsule_sha256,candidate_oid,candidate_tree_oid,ledger_event_sha256,proof_obligation_set_sha256,evidence_matrix_sha256,resource_profile_set_sha256,evidence_selection_sha256?:sha256,review_report_sha256?:sha256,review_critical:u64,review_major:u64,lifecycle_binding_sha256?:sha256,next_stage_grant_sha256?:sha256` |
+| `StageGrantV2` / `stage-grant-v2` | `kind,schema_version,repository_identity,accepted_a_lineage_sha256,from_checkpoint_sha256,to_phase,policy_manifest_sha256,assurance_model_sha256,semantic_registry_sha256,proof_obligation_set_sha256,evidence_matrix_sha256,resource_profile_set_sha256,work_classification_sha256,final_review_profile_sha256,allowed_paths:[]str(set),allowed_operations:[]str(set),authorized_finding_ids:[]str(set),execution_bounds_sha256?:sha256,remaining_resource_budget_sha256,correction_reentry_limit:u64,correction_reentries_used:u64` |
+| `FindingEvidenceV2` / `finding-evidence-v2` | `kind,schema_version,finding_id,rule_id,classification,affected_path_set_sha256,evidence_sha256,review_report_sha256` |
+| `ControllerAffectedPathSetV1` / `controller-affected-path-set-v1` | `kind,schema_version,finding_id,base_oid,candidate_oid,changed_paths:[]str(set),rule_scope_paths:[]str(set),original_b_paths:[]str(set),derived_affected_paths:[]str(set),derivation="GIT_DIFF_RULE_SCOPE_INTERSECTION_V1"` |
+| `IntegrationFailureV1` / `integration-failure-v1` | `kind,schema_version,accepted_a_lineage_sha256,c_stage_tip_sha256,integration_subject_sha256,integration_validator_id,classification,finding_ids:[]str(set),evidence_sha256,created_sequence:u64` |
+| `FailedStageV1` / `failed-stage-v1` | `kind,schema_version,accepted_a_lineage_sha256,stage,candidate_oid,candidate_tree_oid,stage_tip_sha256,classification,finding_ids:[]str(set),evidence_sha256,integration_failure_sha256?:sha256,invalidated_tip_sha256,created_sequence:u64` (contains **no correction paths**) |
+| `CorrectionBGrantV1` / `correction-b-grant-v1` | `kind,schema_version,accepted_a_lineage_sha256,failed_stage_sha256,prior_c_tip_sha256,correction_generation:u64,correction_reentry_ordinal:u64,finding_ids:[]str(set),affected_path_sets:[]sha256(set),derived_allowed_paths:[]str(set),semantic_registry_sha256,original_b_scope_sha256,execution_bounds_sha256,remaining_resource_budget_sha256` |
+| `AssuranceEscapeV1` / `assurance-escape-v1` | `kind,schema_version,accepted_a_lineage_sha256,discovery_stage,candidate_oid,missed_scenario_ids:[]str(set),affected_invariant_ids:[]str(set),affected_proof_ids:[]str(set),evidence_sha256,required_action="A_REQUIRED"` |
+| `ResourceProfileV1` / `resource-profile-v1` | `id,process_memory_bytes:u64,process_pids:u64,process_cpu_micros_per_period:u64,process_cpu_period_micros:u64,nofile:u64,wall_ms:u64,stdout_bytes:u64,stderr_bytes:u64,evidence_bytes:u64,transient_bytes:u64,container_memory_bytes:u64,container_pids:u64,container_cpu_micros_per_period:u64,container_tmpfs_bytes:u64,secret_capability,network_policy` |
+| `ResourceBudgetV1` / `resource-budget-v1` | `kind,schema_version,validator_invocations:u64,rejected_attempts:u64,external_observations:u64,retained_evidence_bytes:u64,transient_bytes:u64,elapsed_ms:u64,correction_reentries:u64` |
+| `WorkerCapacityReservationV1` / `worker-capacity-reservation-v1` | `kind,schema_version,reservation_id,process_memory_bytes:u64,process_pids:u64,process_cpu_micros:u64,nofile:u64,container_memory_bytes:u64,container_pids:u64,container_cpu_micros:u64,container_tmpfs_bytes:u64` |
+| `PathSetV1` / `path-set-v1` | `kind,schema_version,paths:[]str(set)` |
+| `AssuranceResourceReservationV1` / `assurance-resource-reservation-v1` | `kind,schema_version,accepted_a_lineage_sha256,invocation_ordinal,cell_attempt_ordinal,cell_id,proof_id,stage,subject_sha256,validator_id,resource_profile_id,predecessor_state_revision:u64,predecessor_stage_tip_sha256,reserved_worker_capacity_sha256,parent_reservation_sha256?:sha256,nesting_depth:u64` |
+| `ExecutionIdentityV1` / `execution-identity-v1` | `kind,schema_version,repository_identity,working_directory,argv_sha256,environment_policy_sha256,executable_sha256,toolchain_sha256,resource_profile_id,secret_capability,codex_provider_isolation_profile_sha256?:sha256,ralphex_sha256?:sha256,codex_sha256?:sha256,codex_model?:str,codex_effort?:str` |
+| `CodexProviderIsolationProfileV1` / `codex-provider-isolation-profile-v1` | `kind,schema_version,id="CODEX_BROKER_V1",provider_id="abcp-broker",wire_api="responses",requires_openai_auth=false,env_key_name="ABCP_BROKER_SESSION_TOKEN",sandbox_mode="workspace-write",shell_excluded_env_names:["ABCP_BROKER_SESSION_TOKEN"],loopback_only:bool=true,tool_network_must_be_denied:bool=true,parent_environ_must_be_denied:bool=true,model="gpt-5.6-sol",reasoning_effort="xhigh"` |
+| `AssuranceEvidenceCellV1` / `assurance-evidence-cell-v1` | `kind,schema_version,accepted_a_lineage_sha256,reservation_sha256,invocation_ordinal,cell_attempt_ordinal,cell_id,proof_id,evidence_class,stage,subject_sha256,validator_id,execution_identity_sha256,started_at,ended_at,outcome,structured_result_sha256,stdout_sha256?:sha256,stderr_sha256?:sha256,resource_evidence_sha256?:sha256,secret_scan_sha256?:sha256` |
+| `StageEvidenceSelectionV1` / `stage-evidence-selection-v1` | `kind,schema_version,accepted_a_lineage_sha256,stage,subject_sha256,predecessor_stage_tip_sha256,inventory_sha256,selected_cells:[]SelectedCellV1(set:cell_id),remaining_budget_sha256` |
+| `RetainedArtifactInventoryV1` / `retained-artifact-inventory-v1` | `kind,schema_version,accepted_a_lineage_sha256,stage,through_artifact_sequence:u64,artifact_entries:[]ArtifactInventoryEntryV1(set:artifact_sha256),inventory_complete:bool=true` |
+| `SecretScanEvidenceV1` / `secret-scan-evidence-v1` | `kind,schema_version,accepted_a_lineage_sha256,stage,inventory_sha256,scanner_sha256,secret_count:u64,scanned_bytes:u64,match_count:u64` |
+| `SecretEgressIncidentV1` / `secret-egress-incident-v1` | `kind,schema_version,accepted_a_lineage_sha256,stage,artifact_kind,artifact_sha256?:sha256,scanner_sha256,match_count:u64,raw_bytes_retained:bool=false,created_sequence:u64` |
+| `CrashBoundaryEvidenceV1` / `crash-boundary-evidence-v1` | `kind,schema_version,family,boundary,pre_state_sha256,post_state_sha256?:sha256,artifact_sha256?:sha256,recovery_outcome` |
+| `ResourceEvidenceV1` / `resource-evidence-v1` | `kind,schema_version,reservation_sha256,process_peak_memory_bytes,process_peak_pids,process_cpu_usec,nofile_peak,container_peak_memory_bytes,container_peak_pids,container_cpu_usec,tmpfs_bytes,retained_evidence_bytes,transient_bytes,elapsed_ms,cleanup_outcome` |
+| `DogfoodPolicyFloorV1` / `dogfood-policy-floor-v1` | `kind,schema_version,parent_lineage_sha256,policy_manifest_sha256,required_failure_dimensions:[]str(set),required_evidence_classes:[]str(set),required_final_review_profile_sha256,forbidden_operations:[]str(set),max_child_budget_sha256` |
+| `DogfoodChildActivationV1` / `dogfood-child-activation-v1` | `kind,schema_version,activation_mode="DOGFOOD_DELEGATED",parent_lineage_sha256,parent_integration_tip_sha256,parent_reservation_sha256,child_repository_identity,child_baseline_oid,child_baseline_tree_oid,child_plan_path,child_plan_sha256,policy_floor_sha256,codex_provider_isolation_profile_sha256,nesting_depth=1,allowed_operations:["A_DESIGN"]` |
+| `PREffectIntentV1` / `pr-effect-intent-v1` | `kind,schema_version,accepted_a_lineage_sha256,candidate_oid,candidate_tree_oid,integration_tip_sha256,final_review_tip_sha256,pr_request_sha256,effect_ordinal:u64` |
+| `PREffectClaimV1` / `pr-effect-claim-v1` | `kind,schema_version,intent_sha256,claimant_instance_sha256,claim_token_sha256,provider_request_sha256,claim_sequence:u64,effect_state="PR_SUBMITTING"` |
+| `MergeEffectIntentV1` / `merge-effect-intent-v1` | `kind,schema_version,accepted_a_lineage_sha256,candidate_oid,candidate_tree_oid,ledger_ready_event_sha256,pr_published_tip_sha256,integration_tip_sha256,merge_authorized_tip_sha256,provider_request_sha256,effect_ordinal:u64` |
+| `MergeEffectClaimV1` / `merge-effect-claim-v1` | `kind,schema_version,intent_sha256,claimant_instance_sha256,claim_token_sha256,provider_request_sha256,claim_sequence:u64,effect_state="MERGE_SUBMITTING"` |
+| `PostMergeFailureV1` / `post-merge-failure-v1` | `kind,schema_version,accepted_a_lineage_sha256,merge_result_oid,merge_result_tree_oid,ledger_terminal_event_sha256,post_merge_evidence_sha256,reason_code,created_sequence:u64` |
+| `ControllerStateV2` / `governance-controller-state-v2` | `kind,schema_version,controller_identity,repository_identity,revision,predecessor_state_v1_artifact_sha256,predecessor_state_v1_revision,activation_v2_sha256,active_lineage_sha256?:sha256,stage_generation,active_stage,active_stage_tip_sha256?:sha256,invalidated_stage_tip_sha256?:sha256,ledger_event_tip_sha256?:sha256,a_required,correction_reentries_used,active_resource_reservations:[]sha256(set),selected_stage_evidence_sha256?:sha256,pr_effect_intent_sha256?:sha256,pr_effect_claim_sha256?:sha256,merge_effect_intent_sha256?:sha256,merge_effect_claim_sha256?:sha256,effect_state,cumulative_resource_counters:ResourceCountersV2` |
 
-Nested registry/resource schemas are equally frozen; no implementation may infer fields from Markdown columns:
+Nested exact records: `PolicyFileV1={path,sha256}`; `ScenarioV1={id,dimension,scenario,invariant_ids:[]str(set),proof_ids:[]str(set)}`; `InvariantV1={id,claim}`; `ProofV1={id,claim,invariant_ids:[]str(set)}`; `ValidatorV1={id,stage,command,purpose,resource_profile_id,secret_capability,requires_postgres:bool,requires_container:bool}`; `CellV1={id,proof_id,evidence_class,stage,subject_rule,validator_id}`; `JourneyV1={id,validator_id,title,subject_rule,required_boundary_ids:[]str(set)}`; `ComponentScopeV1={id,allowed_paths:[]str(set)}`; `SemanticRuleV2={rule_id,proof_id,correction_relation,owner_component,allowed_scope_ids:[]str(set)}`; `SelectedCellV1={cell_id,evidence_sha256,reservation_sha256}`; `ArtifactInventoryEntryV1={artifact_sha256,artifact_kind,artifact_sequence:u64,byte_size:u64,outcome,stage}`; `ResourceCountersV2={validator_invocations,rejected_assurance_attempts,external_observations,retained_evidence_refs,retained_evidence_bytes,transient_bytes,elapsed_ms,active_validator_reservations,worker_memory_reserved_bytes,worker_pids_reserved,worker_cpu_micros_reserved,worker_nofile_reserved}`.
 
-| Nested record | Exact field order |
-|---|---|
-| `ScenarioV1` | `id:str, dimension:str, scenario:str, invariant_ids:[]str(set:value), proof_ids:[]str(set:value)` |
-| `InvariantV1` | `id:str, claim:str` |
-| `ProofV1` | `id:str, claim:str, invariant_ids:[]str(set:value)` |
-| `ValidatorV1` | `id:str, stage:str, command:str, purpose:str` |
-| `CellV1` | `id:str, proof_id:str, evidence_class:str, stage:str, subject_rule:str, validator_id:str` |
-| `JourneyV1` | `id:str, validator_id:str, title:str, subject_rule:str, required_boundary_ids:[]str(set:value)` |
-| `ResourceCountersV1` | `validator_invocations:u64, rejected_assurance_attempts:u64, external_observations:u64, retained_evidence_refs:u64, retained_evidence_bytes:u64, transient_bytes:u64, elapsed_ms:u64, active_validator_reservations:u64` |
-| `SelectedCellV1` | `cell_id:str, evidence_sha256:sha256, reservation_sha256:sha256` |
-| `PolicyFileV1` | `path:str, sha256:sha256` |
+Canonical test vectors are frozen: WorkClassification vector digest `d79b2b9c6e77db88f096bfe5597ec56599369ee4d34cf3c23a64ae685fd5f684` for `{"kind":"WorkClassificationV1","schema_version":"work-classification-v1","classification":"CODE_BEARING","eligible_paths":[],"rationale":"ABCP assurance-governance enforcement changes authority-bearing code","classifier_identity":"controller"}`; FinalReviewProfile digest `073885532416375d9cb7e81d674812131eabfd1929867daa041490c854b49553` for `{"kind":"FinalReviewProfileV1","schema_version":"final-review-profile-v1","profile_id":"ABCP_XHIGH_FRESH_V1","provider":"codex","model":"gpt-5.6-sol","reasoning_effort":"xhigh","fresh_session":true,"required_critical":0,"required_major":0,"classification_vocabulary":["ASSURANCE_MODEL_GAP","IMPLEMENTATION_FINDING"]}`.
 
-The `AssuranceModelV1` digest therefore commits these exact nested shapes as well as all nested values. `CellV1.stage` is one closed lifecycle-stage token only; journey identity belongs in `JourneyV1.id`/the subject rule and is never concatenated into a stage token.
+The manifest contains exactly these sorted full paths: `docs/architecture/ASSURANCE_MODEL_AND_PROOF_OBLIGATION_POLICY.md`, `docs/architecture/AUTONOMOUS_EXECUTION_GOVERNANCE.md`, `docs/architecture/CONTEXT_AUTHORITY_AND_CAPSULE_POLICY.md`, `docs/architecture/DECISION_AND_ACCEPTANCE_POLICY.md`, `docs/architecture/IMPLEMENTATION_DESIGN_GATE.md`.
 
-`ControllerStateV1` is never parsed as V2. Upgrade first stores the exact validated V1 canonical bytes as a content-addressed immutable artifact, then one expected-revision PostgreSQL CAS replaces the mutable row with `ControllerStateV2` whose `predecessor_state_v1_artifact_sha256` and revision exactly identify those bytes. Exact replay verifies the same V2 bytes. Any competing/mismatching upgrade fails closed. After the CAS, only V2 is mutable; historical V1 validators continue to validate the retained V1 artifact under the old schema.
+`proof_obligation_set_sha256`, `evidence_matrix_sha256`, and `resource_profile_set_sha256` are independent content-addressed artifacts, not aliases for the whole assurance-model digest. A validates the three canonical projections from the frozen model, and every A checkpoint, A→B grant, B/C capsule, B→C grant and C checkpoint must preserve the same exact values. Any missing/mismatched projection digest is lineage invalidation, never an inferred fallback.
 
-### Executable validity predicates
+### Frozen semantic registry and final-review authority
 
-`HistoricalValid(record)` means its strict canonical bytes/digest and its complete ancestor chain validate under the schema that created it. Historical validity is immutable and is never revoked by later controller revisions. `OperationallyUsable(record,state,operation)` is a separate pure predicate and **never compares record creation revision to the current global revision**.
+Component scopes are frozen: `PF-GOV={internal/context/**,internal/governance/**,internal/authority/**,cmd/abcp/**}`; `PF-BACKEND={internal/authoritybackend/**,cmd/abcp/**,go.mod,go.sum}`; `PF-RUN={internal/run/**,internal/acceptance/**,cmd/abcp/**}`; `PF-MERGE={internal/mergelifecycle/**,cmd/abcp/**}`; `PF-PR={internal/prlifecycle/**,cmd/abcp/**}`; `PF-ACCEPT={scripts/acceptance/assurance-go-test-exact.py,scripts/acceptance/assurance-graph-validate.py,scripts/acceptance/assurance-lifecycle-integration.sh,scripts/acceptance/assurance-runner-preflight.sh}`; `PF-SECRET={scripts/acceptance/assurance-secret-scan.py,internal/run/**,internal/authoritybackend/**,cmd/abcp/**}`; `PF-RESOURCE={internal/run/**,internal/acceptance/**,scripts/acceptance/assurance-runner-preflight.sh,cmd/abcp/**}`.
 
-| Record class | `OperationallyUsable` iff |
-|---|---|
-| A/B/C stage grant or checkpoint | `HistoricalValid`; same repository/controller/accepted-A lineage; record generation equals `state.stage_generation`; its digest equals the exact `active_stage_tip_sha256` or required predecessor tip for the requested transition; `a_required=false`; it is not `invalidated_stage_tip_sha256`; requested operation belongs to that stage. Resource/evidence CAS revision advances do not change this result. |
-| resource reservation | its digest is in `active_resource_reservations`, subject/stage generation still match, budget remains charged, and it is not finalized/consumed. |
-| selected stage evidence | digest equals `selected_stage_evidence_sha256`, exact subject and stage generation match, and every selected cell is historically valid PASS evidence. |
-| correction-B grant | failed-stage record is historical-valid implementation finding, `correction_reentry_ordinal<=2`, grant digest is active stage tip for the next generation, and A-required is false. |
-| failed-stage / integration-failure record | historical evidence only: strict record and bound evidence are `HistoricalValid`; it never authorizes mutation by itself. Only the controller CAS that invalidates the stage and (if permitted) later publishes `CorrectionBGrantV1` creates operational state. |
-| time-bounded execution/mutation lease | all exact lineage/tip predicates above **and** the pre-existing frozen expiry has not elapsed; expiry affects operational use only. |
-| `MergeEffectLeaseV1` | digest equals state lease tip, state is `MERGE_SUBMITTING`, `consumed=false`, exact candidate/integration/PR/merge-authorized tips match. Once the provider call may have been submitted it becomes reconciliation authority, not revocable pre-submit authority. |
-| grandfathered V3 | exact activation grandfather entry matches the already-issued V3 lineage and its permitted next V3 transition. It can never parent V4. If a grandfathered V3 C obtains a blocking failure after V4 activation, controller atomically marks it terminal `A_REQUIRED`; no correction-B descendant is permitted and repair begins a new V4 A. |
+Every runtime finding has a unique `finding_id`, exactly one frozen `rule_id=AG-PO-nnn`, classification and evidence digest; reviewer/model output is **never path authority**. The controller recomputes `changed_paths` from the exact accepted-B base→failed-candidate Git diff, expands the frozen semantic rule scope, intersects those with the original accepted-B allowed paths, and publishes `ControllerAffectedPathSetV1`. For implementation findings, `derived_allowed_paths` is the union of each validated finding's `derived_affected_paths`; every member must therefore be in `rule scope ∩ original B scope ∩ controller-recomputed changed paths`. Empty intersection, a required correction outside that intersection, an unmapped rule, or any model gap returns A. The bound final-review profile is the canonical `ABCP_XHIGH_FRESH_V1` vector above.
 
-Only explicit stage transition/invalidation/effect CAS changes `stage_generation`, active stage/tip, invalidation, A-required, or merge-effect state. Validator reservation/finalization, evidence retention, external-observation accounting, and unrelated counters may advance `ControllerStateV2.revision` but cannot invalidate otherwise usable stage authority.
+| Rule | Relation | Scope |
+|---|---|---|
+| AG-PO-001 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-002 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-003 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-004 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-005 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-006 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-007 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-008 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-009 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-010 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-011 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-012 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-013 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-014 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-015 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-016 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-017 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-018 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-019 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-020 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-021 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-022 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-023 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-024 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-025 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-026 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-027 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-028 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-029 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-030 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-031 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-032 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-033 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-034 | IMPLEMENTATION_CORRECTABLE | PF-BACKEND |
+| AG-PO-035 | IMPLEMENTATION_CORRECTABLE | PF-RUN |
+| AG-PO-036 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-037 | IMPLEMENTATION_CORRECTABLE | PF-MERGE |
+| AG-PO-038 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-039 | IMPLEMENTATION_CORRECTABLE | PF-ACCEPT |
+| AG-PO-040 | IMPLEMENTATION_CORRECTABLE | PF-ACCEPT |
+| AG-PO-041 | IMPLEMENTATION_CORRECTABLE | PF-SECRET |
+| AG-PO-042 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-043 | IMPLEMENTATION_CORRECTABLE | PF-MERGE |
+| AG-PO-044 | IMPLEMENTATION_CORRECTABLE | PF-RUN |
+| AG-PO-045 | IMPLEMENTATION_CORRECTABLE | PF-MERGE |
+| AG-PO-046 | IMPLEMENTATION_CORRECTABLE | PF-BACKEND |
+| AG-PO-047 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-048 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-049 | IMPLEMENTATION_CORRECTABLE | PF-GOV |
+| AG-PO-050 | IMPLEMENTATION_CORRECTABLE | PF-BACKEND |
+| AG-PO-051 | IMPLEMENTATION_CORRECTABLE | PF-RESOURCE |
+| AG-PO-052 | IMPLEMENTATION_CORRECTABLE | PF-SECRET |
+| AG-PO-053 | IMPLEMENTATION_CORRECTABLE | PF-RUN |
+| AG-PO-054 | IMPLEMENTATION_CORRECTABLE | PF-PR |
+| AG-PO-055 | IMPLEMENTATION_CORRECTABLE | PF-MERGE |
 
-## Successor activation and grandfather authority
+### Executable validity and drain-before-upgrade
 
-`PolicyVersionV4 = "context-capsule-v4"`. `GovernanceActivationV2` is installed only from `PolicyUpgradeAuthorityV1` derived by the controller from the exact existing EP-005 `MERGE_AUTHORIZED` plus `POST_MERGE_ACCEPTED` chain for this repository's protected `main` branch. The activation commit/tree/principal/merge evidence are therefore controller-derived rather than caller-selected. The controller recomputes the five canonical architecture-policy file digests from that exact merge-result commit and seals `AssurancePolicyManifestV1`.
+`HistoricalValid(record)` validates immutable canonical bytes and full digest ancestor chain under the schema that created them. `OperationallyUsable(record,state,operation)` additionally requires same repository/controller/A lineage, exact current generation/tip, no invalidation/A-required flag, correct operation, and any existing time-bound lease not expired. Resource/evidence/accounting CAS revisions do **not** invalidate stage authority; only stage/effect transition/invalidation CAS changes stage generation/tip.
 
-Immediately before the activation CAS, the controller derives the exact sorted `GrandfatheredV3LineageV1[]` from nonterminal V3 lineages in the predecessor state. A concurrent issuance changes expected revision and forces recomputation. Grandfathered V3 may execute only the already-issued V3 transitions represented by its entry. It cannot mint a new A, become a V4 parent, switch policy, or create a V4 correction descendant. In particular, a blocking C failure after V4 activation terminates that grandfather entry as `A_REQUIRED`; remediation starts a new V4 A.
+`V3Drained(v1)` is true only when `ActiveInvocation=nil`; no mutation lease is ISSUED/STARTED; the bound append-only ledger has no current `READY_FOR_MERGE` or unresolved submission barrier; `internal/prlifecycle` and `internal/mergelifecycle` durable stores have no unresolved write/UNKNOWN effect for the bound repository/run; and either (a) no V3 lineage was ever started (`BCapsuleSHA256==""` and `CheckpointTip=nil`) or (b) `CheckpointTip.Kind==POST_MERGE_ACCEPTED`. Historical review/finding/grant/derivation fields may remain as evidence but cannot be operational. V4 activation rejects otherwise with `V3_DRAIN_REQUIRED`. Therefore this design has **no live V3 grandfather continuation** and `GovernanceActivationV2.grandfathered_v3` is absent/empty by construction.
 
-## Durable publication, recovery, and cleanup matrix
+Upgrade stores exact terminal `ControllerStateV1` canonical bytes in the immutable artifact backend, verifies the decoded V1 `Revision=r`, then the bootstrap/upgrade CAS creates `ControllerStateV2` at revision `r+1` referencing that artifact/revision. No V1 field is reinterpreted or discarded while live because activation is impossible until drained.
 
-All new authority artifacts use one protocol: canonical bytes → content-addressed final artifact durably fsynced → one expected-revision backend CAS referencing exact digest. Durable unreferenced artifacts are non-authoritative orphans. No authority depends on deleting them. PostgreSQL transaction commit ambiguity is reconciled by loading exact controller identity/revision and comparing expected digest before any mutation retry.
+## Successor activation and immutable artifact authority
 
-| Family | Before durable prepare | Prepared/durable / authoritative CAS absent | CAS submitted/response ambiguous | CAS proven applied | Cleanup/recovery rule |
-|---|---|---|---|---|---|
-| successor activation/manifest | no authority | orphan manifest only | reload PostgreSQL state; no second CAS until exact V2 activation digest/revision resolved | V4 successor active | never delete referenced manifest; conflicting orphan fails closed |
-| A model/checkpoint + A→B grant | predecessor A only | orphan only | reconcile exact checkpoint/grant digests and revision | B derivation may use exact bound grant | durable orphan harmless/non-authoritative |
-| B convergence + B→C grant | B remains current | orphan only | reconcile exact converged head/review/grant state | replacement C may be derived | no C mint from ambiguous/unreferenced artifact |
-| validator resource reservation | no process may start | reservation CAS atomically charges invocation/slots/max output/evidence-byte budget and assigns lineage ordinal | reload reservation digest/ordinal before spawn/retry | exactly one attempt may use reservation | abandoned reservation stays charged at maximum until process-dead + artifact reconciliation CAS proves releasable remainder; invocation/rejected-attempt charge never refunded |
-| stage evidence/checkpoint | reservation/attempt only | evidence artifact non-authoritative | reconcile exact evidence digest + reservation + stage revision | selected cell evidence authoritative for exact subject | partial output remains incomplete; stage CAS selects one successful attempt/cell only |
-| failed-C record/C invalidation | C remains valid until invalidation CAS | orphan finding packet only | reconcile failed-C digest + invalidated-C state | C invalid; zero mutation authority | no correction grant until exact failed-C state proven |
-| correction-B grant/reentry counter | failed C, prior counter | orphan proposed grant only | reconcile atomic `{counter+1, grant_digest}` CAS | one reentry consumed | replay verifies existing grant without increment; no separate reservation |
-| integration acceptance | clean C but no merge authority | integration evidence non-authoritative | reconcile integration checkpoint digest/revision | exact C gains integration-passed prerequisite only | integration failure keeps merge unauthorized and returns through frozen failure semantics |
-| merge authorization | C+integration required | proposed merge artifact only | reconcile exact merge-authorized tip before provider effect | provider may execute only against exact tip/revision | concurrent C invalidation vs merge authorization uses one CAS; loser reloads and cannot effect |
-| merge effect lease/submission | no provider call | durable lease artifact alone is non-authoritative | atomic CAS from exact `MERGE_AUTHORIZED` tip publishes lease + `MERGE_SUBMITTING`; if response is ambiguous reload exact lease/tip before any action | provider call may occur at most once under exact lease; after process loss or possible call submission, reconciliation is read-only | after lease issuance a crash is treated as possibly submitted; provider mutation retry is forbidden until exact `NOT_APPLIED` reconciliation and separately governed new effect authority |
-| post-merge acceptance | merge result exists but completion false | post-merge evidence non-authoritative | reconcile exact result/evidence | project may claim merged-state acceptance | failure records `POST_MERGE_FAILED`; no automatic Git rollback; any revert is a separately governed A/B/C change |
-| assurance escape/A-required | current lineage until CAS | orphan escape only | reconcile escape digest + A-required flag | new B/C blocked | only new accepted A lineage clears requirement |
+`GovernanceActivationV2` installs V4 only from exact existing merge-authorized + post-merge-accepted authority for the policy merge commit, exact installed predecessor activation, authenticated principal and protected base. The controller recomputes the exact five manifest files above. V4 activation additionally requires `V3Drained`, the immutable predecessor artifact, and the PostgreSQL database-isolation bootstrap below.
 
-Cancellation/timeout before durable artifact permits bounded temp cleanup. After artifact durability but before CAS, cancellation leaves a harmless orphan and grants zero authority. Once CAS may have been submitted, retry authority is zero until reconciliation proves applied/not-applied state. Backend unavailability produces `RECOVERY_REQUIRED`/`VALIDATION_UNAVAILABLE` and no second mutation. Applied state wins over late cancellation.
+Every digest referenced by V2 state/capsules/checkpoints/grants/model/evidence must resolve in `abcp_v4.abcp_authority_artifact_v1` in the same authenticated domain. Artifact publication is create-or-verify: compute digest/size before INSERT; commit immutable artifact first; conflicting same digest/kind/bytes is integrity failure; state CAS may then reference only an already durable artifact. A crash between artifact commit and state CAS leaves a harmless orphan included in artifact inventory. Fresh hosts traverse ancestors exclusively by these digests; host-local files are never authority.
 
-## Frozen assurance resource profile
+## Durable publication and remote-effect recovery matrix
 
-Structural admission maxima per assurance model remain: 32 dimensions, 128 stable scenarios, 64 invariants, 128 proof obligations, 256 evidence cells, 32 journeys, 256 validator identities; ID ≤128 UTF-8 bytes, claim/rationale/description ≤4096 bytes, each canonical authority record ≤1 MiB.
+| Family | Atomic authority boundary | Crash/ambiguity semantics |
+|---|---|---|
+| immutable artifact | artifact INSERT/create-or-verify commit | orphan is non-authoritative; conflict/inaccessibility fails closed |
+| stage/checkpoint/grant/evidence selection | expected-revision V2 CAS referencing durable artifact | ambiguous CAS is read-back/reconcile only; no second mutation until exact applied/not-applied proof |
+| resource reservation | expected-revision V2 CAS charges lineage+worker vector and assigns ordinal | subprocess/container cannot start before applied reservation; unknown cleanup remains maximum-charged |
+| failed stage / correction grant | failed-stage invalidation CAS, then separately derived correction-grant CAS | finding packet alone has zero mutation authority; grant paths are registry-derived |
+| PR effect | `PREffectIntentV1` durable → one CAS to `PR_SUBMITTING` + `PREffectClaimV1` token hash | exactly one winning process retains raw 256-bit token in a one-shot in-memory capability; loss/possible HTTP submission is reconciliation-only; new write requires exact NOT_APPLIED + new intent/claim |
+| merge effect | `MergeEffectIntentV1` durable → one CAS to `MERGE_SUBMITTING` + `MergeEffectClaimV1` token hash | same one-winner rule; claim is bound to exact READY ledger event, PR/integration/merge tips and provider request; after possible submission no blind retry |
+| post-merge | exact terminal ledger event/evidence then V2 settlement CAS | ledger result remains factual run truth; failed acceptance emits `PostMergeFailureV1`, sets PG non-completion, no automatic rollback |
 
-Lineage-cumulative ceilings from accepted A through post-merge are: ≤1024 validator invocation ordinals, ≤512 rejected assurance mutation/admission attempts, ≤128 external Git/backend observations, ≤2048 retained evidence refs, ≤512 MiB retained assurance evidence, ≤8 GiB cumulative transient workspace/cache materialization, ≤24 hours aggregate validator elapsed time, ≤4 concurrently active validator reservations, and exactly 2 correction-B grants. Candidate/result/subject, B/C generation, process restart, and child dogfood cannot reset them. Reservation CAS atomically charges the maximum elapsed/output/evidence/transient/PID/concurrency allowance before execution; finalization may release only unused byte/concurrency reservation, never invocation/rejected-attempt/elapsed already consumed. Ambiguous cleanup keeps the maximum charged until reconciliation proves release safe.
+Raw effect tokens are generated from 256 bits of OS CSPRNG immediately before the winning claim CAS; only SHA-256(token) is durable. The provider adapter accepts an in-memory `OneShotEffectCapability` object whose `Take()` atomically succeeds once and verifies the raw token against state hash before crossing the HTTP/provider boundary. Another host can read the hash but never obtains the capability. If the winner dies before/after the call, no process may reconstruct/reuse it; only read-only provider reconciliation may establish `NOT_APPLIED`/`APPLIED`/`RECOVERY_REQUIRED`.
 
-Three resource profiles are frozen:
+## Frozen resource authority
 
-| Profile | memory.max | pids.max | cpu.max | RLIMIT_NOFILE | wall time | stdout/stderr retained | evidence max | transient scratch/cache max |
-|---|---:|---:|---|---:|---:|---:|---:|---:|
-| `NORMAL_V1` | 2 GiB | 64 | `200000 100000` (2 CPUs) | 256 | 30 min | 16 MiB each for non-secret-capable validators | 32 MiB | 512 MiB |
-| `SECRET_CAPABLE_V1` | 2 GiB | 64 | `200000 100000` | 256 | 30 min | **0 raw bytes retained**; structured controller result only | 32 MiB | 512 MiB |
-| `DOGFOOD_V1` | 4 GiB | 128 | `400000 100000` (4 CPUs) | 512 | 90 min | **0 raw bytes retained from credential-bearing Ralphex/Codex** | 128 MiB | 2 GiB |
+Validator authority—not the caller—binds `resource_profile_id`, `secret_capability`, `requires_postgres`, and `requires_container`. Reservation must equal or strengthen those exact values and cannot substitute a profile. Worker admission capacity is frozen at 12 GiB aggregate reserved memory, 384 aggregate PIDs, 6 aggregate CPU equivalents (`600000/100000`) and 4096 aggregate NOFILE units; devagent preflight additionally requires ≥8 logical CPUs and ≥16 GiB physical RAM. At most three normal validators are active, while DOGFOOD+PostgreSQL consumes its combined reservation and excludes any combination exceeding worker capacity.
 
-`AssuranceResourceReservationV1.resource_profile_id` selects one exact row. All non-dogfood validators run inside a controller-created child cgroup under `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice`. Preflight proves `cpu,memory,pids` are available; it may enable `+cpu` in the parent only after recording the prior subtree-control value and restores only the controller-added bit after all owned children are empty/removed. It writes and reads back `cpu.max`, `memory.max`, and `pids.max`, applies `prlimit --nofile`, and refuses execution if any limit cannot be established. `systemd-run` is not an authority or dependency.
+Profiles: `NORMAL_V1`: process 2 GiB/64 PIDs/2 CPU/NOFILE256/30m/output16+16MiB/evidence32MiB/transient512MiB; `SECRET_CAPABLE_V1`: same but raw output retention 0; `DOGFOOD_V1`: process 4 GiB/128 PIDs/4 CPU/NOFILE512/90m/evidence128MiB/transient2GiB; `POSTGRES_CONTAINER_V1`: container 1 GiB/128 PIDs/2 CPU/tmpfs576MiB/shm64MiB/no logs/read-only root. A validator requiring PostgreSQL atomically reserves both its process profile and container profile against the worker vector.
 
-Non-mutating validators use `/usr/bin/bwrap`: source and module cache are read-only, working/tmp/GOCACHE are bounded tmpfs inside the validator cgroup. A controlled dependency-prefetch step may populate a content-addressed cache only from exact `go.sum`/module-graph identity before evidence execution; otherwise network/cache need returns `VALIDATION_UNAVAILABLE`. No validator may write an unbounded host `GOCACHE`, `GOMODCACHE`, workspace, Docker log, or temp directory.
+User-process validators use controller-created delegated cgroup v2 children plus `prlimit`; source/module inputs are read-only and scratch/GOCACHE are bounded tmpfs. Docker uses its independent daemon cgroup (the host uses systemd Docker cgroup driver, so the design does **not** pretend the container is under the user delegated cgroup); instead the controller separately reserves the complete container vector and enforces Docker `--memory=1g --memory-swap=1g --pids-limit=128 --cpus=2 --ulimit nofile=256:256 --read-only --shm-size=64m --log-driver=none` plus bounded tmpfs. Shared pre-pulled immutable image layers are trusted runner baseline, not lineage scratch; container writable layer is read-only and all writable mounts are bounded tmpfs. Create ambiguity is resolved by reservation-derived exact name/image/labels before another create; cleanup proves container/name absent before releasing its reserved vector.
 
-`J-05` is the sole depth-1 exception. The outer controller reserves the complete `DOGFOOD_V1` child allowance in advance and child counters debit the parent lineage. No depth >1, child publication/merge, or child dogfood is valid. Child crash leaves its maximum reserved until parent reconciliation proves its cgroup/processes/tmpfs/container absent.
+Lineage ceilings remain ≤1024 invocations, ≤512 rejected attempts, ≤128 external observations, ≤2048 retained artifact refs, ≤512MiB retained evidence, ≤8GiB cumulative transient bytes, ≤24h aggregate validator elapsed, and exactly two correction grants. Subject/process/restart/child churn cannot reset them.
 
-The exact runner preflight is `scripts/acceptance/assurance-runner-preflight.sh`. PASS requires Docker server 29.7.2 or a byte-identical pre-approved capability record with cgroup v2/overlayfs semantics, writable delegated cgroup controls above, `/usr/bin/bwrap`, `/usr/bin/prlimit`, `/usr/bin/unshare`, exact pinned Ralphex/Codex identities for J-05, exact PostgreSQL image digest, and sufficient remaining lineage budgets. Missing capability is `VALIDATION_UNAVAILABLE`, never fallback authority.
+## PostgreSQL authority-domain and artifact backend
 
-PostgreSQL smoke/integration uses only `postgres@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3` (verified linux/amd64 `postgres:17.6-bookworm`). Container creation uses a reservation-derived unique name and labels carrying reservation/lineage/image digests plus: `--read-only`, tmpfs `/var/lib/postgresql/data:rw,noexec,nosuid,size=512m` and `/run/postgresql:rw,noexec,nosuid,size=64m`, `--memory=1g --memory-swap=1g --pids-limit=128 --cpus=2 --ulimit nofile=256:256 --shm-size=64m --log-driver=none`, and a loopback-only published ephemeral port. After create ambiguity the harness may not create again until `docker inspect <exact-name>` proves absent or proves one container with the exact image digest and reservation labels; a conflicting object is `RECOVERY_REQUIRED`. Cleanup waits for removal and verifies the exact name/container ID absent before resource credit is released.
-
-Existing B `ExecutionBoundsV1` Ralphex invocation/review/mutation/time ceilings remain additional mandatory floors and cannot reset across correction reentries.
-
-## Production workflow-authority backend
-
-This pack freezes `PostgresWorkflowAuthorityBackendV1` under `internal/authoritybackend/**` and pins `github.com/jackc/pgx/v5 v5.7.6` in `go.mod`/`go.sum`; v5.7.6 declares Go 1.23 and therefore preserves the repository's `go 1.23` contract. Host-local files, SQLite, memory, or an unspecified service cannot satisfy durable V4 operations.
-
-The exact schema is created only by the bootstrap role:
+Implementation is `PostgresWorkflowAuthorityBackendV1` under `internal/authoritybackend/**` with `github.com/jackc/pgx/v5 v5.7.6` (Go 1.23 compatible). Schema is fixed `abcp_v4`; bootstrap owner is never used by normal execution. Bootstrap revokes `CREATE` on database public schema from PUBLIC and `ALL` on `abcp_v4`/tables/sequences from PUBLIC; runtime roles are LOGIN but `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`, do not own schema/tables, and receive no role memberships permitting bypass. Runtime sessions set/verify `search_path=pg_catalog,abcp_v4` and reject any mismatch.
 
 ```sql
-CREATE TABLE abcp_authority_domain_v1 (
+CREATE SCHEMA abcp_v4 AUTHORIZATION <bootstrap_owner>;
+CREATE TABLE abcp_v4.abcp_authority_domain_v1 (
   authority_domain text PRIMARY KEY CHECK (length(authority_domain) BETWEEN 1 AND 128),
   runtime_role name NOT NULL UNIQUE,
   bootstrap_provenance_sha256 char(64) NOT NULL CHECK (bootstrap_provenance_sha256 ~ '^[0-9a-f]{64}$')
 );
-CREATE TABLE abcp_workflow_authority_v1 (
-  authority_domain text NOT NULL REFERENCES abcp_authority_domain_v1(authority_domain) ON DELETE RESTRICT,
+CREATE TABLE abcp_v4.abcp_workflow_authority_v1 (
+  authority_domain text NOT NULL REFERENCES abcp_v4.abcp_authority_domain_v1(authority_domain) ON DELETE RESTRICT,
   controller_identity char(64) NOT NULL CHECK (controller_identity ~ '^[0-9a-f]{64}$'),
-  revision bigint NOT NULL CHECK (revision > 0),
-  canonical_state bytea NOT NULL CHECK (octet_length(canonical_state) BETWEEN 1 AND 1048576),
-  state_sha256 char(64) NOT NULL CHECK (state_sha256 ~ '^[0-9a-f]{64}$'),
-  updated_at timestamptz NOT NULL,
-  PRIMARY KEY (authority_domain, controller_identity)
+  revision bigint NOT NULL CHECK (revision > 0), canonical_state bytea NOT NULL CHECK (octet_length(canonical_state) BETWEEN 1 AND 1048576),
+  state_sha256 char(64) NOT NULL CHECK (state_sha256 ~ '^[0-9a-f]{64}$'), updated_at timestamptz NOT NULL,
+  PRIMARY KEY(authority_domain,controller_identity)
+);
+CREATE TABLE abcp_v4.abcp_authority_artifact_v1 (
+  authority_domain text NOT NULL REFERENCES abcp_v4.abcp_authority_domain_v1(authority_domain) ON DELETE RESTRICT,
+  artifact_sha256 char(64) NOT NULL CHECK (artifact_sha256 ~ '^[0-9a-f]{64}$'), artifact_kind text NOT NULL,
+  lineage_sha256 char(64), stage text NOT NULL, artifact_sequence bigint GENERATED ALWAYS AS IDENTITY,
+  canonical_bytes bytea NOT NULL CHECK (octet_length(canonical_bytes) BETWEEN 1 AND 33554432), byte_size bigint NOT NULL,
+  created_at timestamptz NOT NULL, PRIMARY KEY(authority_domain,artifact_sha256),
+  UNIQUE(artifact_sequence),
+  CHECK (lineage_sha256 IS NULL OR lineage_sha256 ~ '^[0-9a-f]{64}$'),
+  CHECK (byte_size=octet_length(canonical_bytes))
 );
 ```
 
-`abcp governance-backend-bootstrap --repository <repo> --authority-domain <id> --bootstrap-dsn-file <path> --runtime-role <role> --predecessor-state <ControllerStateV1-artifact>` is the only bootstrap operation. It validates repository/controller identity, strict predecessor V1 bytes/digest, and bootstrap provenance; in one transaction it creates/verifies the exact schema, binds `authority_domain→runtime_role`, and inserts the initial row at revision 1. Concurrent exact bootstrap is idempotent only when schema, domain binding, controller identity, canonical bytes and digest all match; any difference fails. The bootstrap role owns DDL and INSERT and is not usable by ordinary ABCP execution. The runtime role receives only CONNECT plus SELECT/UPDATE on these exact rows/tables; it cannot CREATE/ALTER/DROP/INSERT/DELETE/GRANT. Every runtime connection verifies `current_user` equals the domain's recorded runtime role before loading authority.
+Exact isolation DDL additionally includes:
 
-`LoadWorkflowStateV1/V2` selects the exact `(authority_domain,controller_identity)` row and independently computes `sha256(canonical_state)` in application code; mismatch with `state_sha256`, row revision vs decoded state revision, role/domain binding, strict state schema, or repository/controller identity fails closed. CAS is one transaction with `SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='10s'` and exactly one `UPDATE ... SET revision=$new,canonical_state=$bytes,state_sha256=$sha,updated_at=clock_timestamp() WHERE authority_domain=$domain AND controller_identity=$id AND revision=$expected`; success requires one row and a read-back of exact revision/digest. Ambiguous commit forbids another mutation until fresh connection read-back proves the exact proposed revision/digest applied or exact expected revision still present; any third state is `RECOVERY_REQUIRED`.
+```sql
+ALTER TABLE abcp_v4.abcp_authority_domain_v1 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE abcp_v4.abcp_authority_domain_v1 FORCE ROW LEVEL SECURITY;
+ALTER TABLE abcp_v4.abcp_workflow_authority_v1 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE abcp_v4.abcp_workflow_authority_v1 FORCE ROW LEVEL SECURITY;
+ALTER TABLE abcp_v4.abcp_authority_artifact_v1 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE abcp_v4.abcp_authority_artifact_v1 FORCE ROW LEVEL SECURITY;
+CREATE POLICY abcp_domain_self_select ON abcp_v4.abcp_authority_domain_v1 FOR SELECT USING (runtime_role=current_user);
+CREATE POLICY abcp_workflow_self_select ON abcp_v4.abcp_workflow_authority_v1 FOR SELECT USING (authority_domain IN (SELECT authority_domain FROM abcp_v4.abcp_authority_domain_v1 WHERE runtime_role=current_user));
+CREATE POLICY abcp_workflow_self_update ON abcp_v4.abcp_workflow_authority_v1 FOR UPDATE USING (authority_domain IN (SELECT authority_domain FROM abcp_v4.abcp_authority_domain_v1 WHERE runtime_role=current_user)) WITH CHECK (authority_domain IN (SELECT authority_domain FROM abcp_v4.abcp_authority_domain_v1 WHERE runtime_role=current_user));
+CREATE POLICY abcp_artifact_self_select ON abcp_v4.abcp_authority_artifact_v1 FOR SELECT USING (authority_domain IN (SELECT authority_domain FROM abcp_v4.abcp_authority_domain_v1 WHERE runtime_role=current_user));
+CREATE POLICY abcp_artifact_self_insert ON abcp_v4.abcp_authority_artifact_v1 FOR INSERT WITH CHECK (authority_domain IN (SELECT authority_domain FROM abcp_v4.abcp_authority_domain_v1 WHERE runtime_role=current_user));
+REVOKE ALL ON SCHEMA abcp_v4 FROM PUBLIC;
+REVOKE ALL ON ALL TABLES IN SCHEMA abcp_v4 FROM PUBLIC;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA abcp_v4 TO <runtime_role>;
+GRANT SELECT ON abcp_v4.abcp_authority_domain_v1 TO <runtime_role>;
+GRANT SELECT,UPDATE ON abcp_v4.abcp_workflow_authority_v1 TO <runtime_role>;
+GRANT SELECT,INSERT ON abcp_v4.abcp_authority_artifact_v1 TO <runtime_role>;
+GRANT USAGE,SELECT ON SEQUENCE abcp_v4.abcp_authority_artifact_v1_artifact_sequence_seq TO <runtime_role>;
+```
 
-Connection policy is frozen: connect timeout 5s; operation context 15s; transaction timeout 15s; `lock_timeout=2s`; `statement_timeout=10s`; `idle_in_transaction_session_timeout=15s`; pool `MaxConns=4, MinConns=0, MaxConnLifetime=30m, MaxConnIdleTime=5m, HealthCheckPeriod=30s`. Test harness uses loopback-only PostgreSQL with SCRAM password and `sslmode=disable`; this profile is invalid off loopback. Operator/external PostgreSQL requires TLS `verify-full` plus trusted CA and hostname. Cleartext/non-loopback disable/`prefer`/`require` without verification are invalid.
+All three tables use `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY`. Domain SELECT policy is `runtime_role=current_user`. Workflow SELECT/UPDATE and artifact SELECT/INSERT policies require `authority_domain IN (SELECT authority_domain FROM abcp_v4.abcp_authority_domain_v1 WHERE runtime_role=current_user)` for both USING/WITH CHECK. Runtime receives only USAGE schema, SELECT on its RLS-filtered domain row, SELECT/UPDATE on workflow, SELECT/INSERT on artifact; **no UPDATE on domain**, no DELETE/TRUNCATE/DDL. Bootstrap verifies exact policies, FORCE flags, grants, owner identities and role attributes on every open. Direct SQL with another domain is denied by RLS even with a caller-supplied domain string.
 
-Common CLI backend composition owns `--authority-backend=postgres --authority-domain=<id> --authority-dsn-file=<no-follow-owner-only-path>` and is mandatory for these exact existing durable commands: `run`, `governance-usage-validate` when it opens controller state, `governance-checkpoint-validate`, `governance-review-advance`, `governance-lease-issue`, `governance-lease-begin`, `governance-receipt-validate`, and `governance-activation-install`. This pack freezes these exact new durable command names: `governance-backend-bootstrap`, `governance-state-upgrade`, `assurance-evidence-select`, `assurance-failed-stage-record`, `assurance-correction-grant`, `assurance-integration-advance`, `assurance-pr-publish`, `assurance-merge-authorize`, `assurance-merge-effect-lease`, `assurance-merge-reconcile`, and `assurance-post-merge-advance`. Every one except bootstrap uses the runtime PostgreSQL role/common composition; bootstrap uses only `--bootstrap-dsn-file` and never runtime credentials. Pure parse-only validators may remain backendless. A durable command reaching controller mutation without this composition is an error, not a local fallback.
+Bootstrap requires a drained V1 artifact and inserts initial V2 workflow row at `revision=v1.revision+1`; it never inserts revision 1 blindly. Artifact create-or-verify uses `INSERT ... ON CONFLICT DO NOTHING` followed by same-transaction SELECT and application SHA/kind/size/byte equality; conflicting bytes fail. State CAS is one bounded transaction and RLS-authenticated current-user domain. Application independently hashes loaded state/artifact bytes. Commit ambiguity is fresh-connection read-back only.
 
-The DSN/credentials reside outside repository/evidence roots and are not accepted from repository manifests. Evidence contains only backend kind, authority-domain, current role identity, server version/TLS profile, and secret-free connection-policy digest.
+Connection bounds remain connect 5s, operation/transaction 15s, lock 2s, statement 10s, idle-in-transaction 15s, pool MaxConns4/Min0/lifetime30m/idle5m/health30s. Harness is loopback SCRAM with `sslmode=disable`; non-loopback operator DB requires `verify-full` + CA/hostname. The exact PostgreSQL image remains `postgres@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3` linux/amd64 17.6-bookworm.
+
+Existing durable CLI names that open controller state (`run`, `governance-usage-validate` when stateful, `governance-checkpoint-validate`, `governance-review-advance`, `governance-lease-issue`, `governance-lease-begin`, `governance-receipt-validate`, `governance-activation-install`) and new V4 commands (`governance-backend-bootstrap`, `governance-state-upgrade`, `assurance-evidence-select`, `assurance-failed-stage-record`, `assurance-correction-grant`, `assurance-integration-advance`, `assurance-pr-publish`, `assurance-merge-authorize`, `assurance-merge-effect-claim`, `assurance-merge-reconcile`, `assurance-post-merge-advance`) use the common PostgreSQL composition. Parse-only validation may remain backendless.
 
 ## Evidence-class applicability
 
-`unit`, `static`, `contract`, `fault_injection`, `race_concurrency`, `crash_restart`, `resource`, `replay_idempotency`, `security_negative`, `smoke`, `integration`, `migration`, and `e2e` are applicable and have exact cells below. `runtime` and `production` are explicitly **not applicable** because this pack changes/install-tests the CLI/controller but does not deploy a long-running production ABCP service; no runtime/production cell may be pre-satisfied and external-build readiness remains a later separately authorized runtime/deployment claim.
-
+`unit`, `static`, `contract`, `fault_injection`, `race_concurrency`, `crash_restart`, `resource`, `replay_idempotency`, `security_negative`, `smoke`, `integration`, `migration`, and `e2e` are applicable. `runtime` and `production` are N/A because this pack installs/tests controller/CLI governance but deploys no long-running ABCP production service; external-build readiness remains a later separately authorized deployment claim.
 
 ## Validator registry
 
-`${A_ACCEPTED_HEAD}`, `${CANDIDATE_HEAD}`, `${MERGE_RESULT}` and runtime paths are controller-supplied immutable bindings. Every Go-test invocation goes through `scripts/acceptance/assurance-go-test-exact.py`. The wrapper requires an explicit `--count` for **both exact and suite modes**, always forwards `-count=N`, and rejects `N<1`; C/B suites use `--count 1`. It parses `go test -json`, rejects any package-level `(cached)` indication, requires Go exit 0 and positive `run/pass` evidence for each required package/test, and fails zero-match. No cached result is acceptance evidence.
+Every Go test runs only through `scripts/acceptance/assurance-go-test-exact.py` with explicit `--count`; wrapper always forwards `-count=N`, rejects cached package results/zero-match, and records parsed run/pass/fail events. `ValidatorV1` authority below also freezes resource/secret/container properties; callers cannot weaken them.
 
-| Validator ID | Stage | Exact command / authority | Purpose |
-|---|---|---|---|
-| AG-VAL-B-001 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --suite ./internal/context ./internal/governance ./internal/authority ./internal/authoritybackend/... ./internal/mergelifecycle/... --count 1 --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/context --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/governance --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/authority --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/mergelifecycle` | uncached contracts/backend suite |
-| AG-VAL-B-002 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceConcurrentReplayAndDerivation --count 10 --race` | concurrent/replay authority |
-| AG-VAL-B-003 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssurancePublicationCrashMatrix --count 1` | publication crash matrix |
-| AG-VAL-B-004 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceCancellationAndObservationAmbiguity --count 1` | cancellation/ambiguity |
-| AG-VAL-B-005 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceEvidenceAndStageBinding --count 1` | evidence/selection semantics |
-| AG-VAL-B-006 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceScopeClassificationAndPlanImmutability --count 1` | docs bypass/frozen A |
-| AG-VAL-B-007 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceResourceReservationAccounting --count 10 --race` | atomic resource accounting |
-| AG-VAL-B-008 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceCanonicalUnitSemantics --count 1` | unit evidence |
-| AG-VAL-B-009 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/authoritybackend/postgres --test TestPostgresWorkflowAuthorityBackendCAS --count 10 --race` | PostgreSQL bootstrap/CAS/ambiguity |
-| AG-VAL-B-010 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceOperationalValidity --count 1` | historical vs operational validity |
-| AG-VAL-B-011 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-graph-validate.py --model docs/plans/assurance-proof-obligation-governance-enforcement-assurance.md` | semantic graph closure |
-| AG-VAL-B-012 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceWireStateUpgradeAndGrandfathering --count 1` | exact wire/state migration/V3 grandfathering |
-| AG-VAL-C-001 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --suite ./... --count 1 --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/governance --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/authority --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/run --require-package github.com/pankajleh/autonomous-builder-control-plane/cmd/abcp` | full uncached tests |
-| AG-VAL-C-002 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --suite ./... --count 1 --race --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/governance --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/run` | full uncached race suite |
-| AG-VAL-C-003 | C_BRANCH_ACCEPTANCE | `go vet ./...` | static hygiene only |
-| AG-VAL-C-004 | C_BRANCH_ACCEPTANCE | `git diff --check ${A_ACCEPTED_HEAD}...${CANDIDATE_HEAD}` | diff hygiene only |
-| AG-VAL-C-005 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./cmd/abcp --test TestAssuranceFreshSessionAuthoritySmoke --count 1` | J-01 real CLI/PostgreSQL smoke |
-| AG-VAL-C-006 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceFailedStageCorrectionReentryIntegration --count 1` | J-02 C/integration failure corrections |
-| AG-VAL-C-007 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceGapReturnsToAIntegration --count 1` | J-03 model gap |
-| AG-VAL-C-008 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./cmd/abcp --test TestAssuranceDocumentationBypassSmoke --count 1` | J-04 docs bypass |
-| AG-VAL-C-009 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssurancePhysicalResourceAndCrashStress --count 10 --race` | resource/crash stress |
-| AG-VAL-C-010 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/mergelifecycle --test TestAssuranceMergeEffectLeaseInvalidationRace --count 20 --race` | merge effect lease linearization |
-| AG-VAL-C-011 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-secret-scan.py --candidate ${CANDIDATE_HEAD} --evidence-selection ${C_EVIDENCE_SELECTION} --secret-fd 3` | credential egress zero-match scan |
-| AG-VAL-C-012 | C_BRANCH_ACCEPTANCE | `scripts/acceptance/assurance-runner-preflight.sh --profile NORMAL_V1 --postgres-required` | physical runner/backend preflight |
-| AG-VAL-I-001 | INTEGRATION_ACCEPTANCE | `scripts/acceptance/assurance-governance-dogfood.sh ${A_ACCEPTED_HEAD} ${CANDIDATE_HEAD} ${PARENT_RESOURCE_RESERVATION}` | J-05 deterministic depth-1 dogfood |
-| AG-VAL-I-002 | INTEGRATION_ACCEPTANCE | `scripts/acceptance/assurance-lifecycle-integration.sh ${CANDIDATE_HEAD} ${C_STAGE_TIP}` | real controller/mergelifecycle integration-before-PR/effect-lease flow |
-| AG-VAL-PM-001 | POST_MERGE_ACCEPTANCE | `scripts/acceptance/assurance-governance-postmerge.sh ${MERGE_RESULT}` | merged-state compatibility/fresh PostgreSQL reconnect |
+| Validator ID | Stage | Exact command / authority | Profile / secret | Purpose |
+|---|---|---|---|---|
+| AG-VAL-B-001 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --suite ./internal/context ./internal/governance ./internal/authority ./internal/authoritybackend/... ./internal/mergelifecycle/... ./internal/prlifecycle/... --count 1 --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/governance --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/mergelifecycle --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/prlifecycle` | NORMAL_V1/NONE | contracts suite |
+| AG-VAL-B-002 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceConcurrentReplayAndDerivation --count 10 --race` | NORMAL_V1/NONE | authority concurrency |
+| AG-VAL-B-003 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssurancePublicationCrashMatrix --count 1` | NORMAL_V1/NONE | crash matrix |
+| AG-VAL-B-004 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceCancellationAndObservationAmbiguity --count 1` | NORMAL_V1/NONE | ambiguity |
+| AG-VAL-B-005 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceEvidenceAndStageBinding --count 1` | NORMAL_V1/NONE | evidence semantics |
+| AG-VAL-B-006 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceScopeClassificationAndPlanImmutability --count 1` | NORMAL_V1/NONE | docs bypass |
+| AG-VAL-B-007 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceResourceReservationAccounting --count 10 --race` | NORMAL_V1/NONE | resource accounting |
+| AG-VAL-B-008 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceCanonicalUnitSemantics --count 1` | NORMAL_V1/NONE | unit semantics |
+| AG-VAL-B-009 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/authoritybackend/postgres --test TestPostgresWorkflowAuthorityBackendCAS --count 10 --race` | SECRET_CAPABLE_V1/POSTGRES + POSTGRES_CONTAINER_V1 | backend CAS |
+| AG-VAL-B-010 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceOperationalValidity --count 1` | NORMAL_V1/NONE | validity |
+| AG-VAL-B-011 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-graph-validate.py --model docs/plans/assurance-proof-obligation-governance-enforcement-assurance.md` | NORMAL_V1/NONE | semantic graph |
+| AG-VAL-B-012 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceWireStateUpgradeAndDrain --count 1` | NORMAL_V1/NONE | wire/drain-only upgrade |
+| AG-VAL-B-013 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceEffectClaimSingleWinner --count 20 --race` | NORMAL_V1/NONE | one-winner PR/merge claim |
+| AG-VAL-B-014 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/authoritybackend/postgres --test TestPostgresDomainIsolationArtifactStore --count 10 --race` | SECRET_CAPABLE_V1/POSTGRES + POSTGRES_CONTAINER_V1 | RLS/artifact/fresh-host |
+| AG-VAL-B-015 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceDrainUpgradeAndSemanticRegistry --count 1` | NORMAL_V1/NONE | drain + correction derivation |
+| AG-VAL-B-016 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceResourceProfileBinding --count 10 --race` | NORMAL_V1/NONE | profile no-downgrade/full vector |
+| AG-VAL-B-017 | B_IMPLEMENTATION | `python3 scripts/acceptance/assurance-secret-scan.py --stage B_IMPLEMENTATION --inventory ${B_ARTIFACT_INVENTORY}` | SECRET_CAPABLE_V1/POSTGRES | B credential inventory scan |
+| AG-VAL-C-001 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --suite ./... --count 1 --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/governance --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/run --require-package github.com/pankajleh/autonomous-builder-control-plane/cmd/abcp` | NORMAL_V1/NONE | full tests |
+| AG-VAL-C-002 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --suite ./... --count 1 --race --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/governance --require-package github.com/pankajleh/autonomous-builder-control-plane/internal/run` | NORMAL_V1/NONE | race suite |
+| AG-VAL-C-003 | C_BRANCH_ACCEPTANCE | `go vet ./...` | NORMAL_V1/NONE | static only |
+| AG-VAL-C-004 | C_BRANCH_ACCEPTANCE | `git diff --check ${A_ACCEPTED_HEAD}...${CANDIDATE_HEAD}` | NORMAL_V1/NONE | diff hygiene only |
+| AG-VAL-C-005 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./cmd/abcp --test TestAssuranceFreshSessionAuthoritySmoke --count 1` | SECRET_CAPABLE_V1/POSTGRES + POSTGRES_CONTAINER_V1 | J-01 |
+| AG-VAL-C-006 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceFailedStageCorrectionReentryIntegration --count 1` | NORMAL_V1/NONE | J-02 |
+| AG-VAL-C-007 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssuranceGapReturnsToAIntegration --count 1` | NORMAL_V1/NONE | J-03 |
+| AG-VAL-C-008 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./cmd/abcp --test TestAssuranceDocumentationBypassSmoke --count 1` | NORMAL_V1/NONE | J-04 |
+| AG-VAL-C-009 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/governance --test TestAssurancePhysicalResourceAndCrashStress --count 10 --race` | NORMAL_V1/NONE | physical resource stress |
+| AG-VAL-C-010 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/mergelifecycle --test TestAssuranceMergeEffectClaimInvalidationRace --count 20 --race` | NORMAL_V1/NONE | merge claim race |
+| AG-VAL-C-011 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-secret-scan.py --stage C_BRANCH_ACCEPTANCE --inventory ${C_ARTIFACT_INVENTORY}` | SECRET_CAPABLE_V1/POSTGRES | C credential inventory scan |
+| AG-VAL-C-012 | C_BRANCH_ACCEPTANCE | `scripts/acceptance/assurance-runner-preflight.sh --profile NORMAL_V1 --postgres-required` | NORMAL_V1/NONE | runner capacity |
+| AG-VAL-C-013 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/prlifecycle --test TestAssurancePREffectClaimInvalidationRace --count 20 --race` | NORMAL_V1/NONE | PR effect race |
+| AG-VAL-C-014 | C_BRANCH_ACCEPTANCE | `python3 scripts/acceptance/assurance-go-test-exact.py --package ./internal/mergelifecycle --test TestAssuranceLedgerPostgresHandoffCrashMatrix --count 1` | NORMAL_V1/NONE | ledger/PG crash ordering |
+| AG-VAL-I-001 | INTEGRATION_ACCEPTANCE | `scripts/acceptance/assurance-governance-dogfood.sh ${A_ACCEPTED_HEAD} ${CANDIDATE_HEAD} ${PARENT_RESOURCE_RESERVATION}` | DOGFOOD_V1/CODEX_PROVIDER + POSTGRES_CONTAINER_V1 | J-05 |
+| AG-VAL-I-002 | INTEGRATION_ACCEPTANCE | `scripts/acceptance/assurance-lifecycle-integration.sh ${CANDIDATE_HEAD} ${C_STAGE_TIP}` | SECRET_CAPABLE_V1/POSTGRES + POSTGRES_CONTAINER_V1 | real PR/merge/ledger coordination |
+| AG-VAL-I-003 | INTEGRATION_ACCEPTANCE | `python3 scripts/acceptance/assurance-secret-scan.py --stage INTEGRATION_ACCEPTANCE --inventory ${I_ARTIFACT_INVENTORY}` | SECRET_CAPABLE_V1/CODEX_PROVIDER | integration inventory scan |
+| AG-VAL-PM-001 | POST_MERGE_ACCEPTANCE | `scripts/acceptance/assurance-governance-postmerge.sh ${MERGE_RESULT}` | SECRET_CAPABLE_V1/POSTGRES + POSTGRES_CONTAINER_V1 | merged-state/fresh-host smoke |
+| AG-VAL-PM-002 | POST_MERGE_ACCEPTANCE | `python3 scripts/acceptance/assurance-secret-scan.py --stage POST_MERGE_ACCEPTANCE --inventory ${PM_ARTIFACT_INVENTORY}` | SECRET_CAPABLE_V1/POSTGRES | post-merge inventory scan |
 
-## Evidence artifact schema
+## Evidence and secret inventory authority
 
-`AssuranceResourceReservationV1`, `AssuranceEvidenceCellV1` and `StageEvidenceSelectionV1` use the exact canonical schemas above. Process execution identity additionally hashes: working-directory repository identity/relative path, allowlisted non-secret environment policy, acting principal ID, exact argv, executable/toolchain hashes, cgroup/profile, and (when applicable) Ralphex source/binary plus Codex CLI/model/effort/executor identities. Attempts are lineage-global ordinals; failed/unavailable attempts consume their reservation and never satisfy a cell. Stage CAS selects exactly one PASS evidence digest per required cell.
+Every attempt first publishes `AssuranceResourceReservationV1`; then execution emits an `ExecutionIdentityV1`, evidence/resource records and an immutable artifact row. The artifact backend assigns a database-global monotonically increasing identity `artifact_sequence`; inventory queries are RLS-domain-filtered and additionally bind lineage+stage, so callers cannot skip same-lineage artifacts by choosing a sequence. `RetainedArtifactInventoryV1` is complete through a frozen sequence and enumerates **all** authoritative retained PASS/FAIL/VALIDATION_UNAVAILABLE/unselected/orphan artifacts in that lineage+stage; the controller queries the artifact table itself, so a caller cannot omit entries. A positive secret match prevents stage PASS and stores only a redacted `SecretEgressIncidentV1` metadata record; offending raw bytes/raw output are never inserted into the authority artifact table.
 
-Secret handling is a trust boundary, not a logging convention. A process marked `SECRET_CAPABLE_V1` (Codex/Ralphex provider execution, PostgreSQL bootstrap/runtime client, Docker credential setup) may receive credential material only through controller-owned ephemeral memory/file/FD outside repository/evidence roots. Its **raw stdout/stderr are never copied into `AssuranceEvidenceCellV1` or retained artifact storage**, even on failure; controller records only bounded structured exit/status fields and digests of explicitly classified secret-free protocol results. Before launch, J-05 requires a capability probe demonstrating a Codex tool subprocess cannot read the credential sentinel/file/FD used by the parent Codex process; inability to prove that isolation is `VALIDATION_UNAVAILABLE`.
+Real upstream provider credentials never enter the Codex process, repository, child environment, argv, config file, or evidence. J-05 starts a controller-owned loopback-only `CodexProviderBrokerV1` that holds the upstream credential in controller memory/FD and exposes only the exact OpenAI Responses-compatible routes required by the pinned client. Codex 0.149.0 is invoked with `model_provider="abcp-broker"` and an ephemeral config equivalent to `[model_providers.abcp-broker] base_url="http://127.0.0.1:<reserved-port>/v1", env_key="ABCP_BROKER_SESSION_TOKEN", wire_api="responses", requires_openai_auth=false`; the session token is 256-bit controller CSPRNG, short-lived, bound to one execution identity/model/request budget, and is not an upstream credential. `shell_environment_policy.exclude=["ABCP_BROKER_SESSION_TOKEN"]` is mandatory. Before any real broker session, the exact Codex sandbox/config runs harmless-sentinel probes proving (a) the token-name is absent from tool-shell environment, (b) a tool subprocess cannot read a same-shaped marker from the Codex parent process environment/proc view, and (c) a tool subprocess cannot connect to the broker loopback endpoint while the Codex client can. Any readable marker, reachable tool connection, inability to prove the parent-process boundary, provider/config drift, or probe ambiguity is `VALIDATION_UNAVAILABLE`; no real provider credential/session is then started. The broker rejects non-loopback clients, wrong/expired/replayed session tokens, unbound model identities and non-allowlisted routes; strips inbound authorization before injecting the upstream credential; and never logs either credential or session token.
 
-The controller retains exact credential byte values only in ephemeral memory long enough to run `assurance-secret-scan.py` against the exact candidate diff and every retained evidence artifact produced by that credential-bearing stage. FD 3 is a controller-owned pipe carrying one or more frames `uint32_be_length || secret_bytes`, terminated by a zero-length frame; the scanner never accepts secret bytes through argv, environment, repository files, or retained evidence. PASS requires zero exact-value occurrences. The scan artifact contains artifact identities, byte counts, scanner version/digest and zero/nonzero match counts only; it never contains the credential value. A positive match fails the stage and quarantines the offending artifact outside authoritative evidence. Generic environment capture, command lines, DSNs, passwords, tokens, cookies, SSH/cloud material and raw secret-capable output are forbidden evidence fields.
+PostgreSQL/Docker passwords are controller-generated into 0400 files in an ephemeral 0700 directory outside repo/evidence roots; Docker receives only `POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password` and a read-only bind of that file. Secret-capable process raw stdout/stderr is scanned in bounded memory and discarded; only structured secret-free results are retained. Exact secret values (including the broker session token and upstream credential inside the controller boundary) are delivered to `assurance-secret-scan.py` over controller-owned FD3 length frames, never argv/env/file evidence.
 
-Non-secret-capable validators may retain stdout/stderr under their resource profile. Crash evidence records boundary/kill point/pre/post revisions and recovery outcome; resource evidence records reserved/final counters plus cgroup/process/FD/output/evidence/transient/elapsed observations. Candidate subjects bind exact repository identity/commit/tree/A-lineage; integration adds integration repo/source candidate/parent reservation; post-merge adds exact merge result/tree/integration tip.
-
-## Production composition / fake boundary matrix
-
-| Boundary | Unit/B fake allowed? | Required real boundary |
-|---|---|---|
-| Git repository/object/ref | parser fixtures | C/J-01/J-05 use real temporary Git repositories/objects |
-| controller durable state/CAS | canonical pure fixtures | C/integration use real PostgreSQL adapter and fresh reconnect |
-| filesystem/path durability | parser fixtures | crash/resource use real filesystem and fresh process |
-| cgroup/process limits | API mock for unit only | C preflight/resource use real delegated cgroup v2 + prlimit/bwrap |
-| PostgreSQL | parser/mock for local unit only | smoke/integration use exact pinned Docker image/production adapter |
-| Ralphex/Codex | deterministic helper for local controller unit only | J-05 uses exact pinned official Ralphex + Codex identities and credential-isolation probe |
-| merge provider | deterministic provider may be used to force races in unit | integration uses real `internal/mergelifecycle` controller and effect-lease handoff; no external GitHub merge is performed by J-05 |
+A credential-bearing stage cannot publish its evidence-selection checkpoint until its complete inventory and matching stage-local PO-041/PO-052 zero-match scan are PASS. B, C, integration and post-merge each have such cells.
 
 ## Strict evidence-cell registry
 
-One row = one proof + one evidence class + one stage + one subject + one validator. The mapping below is semantic authority; a validator cannot satisfy a claim outside the row naming it.
+One row is exactly one proof/class/stage/subject/validator. Existing AG-E-001..062 retain their meanings from the prior A revision except AG-PO-041 now additionally requires stage-local inventory cells below. New closure cells are:
 
 | Cell ID | Proof | Class | Stage | Subject | Validator |
 |---|---|---|---|---|---|
@@ -438,33 +547,58 @@ One row = one proof + one evidence class + one stage + one subject + one validat
 | AG-E-060 | AG-PO-023 | replay_idempotency | POST_MERGE_ACCEPTANCE | exact merge result + fresh backend | AG-VAL-PM-001 |
 | AG-E-061 | AG-PO-005 | migration | POST_MERGE_ACCEPTANCE | exact merge-result commit/tree | AG-VAL-PM-001 |
 | AG-E-062 | AG-PO-033 | race_concurrency | C_BRANCH_ACCEPTANCE | unchanged exact C candidate | AG-VAL-C-002 |
+| AG-E-063 | AG-PO-045 | race_concurrency | B_IMPLEMENTATION | exact B candidate | AG-VAL-B-013 |
+| AG-E-064 | AG-PO-045 | integration | INTEGRATION_ACCEPTANCE | exact merge effect subject | AG-VAL-I-002 |
+| AG-E-065 | AG-PO-046 | security_negative | B_IMPLEMENTATION | exact PostgreSQL authority domain | AG-VAL-B-014 |
+| AG-E-066 | AG-PO-046 | integration | INTEGRATION_ACCEPTANCE | real multi-role PostgreSQL | AG-VAL-I-002 |
+| AG-E-067 | AG-PO-047 | contract | B_IMPLEMENTATION | exact B candidate | AG-VAL-B-015 |
+| AG-E-068 | AG-PO-048 | contract | B_IMPLEMENTATION | frozen semantic registry | AG-VAL-B-015 |
+| AG-E-069 | AG-PO-049 | migration | B_IMPLEMENTATION | exact drained V1→V2 transition | AG-VAL-B-015 |
+| AG-E-070 | AG-PO-050 | contract | B_IMPLEMENTATION | immutable artifact backend | AG-VAL-B-014 |
+| AG-E-071 | AG-PO-050 | crash_restart | C_BRANCH_ACCEPTANCE | fresh-host artifact traversal | AG-VAL-C-014 |
+| AG-E-072 | AG-PO-051 | resource | B_IMPLEMENTATION | frozen validator/profile set | AG-VAL-B-016 |
+| AG-E-073 | AG-PO-051 | resource | C_BRANCH_ACCEPTANCE | physical worker/container capacity | AG-VAL-C-012 |
+| AG-E-074 | AG-PO-052 | security_negative | B_IMPLEMENTATION | complete B artifact inventory | AG-VAL-B-017 |
+| AG-E-075 | AG-PO-052 | security_negative | C_BRANCH_ACCEPTANCE | complete C artifact inventory | AG-VAL-C-011 |
+| AG-E-076 | AG-PO-052 | security_negative | INTEGRATION_ACCEPTANCE | complete integration artifact inventory | AG-VAL-I-003 |
+| AG-E-077 | AG-PO-052 | security_negative | POST_MERGE_ACCEPTANCE | complete post-merge artifact inventory | AG-VAL-PM-002 |
+| AG-E-078 | AG-PO-053 | e2e | INTEGRATION_ACCEPTANCE | exact delegated J-05 child | AG-VAL-I-001 |
+| AG-E-079 | AG-PO-054 | race_concurrency | C_BRANCH_ACCEPTANCE | unchanged C+integration tip | AG-VAL-C-013 |
+| AG-E-080 | AG-PO-054 | integration | INTEGRATION_ACCEPTANCE | real PR effect claim/reconcile | AG-VAL-I-002 |
+| AG-E-081 | AG-PO-055 | crash_restart | C_BRANCH_ACCEPTANCE | exact ledger↔PG handoff | AG-VAL-C-014 |
+| AG-E-082 | AG-PO-055 | integration | INTEGRATION_ACCEPTANCE | real ledger/PR/merge coordination | AG-VAL-I-002 |
+| AG-E-083 | AG-PO-041 | security_negative | B_IMPLEMENTATION | complete B artifact inventory | AG-VAL-B-017 |
+| AG-E-084 | AG-PO-041 | security_negative | POST_MERGE_ACCEPTANCE | complete post-merge inventory | AG-VAL-PM-002 |
 
-Every AG-PO-001..044 has ≥1 exact cell and every validator above is referenced. Static hygiene proves only AG-PO-039. Graph completeness proves AG-PO-006/027/040. Physical resource claims use resource/preflight validators. Merge-order/effect claims use C-010/I-002. AG-PO-029 has five distinct journey cells, one per J-01..J-05.
-
-Frozen current registry cardinality: **50 scenarios, 20 invariants, 44 proof obligations, 62 evidence cells, 27 validators, and 5 critical journeys**. These cardinalities are committed by `AssuranceModelV1`; a changed count changes the model digest and requires A authority.
+All AG-PO-001..055 must have at least one exact cell. The graph validator expands the preserved AG-E-001..062 plus AG-E-063..084 and rejects any duplicate, missing proof/validator, stage mismatch, unused validator, profile/capability downgrade, or missing AG-PO-029 J-01..J-05 row.
 
 ## Critical journeys
 
-**J-01 / AG-VAL-C-005 — Fresh-session authority smoke.** Real temporary Git repository + assembled `abcp` + real PostgreSQL. Consume exact merged/post-merge `PolicyUpgradeAuthorityV1`, perform the V1→V2 controller-state upgrade, install/replay exact V4 activation, then A→B→C. Mutated manifest/commit/principal/base/schema/repo/path/candidate/grandfather inputs fail before mutation.
+**J-01 / AG-VAL-C-005 — Fresh-session authority smoke.** Real Git + real PostgreSQL. Start from an exact **drained** V1 state and immutable predecessor artifact, bootstrap V2 at `r+1`, install V4 manifest, derive A→B→C, then prove wrong commit/principal/domain/schema/artifact/capsule/candidate inputs fail before mutation. A non-drained V3 state must fail `V3_DRAIN_REQUIRED`.
 
-**J-02 / AG-VAL-C-006 — Bounded failed-stage correction.** From one accepted A: C1 implementation finding → `FailedStageV1` → correction-B1 (counter 1); replacement C2 → implementation finding → correction-B2 (counter 2); restart/fresh backend → C3 blocker → no grant, counter remains 2, A required. The same flow is repeated with an integration-stage implementation finding before PR publication. Model-gap variants consume zero correction count. Concurrent/exact replay cannot double-consume.
+**J-02 / AG-VAL-C-006 — bounded correction.** C1 implementation finding → failed-stage → correction-B1; replacement C2 → correction-B2; restart C3 blocker → no third grant/A-required. Reviewer/finding paths are ignored as authority; controller derives correction paths only from frozen semantic rule scope + original B scope + controller-recomputed exact accepted-B base→failed-candidate Git diff paths. Repeat for integration-stage finding before PR publication.
 
-**J-03 / AG-VAL-C-007 — Assurance-gap return-to-A.** Missing scenario, unjustified N/A, wrong cell/subject/attempt, missing real boundary, or inadequate proof produces `ASSURANCE_MODEL_GAP`, zero mutation/reentry authority, and A-required state.
+**J-03 / AG-VAL-C-007 — assurance-gap return A.** Missing/misclassified scenario/N-A, inadequate proof, missing boundary, wrong cell/subject/profile, or disconnected semantic rule produces `ASSURANCE_MODEL_GAP`, zero correction grant, A-required.
 
-**J-04 / AG-VAL-C-008 — Documentation bypass smoke.** Narrow non-authoritative docs-only classification may pass; a candidate touching governance/runtime bytes invalidates it before acceptance.
+**J-04 / AG-VAL-C-008 — documentation bypass.** Controller-owned non-authoritative docs-only classification passes only for eligible docs; governance/runtime byte appears → exact-diff revalidation invalidates exemption before acceptance.
 
-**J-05 / AG-VAL-I-001 — Frozen deterministic dogfood.** The fixture bytes are exactly the UTF-8 bytes in these fenced blocks, including LF newlines and the final LF; tabs shown in Go indentation are one U+0009 byte. No CRLF normalization is permitted.
+**J-05 / AG-VAL-I-001 — deterministic delegated dogfood.** Frozen baseline contains exactly four files:
 
-`go.mod` (41 bytes; SHA-256 `890f65191c956c6601f033eefc794abff1d63cdc05479e17f3309b68181face3`):
+- `docs/plans/unique-sorted.md` 497 bytes SHA-256 `9aeb0465e37a67f280b27ab7994f50a815e1b76e13d24dbb686db977f22b6500`;
+- `go.mod` 41 bytes SHA-256 `890f65191c956c6601f033eefc794abff1d63cdc05479e17f3309b68181face3`;
+- `numbers/numbers.go` 148 bytes SHA-256 `ba8c8918c5c3a6b354962dd663f5b65fe04160a814d72c9f64097456f2851e48`;
+- `numbers/numbers_test.go` 536 bytes SHA-256 `8a87e111af64b9534bf23aa5f90b43f924e439ab01ab124a64b92f03a90489ae`.
 
+The other three file bytes are also frozen exactly:
+
+`go.mod`
 ```text
 module example.com/abcp-dogfood
 
 go 1.23
 ```
 
-`numbers/numbers.go` (148 bytes; SHA-256 `ba8c8918c5c3a6b354962dd663f5b65fe04160a814d72c9f64097456f2851e48`):
-
+`numbers/numbers.go`
 ```go
 package numbers
 
@@ -474,8 +608,7 @@ func UniqueSorted(in []int) []int {
 }
 ```
 
-`numbers/numbers_test.go` (574 bytes; SHA-256 `0a032466c1f8801128bef9d93cf7327168eeabc78349d752763ce33181813a2d`):
-
+`numbers/numbers_test.go`
 ```go
 package numbers_test
 
@@ -488,39 +621,62 @@ import (
 
 func TestUniqueSorted(t *testing.T) {
 	in := []int{3, -1, 3, 2, -1}
-	want := []int{-1, 2, 3}
+	before := append([]int(nil), in...)
 	got := numbers.UniqueSorted(in)
+	want := []int{-1, 2, 3}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("UniqueSorted() = %v, want %v", got, want)
+		t.Fatalf("got %v want %v", got, want)
 	}
-	if !reflect.DeepEqual(in, []int{3, -1, 3, 2, -1}) {
-		t.Fatalf("input mutated: %v", in)
+	if !reflect.DeepEqual(in, before) {
+		t.Fatalf("input mutated: got %v want %v", in, before)
 	}
-	var nilInput []int
-	nilGot := numbers.UniqueSorted(nilInput)
-	if nilGot != nil && len(nilGot) != 0 {
-		t.Fatalf("nil input result = %v, want nil or empty", nilGot)
+	if gotNil := numbers.UniqueSorted(nil); len(gotNil) != 0 {
+		t.Fatalf("nil input: got %v", gotNil)
 	}
 }
 ```
 
-The fixture-set digest is SHA-256 `93e1dcef80ff14255ec1b78a8932d90bbcc9d1679d54dc0e741d961d5e92cc6e` over each sorted entry `path || NUL || decimal-byte-length || NUL || bytes`. '' '
-The harness creates a fresh Git repo from exactly those bytes with fixed identity `ABCP Dogfood <dogfood@example.invalid>`, UTC timestamp `2000-01-01T00:00:00Z`, branch `main`, message `baseline`, then verifies the fixture digest before authority issuance. The task is exactly: **implement `numbers.UniqueSorted` so it returns ascending unique integers, does not mutate input, and preserves nil-or-empty semantics; change production code only.** PASS requires `go test -count=1 ./...`, unchanged test/go.mod bytes, zero secret scan matches, and only the expected production-file diff.
+Fixture-set digest over sorted `path NUL decimal-length NUL bytes` is `7dcaed92fb671a8c7961dd535f06d704a4f10ead8af84f86e47f7243fdf0b6b0`. With fixed `ABCP Dogfood <dogfood@example.invalid>`, UTC `2000-01-01T00:00:00Z`, branch `main`, message `baseline`, the exact baseline commit is `eb301906130c0d7ac13b7d90942d469753ab7708`, tree `6b50353385765d0809844bc6ef2415ce112f7e2b`.
 
-Outer integration reserves `DOGFOOD_V1` plus child maxima of 16 validator invocations, 128 MiB retained evidence, 2 GiB transient scratch, 90 min elapsed, one active child graph. It issues `DogfoodChildActivationV1` mode `DOGFOOD_DELEGATED`, depth 1, exact child repository/baseline tree, parent integration tip/reservation, and exact V4 policy/model digests. Child allowed operations are only A_DESIGN/B_IMPLEMENTATION/C_BRANCH_ACCEPTANCE; PR publication, merge, post-merge, another dogfood, and authority reuse outside that repository/reservation are invalid.
+The exact plan bytes are:
 
-Tool authority is exact: Ralphex origin `https://github.com/umputun/ralphex.git`, source `319e30618352a1b43e4be1b8a894c6c05e6d5fa8`, binary SHA-256 `9ad47b083aaaf34eed4b35ca82f3c92d1a3b7641921be0ea606cbd1cd1c3adac`; Codex CLI 0.149.0 binary SHA-256 `134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477`, executor `codex`, model `gpt-5.6-sol`, reasoning effort `xhigh`. Credential-isolation capability probe and runner preflight must PASS before launch.
+```markdown
+# Plan: Implement UniqueSorted
+
+## Overview
+Implement numbers.UniqueSorted for the frozen ABCP dogfood fixture. Change production code only.
+
+## Validation Commands
+- `go test -count=1 ./...`
+
+### Task 1: Implement UniqueSorted
+- [ ] Implement numbers.UniqueSorted to return ascending unique integers without mutating input.
+- [ ] Preserve nil-or-empty semantics for nil input.
+- [ ] Do not modify go.mod, tests, or the plan requirements.
+- [ ] Run `go test -count=1 ./...`.
+- [ ] Mark completed.
+```
+
+`DogfoodChildActivationV1` binds this plan path/hash + baseline commit/tree, `DogfoodPolicyFloorV1`, and the exact `CODEX_BROKER_V1` isolation-profile digest; it authorizes only child `A_DESIGN`. The child A creates a new toy-repository `AssuranceModelV1`/semantic registry/capsule and must achieve child `DESIGN_ACCEPTED` before parent controller may issue child B. It is forbidden to reuse the parent ABCP model digest. Child B/C remain bounded to parent reservation; PR publication, merge, post-merge and nested dogfood are forbidden. Child maxima: 16 validator invocations, 128MiB retained evidence, 2GiB transient, 90m elapsed, one graph. Tool identities remain Ralphex `umputun/ralphex@319e30618352a1b43e4be1b8a894c6c05e6d5fa8` binary `9ad47b083aaaf34eed4b35ca82f3c92d1a3b7641921be0ea606cbd1cd1c3adac`; Codex CLI 0.149.0 `134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477`, model `gpt-5.6-sol`, effort `xhigh`, executor `codex`. Parent AG-VAL-I-001 cannot start the child until the harmless `CODEX_BROKER_V1` isolation probes PASS; a probe failure is evidence-incomplete/validation-unavailable, not permission to fall back to local Codex credentials.
 
 ## Functional-plan mutation and B convergence
 
-The assurance model is immutable throughout B/C. Functional-plan changes are limited to status/checkbox progression and final semantic move. B convergence requires every B cell against one exact candidate; C independently executes its cells and performs read-only exact-head review.
+The A model is immutable in B/C. The functional plan may only progress status/checkboxes or move semantically unchanged to completed. B convergence requires all B cells, including complete B secret inventory scan; C independently executes C cells and exact-head review.
 
-The V4 lifecycle transition graph is exactly:
+V4 coordination order is exactly:
 
-`DESIGN_ACCEPTED → IMPLEMENTATION_CONVERGED → BRANCH_ACCEPTED → FINAL_REVIEW_CLEAN → INTEGRATION_ACCEPTED → PR_PUBLISHED → MERGE_AUTHORIZED → MERGE_SUBMITTING → (MERGE_APPLIED → POST_MERGE_ACCEPTED | MERGE_NOT_APPLIED | RECOVERY_REQUIRED)`.
+`DESIGN_ACCEPTED → IMPLEMENTATION_CONVERGED → BRANCH_ACCEPTED → FINAL_REVIEW_CLEAN → INTEGRATION_ACCEPTED → PR_SUBMITTING → PR_PUBLISHED → MERGE_AUTHORIZED → MERGE_SUBMITTING → (MERGE_APPLIED → POST_MERGE_ACCEPTED | MERGE_NOT_APPLIED | POST_MERGE_FAILED | RECOVERY_REQUIRED)`.
 
-`PR_PUBLISHED` before `INTEGRATION_ACCEPTED` is invalid. Thus an integration failure occurs before a PR can become stale. Integration failure atomically publishes `FailedStageV1` and invalidates the C tip: `ASSURANCE_MODEL_GAP` sets A-required and grants no correction; `IMPLEMENTATION_FINDING` may issue one `CorrectionBGrantV1` under the same cumulative two-reentry counter used for C-review findings.
+### PR effect linearization
 
-`MERGE_AUTHORIZED` requires unchanged candidate/C-review/integration/PR tips. The next external-effect authorization is a **single atomic CAS** that consumes that exact tip, publishes one unconsumed `MergeEffectLeaseV1`, and changes controller merge state to `MERGE_SUBMITTING`. C/stage invalidation and lease issuance therefore compete on one predecessor tip: if invalidation wins, no lease/provider call is legal; if lease wins, later observations cannot retroactively revoke an effect that may already have been submitted. `internal/mergelifecycle` must require the exact lease before `Provider.SubmitTarget` and mark it submitted/consumed according to durable outcome. A timeout/cancellation/connection ambiguity after possible submission authorizes **read-only reconciliation only**. Another provider mutation is forbidden unless reconciliation proves exact `MERGE_NOT_APPLIED` and a separately governed new effect authority is issued; `RECOVERY_REQUIRED` is fail-closed. Post-submission blockers are evidence for completion/repair governance, not retroactive C correction authority.
+After integration, controller seals `PREffectIntentV1`. PR invalidation vs effect claim competes on one PostgreSQL predecessor tip. Winner claim CAS installs `PREffectClaimV1`, sets `PR_SUBMITTING`, and returns the one-shot in-memory token capability only to the CAS winner. `internal/prlifecycle` accepts that capability plus exact intent and refuses any HTTP write otherwise. Process death/timeout after claim is reconciliation-only: read existing PRs/ref/provider evidence for exact request identity. Proven NOT_APPLIED allows a separately governed new intent/claim; APPLIED settles `PR_PUBLISHED`; ambiguous remains `RECOVERY_REQUIRED`. No `internal/githublifecycle/**` mutation is required.
 
-Post-merge failure records non-completion and blocks external-build readiness; no automatic rollback exists. Any revert/repair is a new governed A/B/C change. Publication/merge requires all applicable B/C/integration cells PASS, exact-head Critical=0/Major=0, clean unchanged candidate, unexhausted lineage budgets, and operationally usable exact tips.
+### Merge and ledger↔PostgreSQL handoff
+
+The append-only ledger remains the sole operational run-state truth (`READY_FOR_MERGE`, terminal MERGED/FAILED etc.); PostgreSQL never duplicates those domain states. Instead each V4 stage/effect binds an exact ledger event digest. `MergeEffectIntentV1` can exist only when the current ledger tip is exact `READY_FOR_MERGE` for the same run/candidate and PG is `MERGE_AUTHORIZED`; it binds that READY event digest. The claim CAS sets `MERGE_SUBMITTING` and only the one-shot claim capability can enter `internal/mergelifecycle.Provider.SubmitTarget`.
+
+If provider effect is APPLIED, existing merge lifecycle first durably appends its exact terminal ledger event/result/proof. Only after reopening/verifying that ledger event may PG CAS settle `MERGE_APPLIED` and later `POST_MERGE_ACCEPTED`. If provider is proven NOT_APPLIED, PG may settle `MERGE_NOT_APPLIED`; ambiguity remains `RECOVERY_REQUIRED`. A crash after ledger terminal but before PG settlement is recovered by reading exact bound ledger event; a crash after PG claim but before any ledger terminal cannot infer result and is reconciliation-only. Thus no crash creates two authoritative run states.
+
+Post-merge acceptance failure leaves the factual merge/MERGED ledger event intact, stores `PostMergeFailureV1`, and sets PG coordination state `POST_MERGE_FAILED`; external-build readiness stays false. Any revert/repair is a new governed A/B/C change.
+
+Publication/merge requires all applicable B/C/integration cells PASS, exact-head 0 Critical/0 Major, unchanged clean candidate, complete secret inventories, unexhausted budgets, operationally usable exact tips, and one-winner effect capabilities. B scope includes the minimal required `internal/prlifecycle/**` and `internal/mergelifecycle/**`; `internal/githublifecycle/**` remains frozen.
