@@ -2846,6 +2846,9 @@ func ParseCanonical(data []byte, target any) error {
 	if len(data) == 0 || len(data) > 1<<20 {
 		return errors.New("canonical JSON input is empty or exceeds 1 MiB")
 	}
+	if err := validateNoDuplicateJSONFields(data); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {

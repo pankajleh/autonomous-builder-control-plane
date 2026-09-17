@@ -1,0 +1,2 @@
+REVOKE abcp_v4_schema_owner,abcp_v4_domain_fn,abcp_v4_worker_fn FROM abcp_v4_migrator;
+ALTER ROLE abcp_v4_migrator NOLOGIN NOCREATEROLE;

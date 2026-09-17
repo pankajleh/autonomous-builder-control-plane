@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -29,7 +30,7 @@ func (f requestAuthenticatorFunc) AuthenticateGitHubRequest(request *http.Reques
 	return f(request)
 }
 
-func TestProductionConstructionPinsHostRootAndExactLedger(t *testing.T) {
+func TestProductionConstructionRejectsNonPostgresFenceAndUnfencedLedger(t *testing.T) {
 	first := provisionStore(t)
 	old := productionAdmissionRoot
 	productionAdmissionRoot = first.Root()
@@ -46,26 +47,24 @@ func TestProductionConstructionPinsHostRootAndExactLedger(t *testing.T) {
 	if err := os.Chmod(ledgerParent, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	authoritative, err := ledger.NewJSONLLedger(filepath.Join(ledgerParent, "authoritative.jsonl"))
+	unfenced, err := ledger.NewJSONLLedger(filepath.Join(ledgerParent, "unfenced.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := ProductionControllerConfig{GitHub: adapter, Artifacts: artifacts, AuthoritativeLedger: authoritative}
-	one, err := NewProductionController(config)
+	if _, err := NewProductionController(ProductionControllerConfig{GitHub: adapter, Artifacts: artifacts, AuthoritativeLedger: unfenced}); err == nil {
+		t.Fatal("production PR controller accepted an unfenced ledger and absent durable predecessor fence")
+	}
+	fence := acceptingPredecessorFenceV1{}
+	authoritative, err := ledger.NewFencedJSONLLedger(filepath.Join(ledgerParent, "authoritative.jsonl"), fence, []string{"ledger-production-run"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondRoot := provisionStore(t).Root()
-	t.Setenv("ABCP_PR_ADMISSION_ROOT", secondRoot)
-	two, err := NewProductionController(config)
-	if err != nil {
-		t.Fatal(err)
+	config := ProductionControllerConfig{GitHub: adapter, Artifacts: artifacts, AuthoritativeLedger: authoritative, PredecessorFence: fence, PredecessorBindingIDs: []string{"pr-admission"}}
+	if _, err := NewProductionController(config); err == nil || !strings.Contains(err.Error(), "same durable PostgreSQL fence") {
+		t.Fatalf("production PR controller accepted an interface fake/process-local composition: %v", err)
 	}
-	if one.store.Root() != first.Root() || two.store.Root() != first.Root() {
-		t.Fatal("process-startup admission identity was re-keyed by later host input")
-	}
-	if one.ledger.path != authoritative.Path() || two.ledger.path != authoritative.Path() {
-		t.Fatal("production recorder did not derive the exact authoritative ledger path")
+	if _, err := ledger.NewProductionFencedJSONLLedger(filepath.Join(ledgerParent, "fake-production.jsonl"), fence, []string{"ledger-production-run"}); err == nil {
+		t.Fatal("production ledger accepted an interface fake predecessor fence")
 	}
 	config.AuthoritativeLedger = nil
 	if _, err := NewProductionController(config); err == nil {
@@ -79,6 +78,12 @@ func TestProductionConstructionPinsHostRootAndExactLedger(t *testing.T) {
 	if !ok || sealed.base.MaxResponseHeaderBytes != MaxResponseHeaderBytes {
 		t.Fatal("sealed authenticated transport lacks network response-header cap")
 	}
+}
+
+type acceptingPredecessorFenceV1 struct{}
+
+func (acceptingPredecessorFenceV1) AcquirePredecessorWriterV1([]string, string) (authoritybackend.PredecessorWriterLeaseHandleV1, error) {
+	return nil, nil
 }
 
 func TestAdmissionRootAndAcquiredLockReplacementFailClosed(t *testing.T) {

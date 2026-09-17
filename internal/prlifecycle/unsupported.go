@@ -7,6 +7,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
@@ -34,21 +35,25 @@ type ArtifactWriter interface {
 }
 
 type ControllerConfig struct {
-	Store     *PRWriteAdmissionStore
-	GitHub    *GitHubAdapter
-	Artifacts ArtifactWriter
-	Ledger    *MaterialLedgerRecorder
-	Now       func() time.Time
+	Store                 *PRWriteAdmissionStore
+	GitHub                *GitHubAdapter
+	Artifacts             ArtifactWriter
+	Ledger                *MaterialLedgerRecorder
+	Now                   func() time.Time
+	PredecessorFence      authoritybackend.PredecessorWriterFenceV1
+	PredecessorBindingIDs []string
 }
 type Controller struct{}
 
 func newController(ControllerConfig) (*Controller, error) { return nil, errUnsupportedLockSemantics }
 
 type ProductionControllerConfig struct {
-	GitHub              *GitHubAdapter
-	Artifacts           ArtifactWriter
-	AuthoritativeLedger *ledger.JSONLLedger
-	Now                 func() time.Time
+	GitHub                *GitHubAdapter
+	Artifacts             ArtifactWriter
+	AuthoritativeLedger   *ledger.JSONLLedger
+	Now                   func() time.Time
+	PredecessorFence      authoritybackend.PredecessorWriterFenceV1
+	PredecessorBindingIDs []string
 }
 
 func NewProductionController(ProductionControllerConfig) (*Controller, error) {
@@ -64,4 +69,7 @@ type Request struct {
 
 func (*Controller) Upsert(context.Context, Request) (PRLifecycleResultV1, error) {
 	return PRLifecycleResultV1{}, errUnsupportedLockSemantics
+}
+func (*Controller) PredecessorDrainSnapshotV1() (string, error) {
+	return "", errUnsupportedLockSemantics
 }

@@ -12,6 +12,10 @@ import (
 	"reflect"
 	"sync"
 	"time"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
+	postgresbackend "github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 )
 
 const (
@@ -22,14 +26,17 @@ const (
 )
 
 type JSONLLedger struct {
-	path       string
-	parentPath string
-	file       *os.File
-	parent     *os.File
-	fileInfo   os.FileInfo
-	parentInfo os.FileInfo
-	physicalID string
-	mu         sync.Mutex
+	path                  string
+	parentPath            string
+	file                  *os.File
+	parent                *os.File
+	fileInfo              os.FileInfo
+	parentInfo            os.FileInfo
+	physicalID            string
+	mu                    sync.Mutex
+	predecessorFence      authoritybackend.PredecessorWriterFenceV1
+	predecessorBindingIDs []string
+	productionFence       *postgresbackend.PostgresPredecessorDirectoryFenceV1
 }
 
 func NewJSONLLedger(path string) (*JSONLLedger, error) {
@@ -82,6 +89,52 @@ func NewJSONLLedger(path string) (*JSONLLedger, error) {
 	return result, nil
 }
 
+// NewFencedJSONLLedger binds every retained ledger transition and run-wide
+// operation to the shared predecessor cutover fence. NewJSONLLedger remains
+// available to read historical/unactivated stores without reinterpreting
+// their bytes.
+func NewFencedJSONLLedger(path string, fence authoritybackend.PredecessorWriterFenceV1, bindingIDs []string) (*JSONLLedger, error) {
+	if fence == nil || len(bindingIDs) == 0 {
+		return nil, errors.New("predecessor writer fence and ledger binding IDs are required")
+	}
+	value, err := NewJSONLLedger(path)
+	if err != nil {
+		return nil, err
+	}
+	value.predecessorFence = fence
+	value.predecessorBindingIDs = append([]string(nil), bindingIDs...)
+	return value, nil
+}
+
+// NewProductionFencedJSONLLedger admits only the durable PostgreSQL fence.
+// The generic fenced constructor remains for retained unit tests and
+// historical non-production compositions.
+func NewProductionFencedJSONLLedger(path string, fence authoritybackend.PredecessorWriterFenceV1, bindingIDs []string) (*JSONLLedger, error) {
+	postgresFence, ok := fence.(*postgresbackend.PostgresPredecessorDirectoryFenceV1)
+	if !ok || postgresFence == nil {
+		return nil, errors.New("production ledger requires the durable PostgreSQL predecessor fence")
+	}
+	directory, err := postgresFence.DirectoryV1()
+	if err != nil {
+		return nil, fmt.Errorf("verify production PostgreSQL predecessor fence: %w", err)
+	}
+	registered := make(map[string]governance.PredecessorBindingKind, len(directory.Bindings))
+	for _, binding := range directory.Bindings {
+		registered[binding.BindingID] = binding.BindingKind
+	}
+	for _, bindingID := range bindingIDs {
+		if registered[bindingID] != governance.PredecessorBindingLedger {
+			return nil, fmt.Errorf("production ledger binding %q is not the registered durable ledger", bindingID)
+		}
+	}
+	value, err := NewFencedJSONLLedger(path, postgresFence, bindingIDs)
+	if err != nil {
+		return nil, err
+	}
+	value.productionFence = postgresFence
+	return value, nil
+}
+
 func (l *JSONLLedger) Append(event Event) error {
 	return l.appendOrVerify(event, "", false)
 }
@@ -114,12 +167,23 @@ func (l *JSONLLedger) AppendOrVerifyLeased(event Event, lease *RunTransitionLeas
 	return l.appendOrVerify(event, leasedAppendSentinel, true)
 }
 
-func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyExisting bool) error {
+func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyExisting bool) (resultErr error) {
 	if l == nil {
 		return errors.New("ledger is required")
 	}
 	if err := event.Validate(); err != nil {
 		return fmt.Errorf("validate event: %w", err)
+	}
+	var predecessorLease authoritybackend.PredecessorWriterLeaseHandleV1
+	if barrierSHA256 != leasedAppendSentinel {
+		var err error
+		predecessorLease, err = l.acquirePredecessorWriterV1("maintenance")
+		if err != nil {
+			return err
+		}
+		if predecessorLease != nil {
+			defer func() { resultErr = errors.Join(resultErr, predecessorLease.Release()) }()
+		}
 	}
 	if err := l.ensurePhysicalIdentity(true); err != nil {
 		return err
@@ -183,7 +247,27 @@ func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyEx
 	})
 }
 
+func (l *JSONLLedger) acquirePredecessorWriterV1(operation string) (authoritybackend.PredecessorWriterLeaseHandleV1, error) {
+	if l == nil || l.predecessorFence == nil {
+		return nil, nil
+	}
+	return l.predecessorFence.AcquirePredecessorWriterV1(l.predecessorBindingIDs, operation)
+}
+
 func (l *JSONLLedger) Path() string { return l.path }
+
+// PredecessorFencedV1 reports whether this ledger was opened through the
+// production predecessor-writer composition. It exposes no fence authority;
+// production constructors use it only to reject an unfenced ledger handle.
+func (l *JSONLLedger) PredecessorFencedV1() bool {
+	return l != nil && l.predecessorFence != nil && len(l.predecessorBindingIDs) != 0
+}
+
+// UsesProductionPostgresFenceV1 proves pointer-identical production
+// composition without exposing a generic fence capability.
+func (l *JSONLLedger) UsesProductionPostgresFenceV1(fence *postgresbackend.PostgresPredecessorDirectoryFenceV1) bool {
+	return l != nil && fence != nil && l.productionFence == fence && l.predecessorFence == fence && len(l.predecessorBindingIDs) != 0
+}
 
 // Snapshot returns one bounded, complete ledger image while holding the same
 // lock used by appenders. The returned identity is the cleaned physical path.
