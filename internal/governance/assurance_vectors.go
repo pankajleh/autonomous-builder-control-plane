@@ -33,8 +33,10 @@ type ExecutableCanonicalVectorSetV1 struct {
 }
 
 type canonicalPredicateContextV1 struct {
-	recordPositiveByType map[string][]byte
-	validDigestByTarget  map[string]map[string]struct{}
+	recordPositiveByType  map[string][]byte
+	recordByTypeAndDigest map[string]map[string][]byte
+	validDigestByTarget   map[string]map[string]struct{}
+	exactBytes            []byte
 }
 
 // GenerateCanonicalCatalogPositiveVectorsV1 materializes the complete frozen
@@ -155,24 +157,34 @@ func generateCanonicalCatalogPositiveVectorsV1(catalog CanonicalVectorCatalogV1)
 			return nil, nil, err
 		}
 	}
-	context, err := newCanonicalPredicateContextV1(catalog, prototypes)
-	if err != nil {
+	context := newEmptyCanonicalPredicateContextV1()
+	if err := context.addFrozenRetainedRecords(); err != nil {
 		return nil, nil, err
+	}
+	if artifact, ok := byRecord["ArtifactBlobV1"]; ok {
+		context.exactBytes = append([]byte(nil), prototypes[artifact.SchemaID]...)
 	}
 	result := make(map[string][]byte, len(catalog.Entries))
 	visiting = make(map[string]bool)
+	prototypeBackedTypes := make(map[string]bool)
+	var finalizationStack []string
 	var finalize func(CanonicalVectorEntryV1) ([]byte, error)
 	finalize = func(entry CanonicalVectorEntryV1) ([]byte, error) {
 		if positive, ok := result[entry.SchemaID]; ok {
 			return append([]byte(nil), positive...), nil
 		}
 		if visiting[entry.SchemaID] {
-			return nil, fmt.Errorf("required record target cycle at %s", entry.SchemaID)
+			return nil, fmt.Errorf("required record target cycle at %s: %s", entry.SchemaID, strings.Join(append(finalizationStack, entry.SchemaID), " -> "))
 		}
 		visiting[entry.SchemaID] = true
-		defer delete(visiting, entry.SchemaID)
+		finalizationStack = append(finalizationStack, entry.SchemaID)
+		defer func() {
+			delete(visiting, entry.SchemaID)
+			finalizationStack = finalizationStack[:len(finalizationStack)-1]
+		}()
 		if entry.RecordName == "ArtifactBlobV1" && entry.SchemaID == "artifact-blob-v1" {
 			result[entry.SchemaID] = append([]byte(nil), prototypes[entry.SchemaID]...)
+			context.addRecord(entry.RecordName, prototypes[entry.SchemaID])
 			return append([]byte(nil), prototypes[entry.SchemaID]...), nil
 		}
 		values, _, _, err := decodeCanonicalVectorObjectV1(prototypes[entry.SchemaID])
@@ -211,10 +223,58 @@ func generateCanonicalCatalogPositiveVectorsV1(catalog CanonicalVectorCatalogV1)
 				return nil, err
 			}
 		}
+		for index, field := range entry.Fields {
+			if field.DigestTarget == "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
+				continue
+			}
+			if _, present := values[field.FieldPath]; !present {
+				continue
+			}
+			for _, member := range selectedDigestTargetMembersV1(field.DigestTarget, values) {
+				if member == "exact-bytes" {
+					if len(context.exactBytes) == 0 {
+						return nil, fmt.Errorf("%s.%s cannot resolve exact emitted bytes", entry.SchemaID, field.FieldPath)
+					}
+					continue
+				}
+				target, ok := byRecord[member]
+				if !ok {
+					if len(context.recordPositiveByType[member]) != 0 {
+						continue
+					}
+					return nil, fmt.Errorf("%s.%s cannot resolve emitted target type %s", entry.SchemaID, field.FieldPath, member)
+				}
+				if visiting[target.SchemaID] {
+					context.addRecordVariant(member, prototypes[target.SchemaID])
+					prototypeBackedTypes[member] = true
+					continue
+				}
+				if _, err := finalize(target); err != nil {
+					return nil, err
+				}
+			}
+		}
+		for _, predicate := range entry.Predicates {
+			if predicate.PredicateID != "P-PARENT-001" {
+				continue
+			}
+			target, ok := byRecord["PhaseCheckpointV2"]
+			if !ok {
+				return nil, errors.New("P-PARENT-001 source PhaseCheckpointV2 is unavailable")
+			}
+			if visiting[target.SchemaID] {
+				context.addRecordVariant(target.RecordName, prototypes[target.SchemaID])
+				prototypeBackedTypes[target.RecordName] = true
+				continue
+			}
+			if _, err := finalize(target); err != nil {
+				return nil, err
+			}
+		}
 		if err := applyTypedReferencePositivesV1(entry, values, context); err != nil {
 			return nil, err
 		}
-		if err := applyPositivePredicatesV1(entry, values); err != nil {
+		if err := applyPositivePredicatesV1(entry, values, context); err != nil {
 			return nil, err
 		}
 		if err := applyEd25519VectorsV1(entry, values); err != nil {
@@ -235,12 +295,27 @@ func generateCanonicalCatalogPositiveVectorsV1(catalog CanonicalVectorCatalogV1)
 			return nil, err
 		}
 		result[entry.SchemaID] = append([]byte(nil), positive...)
+		context.addRecord(entry.RecordName, positive)
 		return positive, nil
 	}
 	for _, entry := range catalog.Entries {
 		if _, err := finalize(entry); err != nil {
 			return nil, nil, err
 		}
+	}
+	context, err := newCanonicalPredicateContextV1(catalog, result)
+	if err != nil {
+		return nil, nil, err
+	}
+	for recordType := range prototypeBackedTypes {
+		for _, entry := range catalog.Entries {
+			if entry.RecordName == recordType {
+				context.addRecordVariant(recordType, prototypes[entry.SchemaID])
+			}
+		}
+	}
+	if err := assertFinalTypedReferenceContextV1(catalog, prototypes, result, context, prototypeBackedTypes); err != nil {
+		return nil, nil, err
 	}
 	for _, entry := range catalog.Entries {
 		if err := validateCanonicalCatalogPositiveV1(entry, result[entry.SchemaID], byRecord, make(map[string]bool), context); err != nil {
@@ -250,21 +325,28 @@ func generateCanonicalCatalogPositiveVectorsV1(catalog CanonicalVectorCatalogV1)
 	return result, context, nil
 }
 
+func newEmptyCanonicalPredicateContextV1() *canonicalPredicateContextV1 {
+	return &canonicalPredicateContextV1{
+		recordPositiveByType:  make(map[string][]byte),
+		recordByTypeAndDigest: make(map[string]map[string][]byte),
+		validDigestByTarget:   make(map[string]map[string]struct{}),
+	}
+}
+
 func newCanonicalPredicateContextV1(catalog CanonicalVectorCatalogV1, positives map[string][]byte) (*canonicalPredicateContextV1, error) {
-	context := &canonicalPredicateContextV1{
-		recordPositiveByType: make(map[string][]byte, len(catalog.Entries)),
-		validDigestByTarget:  make(map[string]map[string]struct{}),
+	context := newEmptyCanonicalPredicateContextV1()
+	if err := context.addFrozenRetainedRecords(); err != nil {
+		return nil, err
 	}
 	for _, entry := range catalog.Entries {
 		positive := positives[entry.SchemaID]
 		if len(positive) == 0 {
 			return nil, fmt.Errorf("catalog type %s has no positive record", entry.RecordName)
 		}
-		context.recordPositiveByType[entry.RecordName] = append([]byte(nil), positive...)
-	}
-	context.recordPositiveByType["exact-bytes"] = []byte("a")
-	for target, positive := range context.recordPositiveByType {
-		context.addValidDigest(target, sha256Hex(positive))
+		context.addRecord(entry.RecordName, positive)
+		if entry.RecordName == "ArtifactBlobV1" {
+			context.exactBytes = append([]byte(nil), positive...)
+		}
 	}
 	for _, entry := range catalog.Entries {
 		for index, field := range entry.Fields {
@@ -276,18 +358,78 @@ func newCanonicalPredicateContextV1(catalog CanonicalVectorCatalogV1, positives 
 				return nil, fmt.Errorf("%s.%s has unresolved digest target %q", entry.SchemaID, field.FieldPath, field.DigestTarget)
 			}
 			for _, member := range members {
+				if member == "exact-bytes" {
+					if len(context.exactBytes) == 0 {
+						return nil, fmt.Errorf("%s.%s has no exact emitted byte target", entry.SchemaID, field.FieldPath)
+					}
+					context.addValidDigest(field.DigestTarget, sha256Hex(context.exactBytes))
+					continue
+				}
 				positive := context.recordPositiveByType[member]
 				if len(positive) == 0 {
-					// Retained predecessor types use a closed type-domain record;
-					// catalog types always use their generated record bytes above.
-					positive = []byte("ABCP-RETAINED-CANONICAL-TYPE-V1\x00" + member)
-					context.recordPositiveByType[member] = positive
+					return nil, fmt.Errorf("%s.%s has unavailable target type %s", entry.SchemaID, field.FieldPath, member)
 				}
 				context.addValidDigest(field.DigestTarget, sha256Hex(positive))
 			}
 		}
 	}
 	return context, nil
+}
+
+var frozenRetainedCanonicalRecordsV1 = map[string]string{
+	"AuthorizationSealV1":        `{"schema":"authorization-seal-v1"}`,
+	"ContextCapsuleV3":           `{"policy_version":"context-capsule-v3"}`,
+	"ExecutionBoundsV1":          `{"max_iterations":1,"session_timeout":"1s","idle_timeout":"1s","wall_clock_timeout":"1s","aggregate_wall_clock_timeout":"1s","finalize":false,"max_incomplete_tasks":0,"max_initial_active_findings":0,"max_ralphex_invocations":1,"max_review_reports":1,"max_mutation_leases":1,"max_total_fix_batches":1,"max_changed_files":1,"max_changed_bytes":1}`,
+	"ExpectedMergeContentV1":     `{"derivation_policy":"phase3-ready-tree-v1"}`,
+	"GitHubLifecycleLimitsV1":    `{"schema":"github-lifecycle-limits-v1"}`,
+	"GovernanceActivationV1":     `{"kind":"GovernanceActivationV1","policy_version":"context-capsule-v3"}`,
+	"MergePolicyV1":              `{"schema":"merge-policy-v1"}`,
+	"PhaseCheckpointV1":          `{"kind":"DESIGN_ACCEPTED"}`,
+	"ReadyAuthorityBindingV1":    `{"schema":"ready-authority-binding-v1"}`,
+	"SealedMergeAuthorizationV1": `{"schema":"sealed-merge-authorization-v1"}`,
+	"TargetRefCommitmentV1":      `{"schema":"target-ref-commitment-v1"}`,
+}
+
+func (context *canonicalPredicateContextV1) addFrozenRetainedRecords() error {
+	for recordType, encoded := range frozenRetainedCanonicalRecordsV1 {
+		if !json.Valid([]byte(encoded)) {
+			return fmt.Errorf("retained canonical record %s is invalid", recordType)
+		}
+		context.addRecord(recordType, []byte(encoded))
+	}
+	return nil
+}
+
+func (context *canonicalPredicateContextV1) addRecord(recordType string, record []byte) {
+	copyOfRecord := append([]byte(nil), record...)
+	context.recordPositiveByType[recordType] = copyOfRecord
+	digest := sha256Hex(record)
+	if context.recordByTypeAndDigest[recordType] == nil {
+		context.recordByTypeAndDigest[recordType] = make(map[string][]byte)
+	}
+	context.recordByTypeAndDigest[recordType][digest] = copyOfRecord
+	context.addValidDigest(recordType, digest)
+}
+
+func (context *canonicalPredicateContextV1) addRecordVariant(recordType string, record []byte) {
+	copyOfRecord := append([]byte(nil), record...)
+	if len(context.recordPositiveByType[recordType]) == 0 {
+		context.recordPositiveByType[recordType] = copyOfRecord
+	}
+	digest := sha256Hex(record)
+	if context.recordByTypeAndDigest[recordType] == nil {
+		context.recordByTypeAndDigest[recordType] = make(map[string][]byte)
+	}
+	context.recordByTypeAndDigest[recordType][digest] = copyOfRecord
+	context.addValidDigest(recordType, digest)
+}
+
+func (context *canonicalPredicateContextV1) recordForDigest(recordType, digest string) ([]byte, bool) {
+	if context == nil || context.recordByTypeAndDigest[recordType] == nil {
+		return nil, false
+	}
+	record, ok := context.recordByTypeAndDigest[recordType][digest]
+	return append([]byte(nil), record...), ok
 }
 
 func (context *canonicalPredicateContextV1) addValidDigest(target, digest string) {
@@ -324,6 +466,14 @@ func selectedDigestTargetMembersV1(target string, values map[string]json.RawMess
 			return []string{member}
 		}
 	}
+	if target == "StageGrantV2-or-PhaseCheckpointV2" {
+		var stage string
+		_ = json.Unmarshal(values["stage"], &stage)
+		if stage == "B_IMPLEMENTATION" || stage == "C_BRANCH_ACCEPTANCE" {
+			return []string{"StageGrantV2"}
+		}
+		return []string{"PhaseCheckpointV2"}
+	}
 	return members
 }
 
@@ -332,6 +482,12 @@ func (context *canonicalPredicateContextV1) digestValidForTarget(target, digest 
 		return false
 	}
 	for _, member := range digestTargetMembersV1(target) {
+		if member == "exact-bytes" {
+			if len(context.exactBytes) != 0 && digest == sha256Hex(context.exactBytes) {
+				return true
+			}
+			continue
+		}
 		if positive := context.recordPositiveByType[member]; len(positive) != 0 && digest == sha256Hex(positive) {
 			return true
 		}
@@ -346,6 +502,12 @@ func (context *canonicalPredicateContextV1) firstValidDigest(target string, valu
 	}
 	digests := make([]string, 0)
 	for _, member := range selectedDigestTargetMembersV1(target, values) {
+		if member == "exact-bytes" {
+			if len(context.exactBytes) != 0 {
+				digests = append(digests, sha256Hex(context.exactBytes))
+			}
+			continue
+		}
 		if positive := context.recordPositiveByType[member]; len(positive) != 0 {
 			digests = append(digests, sha256Hex(positive))
 		}
@@ -391,6 +553,71 @@ func (context *canonicalPredicateContextV1) firstForeignDigest(target string) (s
 	return digests[0], true
 }
 
+func (context *canonicalPredicateContextV1) digestValidForSelectedTarget(target, digest string, values map[string]json.RawMessage) bool {
+	if context == nil {
+		return false
+	}
+	for _, member := range selectedDigestTargetMembersV1(target, values) {
+		if member == "exact-bytes" {
+			return len(context.exactBytes) != 0 && digest == sha256Hex(context.exactBytes)
+		}
+		if records := context.recordByTypeAndDigest[member]; records != nil {
+			if _, ok := records[digest]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func assertFinalTypedReferenceContextV1(catalog CanonicalVectorCatalogV1, prototypes, finals map[string][]byte, context *canonicalPredicateContextV1, prototypeBackedTypes map[string]bool) error {
+	for _, entry := range catalog.Entries {
+		if entry.RecordName == "ArtifactBlobV1" {
+			continue
+		}
+		values, _, _, err := decodeCanonicalVectorObjectV1(finals[entry.SchemaID])
+		if err != nil {
+			return err
+		}
+		for index, field := range entry.Fields {
+			if field.DigestTarget == "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
+				continue
+			}
+			raw, present := values[field.FieldPath]
+			if !present {
+				continue
+			}
+			candidates := []json.RawMessage{raw}
+			if field.JSONType == WireArray && json.Unmarshal(raw, &candidates) != nil {
+				return fmt.Errorf("%s.%s final typed-reference array is invalid", entry.SchemaID, field.FieldPath)
+			}
+			for _, candidate := range candidates {
+				var digest string
+				if json.Unmarshal(candidate, &digest) != nil || !context.digestValidForSelectedTarget(field.DigestTarget, digest, values) && !frozenExactBytesDigestValidV1(entry, field.FieldPath, digest, values) {
+					return fmt.Errorf("%s.%s does not digest exact final emitted target bytes", entry.SchemaID, field.FieldPath)
+				}
+				for _, member := range selectedDigestTargetMembersV1(field.DigestTarget, values) {
+					if member == "exact-bytes" {
+						continue
+					}
+					var prototype []byte
+					for _, targetEntry := range catalog.Entries {
+						if targetEntry.RecordName == member {
+							prototype = prototypes[targetEntry.SchemaID]
+							break
+						}
+					}
+					final := context.recordPositiveByType[member]
+					if len(prototype) != 0 && !bytes.Equal(prototype, final) && digest == sha256Hex(prototype) && !prototypeBackedTypes[member] {
+						return fmt.Errorf("%s.%s retained prototype digest for finalized %s", entry.SchemaID, field.FieldPath, member)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func applyTypedReferencePositivesV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) error {
 	for index, field := range entry.Fields {
 		if field.DigestTarget == "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
@@ -425,23 +652,13 @@ func applyTypedReferencePositivesV1(entry CanonicalVectorEntryV1, values map[str
 }
 
 func standaloneCanonicalPredicateContextV1(entry CanonicalVectorEntryV1, positive []byte) *canonicalPredicateContextV1 {
-	context := &canonicalPredicateContextV1{
-		recordPositiveByType: map[string][]byte{"ArtifactBlobV1": []byte("a"), "exact-bytes": []byte("a")},
-		validDigestByTarget:  make(map[string]map[string]struct{}),
-	}
-	context.addValidDigest("ArtifactBlobV1", sha256Hex([]byte("a")))
-	context.addValidDigest("exact-bytes", sha256Hex([]byte("a")))
-	context.recordPositiveByType[entry.RecordName] = append([]byte(nil), positive...)
+	context := newEmptyCanonicalPredicateContextV1()
+	context.addRecord(entry.RecordName, positive)
 	for index, field := range entry.Fields {
 		if field.DigestTarget == "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
 			continue
 		}
-		for _, member := range digestTargetMembersV1(field.DigestTarget) {
-			if member != "ArtifactBlobV1" && member != "exact-bytes" {
-				return nil
-			}
-			context.addValidDigest(field.DigestTarget, sha256Hex(context.recordPositiveByType[member]))
-		}
+		return nil
 	}
 	return context
 }
@@ -905,13 +1122,13 @@ func falseCanonicalPredicatesV1(entry CanonicalVectorEntryV1, values map[string]
 	return result
 }
 
-func minimalCanonicalPredicateValuesV1(entry CanonicalVectorEntryV1) map[string]json.RawMessage {
-	positive, err := GenerateMinimalCanonicalVectorV1(entry)
-	if err != nil {
+func finalizedCanonicalPredicateValuesV1(entry CanonicalVectorEntryV1, context *canonicalPredicateContextV1) map[string]json.RawMessage {
+	if context == nil {
 		return nil
 	}
-	values, _, _, err := decodeCanonicalVectorObjectV1(positive)
-	if err != nil {
+	record := context.recordPositiveByType[entry.RecordName]
+	values, _, duplicate, err := decodeCanonicalVectorObjectV1(record)
+	if err != nil || duplicate {
 		return nil
 	}
 	return values
@@ -1033,39 +1250,15 @@ func canonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate Predicate
 				if json.Unmarshal(candidate, &digest) != nil {
 					return false
 				}
-				if context.digestValidForTarget(field.DigestTarget, digest) {
+				if context.digestValidForSelectedTarget(field.DigestTarget, digest, values) || frozenExactBytesDigestValidV1(entry, path, digest, values) {
 					continue
 				}
-				if field.DigestTarget == "exact-bytes" {
-					formulaValid := false
-					for _, companion := range entry.Predicates {
-						if companion.Operator == PredicateDigestPreimage && containsCanonicalVectorStringV1(companion.FieldPaths, path) {
-							if _, compatibilityOnly := frozenCrossRecordPredicateIDsV1[companion.PredicateID]; compatibilityOnly {
-								break
-							}
-							formulaValid = frozenDigestPreimagePredicateV1(entry, companion, values, minimalCanonicalPredicateValuesV1(entry))
-							break
-						}
-					}
-					if formulaValid {
-						continue
-					}
-				}
-				embeddedValid := false
-				for _, embeddedField := range entry.Fields {
-					if embeddedField.JSONType == WireObject && embeddedField.RecordTarget == field.DigestTarget {
-						embedded, ok := values[embeddedField.FieldPath]
-						embeddedValid = ok && digest == sha256Hex(embedded)
-					}
-				}
-				if !embeddedValid {
-					return false
-				}
+				return false
 			}
 		}
 		return true
 	case PredicateDigestPreimage:
-		return frozenDigestPreimagePredicateV1(entry, predicate, values, minimalCanonicalPredicateValuesV1(entry))
+		return frozenDigestPreimagePredicateV1(entry, predicate, values, finalizedCanonicalPredicateValuesV1(entry, context))
 	case PredicateDerivation:
 		return false
 	case PredicateAggregateLEQ:
@@ -1087,6 +1280,18 @@ func canonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate Predicate
 	}
 }
 
+func frozenExactBytesDigestValidV1(entry CanonicalVectorEntryV1, path, digest string, values map[string]json.RawMessage) bool {
+	if path == "probe_result_sha256" {
+		expected, handled := absenceProbeResultDigestV1(entry.SchemaID, values)
+		return handled && expected == digest
+	}
+	if path == "commitment_sha256" {
+		commitment, present := values["commitment"]
+		return present && digest == sha256Hex(commitment)
+	}
+	return false
+}
+
 func canonicalPredicateConditionV1(path string, fields map[string]WireFieldDescriptorV1, values map[string]json.RawMessage) (bool, bool) {
 	actual, present := values[path]
 	field, ok := fields[path]
@@ -1103,34 +1308,42 @@ func canonicalPredicateConditionV1(path string, fields map[string]WireFieldDescr
 }
 
 func frozenCanonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, paths []string, fields map[string]WireFieldDescriptorV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) (bool, bool) {
+	switch predicate.PredicateID {
+	case "P-DIFF-002":
+		return frozenStageDiffAuthorityValidV1(values, context), true
+	case "P-PARENT-001":
+		return frozenCheckpointParentProjectionValidV1(values, context), true
+	}
 	if predicate.PredicateID == "P-EVENT-001" && entry.RecordName != "EffectLedgerEventPreimageV1" {
-		expected := minimalCanonicalPredicateValuesV1(entry)
+		expected := finalizedCanonicalPredicateValuesV1(entry, context)
 		actual, present := values["event_id"]
 		want, expectedPresent := expected["event_id"]
 		return present == expectedPresent && (!present || bytes.Equal(actual, want)), true
 	}
 	if predicate.Operator == PredicateDerivation {
-		return frozenDerivationPredicateValidV1(predicate, values, context), true
+		if _, crossRecord := frozenCrossRecordPredicateIDsV1[predicate.PredicateID]; !crossRecord {
+			return frozenDerivationPredicateValidV1(predicate, values, context), true
+		}
 	}
 	if predicate.Operator == PredicateAggregateLEQ && predicate.PredicateID == "P-RESOURCE-001" {
-		containerDemand := false
-		for _, path := range []string{
-			"container_memory_bytes", "container_pids", "container_cpu_micros_per_period", "container_cpu_period_micros",
-			"container_tmpfs_bytes", "container_shm_bytes", "container_log_bytes", "container_writable_layer_bytes", "container_image_sha256",
-		} {
-			raw, present := values[path]
-			if !present {
-				continue
-			}
-			var integer uint64
-			if json.Unmarshal(raw, &integer) == nil && integer != 0 {
-				containerDemand = true
-			}
-			if path == "container_image_sha256" {
-				containerDemand = true
+		expected, err := materializedResourceProfileValuesV1(values, context)
+		if err != nil {
+			return false, true
+		}
+		for path, want := range expected {
+			actual, present := values[path]
+			if !present || !bytes.Equal(actual, want) {
+				return false, true
 			}
 		}
-		return bytes.Equal(values["container_read_only_root"], []byte(strconv.FormatBool(containerDemand))), true
+		for _, optional := range []string{"container_image_sha256"} {
+			_, actual := values[optional]
+			_, wanted := expected[optional]
+			if actual != wanted {
+				return false, true
+			}
+		}
+		return true, true
 	}
 	if predicate.Operator == PredicateStateTransition {
 		switch predicate.PredicateID {
@@ -1144,7 +1357,7 @@ func frozenCanonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate Pre
 		}
 	}
 	if _, compatible := frozenCrossRecordPredicateIDsV1[predicate.PredicateID]; compatible {
-		expected := minimalCanonicalPredicateValuesV1(entry)
+		expected := finalizedCanonicalPredicateValuesV1(entry, context)
 		path := frozenCrossRecordMutationPathV1(entry, predicate, paths, fields)
 		if path == "" {
 			return false, true
@@ -1154,6 +1367,285 @@ func frozenCanonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate Pre
 		return present == expectedPresent && (!present || bytes.Equal(actual, want)), true
 	}
 	return false, false
+}
+
+func frozenStageDiffAuthorityValidV1(values map[string]json.RawMessage, context *canonicalPredicateContextV1) bool {
+	if context == nil {
+		return false
+	}
+	var stage, authorityDigest string
+	if json.Unmarshal(values["stage"], &stage) != nil || json.Unmarshal(values["derivation_authority_sha256"], &authorityDigest) != nil {
+		return false
+	}
+	authorityType := "PhaseCheckpointV2"
+	if stage == "B_IMPLEMENTATION" || stage == "C_BRANCH_ACCEPTANCE" {
+		authorityType = "StageGrantV2"
+	}
+	authorityBytes, ok := context.recordForDigest(authorityType, authorityDigest)
+	if !ok {
+		return false
+	}
+	authority, _, duplicate, err := decodeCanonicalVectorObjectV1(authorityBytes)
+	if err != nil || duplicate {
+		return false
+	}
+	compare := func(lineagePath, authorityPath string) bool {
+		actual, actualPresent := values[lineagePath]
+		expected, expectedPresent := authority[authorityPath]
+		return actualPresent && expectedPresent && bytes.Equal(actual, expected)
+	}
+	switch stage {
+	case "B_IMPLEMENTATION":
+		return compare("base_oid", "base_sha")
+	case "C_BRANCH_ACCEPTANCE":
+		return compare("base_oid", "base_sha") && compare("candidate_oid", "candidate_sha")
+	case "INTEGRATION_ACCEPTANCE":
+		return compare("base_oid", "integration_base_oid") && compare("candidate_oid", "candidate_sha")
+	case "POST_MERGE_ACCEPTANCE":
+		return compare("base_oid", "premerge_base_oid") && compare("candidate_oid", "merge_result_oid")
+	default:
+		return false
+	}
+}
+
+func frozenCheckpointParentProjectionValidV1(values map[string]json.RawMessage, context *canonicalPredicateContextV1) bool {
+	if context == nil {
+		return false
+	}
+	checkpointBytes := context.recordPositiveByType["PhaseCheckpointV2"]
+	checkpoint, _, duplicate, err := decodeCanonicalVectorObjectV1(checkpointBytes)
+	if err != nil || duplicate {
+		return false
+	}
+	compared := 0
+	for path, actual := range values {
+		if path == "next_stage_grant_sha256" || path == "checkpoint_sha256" {
+			return false
+		}
+		expected, present := checkpoint[path]
+		if !present || !bytes.Equal(actual, expected) {
+			return false
+		}
+		compared++
+	}
+	for path := range checkpoint {
+		if path == "next_stage_grant_sha256" || path == "checkpoint_sha256" {
+			continue
+		}
+		if _, present := values[path]; !present {
+			return false
+		}
+	}
+	return compared != 0
+}
+
+func applyFrozenCrossRecordPositiveV1(predicate PredicateDescriptorV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) error {
+	switch predicate.PredicateID {
+	case "P-PARENT-001":
+		checkpointBytes := context.recordPositiveByType["PhaseCheckpointV2"]
+		checkpoint, _, duplicate, err := decodeCanonicalVectorObjectV1(checkpointBytes)
+		if err != nil || duplicate {
+			return errors.New("P-PARENT-001 has no exact finalized checkpoint")
+		}
+		for path := range values {
+			if path == "next_stage_grant_sha256" || path == "checkpoint_sha256" {
+				return fmt.Errorf("P-PARENT-001 projection contains forbidden field %s", path)
+			}
+			value, present := checkpoint[path]
+			if !present {
+				delete(values, path)
+				continue
+			}
+			values[path] = append(json.RawMessage(nil), value...)
+		}
+		for path, value := range checkpoint {
+			if path == "next_stage_grant_sha256" || path == "checkpoint_sha256" {
+				continue
+			}
+			if _, known := values[path]; known {
+				values[path] = append(json.RawMessage(nil), value...)
+			}
+		}
+	case "P-DIFF-002":
+		var stage, digest string
+		if json.Unmarshal(values["stage"], &stage) != nil || json.Unmarshal(values["derivation_authority_sha256"], &digest) != nil {
+			return errors.New("P-DIFF-002 has unresolved stage authority")
+		}
+		authorityType := "PhaseCheckpointV2"
+		if stage == "B_IMPLEMENTATION" || stage == "C_BRANCH_ACCEPTANCE" {
+			authorityType = "StageGrantV2"
+		}
+		record, ok := context.recordForDigest(authorityType, digest)
+		if !ok {
+			return errors.New("P-DIFF-002 authority record is unavailable")
+		}
+		authority, _, _, err := decodeCanonicalVectorObjectV1(record)
+		if err != nil {
+			return err
+		}
+		copyField := func(destination, source string) error {
+			value, present := authority[source]
+			if !present {
+				return fmt.Errorf("P-DIFF-002 authority omits %s", source)
+			}
+			values[destination] = append(json.RawMessage(nil), value...)
+			return nil
+		}
+		switch stage {
+		case "B_IMPLEMENTATION":
+			return copyField("base_oid", "base_sha")
+		case "C_BRANCH_ACCEPTANCE":
+			if err := copyField("base_oid", "base_sha"); err != nil {
+				return err
+			}
+			if _, present := authority["candidate_sha"]; present {
+				return copyField("candidate_oid", "candidate_sha")
+			}
+		case "INTEGRATION_ACCEPTANCE":
+			if err := copyField("base_oid", "integration_base_oid"); err != nil {
+				return err
+			}
+			return copyField("candidate_oid", "candidate_sha")
+		case "POST_MERGE_ACCEPTANCE":
+			if err := copyField("base_oid", "premerge_base_oid"); err != nil {
+				return err
+			}
+			return copyField("candidate_oid", "merge_result_oid")
+		default:
+			return errors.New("P-DIFF-002 stage is not frozen")
+		}
+	}
+	return nil
+}
+
+var resourceSummedFieldsV1 = []string{
+	"process_memory_bytes", "process_pids", "process_cpu_micros_per_period", "nofile", "wall_ms", "stdout_bytes", "stderr_bytes",
+	"evidence_bytes", "transient_bytes", "cache_bytes", "container_memory_bytes", "container_pids", "container_cpu_micros_per_period",
+	"container_tmpfs_bytes", "container_shm_bytes", "container_log_bytes", "container_writable_layer_bytes", "docker_daemon_memory_bytes",
+	"docker_daemon_pids", "docker_daemon_cpu_micros_per_period", "docker_daemon_cache_bytes", "docker_daemon_log_bytes",
+}
+
+var resourcePeriodFieldsV1 = []string{
+	"process_cpu_period_micros", "container_cpu_period_micros", "docker_daemon_cpu_period_micros",
+}
+
+func materializedResourceProfileValuesV1(values map[string]json.RawMessage, context *canonicalPredicateContextV1) (map[string]json.RawMessage, error) {
+	if context == nil {
+		return nil, errors.New("P-RESOURCE-001 has no finalized component context")
+	}
+	var digests []string
+	if json.Unmarshal(values["component_profile_sha256s"], &digests) != nil || len(digests) == 0 {
+		return nil, errors.New("P-RESOURCE-001 has no component digests")
+	}
+	components := make([]map[string]json.RawMessage, 0, len(digests))
+	for _, digest := range digests {
+		record, ok := context.recordForDigest("ResourceProfileV1", digest)
+		if !ok {
+			return nil, fmt.Errorf("P-RESOURCE-001 component %s is unavailable", digest)
+		}
+		component, _, duplicate, err := decodeCanonicalVectorObjectV1(record)
+		if err != nil || duplicate {
+			return nil, fmt.Errorf("P-RESOURCE-001 component %s is not canonical", digest)
+		}
+		components = append(components, component)
+	}
+	expected := make(map[string]json.RawMessage)
+	for _, path := range resourceSummedFieldsV1 {
+		var sum uint64
+		for _, component := range components {
+			var addend uint64
+			if json.Unmarshal(component[path], &addend) != nil || ^uint64(0)-sum < addend {
+				return nil, fmt.Errorf("P-RESOURCE-001 %s component sum overflows", path)
+			}
+			sum += addend
+		}
+		expected[path] = []byte(strconv.FormatUint(sum, 10))
+	}
+	for _, path := range resourcePeriodFieldsV1 {
+		var period uint64
+		for _, component := range components {
+			var candidate uint64
+			if json.Unmarshal(component[path], &candidate) != nil {
+				return nil, fmt.Errorf("P-RESOURCE-001 %s component is invalid", path)
+			}
+			if candidate == 0 {
+				continue
+			}
+			if period != 0 && candidate != period {
+				return nil, fmt.Errorf("P-RESOURCE-001 %s components disagree", path)
+			}
+			period = candidate
+		}
+		expected[path] = []byte(strconv.FormatUint(period, 10))
+	}
+	containerDemandFields := []string{
+		"container_memory_bytes", "container_pids", "container_cpu_micros_per_period", "container_cpu_period_micros",
+		"container_tmpfs_bytes", "container_shm_bytes", "container_log_bytes", "container_writable_layer_bytes",
+	}
+	hasContainerDemand, allContainerReadOnly := false, true
+	var image string
+	secrets := make(map[string]struct{})
+	networks := make(map[string]struct{})
+	for _, component := range components {
+		bearing := false
+		for _, path := range containerDemandFields {
+			var value uint64
+			if json.Unmarshal(component[path], &value) != nil {
+				return nil, fmt.Errorf("P-RESOURCE-001 %s container demand is invalid", path)
+			}
+			bearing = bearing || value != 0
+		}
+		var componentImage string
+		if raw, present := component["container_image_sha256"]; present {
+			if json.Unmarshal(raw, &componentImage) != nil || componentImage == "" {
+				return nil, errors.New("P-RESOURCE-001 component image is invalid")
+			}
+			bearing = true
+			if image != "" && componentImage != image {
+				return nil, errors.New("P-RESOURCE-001 component images are incompatible")
+			}
+			image = componentImage
+		}
+		var readOnly bool
+		if json.Unmarshal(component["container_read_only_root"], &readOnly) != nil {
+			return nil, errors.New("P-RESOURCE-001 component read-only-root is invalid")
+		}
+		if bearing {
+			hasContainerDemand = true
+			allContainerReadOnly = allContainerReadOnly && readOnly
+		}
+		for path, union := range map[string]map[string]struct{}{"secret_capability": secrets, "network_policy": networks} {
+			var member string
+			if json.Unmarshal(component[path], &member) != nil || member == "" {
+				return nil, fmt.Errorf("P-RESOURCE-001 component %s is invalid", path)
+			}
+			union[member] = struct{}{}
+		}
+	}
+	if image != "" {
+		expected["container_image_sha256"] = mustMarshalCanonicalVectorStringV1(image)
+	}
+	expected["container_read_only_root"] = []byte(strconv.FormatBool(hasContainerDemand && allContainerReadOnly))
+	if len(networks) > 1 {
+		if _, denyAll := networks["DENY_ALL"]; denyAll {
+			return nil, errors.New("P-RESOURCE-001 DENY_ALL network is incompatible with another policy")
+		}
+	}
+	unionJSON := func(union map[string]struct{}, removeNone bool) json.RawMessage {
+		if removeNone && len(union) > 1 {
+			delete(union, "NONE")
+		}
+		members := make([]string, 0, len(union))
+		for member := range union {
+			members = append(members, member)
+		}
+		sort.Strings(members)
+		encoded, _ := json.Marshal(members)
+		return encoded
+	}
+	expected["secret_capabilities"] = unionJSON(secrets, true)
+	expected["network_policies"] = unionJSON(networks, true)
+	return expected, nil
 }
 
 var frozenCrossRecordPredicateIDsV1 = map[string]struct{}{
@@ -1179,6 +1671,7 @@ var frozenCrossRecordPredicateIDsV1 = map[string]struct{}{
 	"P-ledger-evidence-ref-list-v1-ROW-002":        {},
 	"P-pr-publication-authority-v1-ROW-001":        {},
 	"P-stage-diff-lineage-v1-ROW-003":              {},
+	"P-phase-checkpoint-v2-ROW-002":                {},
 }
 
 func frozenDerivationPredicateValidV1(predicate PredicateDescriptorV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) bool {
@@ -1326,6 +1819,9 @@ func applyFrozenDerivationPositiveV1(predicate PredicateDescriptorV1, values map
 		// Typed-reference materialization and descriptor-valid set generation
 		// already install the exact positive operands for these formulas.
 	default:
+		if _, ok := frozenCrossRecordPredicateIDsV1[predicate.PredicateID]; ok {
+			return nil
+		}
 		return fmt.Errorf("derivation %s has no frozen formula", predicate.PredicateID)
 	}
 	return nil
@@ -2038,7 +2534,10 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 	if _, compatible := frozenCrossRecordPredicateIDsV1[predicate.PredicateID]; compatible {
 		path := frozenCrossRecordMutationPathV1(entry, predicate, paths, fields)
 		if path == "" {
-			return operandErr
+			if operandErr != nil {
+				return operandErr
+			}
+			return fmt.Errorf("predicate %s has no closed frozen mutation rule", predicate.PredicateID)
 		}
 		changed, err := primitiveValidChangeV1(fields[path], values[path])
 		if err != nil {
@@ -2271,7 +2770,24 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 		return mutateFrozenImplicationPredicateV1(entry, predicate, paths, fields, values)
 	case PredicateAggregateLEQ:
 		if predicate.PredicateID == "P-RESOURCE-001" {
-			values["container_read_only_root"] = []byte("true")
+			expected, err := materializedResourceProfileValuesV1(values, context)
+			if err != nil {
+				return err
+			}
+			path := resourceSummedFieldsV1[0]
+			var sum uint64
+			if json.Unmarshal(expected[path], &sum) != nil {
+				return errors.New("P-RESOURCE-001 aggregate output is invalid")
+			}
+			field := fields[path]
+			if field.MaxU64 != nil && sum == *field.MaxU64 {
+				if sum == 0 {
+					return errors.New("P-RESOURCE-001 has no descriptor-valid aggregate violation")
+				}
+				values[path] = []byte(strconv.FormatUint(sum-1, 10))
+				return nil
+			}
+			values[path] = []byte(strconv.FormatUint(sum+1, 10))
 			return nil
 		}
 		integerPaths := integerPredicatePathsV1(paths, fields)
@@ -2309,7 +2825,7 @@ func frozenCrossRecordMutationPathV1(entry CanonicalVectorEntryV1, predicate Pre
 		"P-PUBLISHER-003": {"opened_revision"}, "P-PUBLISHER-004": {"committed_stage_revision"},
 		"P-PUBLISHER-005": {"finalized_revision"}, "P-PUBLISHER-007": {"abandoned_revision"},
 		"P-RESOURCE-003": {"direct_materialized_resource_profile_id", "materialized_resource_profile_id"},
-		"P-DIFF-002":     {"base_oid"}, "P-DIFF-004": {"diff_base_oid"},
+		"P-DIFF-002":     {"base_oid"}, "P-DIFF-003": {"base_oid"}, "P-DIFF-004": {"diff_base_oid"}, "P-DIFF-005": {"match_count"},
 		"P-BARRIER-002": {"expected_pg_revision"}, "P-BARRIER-003": {"allowed_state_to"},
 		"P-BARRIER-004": {"pg_revision"}, "P-BARRIER-005": {"locked_pg_revision"},
 		"P-BARRIER-007": {"resolved_at_pg_revision"}, "P-RECONCILE-001": {"derived_at_pg_revision"},
@@ -2335,14 +2851,10 @@ func frozenCrossRecordMutationPathV1(entry CanonicalVectorEntryV1, predicate Pre
 		"P-ledger-evidence-ref-list-v1-ROW-002":        {"kind"},
 		"P-pr-publication-authority-v1-ROW-001":        {"repository_identity"},
 		"P-stage-diff-lineage-v1-ROW-003":              {"base_oid"},
+		"P-phase-checkpoint-v2-ROW-002":                {"kind"},
 	}
 	for _, path := range candidates[predicate.PredicateID] {
 		if field, ok := fields[path]; ok && field.JSONType != WireObject && field.JSONType != WireRawJSON {
-			return path
-		}
-	}
-	for _, path := range paths {
-		if field := fields[path]; field.LiteralValue == "" && field.JSONType != WireObject && field.JSONType != WireRawJSON {
 			return path
 		}
 	}

@@ -1233,7 +1233,11 @@ func minimalArrayElementJSONV1(parent WireFieldDescriptorV1, elementType string,
 	return value, nil
 }
 
-func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage) error {
+func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage, contexts ...*canonicalPredicateContextV1) error {
+	var context *canonicalPredicateContextV1
+	if len(contexts) != 0 {
+		context = contexts[0]
+	}
 	fields := make(map[string]WireFieldDescriptorV1, len(entry.Fields))
 	for _, field := range entry.Fields {
 		fields[field.FieldPath] = field
@@ -1245,6 +1249,11 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 		paths, operandErr := resolveCanonicalPredicateOperandPathsV1(entry, predicate, fields)
 		if operandErr != nil && !predicateHasFrozenFormulaV1(predicate) {
 			return operandErr
+		}
+		if context != nil {
+			if err := applyFrozenCrossRecordPositiveV1(predicate, values, context); err != nil {
+				return err
+			}
 		}
 		switch predicate.Operator {
 		case PredicateExactLiteral, PredicateTypedReference:
@@ -1377,7 +1386,17 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 			}
 		case PredicateAggregateLEQ:
 			if predicate.PredicateID == "P-RESOURCE-001" {
-				values["container_read_only_root"] = []byte("false")
+				if context == nil {
+					values["container_read_only_root"] = []byte("false")
+					continue
+				}
+				expected, err := materializedResourceProfileValuesV1(values, context)
+				if err != nil {
+					return err
+				}
+				for path, value := range expected {
+					values[path] = append(json.RawMessage(nil), value...)
+				}
 				continue
 			}
 			if len(paths) < 2 {

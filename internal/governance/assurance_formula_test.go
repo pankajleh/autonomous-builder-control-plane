@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -251,5 +252,239 @@ func TestDiffDerivationExecutesStageFormula(t *testing.T) {
 	}
 	if _, err := GenerateExecutableCanonicalVectorsV1(unresolved); err == nil || !strings.Contains(err.Error(), "no frozen formula") {
 		t.Fatalf("unresolved derivation did not fail closed: %v", err)
+	}
+}
+
+func TestTypedReferencesUseFinalizedTargetBytesAndFailClosed(t *testing.T) {
+	definitions := []WireSchemaDefinitionV1{
+		{SchemaID: "artifact-blob-v1", RecordName: "ArtifactBlobV1", Fields: []WireFieldSpecV1{{"artifact_sha256", "blob256", false}, {"byte_size", "u64=1..33554432", false}}},
+		{SchemaID: "final-target-v1", RecordName: "FinalTargetV1", Fields: []WireFieldSpecV1{{"kind", `id="FinalTargetV1"`, false}, {"schema_version", `id="final-target-v1"`, false}, {"artifact_sha256", "sha256<ArtifactBlobV1>", false}, {"target_sha256", "sha256<FinalTargetV1>", false}}},
+		{SchemaID: "final-holder-v1", RecordName: "FinalHolderV1", Fields: []WireFieldSpecV1{{"kind", `id="FinalHolderV1"`, false}, {"schema_version", `id="final-holder-v1"`, false}, {"target_sha256", "sha256<FinalTargetV1>", false}}},
+	}
+	catalog, err := BuildCanonicalVectorCatalogV1(definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positives, context, err := generateCanonicalCatalogPositiveVectorsV1(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var targetEntry CanonicalVectorEntryV1
+	for _, entry := range catalog.Entries {
+		if entry.SchemaID == "final-target-v1" {
+			targetEntry = entry
+		}
+	}
+	prototype, err := GenerateMinimalCanonicalVectorV1(targetEntry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(prototype, positives["final-target-v1"]) {
+		t.Fatal("fixture did not create prototype/final target drift")
+	}
+	var holder map[string]json.RawMessage
+	if json.Unmarshal(positives["final-holder-v1"], &holder) != nil {
+		t.Fatal("holder positive is not JSON")
+	}
+	var digest string
+	_ = json.Unmarshal(holder["target_sha256"], &digest)
+	if digest != sha256Hex(positives["final-target-v1"]) || digest == sha256Hex(prototype) {
+		t.Fatalf("holder digest = %s, want exact finalized target %s", digest, sha256Hex(positives["final-target-v1"]))
+	}
+	if _, ok := context.recordForDigest("FinalTargetV1", digest); !ok {
+		t.Fatal("final target bytes are absent from typed context")
+	}
+
+	unavailable, err := BuildCanonicalVectorCatalogV1([]WireSchemaDefinitionV1{{
+		SchemaID: "unavailable-holder-v1", RecordName: "UnavailableHolderV1",
+		Fields: []WireFieldSpecV1{{"kind", `id="UnavailableHolderV1"`, false}, {"schema_version", `id="unavailable-holder-v1"`, false}, {"target_sha256", "sha256<UnavailableV1>", false}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GenerateCanonicalCatalogPositiveVectorsV1(unavailable); err == nil || !strings.Contains(err.Error(), "cannot resolve emitted target type UnavailableV1") {
+		t.Fatalf("unavailable target did not fail closed: %v", err)
+	}
+}
+
+func TestDiffAuthorityAndCheckpointParentUseSourceRecords(t *testing.T) {
+	context := newEmptyCanonicalPredicateContextV1()
+	grant := []byte(`{"kind":"StageGrantV2","base_sha":"` + strings.Repeat("b", 40) + `","candidate_sha":"` + strings.Repeat("c", 40) + `"}`)
+	context.addRecord("StageGrantV2", grant)
+	values := map[string]json.RawMessage{
+		"stage": mustMarshalCanonicalVectorStringV1("B_IMPLEMENTATION"), "base_oid": mustMarshalCanonicalVectorStringV1(strings.Repeat("b", 40)),
+		"candidate_oid": mustMarshalCanonicalVectorStringV1(strings.Repeat("a", 40)), "derivation_authority_sha256": mustMarshalCanonicalVectorStringV1(sha256Hex(grant)),
+	}
+	if !frozenStageDiffAuthorityValidV1(values, context) {
+		t.Fatal("P-DIFF-002 rejected the exact active-stage authority base")
+	}
+	values["base_oid"] = mustMarshalCanonicalVectorStringV1(strings.Repeat("a", 40))
+	if frozenStageDiffAuthorityValidV1(values, context) {
+		t.Fatal("P-DIFF-002 accepted a local minimal base instead of the stage authority base")
+	}
+
+	checkpoint := []byte(`{"kind":"C_ACCEPTED","repository":"repo","sequence":7,"candidate_sha":"` + strings.Repeat("d", 40) + `","next_stage_grant_sha256":"` + strings.Repeat("e", 64) + `","checkpoint_sha256":"` + strings.Repeat("f", 64) + `"}`)
+	context.addRecord("PhaseCheckpointV2", checkpoint)
+	parent := map[string]json.RawMessage{
+		"kind": json.RawMessage(`"C_ACCEPTED"`), "repository": json.RawMessage(`"repo"`), "sequence": json.RawMessage(`7`), "candidate_sha": mustMarshalCanonicalVectorStringV1(strings.Repeat("d", 40)),
+	}
+	if !frozenCheckpointParentProjectionValidV1(parent, context) {
+		t.Fatal("P-PARENT-001 rejected the complete checkpoint projection")
+	}
+	parent["candidate_sha"] = mustMarshalCanonicalVectorStringV1(strings.Repeat("a", 40))
+	if frozenCheckpointParentProjectionValidV1(parent, context) {
+		t.Fatal("P-PARENT-001 ignored a copied checkpoint field while sequence still matched")
+	}
+}
+
+func resourceComponentFixtureV1(overrides map[string]any) []byte {
+	values := map[string]any{"id": "component", "container_read_only_root": false, "secret_capability": "NONE", "network_policy": "DENY_ALL"}
+	for _, path := range append(append([]string{}, resourceSummedFieldsV1...), resourcePeriodFieldsV1...) {
+		values[path] = uint64(0)
+	}
+	for path, value := range overrides {
+		values[path] = value
+	}
+	encoded, _ := json.Marshal(values)
+	return encoded
+}
+
+func TestMaterializedResourceProfileFrozenSemantics(t *testing.T) {
+	context := newEmptyCanonicalPredicateContextV1()
+	image := strings.Repeat("1", 64)
+	first := resourceComponentFixtureV1(map[string]any{
+		"id": "first", "process_memory_bytes": uint64(2), "process_cpu_period_micros": uint64(100), "container_memory_bytes": uint64(3),
+		"container_cpu_period_micros": uint64(100), "container_read_only_root": true, "container_image_sha256": image,
+		"secret_capability": "NONE", "network_policy": "LOOPBACK_BROKER",
+	})
+	second := resourceComponentFixtureV1(map[string]any{
+		"id": "second", "process_memory_bytes": uint64(4), "process_cpu_period_micros": uint64(100),
+		"secret_capability": "POSTGRES", "network_policy": "LOOPBACK_POSTGRES",
+	})
+	context.addRecordVariant("ResourceProfileV1", first)
+	context.addRecordVariant("ResourceProfileV1", second)
+	digests := []string{sha256Hex(first), sha256Hex(second)}
+	sort.Strings(digests)
+	digestJSON, _ := json.Marshal(digests)
+	values := map[string]json.RawMessage{"component_profile_sha256s": digestJSON}
+	expected, err := materializedResourceProfileValuesV1(values, context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, value := range expected {
+		values[path] = value
+	}
+	if string(values["process_memory_bytes"]) != "6" || string(values["process_cpu_period_micros"]) != "100" || string(values["container_read_only_root"]) != "true" {
+		t.Fatalf("resource numeric/period/read-only aggregate is wrong: %v", values)
+	}
+	if string(values["secret_capabilities"]) != `["POSTGRES"]` || string(values["network_policies"]) != `["LOOPBACK_BROKER","LOOPBACK_POSTGRES"]` || string(values["container_image_sha256"]) != `"`+image+`"` {
+		t.Fatalf("resource union/image aggregate is wrong: %v", values)
+	}
+	predicate := PredicateDescriptorV1{PredicateID: "P-RESOURCE-001", Operator: PredicateAggregateLEQ}
+	if valid, handled := frozenCanonicalPredicateValidV1(CanonicalVectorEntryV1{}, predicate, nil, nil, values, context); !handled || !valid {
+		t.Fatal("exact materialized resource aggregate did not validate")
+	}
+	values["container_read_only_root"] = []byte("false")
+	if valid, _ := frozenCanonicalPredicateValidV1(CanonicalVectorEntryV1{}, predicate, nil, nil, values, context); valid {
+		t.Fatal("container read-only-root iff violation validated")
+	}
+	values["container_read_only_root"] = []byte("true")
+
+	entry, err := buildCanonicalVectorEntry(WireSchemaDefinitionV1{
+		SchemaID: "resource-fixture-v1", RecordName: "MaterializedResourceProfileV1",
+		Fields:     []WireFieldSpecV1{{"component_profile_sha256s", "[]sha256<ResourceProfileV1>(set,1..4)", false}, {"process_memory_bytes", "u64", false}, {"container_read_only_root", "bool", false}},
+		Predicates: []WirePredicateSpecV1{{"P-RESOURCE-001", []string{"container_read_only_root"}, PredicateAggregateLEQ, []string{"frozen flattened resource semantics"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mutatePredicateV1(entry, predicate, values, nil, context); err != nil {
+		t.Fatal(err)
+	}
+	if string(values["process_memory_bytes"]) != "7" {
+		t.Fatalf("aggregate rejection = %s, want exact sum+1 violation 7", values["process_memory_bytes"])
+	}
+
+	periodMismatch := resourceComponentFixtureV1(map[string]any{"id": "period-mismatch", "process_cpu_period_micros": uint64(200)})
+	context.addRecordVariant("ResourceProfileV1", periodMismatch)
+	badDigests, _ := json.Marshal([]string{sha256Hex(first), sha256Hex(periodMismatch)})
+	if _, err := materializedResourceProfileValuesV1(map[string]json.RawMessage{"component_profile_sha256s": badDigests}, context); err == nil || !strings.Contains(err.Error(), "disagree") {
+		t.Fatalf("period mismatch did not fail closed: %v", err)
+	}
+	imageMismatch := resourceComponentFixtureV1(map[string]any{"id": "image-mismatch", "container_memory_bytes": uint64(1), "container_read_only_root": true, "container_image_sha256": strings.Repeat("2", 64)})
+	context.addRecordVariant("ResourceProfileV1", imageMismatch)
+	badDigests, _ = json.Marshal([]string{sha256Hex(first), sha256Hex(imageMismatch)})
+	if _, err := materializedResourceProfileValuesV1(map[string]json.RawMessage{"component_profile_sha256s": badDigests}, context); err == nil || !strings.Contains(err.Error(), "images are incompatible") {
+		t.Fatalf("image mismatch did not fail closed: %v", err)
+	}
+	denyAll := resourceComponentFixtureV1(map[string]any{"id": "deny", "network_policy": "DENY_ALL"})
+	context.addRecordVariant("ResourceProfileV1", denyAll)
+	badDigests, _ = json.Marshal([]string{sha256Hex(second), sha256Hex(denyAll)})
+	if _, err := materializedResourceProfileValuesV1(map[string]json.RawMessage{"component_profile_sha256s": badDigests}, context); err == nil || !strings.Contains(err.Error(), "DENY_ALL") {
+		t.Fatalf("incompatible networks did not fail closed: %v", err)
+	}
+}
+
+func TestFrozenPredicateMutationHasNoFallbackPathSearch(t *testing.T) {
+	entry, err := buildCanonicalVectorEntry(WireSchemaDefinitionV1{
+		SchemaID: "unresolved-frozen-v1", RecordName: "UnresolvedFrozenV1",
+		Fields:     []WireFieldSpecV1{{"kind", `id="UnresolvedFrozenV1"`, false}, {"schema_version", `id="unresolved-frozen-v1"`, false}, {"unrelated", "id", false}},
+		Predicates: []WirePredicateSpecV1{{"P-DIFF-003", []string{"$"}, PredicateDerivation, []string{"unresolved frozen source relation"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := GenerateMinimalCanonicalVectorV1(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, _, _, _ := decodeCanonicalVectorObjectV1(positive)
+	predicate, _ := canonicalVectorPredicateV1(entry.Predicates, "P-DIFF-003")
+	if err := mutatePredicateV1(entry, predicate, values, nil, newEmptyCanonicalPredicateContextV1()); err == nil || !strings.Contains(err.Error(), "does not name operands") {
+		t.Fatalf("unresolved predicate used a fallback descriptor path: %v", err)
+	}
+}
+
+func TestFrozenCatalogTypedDigestsResolveExactContextBytes(t *testing.T) {
+	extraction, err := ExtractFrozenCanonicalVectorCatalogV1(readFrozenAssuranceModel(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	positives, context, err := generateCanonicalCatalogPositiveVectorsV1(extraction.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range extraction.Catalog.Entries {
+		if entry.RecordName == "ArtifactBlobV1" {
+			continue
+		}
+		values, _, _, err := decodeCanonicalVectorObjectV1(positives[entry.SchemaID])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if falseIDs := falseCanonicalPredicatesV1(entry, values, context); len(falseIDs) != 0 {
+			t.Fatalf("%s positive has false predicates %v", entry.SchemaID, falseIDs)
+		}
+		for index, field := range entry.Fields {
+			if field.DigestTarget == "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
+				continue
+			}
+			raw, present := values[field.FieldPath]
+			if !present {
+				continue
+			}
+			candidates := []json.RawMessage{raw}
+			if field.JSONType == WireArray {
+				_ = json.Unmarshal(raw, &candidates)
+			}
+			for _, candidate := range candidates {
+				var digest string
+				_ = json.Unmarshal(candidate, &digest)
+				if context.digestValidForSelectedTarget(field.DigestTarget, digest, values) || frozenExactBytesDigestValidV1(entry, field.FieldPath, digest, values) {
+					continue
+				}
+				t.Fatalf("%s.%s digest %s has no exact emitted target bytes", entry.SchemaID, field.FieldPath, digest)
+			}
+		}
 	}
 }

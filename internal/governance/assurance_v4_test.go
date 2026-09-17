@@ -184,30 +184,41 @@ func TestAssuranceWireCatalogPathIdentityAndLiteralVectors(t *testing.T) {
 }
 
 func TestExecutableCanonicalVectorsAreGeneratedAndValidated(t *testing.T) {
-	definitions := []WireSchemaDefinitionV1{{
-		SchemaID: "executable-vector-v1", RecordName: "ExecutableVectorV1",
-		Fields: []WireFieldSpecV1{
-			{"kind", `id="ExecutableVectorV1"`, false},
-			{"schema_version", `id="executable-vector-v1"`, false},
-			{"repository_path", "path", false},
-			{"workdir", "absPath", false},
-			{"authority_domain", "authorityDomain", false},
-			{"controller_identity", "dbIdentity", false},
-			{"artifact_sha256", "sha256<ArtifactBlobV1>", false},
-			{"mode", "{ALPHA,BETA}", false},
-			{"members", "[]id(set,2..3)", false},
+	definitions := []WireSchemaDefinitionV1{
+		{SchemaID: "artifact-blob-v1", RecordName: "ArtifactBlobV1", Fields: []WireFieldSpecV1{{"artifact_sha256", "blob256", false}, {"byte_size", "u64=1..33554432", false}}},
+		{SchemaID: "foreign-v1", RecordName: "ForeignV1", Fields: []WireFieldSpecV1{{"kind", `id="ForeignV1"`, false}, {"schema_version", `id="foreign-v1"`, false}}},
+		{
+			SchemaID: "executable-vector-v1", RecordName: "ExecutableVectorV1",
+			Fields: []WireFieldSpecV1{
+				{"kind", `id="ExecutableVectorV1"`, false},
+				{"schema_version", `id="executable-vector-v1"`, false},
+				{"repository_path", "path", false},
+				{"workdir", "absPath", false},
+				{"authority_domain", "authorityDomain", false},
+				{"controller_identity", "dbIdentity", false},
+				{"artifact_sha256", "sha256<ArtifactBlobV1>", false},
+				{"mode", "{ALPHA,BETA}", false},
+				{"members", "[]id(set,2..3)", false},
+			},
 		},
-	}}
+	}
 	catalog, err := BuildCanonicalVectorCatalogV1(definitions)
 	if err != nil {
 		t.Fatal(err)
 	}
-	vectors, err := GenerateExecutableCanonicalVectorsV1(catalog.Entries[0])
+	sets, err := GenerateExecutableCanonicalCatalogVectorsV1(catalog)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(vectors.Rejections) != len(catalog.Entries[0].Rejections) {
-		t.Fatalf("generated %d rejections, want %d", len(vectors.Rejections), len(catalog.Entries[0].Rejections))
+	vectors := sets["executable-vector-v1"]
+	var executableEntry CanonicalVectorEntryV1
+	for _, entry := range catalog.Entries {
+		if entry.SchemaID == "executable-vector-v1" {
+			executableEntry = entry
+		}
+	}
+	if len(vectors.Rejections) != len(executableEntry.Rejections) {
+		t.Fatalf("generated %d rejections, want %d", len(vectors.Rejections), len(executableEntry.Rejections))
 	}
 	mutations := make(map[string]bool)
 	for _, vector := range vectors.Rejections {
@@ -480,7 +491,24 @@ func TestCanonicalPredicateOperatorsEvaluateActualOperands(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			set, err := GenerateExecutableCanonicalVectorsV1(entry)
+			var set ExecutableCanonicalVectorSetV1
+			if test.name == "TYPED_REFERENCE" {
+				catalog, catalogErr := BuildCanonicalVectorCatalogV1([]WireSchemaDefinitionV1{
+					{SchemaID: "artifact-blob-v1", RecordName: "ArtifactBlobV1", Fields: []WireFieldSpecV1{{"artifact_sha256", "blob256", false}, {"byte_size", "u64=1..33554432", false}}},
+					{SchemaID: "foreign-v1", RecordName: "ForeignV1", Fields: baseFields("ForeignV1", "foreign-v1")},
+					definition,
+				})
+				if catalogErr != nil {
+					t.Fatal(catalogErr)
+				}
+				sets, catalogErr := GenerateExecutableCanonicalCatalogVectorsV1(catalog)
+				if catalogErr != nil {
+					t.Fatal(catalogErr)
+				}
+				set = sets[test.schemaID]
+			} else {
+				set, err = GenerateExecutableCanonicalVectorsV1(entry)
+			}
 			if err != nil {
 				t.Fatal(err)
 			}

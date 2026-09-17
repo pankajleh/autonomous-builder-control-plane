@@ -107,6 +107,23 @@ func extractTableDefinition(line string) (WireSchemaDefinitionV1, string, bool, 
 	}
 	contract := strings.TrimSpace(strings.Join(parts[2:len(parts)-1], "|"))
 	fieldList := longestFieldCodeSpan(contract)
+	if strings.Contains(contract, "; then") && (recordName == "PhaseCheckpointV2" || recordName == "StageGrantV2") {
+		var composite []string
+		for _, span := range markdownCodeSpans(contract) {
+			if !strings.Contains(span, ",") && !strings.Contains(span, ":") {
+				continue
+			}
+			if fields, parseErr := parseWireFieldList(span); parseErr == nil && len(fields) != 0 {
+				composite = append(composite, span)
+				if len(composite) == 2 {
+					break
+				}
+			}
+		}
+		if len(composite) == 2 {
+			fieldList = strings.Join(composite, ",")
+		}
+	}
 	if fieldList == "" {
 		if recordName == "ArtifactBlobV1" {
 			fieldList = "artifact_sha256:blob256,byte_size:u64=1..33554432"
@@ -595,6 +612,22 @@ func kebabRecordName(name string) string {
 
 func addCatalogMetaDefinitions(definitions map[string]WireSchemaDefinitionV1) {
 	meta := []WireSchemaDefinitionV1{
+		{SchemaID: "nested:CheckpointGrantParentV2", RecordName: "CheckpointGrantParentV2", Nested: true, Fields: []WireFieldSpecV1{
+			{"kind", "checkpoint_kind", false}, {"repository", "identity", false}, {"capsule_file_sha256", "sha256<ArtifactBlobV1>", false},
+			{"capsule_sha256", "sha256<ContextCapsuleV4>", false}, {"candidate_sha", "gitOID", false}, {"operation", "text", false},
+			{"verdict", "text<=128", false}, {"evidence", "[]EvidenceBindingV1(set,0..256)", false}, {"controller_policy_identity", "identity", false},
+			{"sequence", "u64", false}, {"predecessor_checkpoint_sha256", "sha256<PhaseCheckpointV2>", true}, {"controller_event_identity", "identity", false},
+			{"semantic_registry_sha256", "sha256<SemanticAuthorityRegistryV2>", false}, {"review_scope_tip_sha256", "sha256<ArtifactBlobV1>", true},
+			{"acceptance_result_sha256", "sha256<ArtifactBlobV1>", true}, {"review_critical", "u64", false}, {"review_major", "u64", false},
+			{"reviewed_blocking_scope_ids", "[]id(set,0..256)", false}, {"lifecycle", "LifecycleBindingV1", true},
+			{"schema_version", `id="phase-checkpoint-v2"`, false}, {"repository_identity", "identity", false},
+			{"accepted_a_lineage_sha256", "sha256<AcceptedALineageV1>", true}, {"stage", "phase", false}, {"candidate_tree_oid", "gitOID", false},
+			{"ledger_event_sha256", "sha256<LedgerEventBindingV1>", true}, {"policy_manifest_sha256", "sha256<AssurancePolicyManifestV1>", false},
+			{"assurance_model_sha256", "sha256<AssuranceModelV1>", false}, {"proof_obligation_set_sha256", "sha256<ProofObligationSetV1>", false},
+			{"evidence_matrix_sha256", "sha256<EvidenceMatrixV1>", false}, {"resource_profile_set_sha256", "sha256<ResourceProfileSetV1>", false},
+			{"canonical_vector_catalog_sha256", "sha256<CanonicalVectorCatalogV1>", false}, {"work_classification_sha256", "sha256<WorkClassificationV1>", false},
+			{"final_review_profile_sha256", "sha256<FinalReviewProfileV1>", false}, {"evidence_selection_sha256", "sha256<StageEvidenceSelectionV1>", true},
+		}, Predicates: []WirePredicateSpecV1{{"P-PARENT-001", []string{"$"}, PredicateDerivation, []string{"full PhaseCheckpointV2 projection excluding next_stage_grant_sha256 and checkpoint_sha256"}}}},
 		{SchemaID: "canonical-vector-catalog-v1", RecordName: "CanonicalVectorCatalogV1", Fields: []WireFieldSpecV1{{"kind", `id="CanonicalVectorCatalogV1"`, false}, {"schema_version", `id="canonical-vector-catalog-v1"`, false}, {"descriptor_version", `id="CANONICAL-VECTOR-CATALOG-V3"`, false}, {"entries", "[]CanonicalVectorEntryV1(set,1..256)", false}, {"catalog_sha256", "sha256<CanonicalVectorCatalogV1>", false}}},
 		{SchemaID: "nested:CanonicalVectorEntryV1", RecordName: "CanonicalVectorEntryV1", Nested: true, Fields: []WireFieldSpecV1{{"schema_id", "id", false}, {"record_name", "id", false}, {"fields", "[]WireFieldDescriptorV1(order,1..256)", false}, {"predicates", "[]PredicateDescriptorV1(set,0..256)", false}, {"positive_recipe", `id="MINIMAL-VALID-V3"`, false}, {"rejections", "[]CanonicalRejectionVectorV1(set,1..4096)", false}}},
 		{SchemaID: "nested:WireFieldDescriptorV1", RecordName: "WireFieldDescriptorV1", Nested: true, Fields: []WireFieldSpecV1{{"schema_id", "id", false}, {"field_path", "text<=512", false}, {"ordinal", "u64>=1", false}, {"json_type", "{STRING,INTEGER,BOOLEAN,OBJECT,ARRAY,RAW_JSON}", false}, {"value_type", "text<=256", false}, {"min_u64", "u64", true}, {"max_u64", "u64", true}, {"min_bytes", "u64", true}, {"max_bytes", "u64", true}, {"min_items", "u64", true}, {"max_items", "u64", true}, {"record_target", "id", true}, {"digest_target", "id", true}, {"optional", "bool", false}, {"literal_value", "text<=4096", true}}},
