@@ -32,25 +32,35 @@ type ExecutableCanonicalVectorSetV1 struct {
 	Rejections []ExecutableCanonicalVectorV1
 }
 
+type canonicalPredicateContextV1 struct {
+	recordPositiveByType map[string][]byte
+	validDigestByTarget  map[string]map[string]struct{}
+}
+
 // GenerateCanonicalCatalogPositiveVectorsV1 materializes the complete frozen
 // positive corpus. Record-valued fields and arrays are resolved recursively,
 // so the result never substitutes an empty object for a required record.
 func GenerateCanonicalCatalogPositiveVectorsV1(catalog CanonicalVectorCatalogV1) (map[string][]byte, error) {
+	positives, _, err := generateCanonicalCatalogPositiveVectorsV1(catalog)
+	return positives, err
+}
+
+func generateCanonicalCatalogPositiveVectorsV1(catalog CanonicalVectorCatalogV1) (map[string][]byte, *canonicalPredicateContextV1, error) {
 	if err := catalog.Validate(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	byRecord := make(map[string]CanonicalVectorEntryV1, len(catalog.Entries))
 	for _, entry := range catalog.Entries {
 		if prior, duplicate := byRecord[entry.RecordName]; duplicate && prior.SchemaID != entry.SchemaID {
-			return nil, fmt.Errorf("record target %s is ambiguous", entry.RecordName)
+			return nil, nil, fmt.Errorf("record target %s is ambiguous", entry.RecordName)
 		}
 		byRecord[entry.RecordName] = entry
 	}
-	result := make(map[string][]byte, len(catalog.Entries))
+	prototypes := make(map[string][]byte, len(catalog.Entries))
 	visiting := make(map[string]bool)
 	var generate func(CanonicalVectorEntryV1) ([]byte, error)
 	generate = func(entry CanonicalVectorEntryV1) ([]byte, error) {
-		if positive, ok := result[entry.SchemaID]; ok {
+		if positive, ok := prototypes[entry.SchemaID]; ok {
 			return append([]byte(nil), positive...), nil
 		}
 		if visiting[entry.SchemaID] {
@@ -63,7 +73,7 @@ func GenerateCanonicalCatalogPositiveVectorsV1(catalog CanonicalVectorCatalogV1)
 			return nil, err
 		}
 		if entry.RecordName == "ArtifactBlobV1" && entry.SchemaID == "artifact-blob-v1" {
-			result[entry.SchemaID] = append([]byte(nil), positive...)
+			prototypes[entry.SchemaID] = append([]byte(nil), positive...)
 			return positive, nil
 		}
 		values, _, _, err := decodeCanonicalVectorObjectV1(positive)
@@ -137,24 +147,307 @@ func GenerateCanonicalCatalogPositiveVectorsV1(catalog CanonicalVectorCatalogV1)
 		if err != nil {
 			return nil, err
 		}
-		result[entry.SchemaID] = append([]byte(nil), positive...)
+		prototypes[entry.SchemaID] = append([]byte(nil), positive...)
 		return positive, nil
 	}
 	for _, entry := range catalog.Entries {
 		if _, err := generate(entry); err != nil {
+			return nil, nil, err
+		}
+	}
+	context, err := newCanonicalPredicateContextV1(catalog, prototypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	result := make(map[string][]byte, len(catalog.Entries))
+	visiting = make(map[string]bool)
+	var finalize func(CanonicalVectorEntryV1) ([]byte, error)
+	finalize = func(entry CanonicalVectorEntryV1) ([]byte, error) {
+		if positive, ok := result[entry.SchemaID]; ok {
+			return append([]byte(nil), positive...), nil
+		}
+		if visiting[entry.SchemaID] {
+			return nil, fmt.Errorf("required record target cycle at %s", entry.SchemaID)
+		}
+		visiting[entry.SchemaID] = true
+		defer delete(visiting, entry.SchemaID)
+		if entry.RecordName == "ArtifactBlobV1" && entry.SchemaID == "artifact-blob-v1" {
+			result[entry.SchemaID] = append([]byte(nil), prototypes[entry.SchemaID]...)
+			return append([]byte(nil), prototypes[entry.SchemaID]...), nil
+		}
+		values, _, _, err := decodeCanonicalVectorObjectV1(prototypes[entry.SchemaID])
+		if err != nil {
 			return nil, err
+		}
+		for _, field := range entry.Fields {
+			raw, present := values[field.FieldPath]
+			if !present {
+				continue
+			}
+			targetName := field.RecordTarget
+			if targetName == "" && field.JSONType == WireArray {
+				targetName = arrayElementTypeV1(field.ValueType)
+			}
+			target, hasTarget := byRecord[targetName]
+			switch {
+			case hasTarget && field.JSONType == WireObject:
+				values[field.FieldPath], err = finalize(target)
+			case hasTarget && field.JSONType == WireArray:
+				var elements []json.RawMessage
+				if json.Unmarshal(raw, &elements) != nil {
+					return nil, fmt.Errorf("%s.%s positive is not an array", entry.SchemaID, field.FieldPath)
+				}
+				for index := range elements {
+					elements[index], err = finalize(target)
+					if err != nil {
+						break
+					}
+				}
+				if err == nil {
+					values[field.FieldPath], err = json.Marshal(elements)
+				}
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := applyTypedReferencePositivesV1(entry, values, context); err != nil {
+			return nil, err
+		}
+		if err := applyPositivePredicatesV1(entry, values); err != nil {
+			return nil, err
+		}
+		if err := applyEd25519VectorsV1(entry, values); err != nil {
+			return nil, err
+		}
+		for index, field := range entry.Fields {
+			if !isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
+				continue
+			}
+			preimage, err := marshalCanonicalVectorObjectV1(entry.Fields, values, field.FieldPath)
+			if err != nil {
+				return nil, err
+			}
+			values[field.FieldPath], _ = json.Marshal(sha256Hex(preimage))
+		}
+		positive, err := marshalCanonicalVectorObjectV1(entry.Fields, values, "")
+		if err != nil {
+			return nil, err
+		}
+		result[entry.SchemaID] = append([]byte(nil), positive...)
+		return positive, nil
+	}
+	for _, entry := range catalog.Entries {
+		if _, err := finalize(entry); err != nil {
+			return nil, nil, err
 		}
 	}
 	for _, entry := range catalog.Entries {
-		if err := validateCanonicalCatalogPositiveV1(entry, result[entry.SchemaID], byRecord, make(map[string]bool)); err != nil {
-			return nil, fmt.Errorf("validate %s positive: %w", entry.SchemaID, err)
+		if err := validateCanonicalCatalogPositiveV1(entry, result[entry.SchemaID], byRecord, make(map[string]bool), context); err != nil {
+			return nil, nil, fmt.Errorf("validate %s positive: %w", entry.SchemaID, err)
 		}
 	}
-	return result, nil
+	return result, context, nil
 }
 
-func validateCanonicalCatalogPositiveV1(entry CanonicalVectorEntryV1, data []byte, byRecord map[string]CanonicalVectorEntryV1, visiting map[string]bool) error {
-	if err := validateCanonicalVectorBytesV1(entry, data); err != nil {
+func newCanonicalPredicateContextV1(catalog CanonicalVectorCatalogV1, positives map[string][]byte) (*canonicalPredicateContextV1, error) {
+	context := &canonicalPredicateContextV1{
+		recordPositiveByType: make(map[string][]byte, len(catalog.Entries)),
+		validDigestByTarget:  make(map[string]map[string]struct{}),
+	}
+	for _, entry := range catalog.Entries {
+		positive := positives[entry.SchemaID]
+		if len(positive) == 0 {
+			return nil, fmt.Errorf("catalog type %s has no positive record", entry.RecordName)
+		}
+		context.recordPositiveByType[entry.RecordName] = append([]byte(nil), positive...)
+	}
+	context.recordPositiveByType["exact-bytes"] = []byte("a")
+	for target, positive := range context.recordPositiveByType {
+		context.addValidDigest(target, sha256Hex(positive))
+	}
+	for _, entry := range catalog.Entries {
+		for index, field := range entry.Fields {
+			if field.DigestTarget == "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
+				continue
+			}
+			members := digestTargetMembersV1(field.DigestTarget)
+			if len(members) == 0 {
+				return nil, fmt.Errorf("%s.%s has unresolved digest target %q", entry.SchemaID, field.FieldPath, field.DigestTarget)
+			}
+			for _, member := range members {
+				positive := context.recordPositiveByType[member]
+				if len(positive) == 0 {
+					// Retained predecessor types use a closed type-domain record;
+					// catalog types always use their generated record bytes above.
+					positive = []byte("ABCP-RETAINED-CANONICAL-TYPE-V1\x00" + member)
+					context.recordPositiveByType[member] = positive
+				}
+				context.addValidDigest(field.DigestTarget, sha256Hex(positive))
+			}
+		}
+	}
+	return context, nil
+}
+
+func (context *canonicalPredicateContextV1) addValidDigest(target, digest string) {
+	if context.validDigestByTarget[target] == nil {
+		context.validDigestByTarget[target] = make(map[string]struct{})
+	}
+	context.validDigestByTarget[target][digest] = struct{}{}
+}
+
+func digestTargetMembersV1(target string) []string {
+	if index := strings.IndexByte(target, '['); index >= 0 {
+		target = target[:index]
+	}
+	parts := strings.Split(target, "-or-")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" && !containsCanonicalVectorStringV1(result, part) {
+			result = append(result, part)
+		}
+	}
+	return result
+}
+
+func selectedDigestTargetMembersV1(target string, values map[string]json.RawMessage) []string {
+	members := digestTargetMembersV1(target)
+	if len(members) <= 1 {
+		return members
+	}
+	var effectKind string
+	_ = json.Unmarshal(values["effect_kind"], &effectKind)
+	for _, member := range members {
+		if effectKind == "PR" && strings.HasPrefix(member, "PR") || effectKind == "MERGE" && strings.HasPrefix(member, "Merge") {
+			return []string{member}
+		}
+	}
+	return members
+}
+
+func (context *canonicalPredicateContextV1) digestValidForTarget(target, digest string) bool {
+	if context == nil {
+		return false
+	}
+	for _, member := range digestTargetMembersV1(target) {
+		if positive := context.recordPositiveByType[member]; len(positive) != 0 && digest == sha256Hex(positive) {
+			return true
+		}
+	}
+	_, valid := context.validDigestByTarget[target][digest]
+	return valid
+}
+
+func (context *canonicalPredicateContextV1) firstValidDigest(target string, values map[string]json.RawMessage) (string, bool) {
+	if context == nil {
+		return "", false
+	}
+	digests := make([]string, 0)
+	for _, member := range selectedDigestTargetMembersV1(target, values) {
+		if positive := context.recordPositiveByType[member]; len(positive) != 0 {
+			digests = append(digests, sha256Hex(positive))
+		}
+	}
+	if len(digests) == 0 {
+		for digest := range context.validDigestByTarget[target] {
+			digests = append(digests, digest)
+		}
+	}
+	sort.Strings(digests)
+	if len(digests) == 0 {
+		return "", false
+	}
+	return digests[0], true
+}
+
+func (context *canonicalPredicateContextV1) firstForeignDigest(target string) (string, bool) {
+	if context == nil {
+		return "", false
+	}
+	targetMembers := make(map[string]struct{})
+	for _, member := range digestTargetMembersV1(target) {
+		targetMembers[member] = struct{}{}
+	}
+	digests := make([]string, 0, len(context.recordPositiveByType))
+	for recordType, positive := range context.recordPositiveByType {
+		if recordType == "exact-bytes" {
+			continue
+		}
+		if _, targetType := targetMembers[recordType]; targetType || len(positive) == 0 {
+			continue
+		}
+		digest := sha256Hex(positive)
+		if context.digestValidForTarget(target, digest) {
+			continue
+		}
+		digests = append(digests, digest)
+	}
+	sort.Strings(digests)
+	if len(digests) == 0 {
+		return "", false
+	}
+	return digests[0], true
+}
+
+func applyTypedReferencePositivesV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) error {
+	for index, field := range entry.Fields {
+		if field.DigestTarget == "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
+			continue
+		}
+		raw, present := values[field.FieldPath]
+		if !present {
+			continue
+		}
+		digest, ok := context.firstValidDigest(field.DigestTarget, values)
+		if !ok {
+			return fmt.Errorf("%s.%s cannot establish typed target %s", entry.SchemaID, field.FieldPath, field.DigestTarget)
+		}
+		encoded := mustMarshalCanonicalVectorStringV1(digest)
+		if field.JSONType != WireArray {
+			values[field.FieldPath] = encoded
+			continue
+		}
+		var elements []json.RawMessage
+		if json.Unmarshal(raw, &elements) != nil {
+			return fmt.Errorf("%s.%s typed reference array is invalid", entry.SchemaID, field.FieldPath)
+		}
+		for elementIndex := range elements {
+			elements[elementIndex] = append(json.RawMessage(nil), encoded...)
+		}
+		if len(elements) > 1 && strings.Contains(field.ValueType, "(set") {
+			return fmt.Errorf("%s.%s needs multiple distinct target records", entry.SchemaID, field.FieldPath)
+		}
+		values[field.FieldPath], _ = json.Marshal(elements)
+	}
+	return nil
+}
+
+func standaloneCanonicalPredicateContextV1(entry CanonicalVectorEntryV1, positive []byte) *canonicalPredicateContextV1 {
+	context := &canonicalPredicateContextV1{
+		recordPositiveByType: map[string][]byte{"ArtifactBlobV1": []byte("a"), "exact-bytes": []byte("a")},
+		validDigestByTarget:  make(map[string]map[string]struct{}),
+	}
+	context.addValidDigest("ArtifactBlobV1", sha256Hex([]byte("a")))
+	context.addValidDigest("exact-bytes", sha256Hex([]byte("a")))
+	context.recordPositiveByType[entry.RecordName] = append([]byte(nil), positive...)
+	for index, field := range entry.Fields {
+		if field.DigestTarget == "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
+			continue
+		}
+		for _, member := range digestTargetMembersV1(field.DigestTarget) {
+			if member != "ArtifactBlobV1" && member != "exact-bytes" {
+				return nil
+			}
+			context.addValidDigest(field.DigestTarget, sha256Hex(context.recordPositiveByType[member]))
+		}
+	}
+	return context
+}
+
+func validateCanonicalCatalogPositiveV1(entry CanonicalVectorEntryV1, data []byte, byRecord map[string]CanonicalVectorEntryV1, visiting map[string]bool, context *canonicalPredicateContextV1) error {
+	if err := validateCanonicalVectorBytesV1(entry, data, context); err != nil {
 		return err
 	}
 	if entry.RecordName == "ArtifactBlobV1" {
@@ -183,7 +476,7 @@ func validateCanonicalCatalogPositiveV1(entry CanonicalVectorEntryV1, data []byt
 			continue
 		}
 		if field.JSONType == WireObject {
-			if err := validateCanonicalCatalogPositiveV1(target, raw, byRecord, visiting); err != nil {
+			if err := validateCanonicalCatalogPositiveV1(target, raw, byRecord, visiting, context); err != nil {
 				return fmt.Errorf("field %s: %w", field.FieldPath, err)
 			}
 		}
@@ -193,7 +486,7 @@ func validateCanonicalCatalogPositiveV1(entry CanonicalVectorEntryV1, data []byt
 				return fmt.Errorf("field %s is not an array", field.FieldPath)
 			}
 			for index, element := range elements {
-				if err := validateCanonicalCatalogPositiveV1(target, element, byRecord, visiting); err != nil {
+				if err := validateCanonicalCatalogPositiveV1(target, element, byRecord, visiting, context); err != nil {
 					return fmt.Errorf("field %s[%d]: %w", field.FieldPath, index, err)
 				}
 			}
@@ -233,7 +526,37 @@ func GenerateExecutableCanonicalVectorsV1(entry CanonicalVectorEntryV1) (Executa
 	if err != nil {
 		return ExecutableCanonicalVectorSetV1{}, err
 	}
-	return generateExecutableCanonicalVectorsFromPositiveV1(entry, positive)
+	context := standaloneCanonicalPredicateContextV1(entry, positive)
+	if context != nil && entry.RecordName != "ArtifactBlobV1" {
+		values, _, _, decodeErr := decodeCanonicalVectorObjectV1(positive)
+		if decodeErr != nil {
+			return ExecutableCanonicalVectorSetV1{}, decodeErr
+		}
+		if err := applyTypedReferencePositivesV1(entry, values, context); err != nil {
+			return ExecutableCanonicalVectorSetV1{}, err
+		}
+		if err := applyPositivePredicatesV1(entry, values); err != nil {
+			return ExecutableCanonicalVectorSetV1{}, err
+		}
+		if err := applyEd25519VectorsV1(entry, values); err != nil {
+			return ExecutableCanonicalVectorSetV1{}, err
+		}
+		for index, field := range entry.Fields {
+			if !isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
+				continue
+			}
+			preimage, err := marshalCanonicalVectorObjectV1(entry.Fields, values, field.FieldPath)
+			if err != nil {
+				return ExecutableCanonicalVectorSetV1{}, err
+			}
+			values[field.FieldPath] = mustMarshalCanonicalVectorStringV1(sha256Hex(preimage))
+		}
+		positive, err = marshalCanonicalVectorObjectV1(entry.Fields, values, "")
+		if err != nil {
+			return ExecutableCanonicalVectorSetV1{}, err
+		}
+	}
+	return generateExecutableCanonicalVectorsFromPositiveV1(entry, positive, nil, context)
 }
 
 // GenerateExecutableCanonicalCatalogVectorsV1 materializes the complete
@@ -242,7 +565,7 @@ func GenerateExecutableCanonicalVectorsV1(entry CanonicalVectorEntryV1) (Executa
 // array elements; the descriptor-only minimal object is never used as a
 // rejection base for this path.
 func GenerateExecutableCanonicalCatalogVectorsV1(catalog CanonicalVectorCatalogV1) (map[string]ExecutableCanonicalVectorSetV1, error) {
-	positives, err := GenerateCanonicalCatalogPositiveVectorsV1(catalog)
+	positives, context, err := generateCanonicalCatalogPositiveVectorsV1(catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +575,7 @@ func GenerateExecutableCanonicalCatalogVectorsV1(catalog CanonicalVectorCatalogV
 		positiveByRecord[entry.RecordName] = positives[entry.SchemaID]
 	}
 	for _, entry := range catalog.Entries {
-		vectors, err := generateExecutableCanonicalVectorsFromPositiveV1(entry, positives[entry.SchemaID], positiveByRecord)
+		vectors, err := generateExecutableCanonicalVectorsFromPositiveV1(entry, positives[entry.SchemaID], positiveByRecord, context)
 		if err != nil {
 			return nil, fmt.Errorf("materialize %s executable vectors: %w", entry.SchemaID, err)
 		}
@@ -261,17 +584,13 @@ func GenerateExecutableCanonicalCatalogVectorsV1(catalog CanonicalVectorCatalogV
 	return result, nil
 }
 
-func generateExecutableCanonicalVectorsFromPositiveV1(entry CanonicalVectorEntryV1, positive []byte, positiveByRecord ...map[string][]byte) (ExecutableCanonicalVectorSetV1, error) {
-	var recordPositives map[string][]byte
-	if len(positiveByRecord) != 0 {
-		recordPositives = positiveByRecord[0]
-	}
-	if err := validateCanonicalVectorBytesV1(entry, positive); err != nil {
+func generateExecutableCanonicalVectorsFromPositiveV1(entry CanonicalVectorEntryV1, positive []byte, recordPositives map[string][]byte, context *canonicalPredicateContextV1) (ExecutableCanonicalVectorSetV1, error) {
+	if err := validateCanonicalVectorBytesV1(entry, positive, context); err != nil {
 		return ExecutableCanonicalVectorSetV1{}, fmt.Errorf("positive vector for %s is invalid: %w", entry.SchemaID, err)
 	}
 	result := ExecutableCanonicalVectorSetV1{SchemaID: entry.SchemaID, Positive: append([]byte(nil), positive...), Rejections: make([]ExecutableCanonicalVectorV1, 0, len(entry.Rejections))}
 	for _, recipe := range entry.Rejections {
-		mutated, err := mutateCanonicalVectorV1(entry, positive, recipe, recordPositives)
+		mutated, err := mutateCanonicalVectorV1(entry, positive, recipe, recordPositives, context)
 		if err != nil {
 			return ExecutableCanonicalVectorSetV1{}, fmt.Errorf("generate %s: %w", recipe.VectorID, err)
 		}
@@ -286,7 +605,7 @@ func generateExecutableCanonicalVectorsFromPositiveV1(entry CanonicalVectorEntry
 				return ExecutableCanonicalVectorSetV1{}, fmt.Errorf("vector %s (%s paths=%v arguments=%v) violates a descriptor constraint: %w", recipe.VectorID, predicate.Operator, predicate.FieldPaths, predicate.Arguments, descriptorErr)
 			}
 			target := strings.TrimPrefix(recipe.Mutation, "PREDICATE_")
-			falseIDs, err := falseCanonicalPredicatesForMutationV1(entry, positive, mutated, target)
+			falseIDs, err := falseCanonicalPredicatesForMutationV1(entry, positive, mutated, target, context)
 			if err != nil {
 				return ExecutableCanonicalVectorSetV1{}, fmt.Errorf("vector %s does not prove its expected predicate classification: %w", recipe.VectorID, err)
 			}
@@ -295,7 +614,7 @@ func generateExecutableCanonicalVectorsFromPositiveV1(entry CanonicalVectorEntry
 			})
 			continue
 		}
-		validationErr := validateCanonicalVectorBytesV1(entry, mutated)
+		validationErr := validateCanonicalVectorBytesV1(entry, mutated, context)
 		var classified *canonicalVectorValidationErrorV1
 		if !errors.As(validationErr, &classified) || classified.code != recipe.RequiredError {
 			return ExecutableCanonicalVectorSetV1{}, fmt.Errorf("vector %s classified as %v, want %s", recipe.VectorID, validationErr, recipe.RequiredError)
@@ -309,15 +628,15 @@ func generateExecutableCanonicalVectorsFromPositiveV1(entry CanonicalVectorEntry
 	return result, nil
 }
 
-func falseCanonicalPredicatesForMutationV1(entry CanonicalVectorEntryV1, positive, mutated []byte, target string) ([]string, error) {
-	if err := validateCanonicalVectorBytesV1(entry, positive); err != nil {
+func falseCanonicalPredicatesForMutationV1(entry CanonicalVectorEntryV1, positive, mutated []byte, target string, context *canonicalPredicateContextV1) ([]string, error) {
+	if err := validateCanonicalVectorBytesV1(entry, positive, context); err != nil {
 		return nil, fmt.Errorf("positive validation: %w", err)
 	}
 	mutatedValues, err := validateCanonicalVectorDescriptorConstraintsV1(entry, mutated)
 	if err != nil {
 		return nil, fmt.Errorf("mutated descriptor validation: %w", err)
 	}
-	falseIDs := falseCanonicalPredicatesV1(entry, mutatedValues)
+	falseIDs := falseCanonicalPredicatesV1(entry, mutatedValues, context)
 	if _, found := canonicalVectorPredicateV1(entry.Predicates, target); !found {
 		return nil, fmt.Errorf("target predicate %s is absent", target)
 	}
@@ -325,7 +644,7 @@ func falseCanonicalPredicatesForMutationV1(entry CanonicalVectorEntryV1, positiv
 		predicate, _ := canonicalVectorPredicateV1(entry.Predicates, target)
 		return nil, fmt.Errorf("target predicate %s (%s paths=%v arguments=%v) remained true", target, predicate.Operator, predicate.FieldPaths, predicate.Arguments)
 	}
-	validationErr := validateCanonicalVectorBytesV1(entry, mutated)
+	validationErr := validateCanonicalVectorBytesV1(entry, mutated, context)
 	var classified *canonicalVectorValidationErrorV1
 	if !errors.As(validationErr, &classified) || classified.code != CanonicalPredicateInvalid {
 		return nil, fmt.Errorf("mutation classified as %v, want %s", validationErr, CanonicalPredicateInvalid)
@@ -338,7 +657,11 @@ func falseCanonicalPredicatesForMutationV1(entry CanonicalVectorEntryV1, positiv
 	return falseIDs, nil
 }
 
-func validateCanonicalVectorBytesV1(entry CanonicalVectorEntryV1, data []byte) error {
+func validateCanonicalVectorBytesV1(entry CanonicalVectorEntryV1, data []byte, contexts ...*canonicalPredicateContextV1) error {
+	var context *canonicalPredicateContextV1
+	if len(contexts) != 0 {
+		context = contexts[0]
+	}
 	if entry.RecordName == "ArtifactBlobV1" && entry.SchemaID == "artifact-blob-v1" {
 		if len(data) >= 1 && len(data) <= 33554432 {
 			return nil
@@ -352,7 +675,7 @@ func validateCanonicalVectorBytesV1(entry CanonicalVectorEntryV1, data []byte) e
 	if err != nil {
 		return err
 	}
-	falsePredicates := falseCanonicalPredicatesV1(entry, values)
+	falsePredicates := falseCanonicalPredicatesV1(entry, values, context)
 	for fieldIndex, field := range entry.Fields {
 		if !isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, fieldIndex) {
 			continue
@@ -563,15 +886,18 @@ func sha256Hex(data []byte) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func falseCanonicalPredicatesV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage) []string {
+func falseCanonicalPredicatesV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage, contexts ...*canonicalPredicateContextV1) []string {
+	var context *canonicalPredicateContextV1
+	if len(contexts) != 0 {
+		context = contexts[0]
+	}
 	fields := make(map[string]WireFieldDescriptorV1, len(entry.Fields))
 	for _, field := range entry.Fields {
 		fields[field.FieldPath] = field
 	}
-	expected := minimalCanonicalPredicateValuesV1(entry)
 	var result []string
 	for _, predicate := range entry.Predicates {
-		if !canonicalPredicateValidV1(entry, predicate, fields, values, expected) {
+		if !canonicalPredicateValidV1(entry, predicate, fields, values, context) {
 			result = append(result, predicate.PredicateID)
 		}
 	}
@@ -591,8 +917,14 @@ func minimalCanonicalPredicateValuesV1(entry CanonicalVectorEntryV1) map[string]
 	return values
 }
 
-func canonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, fields map[string]WireFieldDescriptorV1, values, expected map[string]json.RawMessage) bool {
-	paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
+func canonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, fields map[string]WireFieldDescriptorV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) bool {
+	paths, operandErr := resolveCanonicalPredicateOperandPathsV1(entry, predicate, fields)
+	if valid, handled := frozenCanonicalPredicateValidV1(entry, predicate, paths, fields, values, context); handled {
+		return valid
+	}
+	if operandErr != nil {
+		return false
+	}
 	switch predicate.Operator {
 	case PredicateExactLiteral:
 		if len(predicate.FieldPaths) != 1 || len(predicate.Arguments) == 0 {
@@ -613,11 +945,6 @@ func canonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate Predicate
 			return false
 		}
 	case PredicateAllEqual:
-		if len(paths) == 1 {
-			actual, present := values[paths[0]]
-			want, expectedPresent := expected[paths[0]]
-			return present == expectedPresent && (!present || bytes.Equal(actual, want))
-		}
 		if len(paths) < 2 {
 			return false
 		}
@@ -638,8 +965,11 @@ func canonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate Predicate
 		if len(paths) < 2 {
 			return false
 		}
-		antecedent := canonicalPredicateConditionV1(paths[0], fields, values, expected)
-		consequent := canonicalPredicateConditionV1(paths[1], fields, values, expected)
+		antecedent, antecedentOK := canonicalPredicateConditionV1(paths[0], fields, values)
+		consequent, consequentOK := canonicalPredicateConditionV1(paths[1], fields, values)
+		if !antecedentOK || !consequentOK {
+			return false
+		}
 		if predicate.Operator == PredicateIfAndOnlyIf {
 			return antecedent == consequent
 		}
@@ -671,53 +1001,73 @@ func canonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate Predicate
 		}
 		return true
 	case PredicateOrdinalSuccess:
-		if len(paths) == 1 {
-			actual, present := values[paths[0]]
-			want, expectedPresent := expected[paths[0]]
-			return present == expectedPresent && (!present || bytes.Equal(actual, want))
-		}
 		if len(paths) < 2 {
 			return false
 		}
 		var predecessor, successor uint64
 		return json.Unmarshal(values[paths[0]], &predecessor) == nil && json.Unmarshal(values[paths[1]], &successor) == nil && predecessor != ^uint64(0) && successor == predecessor+1
 	case PredicateStateTransition:
-		return frozenStatePredicateV1(entry, predicate, paths, values, expected)
+		return frozenStatePredicateV1(entry, predicate, paths, values)
 	case PredicateTypedReference:
-		if len(paths) == 0 {
+		if len(paths) == 0 || context == nil {
 			return false
 		}
 		for _, path := range paths {
-			actual, present := values[path]
+			raw, present := values[path]
 			field := fields[path]
-			if present && field.DigestTarget != "" {
-				for _, candidate := range entry.Fields {
-					if candidate.JSONType != WireObject || candidate.RecordTarget != field.DigestTarget {
-						continue
-					}
-					var digest string
-					if embedded, ok := values[candidate.FieldPath]; ok && json.Unmarshal(actual, &digest) == nil && digest == sha256Hex(embedded) {
-						present = false
-						break
-					}
-				}
-				if !present {
-					continue
+			if !present && field.Optional {
+				continue
+			}
+			if !present || field.DigestTarget == "" {
+				return false
+			}
+			candidates := []json.RawMessage{raw}
+			if field.JSONType == WireArray {
+				candidates = nil
+				if json.Unmarshal(raw, &candidates) != nil {
+					return false
 				}
 			}
-			want, expectedPresent := expected[path]
-			if present != expectedPresent || present && !bytes.Equal(actual, want) {
-				return false
+			for _, candidate := range candidates {
+				var digest string
+				if json.Unmarshal(candidate, &digest) != nil {
+					return false
+				}
+				if context.digestValidForTarget(field.DigestTarget, digest) {
+					continue
+				}
+				if field.DigestTarget == "exact-bytes" {
+					formulaValid := false
+					for _, companion := range entry.Predicates {
+						if companion.Operator == PredicateDigestPreimage && containsCanonicalVectorStringV1(companion.FieldPaths, path) {
+							if _, compatibilityOnly := frozenCrossRecordPredicateIDsV1[companion.PredicateID]; compatibilityOnly {
+								break
+							}
+							formulaValid = frozenDigestPreimagePredicateV1(entry, companion, values, minimalCanonicalPredicateValuesV1(entry))
+							break
+						}
+					}
+					if formulaValid {
+						continue
+					}
+				}
+				embeddedValid := false
+				for _, embeddedField := range entry.Fields {
+					if embeddedField.JSONType == WireObject && embeddedField.RecordTarget == field.DigestTarget {
+						embedded, ok := values[embeddedField.FieldPath]
+						embeddedValid = ok && digest == sha256Hex(embedded)
+					}
+				}
+				if !embeddedValid {
+					return false
+				}
 			}
 		}
 		return true
 	case PredicateDigestPreimage:
-		return frozenDigestPreimagePredicateV1(entry, predicate, values, expected)
+		return frozenDigestPreimagePredicateV1(entry, predicate, values, minimalCanonicalPredicateValuesV1(entry))
 	case PredicateDerivation:
-		path := canonicalDerivedOutputPathV1(entry, predicate, fields)
-		actual, present := values[path]
-		want, expectedPresent := expected[path]
-		return path != "" && present == expectedPresent && (!present || bytes.Equal(actual, want))
+		return false
 	case PredicateAggregateLEQ:
 		if len(paths) < 2 {
 			return false
@@ -737,13 +1087,262 @@ func canonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate Predicate
 	}
 }
 
-func canonicalPredicateConditionV1(path string, fields map[string]WireFieldDescriptorV1, values, expected map[string]json.RawMessage) bool {
+func canonicalPredicateConditionV1(path string, fields map[string]WireFieldDescriptorV1, values map[string]json.RawMessage) (bool, bool) {
 	actual, present := values[path]
-	want, expectedPresent := expected[path]
-	if field, ok := fields[path]; ok && field.JSONType == WireBoolean && present {
-		return bytes.Equal(actual, []byte("true"))
+	field, ok := fields[path]
+	if !ok {
+		return false, false
 	}
-	return present == expectedPresent && (!present || bytes.Equal(actual, want))
+	if field.JSONType == WireBoolean && present {
+		return bytes.Equal(actual, []byte("true")), true
+	}
+	if field.Optional {
+		return present, true
+	}
+	return false, false
+}
+
+func frozenCanonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, paths []string, fields map[string]WireFieldDescriptorV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) (bool, bool) {
+	if predicate.PredicateID == "P-EVENT-001" && entry.RecordName != "EffectLedgerEventPreimageV1" {
+		expected := minimalCanonicalPredicateValuesV1(entry)
+		actual, present := values["event_id"]
+		want, expectedPresent := expected["event_id"]
+		return present == expectedPresent && (!present || bytes.Equal(actual, want)), true
+	}
+	if predicate.Operator == PredicateDerivation {
+		return frozenDerivationPredicateValidV1(predicate, values, context), true
+	}
+	if predicate.Operator == PredicateAggregateLEQ && predicate.PredicateID == "P-RESOURCE-001" {
+		containerDemand := false
+		for _, path := range []string{
+			"container_memory_bytes", "container_pids", "container_cpu_micros_per_period", "container_cpu_period_micros",
+			"container_tmpfs_bytes", "container_shm_bytes", "container_log_bytes", "container_writable_layer_bytes", "container_image_sha256",
+		} {
+			raw, present := values[path]
+			if !present {
+				continue
+			}
+			var integer uint64
+			if json.Unmarshal(raw, &integer) == nil && integer != 0 {
+				containerDemand = true
+			}
+			if path == "container_image_sha256" {
+				containerDemand = true
+			}
+		}
+		return bytes.Equal(values["container_read_only_root"], []byte(strconv.FormatBool(containerDemand))), true
+	}
+	if predicate.Operator == PredicateStateTransition {
+		switch predicate.PredicateID {
+		case "P-BARRIER-001", "P-EVENT-001", "P-BARRIER-008", "P-PUBLISHER-006", "P-predecessor-writer-lease-v1-ROW-001", "P-RESOURCE-002":
+			return frozenStatePredicateV1(entry, predicate, paths, values), true
+		}
+	}
+	if predicate.Operator == PredicateIfAndOnlyIf || predicate.Operator == PredicateImplies {
+		if valid, handled := frozenImplicationPredicateV1(entry, predicate, values); handled {
+			return valid, true
+		}
+	}
+	if _, compatible := frozenCrossRecordPredicateIDsV1[predicate.PredicateID]; compatible {
+		expected := minimalCanonicalPredicateValuesV1(entry)
+		path := frozenCrossRecordMutationPathV1(entry, predicate, paths, fields)
+		if path == "" {
+			return false, true
+		}
+		actual, present := values[path]
+		want, expectedPresent := expected[path]
+		return present == expectedPresent && (!present || bytes.Equal(actual, want)), true
+	}
+	return false, false
+}
+
+var frozenCrossRecordPredicateIDsV1 = map[string]struct{}{
+	"P-PUBLISHER-003": {}, "P-PUBLISHER-004": {}, "P-PUBLISHER-005": {}, "P-PUBLISHER-007": {},
+	"P-RESOURCE-003": {}, "P-DIFF-002": {}, "P-DIFF-003": {}, "P-DIFF-004": {}, "P-DIFF-005": {},
+	"P-BARRIER-002": {}, "P-BARRIER-003": {}, "P-BARRIER-004": {}, "P-BARRIER-005": {}, "P-BARRIER-007": {},
+	"P-RECONCILE-001": {}, "P-RECONCILE-002": {}, "P-MERGE-000": {}, "P-MERGE-001": {}, "P-MERGE-002": {},
+	"P-READY-001": {}, "P-PR-001": {}, "P-PR-003": {}, "P-EFFECT-001": {}, "P-EFFECT-002": {},
+	"P-PUBLISHER-006": {}, "P-PARENT-001": {}, "P-SUBJECT-002": {},
+	"P-effect-attempt-index-v1-ROW-001": {}, "P-effect-attempt-index-v1-ROW-002": {},
+	"P-effect-reauthorization-v1-ROW-001": {}, "P-phase-authority-v4-ROW-001": {},
+	"P-process-absence-observation-v1-ROW-001": {}, "P-process-absence-observation-v1-ROW-002": {},
+	"P-provider-read-response-v1-ROW-001": {}, "P-provider-read-response-v1-ROW-009": {},
+	"P-secret-scan-evidence-v2-ROW-001": {}, "P-stage-subject-v1-ROW-002": {},
+	"P-worker-observation-key-v1-ROW-002": {}, "P-github-git-ref-observation-v1-ROW-001": {},
+	"P-container-absence-observation-v1-ROW-002": {}, "P-pr-effect-request-v1-ROW-004": {},
+	"P-github-installation-repositories-page-v1-ROW-001": {}, "P-merge-provider-observation-v1-ROW-002": {},
+	"P-governance-controller-state-v2-ROW-002": {},
+	"P-pr-effect-reconciliation-v1-ROW-003":    {}, "P-merge-effect-reconciliation-v1-ROW-003": {},
+	"P-pr-provider-observation-v1-ROW-004":         {},
+	"P-provider-authentication-context-v1-ROW-002": {},
+	"P-ledger-evidence-ref-list-v1-ROW-001":        {},
+	"P-ledger-evidence-ref-list-v1-ROW-002":        {},
+	"P-pr-publication-authority-v1-ROW-001":        {},
+	"P-stage-diff-lineage-v1-ROW-003":              {},
+}
+
+func frozenDerivationPredicateValidV1(predicate PredicateDescriptorV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) bool {
+	stringValue := func(path string) string {
+		var value string
+		_ = json.Unmarshal(values[path], &value)
+		return value
+	}
+	switch predicate.PredicateID {
+	case "P-DIFF-001":
+		rules := map[string]string{
+			"B_IMPLEMENTATION":       "B_GRANT_BASE_TO_B_CANDIDATE",
+			"C_BRANCH_ACCEPTANCE":    "C_GRANT_BASE_TO_UNCHANGED_C_CANDIDATE",
+			"INTEGRATION_ACCEPTANCE": "INTEGRATION_BASE_TO_INTEGRATED_HEAD",
+			"POST_MERGE_ACCEPTANCE":  "PREMERGE_BASE_TO_MERGE_RESULT",
+		}
+		return stringValue("derivation_rule") == rules[stringValue("stage")]
+	case "P-github-repository-observation-v1-ROW-001":
+		permission := stringValue("permission")
+		return permission == "WRITE" || permission == "MAINTAIN" || permission == "ADMIN"
+	case "P-effect-pre-call-closure-v1-ROW-001":
+		if context == nil {
+			return false
+		}
+		prefix := "Merge"
+		if stringValue("effect_kind") == "PR" {
+			prefix = "PR"
+		}
+		for path, target := range map[string]string{
+			"intent_sha256": prefix + "EffectIntentV1", "claim_sha256": prefix + "EffectClaimV1", "provider_request_sha256": prefix + "EffectRequestV1",
+		} {
+			var digest string
+			if json.Unmarshal(values[path], &digest) != nil {
+				return false
+			}
+			positive := context.recordPositiveByType[target]
+			if len(positive) == 0 || digest != sha256Hex(positive) {
+				return false
+			}
+		}
+		return true
+	case "P-PR-002":
+		_, number := values["pr_number"]
+		_, node := values["pr_node_id"]
+		mode := stringValue("mutation_mode")
+		return !number && !node && mode == "CREATE" || number && node && mode == "UPDATE"
+	case "P-MERGE-003":
+		var requests, responses []json.RawMessage
+		if json.Unmarshal(values["observation_read_request_sha256s"], &requests) != nil || json.Unmarshal(values["observation_read_response_sha256s"], &responses) != nil {
+			return false
+		}
+		_, credential := values["observation_credential_use_sha256"]
+		_, authentication := values["observation_authentication_context_sha256"]
+		switch stringValue("observation_source") {
+		case "MUTATION_RESPONSE":
+			return len(requests) == 0 && len(responses) == 0 && !credential && !authentication
+		case "READ_ONLY_RECONCILIATION":
+			return len(requests) == 2 && len(responses) == 2 && credential && authentication
+		default:
+			return false
+		}
+	case "P-nested:WorkflowBackendIdentityV1-ROW-002":
+		var digest string
+		if context == nil || json.Unmarshal(values["composition_sha256"], &digest) != nil {
+			return false
+		}
+		return context.digestValidForTarget("ArtifactBlobV1", digest)
+	case "P-stage-secret-set-v1-ROW-001":
+		var uses []map[string]json.RawMessage
+		if json.Unmarshal(values["credential_uses"], &uses) != nil || len(uses) == 0 {
+			return false
+		}
+		seen := make(map[string]struct{}, len(uses))
+		for _, use := range uses {
+			secretID := string(use["secret_id"])
+			if secretID == "" {
+				return false
+			}
+			if _, duplicate := seen[secretID]; duplicate {
+				return false
+			}
+			seen[secretID] = struct{}{}
+		}
+		return true
+	case "P-worker-capacity-reservation-v1-ROW-004":
+		_, parent := values["parent_reservation_sha256"]
+		_, revision := values["parent_envelope_revision"]
+		return parent == revision
+	default:
+		return false
+	}
+}
+
+func applyFrozenDerivationPositiveV1(predicate PredicateDescriptorV1, values map[string]json.RawMessage) error {
+	setString := func(path, value string) { values[path] = mustMarshalCanonicalVectorStringV1(value) }
+	stringValue := func(path string) string {
+		var value string
+		_ = json.Unmarshal(values[path], &value)
+		return value
+	}
+	switch predicate.PredicateID {
+	case "P-DIFF-001":
+		rules := map[string]string{
+			"B_IMPLEMENTATION":       "B_GRANT_BASE_TO_B_CANDIDATE",
+			"C_BRANCH_ACCEPTANCE":    "C_GRANT_BASE_TO_UNCHANGED_C_CANDIDATE",
+			"INTEGRATION_ACCEPTANCE": "INTEGRATION_BASE_TO_INTEGRATED_HEAD",
+			"POST_MERGE_ACCEPTANCE":  "PREMERGE_BASE_TO_MERGE_RESULT",
+		}
+		rule := rules[stringValue("stage")]
+		if rule == "" {
+			return errors.New("P-DIFF-001 has an unknown stage")
+		}
+		setString("derivation_rule", rule)
+	case "P-PR-002":
+		_, number := values["pr_number"]
+		_, node := values["pr_node_id"]
+		if number != node {
+			return errors.New("P-PR-002 has a partial PR identity")
+		}
+		if number {
+			setString("mutation_mode", "UPDATE")
+		} else {
+			setString("mutation_mode", "CREATE")
+		}
+	case "P-MERGE-003":
+		setString("observation_source", "MUTATION_RESPONSE")
+		values["observation_read_request_sha256s"] = []byte("[]")
+		values["observation_read_response_sha256s"] = []byte("[]")
+		delete(values, "observation_credential_use_sha256")
+		delete(values, "observation_authentication_context_sha256")
+	case "P-nested:WorkflowBackendIdentityV1-ROW-002":
+		// The composition is an ArtifactBlobV1 typed record installed by the
+		// catalog context; its derivation is validated against that record.
+	case "P-github-repository-observation-v1-ROW-001":
+		setString("permission", "ADMIN")
+	case "P-worker-capacity-reservation-v1-ROW-004":
+		if _, parent := values["parent_reservation_sha256"]; parent {
+			if _, revision := values["parent_envelope_revision"]; !revision {
+				values["parent_envelope_revision"] = []byte("0")
+			}
+		} else {
+			delete(values, "parent_envelope_revision")
+		}
+	case "P-effect-pre-call-closure-v1-ROW-001", "P-stage-secret-set-v1-ROW-001":
+		// Typed-reference materialization and descriptor-valid set generation
+		// already install the exact positive operands for these formulas.
+	default:
+		return fmt.Errorf("derivation %s has no frozen formula", predicate.PredicateID)
+	}
+	return nil
+}
+
+func predicateHasFrozenFormulaV1(predicate PredicateDescriptorV1) bool {
+	if predicate.Operator == PredicateDerivation || predicate.PredicateID == "P-RESOURCE-001" {
+		return true
+	}
+	if _, ok := frozenCrossRecordPredicateIDsV1[predicate.PredicateID]; ok {
+		return true
+	}
+	switch predicate.PredicateID {
+	case "P-PUBLISHER-001", "P-PUBLISHER-002", "P-SUBJECT-001", "P-BARRIER-001", "P-EVENT-001", "P-BARRIER-008", "P-predecessor-writer-lease-v1-ROW-001", "P-RESOURCE-002":
+		return true
+	}
+	return false
 }
 
 func frozenImplicationPredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, values map[string]json.RawMessage) (bool, bool) {
@@ -775,7 +1374,7 @@ func frozenImplicationPredicateV1(entry CanonicalVectorEntryV1, predicate Predic
 	return false, false
 }
 
-func frozenStatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, paths []string, values, expected map[string]json.RawMessage) bool {
+func frozenStatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, paths []string, values map[string]json.RawMessage) bool {
 	stringValue := func(path string) string {
 		var value string
 		_ = json.Unmarshal(values[path], &value)
@@ -820,19 +1419,23 @@ func frozenStatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDes
 			return edges[stringValue(paths[0])+"\x00"+stringValue(paths[1])]
 		}
 	}
-	path := canonicalStateDestinationPathV1(entry, predicate, paths)
-	actual, present := values[path]
-	want, expectedPresent := expected[path]
-	return path != "" && present == expectedPresent && (!present || bytes.Equal(actual, want))
+	return false
 }
 
 func frozenDigestPreimagePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, values, expected map[string]json.RawMessage) bool {
 	if len(predicate.FieldPaths) == 0 {
 		return false
 	}
+	if strings.HasSuffix(predicate.PredicateID, "-ROW-003") {
+		if digest, handled := absenceProbeResultDigestV1(entry.SchemaID, values); handled {
+			var actual string
+			return json.Unmarshal(values["probe_result_sha256"], &actual) == nil && actual == digest
+		}
+	}
 	if predicate.PredicateID == "P-effect-ledger-event-preimage-v1-ROW-003" {
 		var eventID string
-		return json.Unmarshal(values["event_id"], &eventID) == nil && eventID == effectLedgerEventIDV1(entry, values)
+		expected, err := effectLedgerEventIDV1(values)
+		return err == nil && json.Unmarshal(values["event_id"], &eventID) == nil && eventID == expected
 	}
 	path := predicate.FieldPaths[0]
 	fieldIndex := -1
@@ -913,30 +1516,98 @@ func frozenDigestPreimagePredicateV1(entry CanonicalVectorEntryV1, predicate Pre
 	return true
 }
 
-func effectLedgerEventIDV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage) string {
-	selected := make([]WireFieldDescriptorV1, 0, len(entry.Fields))
-	for _, field := range entry.Fields {
-		if field.FieldPath == "event_id" {
-			continue
-		}
-		selected = append(selected, field)
-		if field.FieldPath == "evidence_refs" {
-			break
-		}
+func absenceProbeResultDigestV1(schemaID string, values map[string]json.RawMessage) (string, bool) {
+	if schemaID != "process-absence-observation-v1" && schemaID != "cgroup-absence-observation-v1" && schemaID != "container-absence-observation-v1" {
+		return "", false
 	}
-	preimage, err := marshalCanonicalVectorObjectV1(selected, values, "")
-	if err != nil {
-		return ""
+	stringValue := func(path string) (string, bool) {
+		var value string
+		err := json.Unmarshal(values[path], &value)
+		return value, err == nil
 	}
-	digest := sha256.Sum256(preimage)
-	return hex.EncodeToString(digest[:16])
+	probeMethod, ok := stringValue("probe_method")
+	if !ok {
+		return "", true
+	}
+	var preimage bytes.Buffer
+	preimage.WriteString(`{"probe_method":`)
+	methodJSON, _ := json.Marshal(probeMethod)
+	preimage.Write(methodJSON)
+	switch schemaID {
+	case "process-absence-observation-v1":
+		path, pathOK := stringValue("proc_stat_path")
+		expected, expectedOK := stringValue("expected_start_ticks")
+		var disposition string
+		_ = json.Unmarshal(values["process_disposition"], &disposition)
+		if !pathOK || !expectedOK {
+			return "", true
+		}
+		pathJSON, _ := json.Marshal(path)
+		expectedJSON, _ := json.Marshal(expected)
+		preimage.WriteString(`,"path":`)
+		preimage.Write(pathJSON)
+		preimage.WriteString(`,"expected_start_ticks":`)
+		preimage.Write(expectedJSON)
+		if observed, present := values["observed_start_ticks"]; present {
+			preimage.WriteString(`,"observed_start_ticks":`)
+			preimage.Write(observed)
+		}
+		resultJSON, _ := json.Marshal(disposition)
+		preimage.WriteString(`,"result":`)
+		preimage.Write(resultJSON)
+	case "cgroup-absence-observation-v1":
+		path, pathOK := stringValue("cgroup_path")
+		if !pathOK {
+			return "", true
+		}
+		pathJSON, _ := json.Marshal(path)
+		preimage.WriteString(`,"path":`)
+		preimage.Write(pathJSON)
+		preimage.WriteString(`,"inode":`)
+		preimage.Write(values["cgroup_inode"])
+		preimage.WriteString(`,"populated":`)
+		preimage.Write(values["populated"])
+	case "container-absence-observation-v1":
+		containerID, idOK := stringValue("container_id")
+		disposition, dispositionOK := stringValue("container_disposition")
+		if !idOK || !dispositionOK {
+			return "", true
+		}
+		idJSON, _ := json.Marshal(containerID)
+		resultJSON, _ := json.Marshal(disposition)
+		preimage.WriteString(`,"container_id":`)
+		preimage.Write(idJSON)
+		preimage.WriteString(`,"http_status":404,"result":`)
+		preimage.Write(resultJSON)
+	default:
+		return "", false
+	}
+	preimage.WriteByte('}')
+	return sha256Hex(preimage.Bytes()), true
 }
 
-func mutateCanonicalVectorV1(entry CanonicalVectorEntryV1, positive []byte, recipe CanonicalRejectionVectorV1, positiveByRecord ...map[string][]byte) ([]byte, error) {
-	var recordPositives map[string][]byte
-	if len(positiveByRecord) != 0 {
-		recordPositives = positiveByRecord[0]
+func effectLedgerEventIDV1(values map[string]json.RawMessage) (string, error) {
+	var effectKind, stateTo string
+	if json.Unmarshal(values["effect_kind"], &effectKind) != nil || json.Unmarshal(values["state_to"], &stateTo) != nil {
+		return "", errors.New("event ID kind or destination is unresolved")
 	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(values["payload"], &payload) != nil {
+		return "", errors.New("event ID payload is unresolved")
+	}
+	var intentDigest, winningOutcomeDigest string
+	if json.Unmarshal(payload["intent_sha256"], &intentDigest) != nil || json.Unmarshal(payload["winning_outcome_sha256"], &winningOutcomeDigest) != nil {
+		return "", errors.New("event ID payload digest chain is unresolved")
+	}
+	if effectKind == "" || stateTo == "" || validateExactLowerHex(intentDigest, 64) != nil || validateExactLowerHex(winningOutcomeDigest, 64) != nil {
+		return "", errors.New("event ID tuple is invalid")
+	}
+	preimage := strings.Join([]string{"ABCP-V4-LEDGER-EVENT-ID-V1", effectKind, intentDigest, winningOutcomeDigest, stateTo}, "\x00")
+	digest := sha256.Sum256([]byte(preimage))
+	return hex.EncodeToString(digest[:16]), nil
+}
+
+func mutateCanonicalVectorV1(entry CanonicalVectorEntryV1, positive []byte, recipe CanonicalRejectionVectorV1, recordPositives map[string][]byte, context *canonicalPredicateContextV1) ([]byte, error) {
 	if entry.RecordName == "ArtifactBlobV1" && entry.SchemaID == "artifact-blob-v1" {
 		switch recipe.Mutation {
 		case "BELOW_MIN":
@@ -990,7 +1661,7 @@ func mutateCanonicalVectorV1(entry CanonicalVectorEntryV1, positive []byte, reci
 		if !found {
 			return nil, fmt.Errorf("unknown predicate %s", predicateID)
 		}
-		if err := mutatePredicateV1(entry, predicate, values, recordPositives); err != nil {
+		if err := mutatePredicateV1(entry, predicate, values, recordPositives, context); err != nil {
 			return nil, fmt.Errorf("mutate %s paths=%v arguments=%v: %w", predicate.Operator, predicate.FieldPaths, predicate.Arguments, err)
 		}
 		changedPaths := append([]string(nil), predicate.FieldPaths...)
@@ -1347,14 +2018,34 @@ func scalarForDescriptorV1(field WireFieldDescriptorV1, value string) (json.RawM
 	}
 }
 
-func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, values map[string]json.RawMessage, recordPositives map[string][]byte) error {
+func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, values map[string]json.RawMessage, recordPositives map[string][]byte, context *canonicalPredicateContextV1) error {
 	fields := make(map[string]WireFieldDescriptorV1, len(entry.Fields))
 	for _, field := range entry.Fields {
 		fields[field.FieldPath] = field
 	}
-	paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
-	if len(paths) == 0 {
-		return fmt.Errorf("predicate %s has no executable field operands in %q", predicate.PredicateID, strings.Join(predicate.Arguments, " "))
+	paths, operandErr := resolveCanonicalPredicateOperandPathsV1(entry, predicate, fields)
+	if operandErr != nil && !predicateHasFrozenFormulaV1(predicate) {
+		return operandErr
+	}
+	if predicate.PredicateID == "P-EVENT-001" && entry.RecordName != "EffectLedgerEventPreimageV1" {
+		changed, err := primitiveValidChangeV1(fields["event_id"], values["event_id"])
+		if err != nil {
+			return err
+		}
+		values["event_id"] = changed
+		return nil
+	}
+	if _, compatible := frozenCrossRecordPredicateIDsV1[predicate.PredicateID]; compatible {
+		path := frozenCrossRecordMutationPathV1(entry, predicate, paths, fields)
+		if path == "" {
+			return operandErr
+		}
+		changed, err := primitiveValidChangeV1(fields[path], values[path])
+		if err != nil {
+			return err
+		}
+		values[path] = changed
+		return nil
 	}
 	switch predicate.Operator {
 	case PredicateExactLiteral:
@@ -1366,15 +2057,22 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 		values[paths[0]], err = scalarForDescriptorV1(field, changed)
 		return err
 	case PredicateAllEqual:
-		if len(paths) == 0 {
-			return errors.New("ALL_EQUAL requires an operand")
+		if len(paths) < 2 {
+			return errors.New("ALL_EQUAL requires two named operands")
 		}
-		field := fields[paths[0]]
-		changed, err := primitiveValidChangeV1(field, values[paths[0]])
-		if err != nil {
-			return err
+		for _, path := range paths {
+			field := fields[path]
+			if field.LiteralValue != "" {
+				continue
+			}
+			changed, err := primitiveValidChangeV1(field, values[path])
+			if err != nil {
+				return err
+			}
+			values[path] = changed
+			return nil
 		}
-		values[paths[0]] = changed
+		return errors.New("ALL_EQUAL has no non-literal participant")
 	case PredicateExactlyOne:
 		for _, path := range paths {
 			if _, present := values[path]; !present {
@@ -1413,14 +2111,7 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 			}
 		}
 		if len(arrayPaths) < 2 {
-			for _, field := range entry.Fields {
-				if field.JSONType == WireArray && !containsCanonicalVectorStringV1(arrayPaths, field.FieldPath) {
-					arrayPaths = append(arrayPaths, field.FieldPath)
-				}
-			}
-		}
-		if len(arrayPaths) == 0 {
-			return errors.New("SUBSET requires an array operand")
+			return errors.New("SUBSET requires two named array operands")
 		}
 		field := fields[arrayPaths[0]]
 		var subset, superset []json.RawMessage
@@ -1451,22 +2142,62 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 		}
 		values[arrayPaths[0]], _ = json.Marshal(subset)
 	case PredicateDigestPreimage:
-		candidates := append([]string(nil), paths...)
+		if _, handled := absenceProbeResultDigestV1(entry.SchemaID, values); handled && containsCanonicalVectorStringV1(predicate.FieldPaths, "probe_result_sha256") {
+			path := map[string]string{
+				"process-absence-observation-v1":   "proc_stat_path",
+				"cgroup-absence-observation-v1":    "cgroup_path",
+				"container-absence-observation-v1": "container_id",
+			}[entry.SchemaID]
+			changed, err := primitiveValidChangeV1(fields[path], values[path])
+			if err != nil {
+				return err
+			}
+			values[path] = changed
+			return nil
+		}
+		if predicate.PredicateID == "P-effect-ledger-event-preimage-v1-ROW-003" {
+			payload, order, duplicate, err := decodeCanonicalVectorObjectV1(values["payload"])
+			if err != nil || duplicate {
+				return errors.New("event ID payload is invalid")
+			}
+			var intent string
+			if json.Unmarshal(payload["intent_sha256"], &intent) != nil {
+				return errors.New("event ID intent digest is invalid")
+			}
+			payload["intent_sha256"] = mustMarshalCanonicalVectorStringV1(flipFirstHexV1(intent))
+			values["payload"] = marshalCanonicalRawObjectV1(order, payload)
+			return nil
+		}
 		outputs := make(map[string]struct{})
+		candidates := append([]string(nil), paths...)
+		selfDigest := false
 		for _, path := range paths {
 			field := fields[path]
 			if field.DigestTarget != "" || strings.HasSuffix(path, "_sha256") || path == "event_id" {
 				outputs[path] = struct{}{}
 			}
 		}
-		for _, field := range entry.Fields {
-			if !containsCanonicalVectorStringV1(candidates, field.FieldPath) {
-				candidates = append(candidates, field.FieldPath)
+		for output := range outputs {
+			fieldIndex := -1
+			for index, field := range entry.Fields {
+				if field.FieldPath == output {
+					fieldIndex = index
+					break
+				}
+			}
+			if isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, fieldIndex) {
+				selfDigest = true
+				candidates = candidates[:0]
+				for _, field := range entry.Fields[:fieldIndex] {
+					candidates = append(candidates, field.FieldPath)
+				}
+				candidates = append(candidates, output)
+				break
 			}
 		}
 		for _, path := range candidates {
 			field := fields[path]
-			if _, output := outputs[path]; output {
+			if _, output := outputs[path]; output || field.LiteralValue != "" || field.DigestTarget != "" || selfDigest && (field.JSONType == WireObject || field.JSONType == WireArray) {
 				continue
 			}
 			raw, present := values[path]
@@ -1477,6 +2208,19 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 			if err == nil {
 				values[path] = changed
 				return nil
+			}
+		}
+		if selfDigest {
+			for _, path := range candidates {
+				field := fields[path]
+				if _, output := outputs[path]; output || field.DigestTarget != "" || field.LiteralValue == "" {
+					continue
+				}
+				changed, err := primitiveValidChangeV1(field, values[path])
+				if err == nil {
+					values[path] = changed
+					return nil
+				}
 			}
 		}
 		return errors.New("digest preimage has no primitive-valid mutable operand")
@@ -1492,22 +2236,14 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 				}
 				values[path] = raw
 			}
-			if field.DigestTarget == "" {
-				baseline := minimalCanonicalPredicateValuesV1(entry)[path]
-				if len(baseline) == 0 {
-					baseline = raw
-				}
-				changed, err := primitiveValidChangeV1(field, baseline)
-				if err != nil {
-					continue
-				}
-				values[path] = changed
-				return nil
-			}
-			foreign, err := foreignTypedReferenceJSONV1(field, recordPositives)
-			if err != nil {
+			if field.DigestTarget == "" || context == nil {
 				continue
 			}
+			foreignDigest, ok := context.firstForeignDigest(field.DigestTarget)
+			if !ok {
+				continue
+			}
+			foreign := mustMarshalCanonicalVectorStringV1(foreignDigest)
 			if field.JSONType == WireArray {
 				var elements []json.RawMessage
 				if json.Unmarshal(raw, &elements) != nil {
@@ -1528,27 +2264,18 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 		}
 		return errors.New("typed reference has no descriptor-valid substitution")
 	case PredicateDerivation:
-		path := canonicalDerivedOutputPathV1(entry, predicate, fields)
-		field := fields[path]
-		if _, present := values[path]; !present {
-			var err error
-			values[path], err = minimalDescriptorJSON(field)
-			if err != nil {
-				return err
-			}
-		}
-		changed, err := primitiveValidChangeV1(field, values[path])
-		if err != nil {
-			return err
-		}
-		values[path] = changed
+		return mutateFrozenDerivationPredicateV1(entry, predicate, fields, values, context)
 	case PredicateStateTransition:
 		return mutateFrozenStatePredicateV1(entry, predicate, paths, fields, values)
 	case PredicateIfAndOnlyIf, PredicateImplies:
 		return mutateFrozenImplicationPredicateV1(entry, predicate, paths, fields, values)
 	case PredicateAggregateLEQ:
+		if predicate.PredicateID == "P-RESOURCE-001" {
+			values["container_read_only_root"] = []byte("true")
+			return nil
+		}
 		integerPaths := integerPredicatePathsV1(paths, fields)
-		if len(integerPaths) < 2 {
+		if len(integerPaths) != len(paths) || len(integerPaths) < 2 {
 			return errors.New("aggregate requires addend and limit")
 		}
 		var sum uint64
@@ -1577,35 +2304,120 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 	return nil
 }
 
-func foreignTypedReferenceJSONV1(field WireFieldDescriptorV1, recordPositives map[string][]byte) (json.RawMessage, error) {
-	names := make([]string, 0, len(recordPositives))
-	for name := range recordPositives {
-		if name != field.DigestTarget {
-			names = append(names, name)
+func frozenCrossRecordMutationPathV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, paths []string, fields map[string]WireFieldDescriptorV1) string {
+	candidates := map[string][]string{
+		"P-PUBLISHER-003": {"opened_revision"}, "P-PUBLISHER-004": {"committed_stage_revision"},
+		"P-PUBLISHER-005": {"finalized_revision"}, "P-PUBLISHER-007": {"abandoned_revision"},
+		"P-RESOURCE-003": {"direct_materialized_resource_profile_id", "materialized_resource_profile_id"},
+		"P-DIFF-002":     {"base_oid"}, "P-DIFF-004": {"diff_base_oid"},
+		"P-BARRIER-002": {"expected_pg_revision"}, "P-BARRIER-003": {"allowed_state_to"},
+		"P-BARRIER-004": {"pg_revision"}, "P-BARRIER-005": {"locked_pg_revision"},
+		"P-BARRIER-007": {"resolved_at_pg_revision"}, "P-RECONCILE-001": {"derived_at_pg_revision"},
+		"P-RECONCILE-002": {"reconciliation_ordinal"}, "P-MERGE-000": {"invocation_id", "write_id"},
+		"P-MERGE-001": {"base_ref"}, "P-MERGE-002": {"request_identity"},
+		"P-READY-001": {"run_id", "repository_identity"}, "P-PR-001": {"base_ref"},
+		"P-PR-003": {"observation_source"}, "P-EFFECT-001": {"principal_type"},
+		"P-EFFECT-002": {"method"}, "P-PUBLISHER-006": {"proved_at_revision", "proof_assembled_at"},
+		"P-PARENT-001": {"sequence"}, "P-SUBJECT-002": {"stage_generation"},
+		"P-effect-attempt-index-v1-ROW-001": {"effect_ordinal"}, "P-effect-attempt-index-v1-ROW-002": {"effect_ordinal"},
+		"P-effect-reauthorization-v1-ROW-001": {"new_effect_ordinal"}, "P-phase-authority-v4-ROW-001": {"stage"},
+		"P-process-absence-observation-v1-ROW-001": {"expected_pid"}, "P-process-absence-observation-v1-ROW-002": {"expected_start_ticks"},
+		"P-provider-read-response-v1-ROW-001": {"parser"}, "P-provider-read-response-v1-ROW-009": {"parser"},
+		"P-secret-scan-evidence-v2-ROW-001": {"match_count"}, "P-stage-subject-v1-ROW-002": {"stage"},
+		"P-worker-observation-key-v1-ROW-002": {"observer_identity"}, "P-github-git-ref-observation-v1-ROW-001": {"ref"},
+		"P-container-absence-observation-v1-ROW-002": {"container_id"}, "P-pr-effect-request-v1-ROW-004": {"body"},
+		"P-github-installation-repositories-page-v1-ROW-001": {"has_next"}, "P-merge-provider-observation-v1-ROW-002": {"base_before_oid"},
+		"P-governance-controller-state-v2-ROW-002": {"revision"},
+		"P-pr-effect-reconciliation-v1-ROW-003":    {"disposition"}, "P-merge-effect-reconciliation-v1-ROW-003": {"disposition"},
+		"P-pr-provider-observation-v1-ROW-004":         {"authenticated"},
+		"P-provider-authentication-context-v1-ROW-002": {"valid_through"},
+		"P-ledger-evidence-ref-list-v1-ROW-001":        {"kind"},
+		"P-ledger-evidence-ref-list-v1-ROW-002":        {"kind"},
+		"P-pr-publication-authority-v1-ROW-001":        {"repository_identity"},
+		"P-stage-diff-lineage-v1-ROW-003":              {"base_oid"},
+	}
+	for _, path := range candidates[predicate.PredicateID] {
+		if field, ok := fields[path]; ok && field.JSONType != WireObject && field.JSONType != WireRawJSON {
+			return path
 		}
 	}
-	sort.Strings(names)
-	var foreign []byte
-	if len(names) != 0 {
-		foreign = recordPositives[names[0]]
+	for _, path := range paths {
+		if field := fields[path]; field.LiteralValue == "" && field.JSONType != WireObject && field.JSONType != WireRawJSON {
+			return path
+		}
 	}
-	if len(foreign) == 0 {
-		foreign = []byte("CanonicalVectorEntryV1")
-	}
-	digest := sha256Hex(foreign)
-	elementField := field
-	if field.JSONType == WireArray {
-		elementType := arrayElementTypeV1(field.ValueType)
-		resolved, err := ResolveWireFieldDescriptorV1(field.SchemaID, field.FieldPath, field.Ordinal, elementType, false)
+	return ""
+}
+
+func mutateFrozenDerivationPredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, fields map[string]WireFieldDescriptorV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) error {
+	switch predicate.PredicateID {
+	case "P-DIFF-001":
+		field := fields["derivation_rule"]
+		changed, err := primitiveValidChangeV1(field, values["derivation_rule"])
 		if err != nil {
-			return nil, err
+			return err
 		}
-		elementField = resolved
+		values["derivation_rule"] = changed
+	case "P-github-repository-observation-v1-ROW-001":
+		values["permission"] = mustMarshalCanonicalVectorStringV1("READ")
+	case "P-effect-pre-call-closure-v1-ROW-001":
+		if context == nil {
+			return errors.New("effect union derivation has no catalog context")
+		}
+		var kind string
+		_ = json.Unmarshal(values["effect_kind"], &kind)
+		foreignType := "PREffectIntentV1"
+		if kind == "PR" {
+			foreignType = "MergeEffectIntentV1"
+		}
+		positive := context.recordPositiveByType[foreignType]
+		if len(positive) == 0 {
+			return errors.New("effect union derivation has no opposite-arm record")
+		}
+		values["intent_sha256"] = mustMarshalCanonicalVectorStringV1(sha256Hex(positive))
+	case "P-PR-002":
+		if string(values["mutation_mode"]) == `"CREATE"` {
+			values["mutation_mode"] = mustMarshalCanonicalVectorStringV1("UPDATE")
+		} else {
+			values["mutation_mode"] = mustMarshalCanonicalVectorStringV1("CREATE")
+		}
+	case "P-MERGE-003":
+		values["observation_source"] = mustMarshalCanonicalVectorStringV1("READ_ONLY_RECONCILIATION")
+	case "P-nested:WorkflowBackendIdentityV1-ROW-002":
+		var digest string
+		if json.Unmarshal(values["composition_sha256"], &digest) != nil {
+			return errors.New("workflow backend composition digest is invalid")
+		}
+		values["composition_sha256"] = mustMarshalCanonicalVectorStringV1(flipFirstHexV1(digest))
+	case "P-stage-secret-set-v1-ROW-001":
+		var uses []json.RawMessage
+		if json.Unmarshal(values["credential_uses"], &uses) != nil || len(uses) == 0 {
+			return errors.New("stage secret derivation has no credential use")
+		}
+		var duplicate map[string]json.RawMessage
+		if json.Unmarshal(uses[0], &duplicate) != nil {
+			return errors.New("stage secret credential use is invalid")
+		}
+		duplicate["byte_length"] = []byte("1")
+		order := []string{"secret_id", "secret_capability", "acquisition_identity_sha256", "value_commitment_sha256", "byte_length"}
+		second := marshalCanonicalRawObjectV1(order, duplicate)
+		uses = append(uses, second)
+		sort.Slice(uses, func(i, j int) bool { return bytes.Compare(uses[i], uses[j]) < 0 })
+		values["credential_uses"], _ = json.Marshal(uses)
+	case "P-worker-capacity-reservation-v1-ROW-004":
+		if _, parent := values["parent_reservation_sha256"]; parent {
+			delete(values, "parent_envelope_revision")
+		} else {
+			value, err := minimalDescriptorJSON(fields["parent_envelope_revision"])
+			if err != nil {
+				return err
+			}
+			values["parent_envelope_revision"] = value
+		}
+	default:
+		return fmt.Errorf("derivation %s has no frozen mutation", predicate.PredicateID)
 	}
-	if elementField.JSONType != WireString || validateCanonicalDescriptorValueV1(elementField, mustMarshalCanonicalVectorStringV1(digest)) != "" {
-		return nil, errors.New("typed reference substitution is not descriptor-valid")
-	}
-	return mustMarshalCanonicalVectorStringV1(digest), nil
+	return nil
 }
 
 func mustMarshalCanonicalVectorStringV1(value string) json.RawMessage {
@@ -1632,36 +2444,28 @@ func mutateFrozenImplicationPredicateV1(entry CanonicalVectorEntryV1, predicate 
 	if len(paths) < 2 {
 		return errors.New("implication requires antecedent and consequent")
 	}
-	expected := minimalCanonicalPredicateValuesV1(entry)
-	values[paths[0]] = append(json.RawMessage(nil), expected[paths[0]]...)
+	antecedent := paths[0]
 	consequent := paths[1]
-	field := fields[consequent]
-	if _, expectedPresent := expected[consequent]; !expectedPresent {
-		value, err := descriptorPositiveForMutationV1(field, nil)
+	antecedentField := fields[antecedent]
+	consequentField := fields[consequent]
+	if antecedentField.JSONType == WireBoolean {
+		values[antecedent] = []byte("true")
+	} else if antecedentField.Optional {
+		value, err := descriptorPositiveForMutationV1(antecedentField, nil)
 		if err != nil {
 			return err
 		}
-		values[consequent] = value
-		return nil
+		values[antecedent] = value
+	} else {
+		return errors.New("implication antecedent has no exact truth semantics")
 	}
-	if field.Optional {
+	if consequentField.JSONType == WireBoolean {
+		values[consequent] = []byte("false")
+	} else if consequentField.Optional {
 		delete(values, consequent)
-		return nil
+	} else {
+		return errors.New("implication consequent has no exact false semantics")
 	}
-	if fields[paths[0]].JSONType == WireBoolean && field.JSONType == WireBoolean {
-		values[paths[0]] = []byte("true")
-		values[consequent] = []byte("false")
-		return nil
-	}
-	if field.JSONType == WireBoolean {
-		values[consequent] = []byte("false")
-		return nil
-	}
-	changed, err := primitiveValidChangeV1(field, expected[consequent])
-	if err != nil {
-		return err
-	}
-	values[consequent] = changed
 	return nil
 }
 
@@ -1676,10 +2480,38 @@ func mutateFrozenStatePredicateV1(entry CanonicalVectorEntryV1, predicate Predic
 		values["commitment"] = changed
 		return nil
 	case "P-EVENT-001":
-		setString("state_to", "a")
+		var source string
+		_ = json.Unmarshal(values["state_from"], &source)
+		allowed := map[string]bool{}
+		var effectKind string
+		_ = json.Unmarshal(values["effect_kind"], &effectKind)
+		if effectKind == "PR" {
+			allowed[source+"\x00READY_FOR_MERGE"] = true
+		} else {
+			allowed[source+"\x00MERGED"] = true
+		}
+		destination, err := firstDisallowedClosedStateV1(source, frozenEnumValues["coordination_state"], allowed)
+		if err != nil {
+			return err
+		}
+		setString("state_to", destination)
 		return nil
 	case "P-BARRIER-008":
-		setString("applied_state_to", "a")
+		var source string
+		_ = json.Unmarshal(values["source_state"], &source)
+		allowed := map[string]bool{}
+		var effectKind string
+		_ = json.Unmarshal(values["effect_kind"], &effectKind)
+		if effectKind == "PR" {
+			allowed[source+"\x00READY_FOR_MERGE"] = true
+		} else {
+			allowed[source+"\x00MERGED"] = true
+		}
+		destination, err := firstDisallowedClosedStateV1(source, frozenEnumValues["coordination_state"], allowed)
+		if err != nil {
+			return err
+		}
+		setString("applied_state_to", destination)
 		return nil
 	case "P-PUBLISHER-006":
 		values["expires_at"] = append(json.RawMessage(nil), values["valid_from"]...)
@@ -1701,13 +2533,12 @@ func mutateFrozenStatePredicateV1(entry CanonicalVectorEntryV1, predicate Predic
 				return errors.New("state transition source is invalid")
 			}
 			members := canonicalClosedEnumMembersV1(fields[paths[1]])
-			for _, destination := range members {
-				if !edges[source+"\x00"+destination] {
-					setString(paths[1], destination)
-					return nil
-				}
+			destination, err := firstDisallowedClosedStateV1(source, members, edges)
+			if err != nil {
+				return err
 			}
-			return errors.New("state transition has no closed-enum invalid destination")
+			setString(paths[1], destination)
+			return nil
 		}
 	}
 	path := canonicalStateDestinationPathV1(entry, predicate, paths)
@@ -1728,6 +2559,17 @@ func mutateFrozenStatePredicateV1(entry CanonicalVectorEntryV1, predicate Predic
 	}
 	values[path] = changed
 	return nil
+}
+
+func firstDisallowedClosedStateV1(source string, members []string, allowed map[string]bool) (string, error) {
+	members = append([]string(nil), members...)
+	sort.Strings(members)
+	for _, destination := range members {
+		if !allowed[source+"\x00"+destination] {
+			return destination, nil
+		}
+	}
+	return "", errors.New("state transition has no closed-enum invalid destination")
 }
 
 var frozenTransitionEdgePatternV1 = regexp.MustCompile(`([A-Z][A-Z0-9_]*)\s*(?:→|->)\s*([A-Z][A-Z0-9_]*)`)
@@ -1770,9 +2612,15 @@ func containsCanonicalVectorStringV1(values []string, target string) bool {
 }
 
 func canonicalPredicateOperandPathsV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, fields map[string]WireFieldDescriptorV1) []string {
-	result := make([]string, 0, len(entry.Fields))
+	paths, _ := resolveCanonicalPredicateOperandPathsV1(entry, predicate, fields)
+	return paths
+}
+
+func resolveCanonicalPredicateOperandPathsV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, fields map[string]WireFieldDescriptorV1) ([]string, error) {
+	result := make([]string, 0, len(predicate.FieldPaths))
+	recordWide := false
 	appendPath := func(path string) {
-		if path == "" || path == "$" || containsCanonicalVectorStringV1(result, path) {
+		if path == "" || containsCanonicalVectorStringV1(result, path) {
 			return
 		}
 		if _, exists := fields[path]; exists {
@@ -1780,6 +2628,13 @@ func canonicalPredicateOperandPathsV1(entry CanonicalVectorEntryV1, predicate Pr
 		}
 	}
 	for _, path := range predicate.FieldPaths {
+		if path == "$" {
+			recordWide = true
+			continue
+		}
+		if _, exists := fields[path]; !exists {
+			return nil, fmt.Errorf("predicate %s names unknown operand %s", predicate.PredicateID, path)
+		}
 		appendPath(path)
 	}
 	arguments := strings.Join(predicate.Arguments, " ")
@@ -1788,137 +2643,14 @@ func canonicalPredicateOperandPathsV1(entry CanonicalVectorEntryV1, predicate Pr
 			appendPath(field.FieldPath)
 		}
 	}
-	if predicate.Operator == PredicateSubset {
-		arrays := result[:0]
-		for _, path := range result {
-			if fields[path].JSONType == WireArray {
-				arrays = append(arrays, path)
-			}
-		}
-		result = arrays
+	if recordWide && len(result) == 0 {
+		return nil, fmt.Errorf("record-wide predicate %s does not name operands in normalized arguments", predicate.PredicateID)
 	}
-	if predicate.Operator == PredicateExactlyOne {
-		optional := result[:0]
-		for _, path := range result {
-			if fields[path].Optional {
-				optional = append(optional, path)
-			}
-		}
-		result = optional
-	}
-	if predicate.Operator == PredicateTypedReference {
-		references := result[:0]
-		for _, path := range result {
-			if fields[path].DigestTarget != "" {
-				references = append(references, path)
-			}
-		}
-		if len(references) == 0 {
-			for _, field := range entry.Fields {
-				if field.DigestTarget != "" && !isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, int(field.Ordinal-1)) {
-					references = append(references, field.FieldPath)
-				}
-			}
-		}
-		result = references
-	}
-
-	eligible := func(index int, field WireFieldDescriptorV1) bool {
-		if field.LiteralValue != "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
-			return false
-		}
-		switch predicate.Operator {
-		case PredicateSubset:
-			return field.JSONType == WireArray
-		case PredicateOrdinalSuccess, PredicateAggregateLEQ:
-			return field.JSONType == WireInteger
-		case PredicateExactlyOne:
-			return field.Optional
-		case PredicateIfAndOnlyIf:
-			return field.JSONType == WireBoolean || field.Optional
-		case PredicateImplies:
-			return field.JSONType != WireObject && field.JSONType != WireRawJSON
-		case PredicateAllEqual:
-			if len(result) == 0 {
-				return field.JSONType != WireObject && field.JSONType != WireRawJSON
-			}
-			return field.ValueType == fields[result[0]].ValueType
-		default:
-			return field.JSONType != WireObject && field.JSONType != WireRawJSON
-		}
-	}
-
 	minimum := predicateOperandCountV1(predicate.Operator)
-	if predicate.Operator == PredicateAggregateLEQ {
-		// The frozen aggregate operands are every numeric addend followed by the
-		// limit. A prose extractor may have named a nearby boolean instead.
-		result = result[:0]
-		for _, field := range entry.Fields {
-			if field.JSONType == WireInteger {
-				result = append(result, field.FieldPath)
-			}
-		}
-		return result
-	}
-	if predicate.Operator == PredicateOrdinalSuccess {
-		integers := integerPredicatePathsV1(result, fields)
-		if len(integers) >= minimum {
-			return integers
-		}
-		result = integers
-	}
-	for index, field := range entry.Fields {
-		if len(result) >= minimum && predicate.Operator != PredicateExactlyOne {
-			break
-		}
-		if eligible(index, field) {
-			appendPath(field.FieldPath)
-		}
-	}
-	if (predicate.Operator == PredicateAllEqual || predicate.Operator == PredicateOrdinalSuccess) && len(result) != 0 {
-		return result
-	}
 	if len(result) < minimum {
-		for index, field := range entry.Fields {
-			if field.LiteralValue == "" && !isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
-				appendPath(field.FieldPath)
-				if len(result) >= minimum {
-					break
-				}
-			}
-		}
+		return result, fmt.Errorf("predicate %s resolves %d operands, requires %d", predicate.PredicateID, len(result), minimum)
 	}
-	return result
-}
-
-func canonicalDerivedOutputPathV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, fields map[string]WireFieldDescriptorV1) string {
-	switch predicate.PredicateID {
-	case "P-DIFF-001":
-		return "derivation_rule"
-	case "P-effect-pre-call-closure-v1-ROW-001":
-		for _, candidate := range []string{"claim_sha256", "call_admission_sha256", "unclaimed_abandonment_sha256"} {
-			if _, ok := fields[candidate]; ok {
-				return candidate
-			}
-		}
-	case "P-PR-002":
-		for _, candidate := range []string{"mutation_mode", "route_template", "request_body"} {
-			if _, ok := fields[candidate]; ok {
-				return candidate
-			}
-		}
-	case "P-MERGE-003":
-		for _, candidate := range []string{"observation_source", "read_request_sha256s"} {
-			if _, ok := fields[candidate]; ok {
-				return candidate
-			}
-		}
-	}
-	paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
-	if len(paths) == 0 {
-		return ""
-	}
-	return paths[len(paths)-1]
+	return result, nil
 }
 
 func canonicalStateDestinationPathV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, paths []string) string {
@@ -1936,7 +2668,7 @@ func canonicalStateDestinationPathV1(entry CanonicalVectorEntryV1, predicate Pre
 
 func predicateOperandCountV1(operator PredicateOperator) int {
 	switch operator {
-	case PredicateAllEqual, PredicateIfAndOnlyIf, PredicateImplies, PredicateSubset, PredicateOrdinalSuccess, PredicateAggregateLEQ, PredicateExactlyOne:
+	case PredicateAllEqual, PredicateIfAndOnlyIf, PredicateImplies, PredicateSubset, PredicateOrdinalSuccess, PredicateStateTransition, PredicateAggregateLEQ, PredicateExactlyOne:
 		return 2
 	default:
 		return 1
@@ -1993,6 +2725,17 @@ func primitiveValidChangeV1(field WireFieldDescriptorV1, raw json.RawMessage) (j
 			}
 			if json.Unmarshal(values[name], &value) == nil {
 				values[name] = []byte(strconv.FormatBool(!value))
+				return marshalCanonicalRawObjectV1(order, values), nil
+			}
+		}
+		for _, name := range order {
+			var value string
+			if json.Unmarshal(values[name], &value) == nil && value != "" {
+				replacement := byte('a')
+				if value[len(value)-1] == replacement {
+					replacement = 'b'
+				}
+				values[name], _ = json.Marshal(value[:len(value)-1] + string(replacement))
 				return marshalCanonicalRawObjectV1(order, values), nil
 			}
 		}

@@ -1242,17 +1242,36 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 		values[path], _ = json.Marshal(value)
 	}
 	for _, predicate := range entry.Predicates {
+		paths, operandErr := resolveCanonicalPredicateOperandPathsV1(entry, predicate, fields)
+		if operandErr != nil && !predicateHasFrozenFormulaV1(predicate) {
+			return operandErr
+		}
 		switch predicate.Operator {
-		case PredicateExactLiteral, PredicateTypedReference, PredicateDerivation:
+		case PredicateExactLiteral, PredicateTypedReference:
 			// Descriptor generation installs the frozen positive value.
+		case PredicateDerivation:
+			if err := applyFrozenDerivationPositiveV1(predicate, values); err != nil {
+				return err
+			}
 		case PredicateDigestPreimage:
+			if digest, handled := absenceProbeResultDigestV1(entry.SchemaID, values); handled {
+				setString("probe_result_sha256", digest)
+			}
 			if predicate.PredicateID == "P-effect-ledger-event-preimage-v1-ROW-003" {
-				setString("event_id", effectLedgerEventIDV1(entry, values))
+				eventID, err := effectLedgerEventIDV1(values)
+				if err != nil {
+					// Prototype generation precedes recursive nested-record
+					// materialization; the finalized pass must resolve this tuple.
+					continue
+				}
+				setString("event_id", eventID)
 			}
 		case PredicateAllEqual:
-			paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
 			if len(paths) < 2 {
-				continue
+				if predicateHasFrozenFormulaV1(predicate) {
+					continue
+				}
+				return operandErr
 			}
 			value, ok := values[paths[0]]
 			if !ok {
@@ -1271,7 +1290,6 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 				values[path] = append(json.RawMessage(nil), value...)
 			}
 		case PredicateExactlyOne:
-			paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
 			present := 0
 			for _, path := range paths {
 				if _, ok := values[path]; ok {
@@ -1290,7 +1308,6 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 				values[paths[0]] = value
 			}
 		case PredicateOrdinalSuccess:
-			paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
 			if len(paths) >= 2 {
 				var predecessor uint64
 				if json.Unmarshal(values[paths[0]], &predecessor) == nil {
@@ -1298,7 +1315,6 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 				}
 			}
 		case PredicateSubset:
-			paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
 			if len(paths) >= 2 {
 				values[paths[0]] = []byte("[]")
 			}
@@ -1347,7 +1363,6 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 			case "P-predecessor-writer-lease-v1-ROW-001":
 				setString("lease_state", "ACTIVE")
 			default:
-				paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
 				edges := frozenTransitionEdgesV1(predicate)
 				if len(paths) >= 2 && len(edges) != 0 {
 					keys := make([]string, 0, len(edges))
@@ -1361,7 +1376,10 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 				}
 			}
 		case PredicateAggregateLEQ:
-			paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
+			if predicate.PredicateID == "P-RESOURCE-001" {
+				values["container_read_only_root"] = []byte("false")
+				continue
+			}
 			if len(paths) < 2 {
 				continue
 			}
@@ -1409,7 +1427,7 @@ func applyEd25519VectorsV1(entry CanonicalVectorEntryV1, values map[string]json.
 		if field.ValueType != "ed25519SignatureHex" {
 			continue
 		}
-		message, err := marshalCanonicalVectorObjectV1(entry.Fields, values, field.FieldPath)
+		message, err := canonicalEd25519MessageV1(entry, values, field.FieldPath)
 		if err != nil {
 			return err
 		}
@@ -1421,6 +1439,40 @@ func applyEd25519VectorsV1(entry CanonicalVectorEntryV1, values map[string]json.
 		values[field.FieldPath] = encoded
 	}
 	return nil
+}
+
+func canonicalEd25519MessageV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage, signaturePath string) ([]byte, error) {
+	domains := map[string]string{
+		"process-absence-observation-v1":   "ABCP-PROCESS-ABSENCE-V1",
+		"cgroup-absence-observation-v1":    "ABCP-CGROUP-ABSENCE-V1",
+		"container-absence-observation-v1": "ABCP-CONTAINER-ABSENCE-V1",
+	}
+	domain := domains[entry.SchemaID]
+	if domain == "" || signaturePath != "signature_hex" {
+		return nil, fmt.Errorf("%s has no frozen Ed25519 message formula", entry.SchemaID)
+	}
+	selected := make([]WireFieldDescriptorV1, 0, len(entry.Fields))
+	foundProbeResult := false
+	for _, field := range entry.Fields {
+		if field.FieldPath == signaturePath {
+			break
+		}
+		selected = append(selected, field)
+		foundProbeResult = foundProbeResult || field.FieldPath == "probe_result_sha256"
+	}
+	if !foundProbeResult || len(selected) == 0 || selected[len(selected)-1].FieldPath != "probe_result_sha256" {
+		return nil, fmt.Errorf("%s unsigned Ed25519 fields do not end through probe_result_sha256", entry.SchemaID)
+	}
+	unsigned, err := marshalCanonicalVectorObjectV1(selected, values, "")
+	if err != nil {
+		return nil, err
+	}
+	preimage := make([]byte, 0, len(domain)+1+len(unsigned))
+	preimage = append(preimage, domain...)
+	preimage = append(preimage, 0)
+	preimage = append(preimage, unsigned...)
+	digest := sha256.Sum256(preimage)
+	return digest[:], nil
 }
 
 func marshalCanonicalVectorObjectV1(fields []WireFieldDescriptorV1, values map[string]json.RawMessage, omitted string) ([]byte, error) {

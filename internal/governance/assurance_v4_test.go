@@ -195,8 +195,6 @@ func TestExecutableCanonicalVectorsAreGeneratedAndValidated(t *testing.T) {
 			{"controller_identity", "dbIdentity", false},
 			{"artifact_sha256", "sha256<ArtifactBlobV1>", false},
 			{"mode", "{ALPHA,BETA}", false},
-			{"public_key", "ed25519PublicKeyHex", false},
-			{"signature", "ed25519SignatureHex", false},
 			{"members", "[]id(set,2..3)", false},
 		},
 	}}
@@ -210,16 +208,6 @@ func TestExecutableCanonicalVectorsAreGeneratedAndValidated(t *testing.T) {
 	}
 	if len(vectors.Rejections) != len(catalog.Entries[0].Rejections) {
 		t.Fatalf("generated %d rejections, want %d", len(vectors.Rejections), len(catalog.Entries[0].Rejections))
-	}
-	var positive map[string]json.RawMessage
-	if err := json.Unmarshal(vectors.Positive, &positive); err != nil {
-		t.Fatal(err)
-	}
-	var publicKey, signature string
-	_ = json.Unmarshal(positive["public_key"], &publicKey)
-	_ = json.Unmarshal(positive["signature"], &signature)
-	if publicKey != "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a" || len(signature) != 128 {
-		t.Fatalf("Ed25519 vector widths/seed differ: key=%q signature-bytes=%d", publicKey, len(signature)/2)
 	}
 	mutations := make(map[string]bool)
 	for _, vector := range vectors.Rejections {
@@ -280,6 +268,10 @@ func TestFrozenCatalogEveryRejectionUsesRecursivePositiveAndValidates(t *testing
 	if len(vectors) != len(extraction.Catalog.Entries) {
 		t.Fatalf("materialized %d catalog entries, want %d", len(vectors), len(extraction.Catalog.Entries))
 	}
+	_, predicateContext, err := generateCanonicalCatalogPositiveVectorsV1(extraction.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	covered := map[string]bool{}
 	for _, entry := range extraction.Catalog.Entries {
@@ -296,7 +288,7 @@ func TestFrozenCatalogEveryRejectionUsesRecursivePositiveAndValidates(t *testing
 			covered[string(vector.RequiredError)+"/"+vectorMutationV1(vector.VectorID)] = true
 			if strings.Contains(vector.VectorID, "/PREDICATE_") {
 				var classified *canonicalVectorValidationErrorV1
-				validationErr := ValidateCanonicalVectorBytesV1(entry, vector.Bytes)
+				validationErr := validateCanonicalVectorBytesV1(entry, vector.Bytes, predicateContext)
 				if !errors.As(validationErr, &classified) || classified.code != vector.RequiredError {
 					t.Fatalf("predicate vector %s classified as %v, want %s", vector.VectorID, validationErr, vector.RequiredError)
 				}
@@ -381,7 +373,7 @@ func TestFrozenCatalogEveryRejectionUsesRecursivePositiveAndValidates(t *testing
 	if json.Unmarshal(observationValues["signature_hex"], &signature) != nil {
 		t.Fatal("process absence signature is not a string")
 	}
-	message, err := marshalCanonicalVectorObjectV1(observationEntry.Fields, observationValues, "signature_hex")
+	message, err := canonicalEd25519MessageV1(observationEntry, observationValues, "signature_hex")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +454,7 @@ func TestCanonicalPredicateOperatorsEvaluateActualOperands(t *testing.T) {
 			}
 		}},
 		{name: "DIGEST_PREIMAGE", schemaID: "digest-op-v1", recordName: "DigestOpV1", fields: withBase("DigestOpV1", "digest-op-v1", WireFieldSpecV1{"payload", "id", false}, WireFieldSpecV1{"record_sha256", "sha256<DigestOpV1>", false}), target: "P-digest-op-v1-DIGEST_PREIMAGE-record_sha256"},
-		{name: "DERIVATION", schemaID: "derivation-op-v1", recordName: "DerivationOpV1", fields: withBase("DerivationOpV1", "derivation-op-v1", WireFieldSpecV1{"input", "id", false}, WireFieldSpecV1{"output", "id", false}), predicate: &WirePredicateSpecV1{"P-TEST-DERIVATION", []string{"input", "output"}, PredicateDerivation, []string{"output derived from input"}}, target: "P-TEST-DERIVATION"},
+		{name: "DERIVATION", schemaID: "derivation-op-v1", recordName: "DerivationOpV1", fields: withBase("DerivationOpV1", "derivation-op-v1", WireFieldSpecV1{"stage", "evidence_stage", false}, WireFieldSpecV1{"derivation_rule", "{B_GRANT_BASE_TO_B_CANDIDATE,C_GRANT_BASE_TO_UNCHANGED_C_CANDIDATE,INTEGRATION_BASE_TO_INTEGRATED_HEAD,PREMERGE_BASE_TO_MERGE_RESULT}", false}), predicate: &WirePredicateSpecV1{"P-DIFF-001", []string{"stage", "derivation_rule"}, PredicateDerivation, []string{"stage selects derivation_rule"}}, target: "P-DIFF-001"},
 		{name: "AGGREGATE_LEQ", schemaID: "aggregate-op-v1", recordName: "AggregateOpV1", fields: withBase("AggregateOpV1", "aggregate-op-v1", WireFieldSpecV1{"first", "u64", false}, WireFieldSpecV1{"second", "u64", false}, WireFieldSpecV1{"limit", "u64", false}), predicate: &WirePredicateSpecV1{"P-TEST-AGGREGATE", []string{"first", "second", "limit"}, PredicateAggregateLEQ, []string{"sum addends <= limit"}}, target: "P-TEST-AGGREGATE", assert: func(t *testing.T, _, mutated []byte) {
 			var values struct {
 				First  uint64 `json:"first"`
