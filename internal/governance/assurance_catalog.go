@@ -294,7 +294,10 @@ func ResolveWireFieldDescriptorV1(schemaID, fieldPath string, ordinal uint64, so
 		return descriptor, nil
 	}
 	if sourceType == "blob256" {
-		descriptor.JSONType, descriptor.ValueType, descriptor.DigestTarget = WireString, sourceType, "exact-bytes"
+		// blob256 is an untyped digest whose preimage is fixed by the enclosing
+		// record's frozen formula. It must never be treated as a typed reference
+		// to an arbitrary catalog record.
+		descriptor.JSONType, descriptor.ValueType = WireString, sourceType
 		descriptor.MinBytes, descriptor.MaxBytes = u64ptr(64), u64ptr(64)
 		return descriptor, nil
 	}
@@ -1251,7 +1254,7 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 			return operandErr
 		}
 		if context != nil {
-			if err := applyFrozenCrossRecordPositiveV1(predicate, values, context); err != nil {
+			if err := applyFrozenCrossRecordPositiveV1(entry, predicate, values, context); err != nil {
 				return err
 			}
 		}

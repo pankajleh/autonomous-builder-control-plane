@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 )
 
 func TestEffectLedgerEventIDUsesFrozenDomainTuple(t *testing.T) {
@@ -53,10 +55,6 @@ func TestAbsenceSignaturesUseFrozenDomainDigests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	positives, err := GenerateCanonicalCatalogPositiveVectorsV1(extraction.Catalog)
-	if err != nil {
-		t.Fatal(err)
-	}
 	publicKey, err := hex.DecodeString("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +65,17 @@ func TestAbsenceSignaturesUseFrozenDomainDigests(t *testing.T) {
 		"container-absence-observation-v1": "ABCP-CONTAINER-ABSENCE-V1",
 	} {
 		t.Run(schemaID, func(t *testing.T) {
-			positive := positives[schemaID]
+			var entry CanonicalVectorEntryV1
+			for _, candidate := range extraction.Catalog.Entries {
+				if candidate.SchemaID == schemaID {
+					entry = candidate
+					break
+				}
+			}
+			positive, err := GenerateMinimalCanonicalVectorV1(entry)
+			if err != nil {
+				t.Fatal(err)
+			}
 			marker := []byte(`,"signature_hex":`)
 			index := bytes.LastIndex(positive, marker)
 			if index < 0 {
@@ -142,7 +150,7 @@ func TestTypedReferenceUsesActualCatalogRecordType(t *testing.T) {
 	}
 	matchedForeignRecord := false
 	for recordType, record := range context.recordPositiveByType {
-		if recordType != "ArtifactBlobV1" && recordType != "exact-bytes" && rejectedDigest == sha256Hex(record) {
+		if recordType != "ArtifactBlobV1" && rejectedDigest == sha256Hex(record) {
 			matchedForeignRecord = true
 		}
 	}
@@ -294,6 +302,34 @@ func TestTypedReferencesUseFinalizedTargetBytesAndFailClosed(t *testing.T) {
 	if _, ok := context.recordForDigest("FinalTargetV1", digest); !ok {
 		t.Fatal("final target bytes are absent from typed context")
 	}
+	if context.digestValidForTarget("FinalTargetV1", sha256Hex(prototype)) {
+		t.Fatal("prototype digest was admitted as typed target authority")
+	}
+	for _, entry := range catalog.Entries {
+		if entry.RecordName == "ArtifactBlobV1" {
+			continue
+		}
+		values, _, _, decodeErr := decodeCanonicalVectorObjectV1(positives[entry.SchemaID])
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		for index, field := range entry.Fields {
+			if field.DigestTarget == "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
+				continue
+			}
+			var actual string
+			if json.Unmarshal(values[field.FieldPath], &actual) != nil {
+				t.Fatalf("%s.%s is not a scalar typed digest", entry.SchemaID, field.FieldPath)
+			}
+			members := selectedDigestTargetMembersV1(field.DigestTarget, values)
+			if len(members) != 1 {
+				t.Fatalf("%s.%s has unresolved selected targets %v", entry.SchemaID, field.FieldPath, members)
+			}
+			if actual != sha256Hex(context.recordPositiveByType[members[0]]) {
+				t.Fatalf("%s.%s does not hash exact finalized %s bytes", entry.SchemaID, field.FieldPath, members[0])
+			}
+		}
+	}
 
 	unavailable, err := BuildCanonicalVectorCatalogV1([]WireSchemaDefinitionV1{{
 		SchemaID: "unavailable-holder-v1", RecordName: "UnavailableHolderV1",
@@ -325,6 +361,11 @@ func TestDiffAuthorityAndCheckpointParentUseSourceRecords(t *testing.T) {
 
 	checkpoint := []byte(`{"kind":"C_ACCEPTED","repository":"repo","sequence":7,"candidate_sha":"` + strings.Repeat("d", 40) + `","next_stage_grant_sha256":"` + strings.Repeat("e", 64) + `","checkpoint_sha256":"` + strings.Repeat("f", 64) + `"}`)
 	context.addRecord("PhaseCheckpointV2", checkpoint)
+	projection, err := checkpointGrantParentProjectionV1(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	context.checkpointProjection = projection
 	parent := map[string]json.RawMessage{
 		"kind": json.RawMessage(`"C_ACCEPTED"`), "repository": json.RawMessage(`"repo"`), "sequence": json.RawMessage(`7`), "candidate_sha": mustMarshalCanonicalVectorStringV1(strings.Repeat("d", 40)),
 	}
@@ -440,51 +481,188 @@ func TestFrozenPredicateMutationHasNoFallbackPathSearch(t *testing.T) {
 	}
 	values, _, _, _ := decodeCanonicalVectorObjectV1(positive)
 	predicate, _ := canonicalVectorPredicateV1(entry.Predicates, "P-DIFF-003")
-	if err := mutatePredicateV1(entry, predicate, values, nil, newEmptyCanonicalPredicateContextV1()); err == nil || !strings.Contains(err.Error(), "does not name operands") {
+	if err := mutatePredicateV1(entry, predicate, values, nil, newEmptyCanonicalPredicateContextV1()); err == nil || !strings.Contains(err.Error(), "no explicit frozen semantic evaluator") {
 		t.Fatalf("unresolved predicate used a fallback descriptor path: %v", err)
 	}
 }
 
-func TestFrozenCatalogTypedDigestsResolveExactContextBytes(t *testing.T) {
+func TestFrozenCatalogFailsClosedWithoutIncompleteSemanticAuthority(t *testing.T) {
 	extraction, err := ExtractFrozenCanonicalVectorCatalogV1(readFrozenAssuranceModel(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	positives, context, err := generateCanonicalCatalogPositiveVectorsV1(extraction.Catalog)
+	if err == nil {
+		t.Fatal("incomplete frozen semantics did not fail closed")
+	}
+	if positives != nil || context != nil {
+		t.Fatal("cycle failure exposed partial/prototype digest authority")
+	}
+}
+
+func TestTypedTargetCycleFailsClosedWithoutPrototypeAuthority(t *testing.T) {
+	catalog, err := BuildCanonicalVectorCatalogV1([]WireSchemaDefinitionV1{
+		{SchemaID: "cycle-a-v1", RecordName: "CycleAV1", Fields: []WireFieldSpecV1{{"kind", `id="CycleAV1"`, false}, {"schema_version", `id="cycle-a-v1"`, false}, {"b_sha256", "sha256<CycleBV1>", false}}},
+		{SchemaID: "cycle-b-v1", RecordName: "CycleBV1", Fields: []WireFieldSpecV1{{"kind", `id="CycleBV1"`, false}, {"schema_version", `id="cycle-b-v1"`, false}, {"a_sha256", "sha256<CycleAV1>", false}}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	positives, context, err := generateCanonicalCatalogPositiveVectorsV1(catalog)
+	if err == nil || !strings.Contains(err.Error(), "required record target cycle") {
+		t.Fatalf("typed digest cycle did not fail closed: %v", err)
+	}
+	if positives != nil || context != nil {
+		t.Fatal("cycle failure exposed partial/prototype digest authority")
+	}
+}
+
+func TestEveryFrozenCrossRecordPredicateHasExplicitSemanticEvaluator(t *testing.T) {
+	extraction, err := ExtractFrozenCanonicalVectorCatalogV1(readFrozenAssuranceModel(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]struct{})
 	for _, entry := range extraction.Catalog.Entries {
-		if entry.RecordName == "ArtifactBlobV1" {
-			continue
-		}
-		values, _, _, err := decodeCanonicalVectorObjectV1(positives[entry.SchemaID])
-		if err != nil {
-			t.Fatal(err)
-		}
-		if falseIDs := falseCanonicalPredicatesV1(entry, values, context); len(falseIDs) != 0 {
-			t.Fatalf("%s positive has false predicates %v", entry.SchemaID, falseIDs)
-		}
-		for index, field := range entry.Fields {
-			if field.DigestTarget == "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
-				continue
-			}
-			raw, present := values[field.FieldPath]
-			if !present {
-				continue
-			}
-			candidates := []json.RawMessage{raw}
-			if field.JSONType == WireArray {
-				_ = json.Unmarshal(raw, &candidates)
-			}
-			for _, candidate := range candidates {
-				var digest string
-				_ = json.Unmarshal(candidate, &digest)
-				if context.digestValidForSelectedTarget(field.DigestTarget, digest, values) || frozenExactBytesDigestValidV1(entry, field.FieldPath, digest, values) {
-					continue
+		for _, predicate := range entry.Predicates {
+			if _, ok := frozenCrossRecordPredicateIDsV1[predicate.PredicateID]; ok {
+				key := frozenCrossRecordSemanticKeyV1(entry.RecordName, predicate.PredicateID)
+				if _, explicit := frozenCrossRecordSemanticRegistryV1[key]; !explicit {
+					t.Errorf("%s has no explicit semantic evaluator", key)
 				}
-				t.Fatalf("%s.%s digest %s has no exact emitted target bytes", entry.SchemaID, field.FieldPath, digest)
+				seen[key] = struct{}{}
 			}
 		}
+	}
+	for key := range frozenCrossRecordSemanticRegistryV1 {
+		if _, registered := seen[key]; !registered {
+			t.Errorf("semantic evaluator %s is not a registered frozen predicate", key)
+		}
+	}
+}
+
+func TestCandidateDiffFullRelationUsesSubjectAndLineageRecords(t *testing.T) {
+	context := newEmptyCanonicalPredicateContextV1()
+	lineage := []byte(`{"repository_identity":"repo","accepted_a_lineage_sha256":"` + strings.Repeat("1", 64) + `","base_oid":"` + strings.Repeat("2", 40) + `","candidate_oid":"` + strings.Repeat("3", 40) + `"}`)
+	context.addRecord("StageDiffLineageV1", lineage)
+	subject := []byte(`{"repository_identity":"repo","accepted_a_lineage_sha256":"` + strings.Repeat("1", 64) + `","diff_base_oid":"` + strings.Repeat("2", 40) + `","diff_candidate_oid":"` + strings.Repeat("3", 40) + `","diff_lineage_sha256":"` + sha256Hex(lineage) + `"}`)
+	context.addRecord("StageSubjectV1", subject)
+	values := map[string]json.RawMessage{
+		"repository_identity":       mustMarshalCanonicalVectorStringV1("repo"),
+		"accepted_a_lineage_sha256": mustMarshalCanonicalVectorStringV1(strings.Repeat("1", 64)),
+		"stage_subject_sha256":      mustMarshalCanonicalVectorStringV1(sha256Hex(subject)),
+		"diff_lineage_sha256":       mustMarshalCanonicalVectorStringV1(sha256Hex(lineage)),
+		"base_oid":                  mustMarshalCanonicalVectorStringV1(strings.Repeat("2", 40)),
+		"candidate_oid":             mustMarshalCanonicalVectorStringV1(strings.Repeat("3", 40)),
+	}
+	if !frozenCandidateDiffRelationValidV1(values, context) {
+		t.Fatal("exact P-DIFF-003 relation was rejected")
+	}
+	for _, path := range []string{"repository_identity", "accepted_a_lineage_sha256", "base_oid", "candidate_oid"} {
+		original := values[path]
+		values[path] = mustMarshalCanonicalVectorStringV1("x")
+		if frozenCandidateDiffRelationValidV1(values, context) {
+			t.Fatalf("P-DIFF-003 ignored %s mismatch", path)
+		}
+		values[path] = original
+	}
+	entry, err := buildCanonicalVectorEntry(WireSchemaDefinitionV1{
+		SchemaID: "candidate-diff-fixture-v1", RecordName: "CandidateDiffArtifactV1",
+		Fields: []WireFieldSpecV1{
+			{"kind", `id="CandidateDiffArtifactV1"`, false}, {"schema_version", `id="candidate-diff-fixture-v1"`, false},
+			{"repository_identity", "identity", false}, {"accepted_a_lineage_sha256", "sha256<AcceptedALineageV1>", false},
+			{"stage_subject_sha256", "sha256<StageSubjectV1>", false}, {"diff_lineage_sha256", "sha256<StageDiffLineageV1>", false},
+			{"base_oid", "gitOID", false}, {"candidate_oid", "gitOID", false},
+		},
+		Predicates: []WirePredicateSpecV1{{"P-DIFF-003", []string{"base_oid", "candidate_oid"}, PredicateImplies, []string{"exact subject and lineage relation"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	predicate, _ := canonicalVectorPredicateV1(entry.Predicates, "P-DIFF-003")
+	if err := mutatePredicateV1(entry, predicate, values, nil, context); err != nil {
+		t.Fatal(err)
+	}
+	if frozenCandidateDiffRelationValidV1(values, context) {
+		t.Fatal("formula-derived P-DIFF-003 mutation left the relation true")
+	}
+}
+
+func TestCrossRecordSemanticFamiliesEvaluateOrFailClosed(t *testing.T) {
+	process := map[string]json.RawMessage{"expected_pid": []byte("7"), "proc_stat_path": json.RawMessage(`"/proc/7/stat"`)}
+	processEntry := CanonicalVectorEntryV1{RecordName: "ProcessAbsenceObservationV1"}
+	processPredicate := PredicateDescriptorV1{PredicateID: "P-process-absence-observation-v1-ROW-001"}
+	if !frozenCrossRecordSemanticValidV1(processEntry, processPredicate, process, newEmptyCanonicalPredicateContextV1()) {
+		t.Fatal("process probe semantic family rejected the exact procfs relation")
+	}
+	process["proc_stat_path"] = json.RawMessage(`"/proc/8/stat"`)
+	if frozenCrossRecordSemanticValidV1(processEntry, processPredicate, process, newEmptyCanonicalPredicateContextV1()) {
+		t.Fatal("process probe semantic family accepted a mismatched PID path")
+	}
+
+	worker := map[string]json.RawMessage{
+		"worker_identity": json.RawMessage(`"worker"`), "host_identity": json.RawMessage(`"host"`), "key_id": json.RawMessage(`"key"`),
+	}
+	digest := sha256.Sum256([]byte("ABCP-WORKER-OBSERVER-V1\x00worker\x00host\x00key"))
+	worker["observer_identity"] = mustMarshalCanonicalVectorStringV1(hex.EncodeToString(digest[:]))
+	workerEntry := CanonicalVectorEntryV1{RecordName: "WorkerObservationKeyV1"}
+	workerPredicate := PredicateDescriptorV1{PredicateID: "P-worker-observation-key-v1-ROW-002"}
+	if !frozenCrossRecordSemanticValidV1(workerEntry, workerPredicate, worker, newEmptyCanonicalPredicateContextV1()) {
+		t.Fatal("worker-key semantic family rejected its domain-separated identity")
+	}
+
+	unimplementedEntry := CanonicalVectorEntryV1{RecordName: "ArtifactPublisherOpenV1"}
+	unimplementedPredicate := PredicateDescriptorV1{PredicateID: "P-PUBLISHER-003"}
+	if frozenCrossRecordSemanticValidV1(unimplementedEntry, unimplementedPredicate, map[string]json.RawMessage{}, newEmptyCanonicalPredicateContextV1()) {
+		t.Fatal("incomplete cross-record formula did not fail closed")
+	}
+}
+
+func TestRetainedGovernanceActivationUsesFullFinalCanonicalBytes(t *testing.T) {
+	records, err := frozenRetainedCanonicalRecordsV1()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := records["GovernanceActivationV1"]
+	var activation GovernanceActivationV1
+	if err := json.Unmarshal(encoded, &activation); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateGovernanceActivationV1(activation); err != nil {
+		t.Fatalf("retained activation is not an actual finalized record: %v", err)
+	}
+	if activation.PolicySHA256 == "" || activation.ActivationRepositoryCommit == "" || activation.ActivationSequence == 0 || activation.ActivationTime == "" || activation.GrandfatheredV2Digests == nil || activation.ActivationSHA256 == "" {
+		t.Fatal("retained activation is an incomplete synthetic subset")
+	}
+	context := newEmptyCanonicalPredicateContextV1()
+	context.addRecord("GovernanceActivationV1", encoded)
+	if !context.digestValidForTarget("GovernanceActivationV1", sha256Hex(encoded)) {
+		t.Fatal("full retained activation bytes were not installed as typed authority")
+	}
+	if len(records) != 3 {
+		t.Fatalf("retained context installed %d records; only three constructor-finalized types are available", len(records))
+	}
+	var bounds contextcapsule.ExecutionBoundsV1
+	if err := json.Unmarshal(records["ExecutionBoundsV1"], &bounds); err != nil || contextcapsule.ValidateExecutionBoundsV1(bounds) != nil {
+		t.Fatalf("retained execution bounds are not constructor-valid: %v", err)
+	}
+	var checkpoint PhaseCheckpointV1
+	if err := json.Unmarshal(records["PhaseCheckpointV1"], &checkpoint); err != nil || ValidatePhaseCheckpointV1(checkpoint) != nil {
+		t.Fatalf("retained checkpoint is not constructor-finalized: %v", err)
+	}
+	for _, unavailable := range []string{"AuthorizationSealV1", "ContextCapsuleV3", "ExpectedMergeContentV1", "GitHubLifecycleLimitsV1", "MergePolicyV1", "ReadyAuthorityBindingV1", "SealedMergeAuthorizationV1", "TargetRefCommitmentV1"} {
+		if _, present := records[unavailable]; present {
+			t.Fatalf("unavailable retained type %s was populated by synthetic bytes", unavailable)
+		}
+	}
+}
+
+func TestBlobDigestsAreNotGenericTypedTargets(t *testing.T) {
+	descriptor, err := ResolveWireFieldDescriptorV1("fixture-v1", "digest", 1, "blob256", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if descriptor.DigestTarget != "" {
+		t.Fatalf("blob256 retained generic digest target %q", descriptor.DigestTarget)
 	}
 }
