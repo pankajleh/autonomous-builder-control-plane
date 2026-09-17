@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -46,11 +47,19 @@ func TestProductionConstructionPinsHostRootAndExactLedger(t *testing.T) {
 	if err := os.Chmod(ledgerParent, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	authoritative, err := ledger.NewJSONLLedger(filepath.Join(ledgerParent, "authoritative.jsonl"))
+	unfenced, err := ledger.NewJSONLLedger(filepath.Join(ledgerParent, "unfenced.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := ProductionControllerConfig{GitHub: adapter, Artifacts: artifacts, AuthoritativeLedger: authoritative}
+	if _, err := NewProductionController(ProductionControllerConfig{GitHub: adapter, Artifacts: artifacts, AuthoritativeLedger: unfenced}); err == nil {
+		t.Fatal("production PR controller accepted an unfenced ledger and absent durable predecessor fence")
+	}
+	fence := acceptingPredecessorFenceV1{}
+	authoritative, err := ledger.NewFencedJSONLLedger(filepath.Join(ledgerParent, "authoritative.jsonl"), fence, []string{"ledger-production-run"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := ProductionControllerConfig{GitHub: adapter, Artifacts: artifacts, AuthoritativeLedger: authoritative, PredecessorFence: fence, PredecessorBindingIDs: []string{"pr-admission"}}
 	one, err := NewProductionController(config)
 	if err != nil {
 		t.Fatal(err)
@@ -79,6 +88,12 @@ func TestProductionConstructionPinsHostRootAndExactLedger(t *testing.T) {
 	if !ok || sealed.base.MaxResponseHeaderBytes != MaxResponseHeaderBytes {
 		t.Fatal("sealed authenticated transport lacks network response-header cap")
 	}
+}
+
+type acceptingPredecessorFenceV1 struct{}
+
+func (acceptingPredecessorFenceV1) AcquirePredecessorWriterV1([]string, string) (authoritybackend.PredecessorWriterLeaseHandleV1, error) {
+	return nil, nil
 }
 
 func TestAdmissionRootAndAcquiredLockReplacementFailClosed(t *testing.T) {

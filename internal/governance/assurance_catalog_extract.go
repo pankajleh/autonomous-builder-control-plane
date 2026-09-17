@@ -12,7 +12,7 @@ import (
 )
 
 var canonicalTableRecordPattern = regexp.MustCompile("^`([^`]+)`\\s*/\\s*(?:inherited\\s*)?`([^`]+)`$")
-var namedPredicatePattern = regexp.MustCompile(`P-[A-Z][A-Z0-9-]*-[0-9]{3}|P-[A-Z][A-Z0-9-]*`)
+var namedPredicatePattern = regexp.MustCompile(`\b(?:P-[A-Z][A-Z0-9-]*-[0-9]{3}|P-[A-Z][A-Z0-9-]*)`)
 var inlineRecordPattern = regexp.MustCompile(`([A-Z][A-Za-z0-9]+V[0-9]+)=\{`)
 
 // CanonicalCatalogExtractionV1 exposes the deterministic extraction audit.
@@ -177,9 +177,25 @@ func normalizeDefinition(definition *WireSchemaDefinitionV1, contract string, un
 			continue
 		}
 		seen[match] = struct{}{}
-		definition.Predicates = append(definition.Predicates, WirePredicateSpecV1{PredicateID: match, FieldPaths: []string{"$"}, Operator: predicateOperatorFromClause(contract), Arguments: []string{normalizedClause(contract, match)}})
+		clause := normalizedClause(contract, match)
+		paths := clauseFieldPaths(clause, definition.Fields)
+		operator := predicateOperatorFromClause(clause)
+		if len(paths) == 0 && operator == PredicateExactlyOne {
+			for _, field := range definition.Fields {
+				if field.Optional {
+					paths = append(paths, field.FieldPath)
+				}
+			}
+		}
+		if len(paths) == 0 {
+			paths = []string{"$"}
+		}
+		definition.Predicates = append(definition.Predicates, WirePredicateSpecV1{PredicateID: match, FieldPaths: paths, Operator: operator, Arguments: []string{clause}})
 	}
 	rowOrdinal := 0
+	if definition.SchemaID == "nested:WireFieldDescriptorV1" {
+		return nil
+	}
 	for _, clause := range rowPredicateClauses(contract) {
 		rowOrdinal++
 		if namedPredicatePattern.MatchString(clause) || !crossFieldClause(clause, definition.Fields) {
@@ -189,9 +205,23 @@ func normalizeDefinition(definition *WireSchemaDefinitionV1, contract string, un
 		if len(paths) == 0 {
 			paths = []string{"$"}
 		}
+		operator := predicateOperatorFromClause(clause)
+		if operator == PredicateExactlyOne {
+			optionalCount := 0
+			for _, path := range paths {
+				for _, field := range definition.Fields {
+					if field.FieldPath == path && field.Optional {
+						optionalCount++
+					}
+				}
+			}
+			if optionalCount < 2 {
+				continue
+			}
+		}
 		definition.Predicates = append(definition.Predicates, WirePredicateSpecV1{
 			PredicateID: fmt.Sprintf("P-%s-ROW-%03d", definition.SchemaID, rowOrdinal),
-			FieldPaths:  paths, Operator: predicateOperatorFromClause(clause), Arguments: []string{strings.Join(strings.Fields(clause), " ")},
+			FieldPaths:  paths, Operator: operator, Arguments: []string{strings.Join(strings.Fields(clause), " ")},
 		})
 	}
 	return nil
@@ -215,7 +245,18 @@ func parseWireFieldList(list string) ([]WireFieldSpecV1, error) {
 			name, sourceType = strings.TrimSpace(token[:colon]), strings.TrimSpace(token[colon+1:])
 		} else if equal := topLevelIndex(token, '='); equal > 0 {
 			name = strings.TrimSpace(token[:equal])
-			sourceType = `id=` + strings.TrimSpace(token[equal+1:])
+			baseType := inferBareWireType(strings.TrimSuffix(name, "?"))
+			if baseType == "" {
+				return nil, fmt.Errorf("exact literal field %s has no frozen base type", name)
+			}
+			literal := strings.Trim(strings.TrimSpace(token[equal+1:]), `"`)
+			if values, enum := frozenEnumValues[baseType]; enum {
+				index := sort.SearchStrings(values, literal)
+				if index >= len(values) || values[index] != literal {
+					baseType = "text"
+				}
+			}
+			sourceType = baseType + `=` + strings.TrimSpace(token[equal+1:])
 		}
 		optional := strings.HasSuffix(name, "?")
 		name = strings.TrimSuffix(name, "?")

@@ -25,6 +25,21 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
+func TestProductionControllerRequiresDurablePredecessorComposition(t *testing.T) {
+	f := newControllerFixture(t)
+	source, err := NewStaticAuthoritySource(f.governed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := NewProduction(Config{StateRoot: f.stateRoot, Ledger: f.ledger, AuthoritySource: source, Provider: &fakeProvider{t: t}})
+	if controller != nil {
+		_ = controller.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "durable predecessor fence") {
+		t.Fatalf("production merge controller accepted an unfenced composition: %v", err)
+	}
+}
+
 func TestControllerAppliedPersistsMergedBeforeCleanup(t *testing.T) {
 	f := newControllerFixture(t)
 	provider := &fakeProvider{t: t, disposition: githublifecycle.ReconciliationApplied}

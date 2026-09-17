@@ -2,6 +2,7 @@ package governance
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -203,13 +204,15 @@ func buildCanonicalVectorEntry(definition WireSchemaDefinitionV1) (CanonicalVect
 		}
 		if descriptor.DigestTarget != "" {
 			operator := PredicateTypedReference
-			if descriptor.DigestTarget == definition.RecordName || descriptor.DigestTarget == definition.SchemaID {
+			requiredError := CanonicalPredicateInvalid
+			if isSelfDigestDescriptorV1(definition.RecordName, definition.SchemaID, definition.Fields, index, descriptor) {
 				operator = PredicateDigestPreimage
+				requiredError = CanonicalDigestInvalid
 			}
 			predicates = append(predicates, PredicateDescriptorV1{
 				PredicateID: "P-" + definition.SchemaID + "-" + string(operator) + "-" + specification.FieldPath,
 				SchemaID:    definition.SchemaID, FieldPaths: []string{specification.FieldPath}, Operator: operator,
-				Arguments: []string{descriptor.DigestTarget}, RequiredError: CanonicalPredicateInvalid,
+				Arguments: []string{descriptor.DigestTarget}, RequiredError: requiredError,
 			})
 		}
 	}
@@ -242,7 +245,7 @@ func buildCanonicalVectorEntry(definition WireSchemaDefinitionV1) (CanonicalVect
 			return CanonicalVectorEntryV1{}, fmt.Errorf("duplicate predicate ID %s", predicates[index].PredicateID)
 		}
 	}
-	rejections := GenerateCanonicalRejectionVectorsV1(definition.SchemaID, fields, predicates)
+	rejections := generateCanonicalRejectionVectorsV1(definition.SchemaID, definition.RecordName, fields, predicates)
 	return CanonicalVectorEntryV1{definition.SchemaID, definition.RecordName, fields, predicates, CanonicalPositiveRecipe, rejections}, nil
 }
 
@@ -723,6 +726,10 @@ func validPredicateOperator(operator PredicateOperator) bool {
 }
 
 func GenerateCanonicalRejectionVectorsV1(schemaID string, fields []WireFieldDescriptorV1, predicates []PredicateDescriptorV1) []CanonicalRejectionVectorV1 {
+	return generateCanonicalRejectionVectorsV1(schemaID, "", fields, predicates)
+}
+
+func generateCanonicalRejectionVectorsV1(schemaID, recordName string, fields []WireFieldDescriptorV1, predicates []PredicateDescriptorV1) []CanonicalRejectionVectorV1 {
 	vectors := make([]CanonicalRejectionVectorV1, 0, len(fields)*5+len(predicates)+4)
 	appendVector := func(path, mutation string, required CanonicalRequiredError) {
 		vectors = append(vectors, CanonicalRejectionVectorV1{schemaID + "/" + path + "/" + mutation, mutation, required})
@@ -730,8 +737,9 @@ func GenerateCanonicalRejectionVectorsV1(schemaID string, fields []WireFieldDesc
 	appendVector("$", "UNKNOWN_FIRST", CanonicalUnknownField)
 	appendVector("$", "UNKNOWN_LAST", CanonicalUnknownField)
 	appendVector("$", "DUPLICATE_FIELD", CanonicalDuplicateField)
+	appendVector("$", "INVALID_UTF8", CanonicalNonCanonical)
 	appendVector("$", "TRAILING_JSON", CanonicalNonCanonical)
-	for _, field := range fields {
+	for fieldIndex, field := range fields {
 		path := strings.ReplaceAll(field.FieldPath, "~", "~0")
 		path = strings.ReplaceAll(path, "/", "~1")
 		if !field.Optional {
@@ -757,7 +765,7 @@ func GenerateCanonicalRejectionVectorsV1(schemaID string, fields []WireFieldDesc
 		if field.MaxItems != nil {
 			appendVector(path, "ABOVE_MAX", CanonicalBoundInvalid)
 		}
-		if field.DigestTarget != "" {
+		if field.DigestTarget != "" && (recordName == "" || isSelfDigestFieldIndexV1(recordName, schemaID, fields, fieldIndex)) {
 			appendVector(path, "SELF_DIGEST_MISMATCH", CanonicalDigestInvalid)
 		}
 		if field.LiteralValue != "" {
@@ -775,13 +783,16 @@ func GenerateCanonicalRejectionVectorsV1(schemaID string, fields []WireFieldDesc
 			appendVector(path, "SHORT", CanonicalBoundInvalid)
 			appendVector(path, "BAD_CHAR", CanonicalBoundInvalid)
 		}
+		if field.ValueType == "path" || field.ValueType == "absPath" || field.ValueType == "authorityDomain" {
+			appendVector(path, "BAD_CHAR", CanonicalBoundInvalid)
+		}
 	}
 	for _, predicate := range predicates {
 		path := "$"
 		if len(predicate.FieldPaths) > 0 {
 			path = predicate.FieldPaths[0]
 		}
-		appendVector(path, "PREDICATE_"+predicate.PredicateID, CanonicalPredicateInvalid)
+		appendVector(path, "PREDICATE_"+predicate.PredicateID, predicate.RequiredError)
 	}
 	sort.Slice(vectors, func(i, j int) bool { return vectors[i].VectorID < vectors[j].VectorID })
 	result := vectors[:0]
@@ -957,6 +968,11 @@ func ValidatePrimitiveWireValueV1(valueType, value string) error {
 		if err := validateAbsoluteWirePath(value); err != nil {
 			return err
 		}
+	case "procStart":
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || parsed == 0 || parsed > 9223372036854775807 {
+			return errors.New("process start ticks are invalid")
+		}
 	case "gitOID", "hexid", "dbIdentity", "hex32", "ed25519PublicKeyHex", "ed25519SignatureHex", "v4LedgerEventID":
 		if err := validateExactLowerHex(value, bounds.MinBytes); err != nil {
 			return err
@@ -1015,9 +1031,10 @@ func validateAbsoluteWirePath(value string) error {
 // from descriptors. It is intentionally mechanical; semantic predicates are
 // represented by their independently executable rejection recipes.
 func GenerateMinimalCanonicalVectorV1(entry CanonicalVectorEntryV1) ([]byte, error) {
-	var buffer bytes.Buffer
-	buffer.WriteByte('{')
-	wrote := false
+	if entry.RecordName == "ArtifactBlobV1" && entry.SchemaID == "artifact-blob-v1" {
+		return []byte{'a'}, nil
+	}
+	values := make(map[string]json.RawMessage, len(entry.Fields))
 	for _, field := range entry.Fields {
 		if field.Optional {
 			continue
@@ -1026,17 +1043,27 @@ func GenerateMinimalCanonicalVectorV1(entry CanonicalVectorEntryV1) ([]byte, err
 		if err != nil {
 			return nil, fmt.Errorf("field %s: %w", field.FieldPath, err)
 		}
-		if wrote {
-			buffer.WriteByte(',')
-		}
-		name, _ := json.Marshal(field.FieldPath)
-		buffer.Write(name)
-		buffer.WriteByte(':')
-		buffer.Write(value)
-		wrote = true
+		values[field.FieldPath] = value
 	}
-	buffer.WriteByte('}')
-	return buffer.Bytes(), nil
+	if err := applyPositivePredicatesV1(entry, values); err != nil {
+		return nil, err
+	}
+	if err := applyEd25519VectorsV1(entry, values); err != nil {
+		return nil, err
+	}
+	for fieldIndex, field := range entry.Fields {
+		if !isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, fieldIndex) {
+			continue
+		}
+		preimage, err := marshalCanonicalVectorObjectV1(entry.Fields, values, field.FieldPath)
+		if err != nil {
+			return nil, err
+		}
+		digest := sha256.Sum256(preimage)
+		encoded, _ := json.Marshal(hex.EncodeToString(digest[:]))
+		values[field.FieldPath] = encoded
+	}
+	return marshalCanonicalVectorObjectV1(entry.Fields, values, "")
 }
 
 func minimalDescriptorJSON(field WireFieldDescriptorV1) ([]byte, error) {
@@ -1060,7 +1087,20 @@ func minimalDescriptorJSON(field WireFieldDescriptorV1) ([]byte, error) {
 		}
 		return []byte(strconv.FormatUint(value, 10)), nil
 	case WireArray:
-		return []byte("[]"), nil
+		minimum := uint64(0)
+		if field.MinItems != nil {
+			minimum = *field.MinItems
+		}
+		elementType := arrayElementTypeV1(field.ValueType)
+		values := make([]json.RawMessage, 0, minimum)
+		for index := uint64(0); index < minimum; index++ {
+			value, err := minimalArrayElementJSONV1(field, elementType, index)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, value)
+		}
+		return json.Marshal(values)
 	case WireObject:
 		return []byte("{}"), nil
 	case WireRawJSON:
@@ -1071,6 +1111,12 @@ func minimalDescriptorJSON(field WireFieldDescriptorV1) ([]byte, error) {
 			value = values[0]
 		} else {
 			switch {
+			case strings.HasPrefix(field.ValueType, "{") && strings.HasSuffix(field.ValueType, "}"):
+				value = strings.Split(strings.Trim(field.ValueType, "{}"), ",")[0]
+			case field.ValueType == "ed25519PublicKeyHex":
+				value = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+			case field.ValueType == "ed25519SignatureHex":
+				value = strings.Repeat("a", 128)
 			case isHexWireType(field.ValueType):
 				count := 64
 				if field.MinBytes != nil {
@@ -1093,6 +1139,8 @@ func minimalDescriptorJSON(field WireFieldDescriptorV1) ([]byte, error) {
 				value = "2000-01-01T00:00:00Z"
 			case field.ValueType == "ledgerTimestamp":
 				value = "2000-01-01T00:00:00Z"
+			case field.ValueType == "procStart":
+				value = "1"
 			}
 		}
 		if field.MinBytes != nil && uint64(len(value)) < *field.MinBytes {
@@ -1102,4 +1150,199 @@ func minimalDescriptorJSON(field WireFieldDescriptorV1) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported JSON type %s", field.JSONType)
 	}
+}
+
+func isSelfDigestDescriptorV1(recordName, schemaID string, specifications []WireFieldSpecV1, index int, descriptor WireFieldDescriptorV1) bool {
+	return index == len(specifications)-1 && (descriptor.DigestTarget == recordName || descriptor.DigestTarget == schemaID)
+}
+
+func isSelfDigestFieldIndexV1(recordName, schemaID string, fields []WireFieldDescriptorV1, index int) bool {
+	if index < 0 || index >= len(fields) {
+		return false
+	}
+	field := fields[index]
+	return index == len(fields)-1 && (field.DigestTarget == recordName || field.DigestTarget == schemaID)
+}
+
+func arrayElementTypeV1(valueType string) string {
+	if !strings.HasPrefix(valueType, "[]") {
+		return ""
+	}
+	valueType = strings.TrimPrefix(valueType, "[]")
+	if index := strings.LastIndex(valueType, "("); index >= 0 {
+		valueType = valueType[:index]
+	}
+	return valueType
+}
+
+func minimalArrayElementJSONV1(parent WireFieldDescriptorV1, elementType string, ordinal uint64) ([]byte, error) {
+	if elementType == "" {
+		return nil, errors.New("array element type is unresolved")
+	}
+	if strings.HasSuffix(elementType, "V1") || strings.HasSuffix(elementType, "V2") || strings.HasSuffix(elementType, "V3") || strings.HasSuffix(elementType, "V4") {
+		return []byte("{}"), nil
+	}
+	descriptor, err := ResolveWireFieldDescriptorV1(parent.SchemaID, parent.FieldPath, parent.Ordinal, elementType, false)
+	if err != nil {
+		return nil, err
+	}
+	value, err := minimalDescriptorJSON(descriptor)
+	if err != nil {
+		return nil, err
+	}
+	if ordinal == 0 || descriptor.JSONType != WireString {
+		return value, nil
+	}
+	var text string
+	if json.Unmarshal(value, &text) != nil {
+		return value, nil
+	}
+	if len(text) != 0 {
+		replacement := byte('b' + byte((ordinal-1)%24))
+		candidate := string(replacement) + text[1:]
+		if ValidatePrimitiveWireValueV1(descriptor.ValueType, candidate) == nil {
+			return json.Marshal(candidate)
+		}
+	}
+	return value, nil
+}
+
+func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage) error {
+	fields := make(map[string]WireFieldDescriptorV1, len(entry.Fields))
+	for _, field := range entry.Fields {
+		fields[field.FieldPath] = field
+	}
+	for _, predicate := range entry.Predicates {
+		switch predicate.Operator {
+		case PredicateExactLiteral, PredicateTypedReference, PredicateDigestPreimage, PredicateDerivation, PredicateStateTransition, PredicateAggregateLEQ:
+			// Exact literals and digest/reference shapes are installed by field
+			// generation; minimal numeric values satisfy aggregate ceilings.
+		case PredicateAllEqual:
+			if len(predicate.FieldPaths) < 2 {
+				continue
+			}
+			value, ok := values[predicate.FieldPaths[0]]
+			if !ok {
+				descriptor, exists := fields[predicate.FieldPaths[0]]
+				if !exists {
+					return fmt.Errorf("predicate %s has no executable operand", predicate.PredicateID)
+				}
+				var err error
+				value, err = minimalDescriptorJSON(descriptor)
+				if err != nil {
+					return err
+				}
+				values[predicate.FieldPaths[0]] = value
+			}
+			for _, path := range predicate.FieldPaths[1:] {
+				values[path] = append(json.RawMessage(nil), value...)
+			}
+		case PredicateExactlyOne:
+			present := 0
+			for _, path := range predicate.FieldPaths {
+				if _, ok := values[path]; ok {
+					present++
+				}
+			}
+			if present == 0 && len(predicate.FieldPaths) != 0 {
+				descriptor, ok := fields[predicate.FieldPaths[0]]
+				if !ok {
+					return fmt.Errorf("predicate %s has no executable arm", predicate.PredicateID)
+				}
+				value, err := minimalDescriptorJSON(descriptor)
+				if err != nil {
+					return err
+				}
+				values[predicate.FieldPaths[0]] = value
+			}
+		case PredicateOrdinalSuccess:
+			paths := integerPredicatePathsV1(predicate.FieldPaths, fields)
+			if len(paths) >= 2 {
+				var predecessor uint64
+				if json.Unmarshal(values[paths[0]], &predecessor) == nil {
+					values[paths[1]] = json.RawMessage(strconv.FormatUint(predecessor+1, 10))
+				}
+			}
+		case PredicateSubset:
+			if len(predicate.FieldPaths) >= 2 {
+				values[predicate.FieldPaths[0]] = []byte("[]")
+			}
+		case PredicateIfAndOnlyIf, PredicateImplies:
+			// Optional operands are absent in the minimal record, making the
+			// implication antecedent false. Explicit boolean operands use false.
+		}
+	}
+	return nil
+}
+
+func integerPredicatePathsV1(paths []string, fields map[string]WireFieldDescriptorV1) []string {
+	result := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if field, ok := fields[path]; ok && field.JSONType == WireInteger {
+			result = append(result, path)
+		}
+	}
+	return result
+}
+
+func applyEd25519VectorsV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage) error {
+	seed, err := hex.DecodeString("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+	if err != nil {
+		return err
+	}
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	if hex.EncodeToString(publicKey) != "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a" {
+		return errors.New("RFC 8032 vector public key disagrees")
+	}
+	for _, field := range entry.Fields {
+		if field.ValueType == "ed25519PublicKeyHex" {
+			encoded, _ := json.Marshal(hex.EncodeToString(publicKey))
+			values[field.FieldPath] = encoded
+		}
+	}
+	for _, field := range entry.Fields {
+		if field.ValueType != "ed25519SignatureHex" {
+			continue
+		}
+		message, err := marshalCanonicalVectorObjectV1(entry.Fields, values, field.FieldPath)
+		if err != nil {
+			return err
+		}
+		signature := ed25519.Sign(privateKey, message)
+		if len(signature) != ed25519.SignatureSize {
+			return errors.New("RFC 8032 vector signature has the wrong width")
+		}
+		encoded, _ := json.Marshal(hex.EncodeToString(signature))
+		values[field.FieldPath] = encoded
+	}
+	return nil
+}
+
+func marshalCanonicalVectorObjectV1(fields []WireFieldDescriptorV1, values map[string]json.RawMessage, omitted string) ([]byte, error) {
+	var buffer bytes.Buffer
+	buffer.WriteByte('{')
+	wrote := false
+	for _, field := range fields {
+		if field.FieldPath == omitted {
+			continue
+		}
+		value, exists := values[field.FieldPath]
+		if !exists {
+			continue
+		}
+		if !json.Valid(value) {
+			return nil, fmt.Errorf("field %s generated invalid JSON", field.FieldPath)
+		}
+		if wrote {
+			buffer.WriteByte(',')
+		}
+		name, _ := json.Marshal(field.FieldPath)
+		buffer.Write(name)
+		buffer.WriteByte(':')
+		buffer.Write(value)
+		wrote = true
+	}
+	buffer.WriteByte('}')
+	return buffer.Bytes(), nil
 }

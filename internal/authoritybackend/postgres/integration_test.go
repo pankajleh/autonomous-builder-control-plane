@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 )
 
 const postgresImageV1 = "postgres@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3"
@@ -216,6 +219,210 @@ func testPostgresDomainIsolation(t *testing.T) {
 	if _, err := backendA.pool.Exec(ctx, `SELECT * FROM abcp_v4.abcp_worker_observation_key_registration_v1`); err == nil {
 		t.Fatal("ordinary runtime directly read observation-key registration")
 	}
+}
+
+func testPostgresBootstrapPOnlyAndHReplay(t *testing.T) {
+	harness := newPostgresHarnessV1(t)
+	config := harness.bootstrapConfigV1(false)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	provisioner, err := connectBootstrapV1(ctx, config.ProvisionerConnectionString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := provisionV1(ctx, provisioner, config); err != nil {
+		provisioner.Close(context.Background())
+		t.Fatal(err)
+	}
+	provisioner.Close(context.Background())
+	if err := BootstrapV1(ctx, config); err != nil {
+		t.Fatalf("P-only replay: %v", err)
+	}
+	if err := BootstrapV1(ctx, config); err != nil {
+		t.Fatalf("already-hardened replay: %v", err)
+	}
+}
+
+func testPostgresBootstrapCommittedMReplay(t *testing.T) {
+	harness := newPostgresHarnessV1(t)
+	config := harness.bootstrapConfigV1(false)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	provisioner, err := connectBootstrapV1(ctx, config.ProvisionerConnectionString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := provisionV1(ctx, provisioner, config); err != nil {
+		provisioner.Close(context.Background())
+		t.Fatal(err)
+	}
+	provisioner.Close(context.Background())
+	migrator, err := connectBootstrapV1(ctx, config.MigratorConnectionString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateV1(ctx, migrator, config); err != nil {
+		migrator.Close(context.Background())
+		t.Fatal(err)
+	}
+	migrator.Close(context.Background())
+	domain := config.Domains[0]
+	workflow := domain.Workflows[0]
+	admin, err := pgx.Connect(ctx, harness.dsnV1("postgres", harness.adminPassword, "abcp_test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `UPDATE abcp_v4.abcp_workflow_authority_v1 SET canonical_state=$3,state_sha256=$4 WHERE authority_domain=$1 AND controller_identity=$2`, domain.AuthorityDomain, workflow.ControllerIdentity, []byte(`{"controller_identity":"`+workflow.ControllerIdentity+`","revision":1,"drift":true}`), strings.Repeat("e", 64)); err != nil {
+		admin.Close(context.Background())
+		t.Fatal(err)
+	}
+	admin.Close(context.Background())
+	if err := BootstrapV1(ctx, config); err == nil || !strings.Contains(err.Error(), "bootstrap rows") {
+		t.Fatalf("committed-M drift was not rejected: %v", err)
+	}
+	admin, err = pgx.Connect(ctx, harness.dsnV1("postgres", harness.adminPassword, "abcp_test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `UPDATE abcp_v4.abcp_workflow_authority_v1 SET canonical_state=$3,state_sha256=$4 WHERE authority_domain=$1 AND controller_identity=$2`, domain.AuthorityDomain, workflow.ControllerIdentity, workflow.CanonicalState, sha256HexV1(workflow.CanonicalState)); err != nil {
+		admin.Close(context.Background())
+		t.Fatal(err)
+	}
+	admin.Close(context.Background())
+	if err := BootstrapV1(ctx, config); err != nil {
+		t.Fatalf("committed-M exact replay: %v", err)
+	}
+}
+
+func testPostgresDurablePredecessorFence(t *testing.T) {
+	harness := newPostgresHarnessV1(t)
+	config := harness.bootstrapConfigV1(false)
+	domain := &config.Domains[0]
+	controllerID := domain.Workflows[0].ControllerIdentity
+	identity := governance.WorkflowBackendIdentityV1{
+		AuthorityDomain: domain.AuthorityDomain, ControllerIdentity: controllerID,
+		ImplementationID: "postgres-v1",
+	}
+	composition := sha256.Sum256([]byte("ABCP-POSTGRES-WORKFLOW-COMPOSITION-V1\x00" + domain.AuthorityDomain + "\x00" + controllerID))
+	identity.CompositionSHA256 = hex.EncodeToString(composition[:])
+	identityDigest, err := identity.SHA256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := postgresFenceDirectoryV1(t, domain.AuthorityDomain, controllerID, identityDigest)
+	directoryBytes, _ := directory.CanonicalJSON()
+	domain.PredecessorDirectories = []PredecessorDirectoryBootstrapV1{{
+		ControllerIdentity: controllerID, WriterEpoch: directory.WriterEpoch, WriterState: string(directory.WriterState),
+		CanonicalDirectory: directoryBytes, DirectorySHA256: directory.DirectorySHA256, Revision: directory.DirectoryRevision,
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := BootstrapV1(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+	backendA, err := OpenPostgresWorkflowAuthorityBackendV1(ctx, ConfigV1{ConnectionString: harness.dsnV1("abcp_runtime_a", harness.runtimePasswordA, "abcp_test"), AuthorityDomain: domain.AuthorityDomain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendA.Close()
+	backendB, err := OpenPostgresWorkflowAuthorityBackendV1(ctx, ConfigV1{ConnectionString: harness.dsnV1("abcp_runtime_a", harness.runtimePasswordA, "abcp_test"), AuthorityDomain: domain.AuthorityDomain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendB.Close()
+	probes := make(map[string]authoritybackend.PredecessorDrainProbeV1)
+	for _, binding := range directory.Bindings {
+		digest := binding.BarrierStateSHA256
+		probes[binding.BindingID] = func(governance.PredecessorStoreBindingV1) (string, error) { return digest, nil }
+	}
+	clock := func() time.Time { return time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC) }
+	fenceA, err := NewPostgresPredecessorDirectoryFenceV1(backendA, PredecessorFenceConfigV1{ControllerIdentity: controllerID, OwnerInstanceSHA256: strings.Repeat("e", 64), LeaseDuration: time.Minute, Now: clock, Probes: probes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fenceB, err := NewPostgresPredecessorDirectoryFenceV1(backendB, PredecessorFenceConfigV1{ControllerIdentity: controllerID, OwnerInstanceSHA256: strings.Repeat("f", 64), LeaseDuration: time.Minute, Now: clock, Probes: probes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wait sync.WaitGroup
+	leases := make(chan authoritybackend.PredecessorWriterLeaseHandleV1, 16)
+	errorsCh := make(chan error, 16)
+	for index := 0; index < 16; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			fence := fenceA
+			if index%2 != 0 {
+				fence = fenceB
+			}
+			lease, err := fence.AcquirePredecessorWriterV1([]string{"ledger-run-1"}, "maintenance")
+			if err != nil {
+				errorsCh <- err
+				return
+			}
+			leases <- lease
+		}(index)
+	}
+	wait.Wait()
+	close(leases)
+	close(errorsCh)
+	for err := range errorsCh {
+		t.Errorf("cross-host open: %v", err)
+	}
+	var opened []authoritybackend.PredecessorWriterLeaseHandleV1
+	for lease := range leases {
+		opened = append(opened, lease)
+	}
+	if len(opened) != 16 {
+		t.Fatalf("opened %d durable leases, want 16", len(opened))
+	}
+	loaded, err := fenceB.DirectoryV1()
+	if err != nil || len(loaded.ActiveWriterLeases) != 16 {
+		t.Fatalf("fresh host sees %d active leases: %v", len(loaded.ActiveWriterLeases), err)
+	}
+	for _, lease := range opened {
+		if err := lease.Release(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loaded, err = fenceA.DirectoryV1()
+	if err != nil || len(loaded.ActiveWriterLeases) != 0 {
+		t.Fatalf("durable releases left %d leases: %v", len(loaded.ActiveWriterLeases), err)
+	}
+}
+
+func postgresFenceDirectoryV1(t *testing.T, domain, controller, workflowIdentity string) governance.PredecessorAuthorityDirectoryV1 {
+	t.Helper()
+	binding := func(id string, kind governance.PredecessorBindingKind, digit string) governance.PredecessorStoreBindingV1 {
+		value := governance.PredecessorStoreBindingV1{BindingID: id, BindingKind: kind, HostIdentity: strings.Repeat(digit, 64), InitialScanArtifactSHA256: strings.Repeat("8", 64), BarrierStateSHA256: strings.Repeat(digit, 64), RegisteredEpoch: 1}
+		switch kind {
+		case governance.PredecessorBindingWorkflowState:
+			value.WorkflowBackendIdentitySHA256 = workflowIdentity
+		case governance.PredecessorBindingLedger:
+			value.RunID = "run-1"
+			value.CanonicalPathSHA256 = strings.Repeat("9", 64)
+			value.PhysicalIdentitySHA256 = strings.Repeat("a", 64)
+		default:
+			value.CanonicalPathSHA256 = strings.Repeat("b", 64)
+			value.PhysicalIdentitySHA256 = strings.Repeat("c", 64)
+		}
+		return value
+	}
+	directory, err := governance.SealPredecessorAuthorityDirectoryV1(governance.PredecessorAuthorityDirectoryV1{
+		Kind: "PredecessorAuthorityDirectoryV1", SchemaVersion: governance.PredecessorAuthorityDirectorySchemaV1,
+		AuthorityDomain: domain, ControllerIdentity: controller, RepositoryIdentity: "repository",
+		WriterEpoch: 1, WriterState: governance.PredecessorWriterOpen,
+		Bindings: []governance.PredecessorStoreBindingV1{
+			binding("ledger-run-1", governance.PredecessorBindingLedger, "1"),
+			binding("merge-root", governance.PredecessorBindingMergeStateStore, "2"),
+			binding("pr-root", governance.PredecessorBindingPRAdmission, "3"),
+			binding("workflow", governance.PredecessorBindingWorkflowState, "4"),
+		}, ActiveWriterLeases: []string{}, DirectoryRevision: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return directory
 }
 
 func newPostgresHarnessV1(t *testing.T) *postgresHarnessV1 {

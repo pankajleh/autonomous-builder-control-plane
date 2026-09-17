@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	postgresbackend "github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
@@ -86,7 +87,7 @@ func TestRunCLIRejectsAutonomousWorkflowWithoutAuthorityBackend(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("run CLI without authority backend exited %d: %s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "workflow-wide authority backend is required") {
+	if !strings.Contains(stderr.String(), "stateful command requires --postgres-dsn") {
 		t.Fatalf("missing fail-closed backend error: %q", stderr.String())
 	}
 	if stdout.Len() != 0 {
@@ -246,6 +247,33 @@ func TestGovernanceCLIRejectsCallerSelectedStatePaths(t *testing.T) {
 	stderr.Reset()
 	if code := runCLI([]string{"run", "--manifest", path, "--ledger", "ledger", "--evidence-root", "evidence", "--governance-state", filepath.Join(t.TempDir(), "state.json")}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "flag provided but not defined") {
 		t.Fatalf("caller-selected run state exited %d: %s", code, stderr.String())
+	}
+}
+
+func TestTask1PostgresCommandsArePresentAndFailClosed(t *testing.T) {
+	bootstrap := postgresbackend.BootstrapConfigV1{}
+	bootstrapBytes, err := json.Marshal(bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapPath := filepath.Join(t.TempDir(), "bootstrap.json")
+	writeCLIFile(t, bootstrapPath, bootstrapBytes, 0o600)
+	var stdout, stderr bytes.Buffer
+	if code := runCLI([]string{"governance-backend-bootstrap", "--input", bootstrapPath}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "bootstrap connections") {
+		t.Fatalf("bootstrap command exited %d: %s", code, stderr.String())
+	}
+
+	request := stateUpgradeRequestV1{Repository: "/repository", ExpectedDirectoryRevision: 1, ExpectedStateRevision: 1, ActivationV2SHA256: strings.Repeat("a", 64), DrainChecks: []stateUpgradeDrainCheckV1{}}
+	requestBytes, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestPath := filepath.Join(t.TempDir(), "upgrade.json")
+	writeCLIFile(t, requestPath, requestBytes, 0o600)
+	stdout.Reset()
+	stderr.Reset()
+	if code := runCLI([]string{"governance-state-upgrade", "--input", requestPath}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "--postgres-dsn") {
+		t.Fatalf("state-upgrade command exited %d: %s", code, stderr.String())
 	}
 }
 

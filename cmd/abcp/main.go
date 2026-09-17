@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -13,8 +14,11 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
+	postgresbackend "github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
@@ -61,6 +65,10 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "run":
 		return runCommand(args[1:], stdout, stderr)
+	case "governance-backend-bootstrap":
+		return governanceBackendBootstrapCommand(args[1:], stdout, stderr)
+	case "governance-state-upgrade":
+		return governanceStateUpgradeCommand(args[1:], stdout, stderr)
 	case "context-build":
 		return contextBuildCommand(args[1:], stdout, stderr)
 	case "context-verify":
@@ -130,10 +138,182 @@ type activationInstallRequest struct {
 	Activation         governancev3.GovernanceActivationV1 `json:"activation"`
 }
 
+type postgresCLIOptionsV1 struct {
+	connectionString string
+	authorityDomain  string
+	workflowBinding  string
+}
+
+type productionPostgresCompositionV1 struct {
+	backend    *postgresbackend.PostgresWorkflowAuthorityBackendV1
+	fence      *postgresbackend.PostgresPredecessorDirectoryFenceV1
+	workflow   *authoritybackend.FencedWorkflowAuthorityBackendV1
+	controller *governancev3.ControllerV1
+}
+
+func (c *productionPostgresCompositionV1) Close() {
+	if c != nil && c.backend != nil {
+		c.backend.Close()
+	}
+}
+
+var processOwnerInstanceSHA256V1 = func() string {
+	seed := make([]byte, 32)
+	if _, err := rand.Read(seed); err != nil {
+		panic("CSPRNG unavailable for PostgreSQL predecessor fence: " + err.Error())
+	}
+	digest := sha256.Sum256(append([]byte("ABCP-PROCESS-OWNER-V1\x00"), seed...))
+	return fmt.Sprintf("%x", digest)
+}()
+
+func addPostgresCLIFlagsV1(flags *flag.FlagSet) (*string, *string, *string) {
+	connection := flags.String("postgres-dsn", "", "verified PostgreSQL runtime connection string")
+	domain := flags.String("authority-domain", "", "authenticated PostgreSQL authority domain")
+	binding := flags.String("workflow-binding-id", "", "registered predecessor workflow binding ID")
+	return connection, domain, binding
+}
+
+func openProductionPostgresCompositionV1(ctx context.Context, repository string, options postgresCLIOptionsV1, probes map[string]authoritybackend.PredecessorDrainProbeV1) (*productionPostgresCompositionV1, error) {
+	if strings.TrimSpace(options.connectionString) == "" || strings.TrimSpace(options.authorityDomain) == "" || strings.TrimSpace(options.workflowBinding) == "" {
+		return nil, errors.New("stateful command requires --postgres-dsn, --authority-domain, and --workflow-binding-id")
+	}
+	backend, err := postgresbackend.OpenPostgresWorkflowAuthorityBackendV1(ctx, postgresbackend.ConfigV1{ConnectionString: options.connectionString, AuthorityDomain: options.authorityDomain})
+	if err != nil {
+		return nil, err
+	}
+	failed := true
+	defer func() {
+		if failed {
+			backend.Close()
+		}
+	}()
+	identityController, err := governancev3.OpenControllerWithAuthorityBackendV1(repository, backend)
+	if err != nil {
+		return nil, err
+	}
+	controllerIdentity := identityController.ControllerIdentity()
+	fence, err := postgresbackend.NewPostgresPredecessorDirectoryFenceV1(backend, postgresbackend.PredecessorFenceConfigV1{
+		ControllerIdentity: controllerIdentity, OwnerInstanceSHA256: processOwnerInstanceSHA256V1,
+		LeaseDuration: 15 * time.Minute, Now: time.Now, Probes: probes,
+	})
+	if err != nil {
+		return nil, err
+	}
+	identity, err := backend.WorkflowBackendIdentityV1(controllerIdentity)
+	if err != nil {
+		return nil, err
+	}
+	workflow, err := authoritybackend.NewFencedWorkflowAuthorityBackendV1(backend, fence, options.workflowBinding, identity)
+	if err != nil {
+		return nil, err
+	}
+	controller, err := governancev3.OpenControllerWithAuthorityBackendV1(repository, workflow)
+	if err != nil {
+		return nil, err
+	}
+	failed = false
+	return &productionPostgresCompositionV1{backend: backend, fence: fence, workflow: workflow, controller: controller}, nil
+}
+
+type stateUpgradeDrainCheckV1 struct {
+	BindingID             string `json:"binding_id"`
+	ObservedBarrierSHA256 string `json:"observed_barrier_sha256"`
+}
+
+type stateUpgradeRequestV1 struct {
+	Repository                string                     `json:"repository"`
+	ExpectedDirectoryRevision uint64                     `json:"expected_directory_revision"`
+	ExpectedStateRevision     uint64                     `json:"expected_state_revision"`
+	ActivationV2SHA256        string                     `json:"activation_v2_sha256"`
+	DrainChecks               []stateUpgradeDrainCheckV1 `json:"drain_checks"`
+}
+
+func governanceBackendBootstrapCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("governance-backend-bootstrap", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	input := flags.String("input", "", "path to strict canonical PostgreSQL bootstrap JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *input == "" {
+		fmt.Fprintln(stderr, "usage: abcp governance-backend-bootstrap --input <path>")
+		return 2
+	}
+	var config postgresbackend.BootstrapConfigV1
+	if err := loadCanonicalGovernance(*input, &config); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err := postgresbackend.BootstrapV1(context.Background(), config); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err := writeJSONOutput(stdout, struct {
+		Bootstrapped bool `json:"bootstrapped"`
+	}{Bootstrapped: true}); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func governanceStateUpgradeCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("governance-state-upgrade", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	input := flags.String("input", "", "path to strict canonical state-upgrade JSON")
+	postgresDSN, authorityDomain, workflowBinding := addPostgresCLIFlagsV1(flags)
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *input == "" {
+		fmt.Fprintln(stderr, "usage: abcp governance-state-upgrade --input <path> --postgres-dsn <dsn> --authority-domain <id> --workflow-binding-id <id>")
+		return 2
+	}
+	var request stateUpgradeRequestV1
+	if err := loadCanonicalGovernance(*input, &request); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	probes := make(map[string]authoritybackend.PredecessorDrainProbeV1, len(request.DrainChecks))
+	previous := ""
+	for _, check := range request.DrainChecks {
+		if check.BindingID == "" || check.BindingID <= previous || len(check.ObservedBarrierSHA256) != 64 {
+			fmt.Fprintln(stderr, "state-upgrade drain checks must be sorted, unique, and complete")
+			return 1
+		}
+		previous = check.BindingID
+		digest := check.ObservedBarrierSHA256
+		probes[check.BindingID] = func(governancev3.PredecessorStoreBindingV1) (string, error) { return digest, nil }
+	}
+	composition, err := openProductionPostgresCompositionV1(context.Background(), request.Repository, postgresCLIOptionsV1{
+		connectionString: *postgresDSN, authorityDomain: *authorityDomain, workflowBinding: *workflowBinding,
+	}, probes)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	defer composition.Close()
+	result, err := composition.workflow.CutoverV1(authoritybackend.PredecessorCutoverRequestV1{
+		ExpectedDirectoryRevision: request.ExpectedDirectoryRevision,
+		ExpectedStateRevision:     request.ExpectedStateRevision,
+		ActivationV2SHA256:        request.ActivationV2SHA256,
+	}, composition.backend)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err := writeJSONOutput(stdout, result); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
 func governanceCommand(name string, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	input := flags.String("input", "", "path to strict canonical governance JSON")
+	postgresDSN, authorityDomain, workflowBinding := addPostgresCLIFlagsV1(flags)
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -145,6 +325,22 @@ func governanceCommand(name string, args []string, stdout, stderr io.Writer) int
 		Valid bool `json:"valid"`
 	}{Valid: true}
 	var err error
+	var compositions []*productionPostgresCompositionV1
+	defer func() {
+		for _, composition := range compositions {
+			composition.Close()
+		}
+	}()
+	openController := func(repository string) (*governancev3.ControllerV1, error) {
+		composition, openErr := openProductionPostgresCompositionV1(context.Background(), repository, postgresCLIOptionsV1{
+			connectionString: *postgresDSN, authorityDomain: *authorityDomain, workflowBinding: *workflowBinding,
+		}, nil)
+		if openErr != nil {
+			return nil, openErr
+		}
+		compositions = append(compositions, composition)
+		return composition.controller, nil
+	}
 	switch name {
 	case "governance-usage-validate":
 		request := usageValidationRequest{}
@@ -152,7 +348,7 @@ func governanceCommand(name string, args []string, stdout, stderr io.Writer) int
 		if err == nil {
 			if request.Operation == contextcapsule.OperationImplementationReview && request.Mutation {
 				var controller *governancev3.ControllerV1
-				controller, err = governancev3.OpenControllerV1(request.Repository)
+				controller, err = openController(request.Repository)
 				if err == nil {
 					err = controller.ValidateCapsuleUsageV3(request.Capsule, request.Operation, request.Mutation, request.LeaseSHA256)
 				}
@@ -165,7 +361,7 @@ func governanceCommand(name string, args []string, stdout, stderr io.Writer) int
 		err = loadCanonicalGovernance(*input, &request)
 		if err == nil {
 			var controller *governancev3.ControllerV1
-			controller, err = governancev3.OpenControllerV1(request.Repository)
+			controller, err = openController(request.Repository)
 			if err == nil {
 				err = controller.AdvanceCheckpointV1(request)
 			}
@@ -199,7 +395,7 @@ func governanceCommand(name string, args []string, stdout, stderr io.Writer) int
 		err = loadCanonicalGovernance(*input, &request)
 		if err == nil {
 			var controller *governancev3.ControllerV1
-			controller, err = governancev3.OpenControllerV1(request.Repository)
+			controller, err = openController(request.Repository)
 			if err == nil {
 				err = controller.AdvanceReviewTipV1(request.Repository, request.Capsule, request.CapsuleFileSHA256, request.Registry, request.Report)
 			}
@@ -209,7 +405,7 @@ func governanceCommand(name string, args []string, stdout, stderr io.Writer) int
 		err = loadCanonicalGovernance(*input, &request)
 		if err == nil {
 			var controller *governancev3.ControllerV1
-			controller, err = governancev3.OpenControllerV1(request.Repository)
+			controller, err = openController(request.Repository)
 			if err == nil {
 				result, err = controller.IssueMutationLeaseV1(request.Capsule, request.Registry, request.Report, request.Limits)
 			}
@@ -219,7 +415,7 @@ func governanceCommand(name string, args []string, stdout, stderr io.Writer) int
 		err = loadCanonicalGovernance(*input, &request)
 		if err == nil {
 			var controller *governancev3.ControllerV1
-			controller, err = governancev3.OpenControllerV1(request.Repository)
+			controller, err = openController(request.Repository)
 			if err == nil {
 				err = controller.BeginMutationLeaseV1(request.LeaseSHA256)
 			}
@@ -229,7 +425,7 @@ func governanceCommand(name string, args []string, stdout, stderr io.Writer) int
 		err = loadCanonicalGovernance(*input, &request)
 		if err == nil {
 			var controller *governancev3.ControllerV1
-			controller, err = governancev3.OpenControllerV1(request.Repository)
+			controller, err = openController(request.Repository)
 			if err == nil {
 				result, err = controller.CompleteMutationReceiptV1(request.Repository, request.Capsule, request.LeaseSHA256, request.CandidateSHA)
 			}
@@ -245,7 +441,7 @@ func governanceCommand(name string, args []string, stdout, stderr io.Writer) int
 		err = loadCanonicalGovernance(*input, &request)
 		if err == nil {
 			var controller *governancev3.ControllerV1
-			controller, err = governancev3.OpenControllerV1(request.Repository)
+			controller, err = openController(request.Repository)
 			if err == nil {
 				err = controller.InstallActivationV1(request.Repository, request.RepositoryIdentity, request.Activation)
 			}
@@ -487,6 +683,8 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	ledgerPath := flags.String("ledger", "", "path to the append-only JSONL ledger")
 	evidenceRoot := flags.String("evidence-root", "", "root directory for immutable run evidence")
 	cgroupRoot := flags.String("cgroup-root", "/sys/fs/cgroup", "controller cgroup v2 root")
+	postgresDSN, authorityDomain, workflowBinding := addPostgresCLIFlagsV1(flags)
+	ledgerBinding := flags.String("ledger-binding-id", "", "registered predecessor ledger binding ID for this run")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -500,11 +698,19 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	controller, err := governancev3.OpenControllerV1(manifest.Repository.Path)
+	composition, err := openProductionPostgresCompositionV1(context.Background(), manifest.Repository.Path, postgresCLIOptionsV1{
+		connectionString: *postgresDSN, authorityDomain: *authorityDomain, workflowBinding: *workflowBinding,
+	}, nil)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	defer composition.Close()
+	if *ledgerBinding == "" {
+		fmt.Fprintln(stderr, "stateful run requires --ledger-binding-id")
+		return 1
+	}
+	controller := composition.controller
 	governed, err := authority.NewWithGovernanceController(manifest, controller)
 	if err != nil {
 		fmt.Fprintf(stderr, "validate authority: %v\n", err)
@@ -520,7 +726,7 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	events, err := ledger.NewJSONLLedger(canonicalLedger)
+	events, err := ledger.NewFencedJSONLLedger(canonicalLedger, composition.fence, []string{*ledgerBinding})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -648,5 +854,5 @@ func loadManifest(path string) (authority.Manifest, error) {
 }
 
 func usage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|governance-*-validate|governance-lease-issue|run|recovery-inspect|recovery-resume>")
+	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|governance-*-validate|governance-lease-issue|governance-backend-bootstrap|governance-state-upgrade|run|recovery-inspect|recovery-resume>")
 }

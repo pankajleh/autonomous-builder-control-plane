@@ -30,6 +30,12 @@ func NewProductionController(config ProductionControllerConfig) (*Controller, er
 	if productionAdmissionRoot == "" {
 		return nil, errors.New("controller host admission root was not configured at process startup")
 	}
+	if config.PredecessorFence == nil || len(config.PredecessorBindingIDs) == 0 {
+		return nil, errors.New("production PR admission/provider requires the durable predecessor fence")
+	}
+	if config.AuthoritativeLedger == nil || !config.AuthoritativeLedger.PredecessorFencedV1() {
+		return nil, errors.New("production PR admission/provider requires a fenced authoritative ledger")
+	}
 	store, err := newPRWriteAdmissionStore(productionAdmissionRoot)
 	if err != nil {
 		return nil, err

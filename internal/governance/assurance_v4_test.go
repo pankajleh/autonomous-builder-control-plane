@@ -1,10 +1,12 @@
 package governance
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -63,6 +65,40 @@ func TestAssuranceCanonicalUnitSemantics(t *testing.T) {
 				t.Fatalf("non-canonical input accepted: %s", invalid)
 			}
 		})
+	}
+}
+
+func TestFrozenFailureScenariosMatchAcceptedAByteExactly(t *testing.T) {
+	model := readFrozenAssuranceModel(t)
+	scanner := bufio.NewScanner(bytes.NewReader(model))
+	rows := make([]string, 0, 70)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "| AG-S-") {
+			continue
+		}
+		cells := strings.Split(line, "|")
+		if len(cells) != 7 {
+			t.Fatalf("accepted A scenario row has %d cells: %q", len(cells), line)
+		}
+		for index := 1; index <= 5; index++ {
+			cells[index] = strings.TrimSpace(cells[index])
+		}
+		rows = append(rows, strings.Join(cells[1:6], "|"))
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 70 {
+		t.Fatalf("accepted A contains %d scenario rows, want 70", len(rows))
+	}
+	if len(frozenScenarioRows) != len(rows) {
+		t.Fatalf("implementation contains %d scenario rows, want %d", len(frozenScenarioRows), len(rows))
+	}
+	for index := range rows {
+		if frozenScenarioRows[index] != rows[index] {
+			t.Fatalf("scenario row %d differs from accepted A\nimplementation: %q\naccepted A:    %q", index+1, frozenScenarioRows[index], rows[index])
+		}
 	}
 }
 
@@ -144,6 +180,106 @@ func TestAssuranceWireCatalogPathIdentityAndLiteralVectors(t *testing.T) {
 	assertFrozenDigest(t,
 		`{"kind":"FinalReviewProfileV1","schema_version":"final-review-profile-v1","profile_id":"ABCP_XHIGH_FRESH_V1","provider":"codex","model":"gpt-5.6-sol","reasoning_effort":"xhigh","fresh_session":true,"required_critical":0,"required_major":0,"classification_vocabulary":["ASSURANCE_MODEL_GAP","IMPLEMENTATION_FINDING"]}`,
 		"073885532416375d9cb7e81d674812131eabfd1929867daa041490c854b49553")
+}
+
+func TestExecutableCanonicalVectorsAreGeneratedAndValidated(t *testing.T) {
+	definitions := []WireSchemaDefinitionV1{{
+		SchemaID: "executable-vector-v1", RecordName: "ExecutableVectorV1",
+		Fields: []WireFieldSpecV1{
+			{"kind", `id="ExecutableVectorV1"`, false},
+			{"schema_version", `id="executable-vector-v1"`, false},
+			{"repository_path", "path", false},
+			{"workdir", "absPath", false},
+			{"authority_domain", "authorityDomain", false},
+			{"controller_identity", "dbIdentity", false},
+			{"artifact_sha256", "sha256<ArtifactBlobV1>", false},
+			{"mode", "{ALPHA,BETA}", false},
+			{"public_key", "ed25519PublicKeyHex", false},
+			{"signature", "ed25519SignatureHex", false},
+			{"members", "[]id(set,2..3)", false},
+		},
+	}}
+	catalog, err := BuildCanonicalVectorCatalogV1(definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vectors, err := GenerateExecutableCanonicalVectorsV1(catalog.Entries[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vectors.Rejections) != len(catalog.Entries[0].Rejections) {
+		t.Fatalf("generated %d rejections, want %d", len(vectors.Rejections), len(catalog.Entries[0].Rejections))
+	}
+	var positive map[string]json.RawMessage
+	if err := json.Unmarshal(vectors.Positive, &positive); err != nil {
+		t.Fatal(err)
+	}
+	var publicKey, signature string
+	_ = json.Unmarshal(positive["public_key"], &publicKey)
+	_ = json.Unmarshal(positive["signature"], &signature)
+	if publicKey != "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a" || len(signature) != 128 {
+		t.Fatalf("Ed25519 vector widths/seed differ: key=%q signature-bytes=%d", publicKey, len(signature)/2)
+	}
+	mutations := make(map[string]bool)
+	for _, vector := range vectors.Rejections {
+		parts := strings.Split(vector.VectorID, "/")
+		mutations[parts[len(parts)-1]] = true
+	}
+	for _, required := range []string{"INVALID_UTF8", "BAD_CHAR", "SHORT", "UPPERCASE", "UNSORTED", "DUPLICATE_MEMBER", "CONSTANT_CHANGED"} {
+		if !mutations[required] {
+			t.Fatalf("executable catalog omitted %s", required)
+		}
+	}
+}
+
+func TestFrozenCatalogEveryPositiveRecipeProducesValidatedBytes(t *testing.T) {
+	extraction, err := ExtractFrozenCanonicalVectorCatalogV1(readFrozenAssuranceModel(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	positives, err := GenerateCanonicalCatalogPositiveVectorsV1(extraction.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(positives["artifact-blob-v1"]) != "a" {
+		t.Fatalf("ArtifactBlobV1 positive = %q, want raw byte 0x61", positives["artifact-blob-v1"])
+	}
+	var authority map[string]json.RawMessage
+	if err := json.Unmarshal(positives["pr-publication-authority-v1"], &authority); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(authority["repository"], []byte("{}")) || bytes.Equal(authority["actor"], []byte("{}")) {
+		t.Fatal("required nested records were replaced by empty objects")
+	}
+}
+
+func TestCanonicalPositiveEvaluatesSelfDigestAndNonCanonicalAbsolutePath(t *testing.T) {
+	definition := WireSchemaDefinitionV1{
+		SchemaID: "self-digest-vector-v1", RecordName: "SelfDigestVectorV1",
+		Fields: []WireFieldSpecV1{{"kind", `id="SelfDigestVectorV1"`, false}, {"schema_version", `id="self-digest-vector-v1"`, false}, {"workdir", "absPath", false}, {"record_sha256", "sha256<SelfDigestVectorV1>", false}},
+	}
+	entry, err := buildCanonicalVectorEntry(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := GenerateMinimalCanonicalVectorV1(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCanonicalVectorBytesV1(entry, positive); err != nil {
+		t.Fatalf("self-digest positive rejected: %v", err)
+	}
+	if _, err := GenerateExecutableCanonicalVectorsV1(entry); err != nil {
+		t.Fatalf("self-digest executable vectors: %v", err)
+	}
+	var values map[string]json.RawMessage
+	_ = json.Unmarshal(positive, &values)
+	values["workdir"], _ = json.Marshal("/a/../b")
+	mutated, _ := marshalCanonicalVectorObjectV1(entry.Fields, values, "")
+	var classified *canonicalVectorValidationErrorV1
+	if err := ValidateCanonicalVectorBytesV1(entry, mutated); !errors.As(err, &classified) || classified.code != CanonicalNonCanonical {
+		t.Fatalf("non-normal absolute path classified as %v", err)
+	}
 }
 
 func readFrozenAssuranceModel(t *testing.T) []byte {

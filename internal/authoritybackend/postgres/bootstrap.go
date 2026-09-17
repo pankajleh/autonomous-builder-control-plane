@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,77 +13,78 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 )
 
 type BootstrapConfigV1 struct {
-	ProvisionerConnectionString string
-	MigratorConnectionString    string
-	MigratorPassword            string
-	DatabaseName                string
-	Domains                     []AuthorityDomainBootstrapV1
-	Workers                     []WorkerBootstrapV1
-	Artifacts                   []ArtifactBootstrapV1
-	Stages                      []StageBootstrapV1
+	ProvisionerConnectionString string                       `json:"provisioner_connection_string"`
+	MigratorConnectionString    string                       `json:"migrator_connection_string"`
+	MigratorPassword            string                       `json:"migrator_password"`
+	DatabaseName                string                       `json:"database_name"`
+	Domains                     []AuthorityDomainBootstrapV1 `json:"domains"`
+	Workers                     []WorkerBootstrapV1          `json:"workers"`
+	Artifacts                   []ArtifactBootstrapV1        `json:"artifacts"`
+	Stages                      []StageBootstrapV1           `json:"stages"`
 }
 
 type AuthorityDomainBootstrapV1 struct {
-	AuthorityDomain           string
-	RuntimeRole               string
-	RuntimePassword           string
-	RecoveryVerifierRole      string
-	RecoveryVerifierPassword  string
-	BootstrapProvenanceSHA256 string
-	Workflows                 []WorkflowBootstrapV1
-	PredecessorDirectories    []PredecessorDirectoryBootstrapV1
+	AuthorityDomain           string                            `json:"authority_domain"`
+	RuntimeRole               string                            `json:"runtime_role"`
+	RuntimePassword           string                            `json:"runtime_password"`
+	RecoveryVerifierRole      string                            `json:"recovery_verifier_role"`
+	RecoveryVerifierPassword  string                            `json:"recovery_verifier_password"`
+	BootstrapProvenanceSHA256 string                            `json:"bootstrap_provenance_sha256"`
+	Workflows                 []WorkflowBootstrapV1             `json:"workflows"`
+	PredecessorDirectories    []PredecessorDirectoryBootstrapV1 `json:"predecessor_directories"`
 }
 
 type WorkflowBootstrapV1 struct {
-	ControllerIdentity string
-	Revision           uint64
-	CanonicalState     []byte
-	UpdatedAt          time.Time
+	ControllerIdentity string    `json:"controller_identity"`
+	Revision           uint64    `json:"revision"`
+	CanonicalState     []byte    `json:"canonical_state"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type PredecessorDirectoryBootstrapV1 struct {
-	ControllerIdentity string
-	WriterEpoch        uint64
-	WriterState        string
-	CanonicalDirectory []byte
-	DirectorySHA256    string
-	Revision           uint64
+	ControllerIdentity string `json:"controller_identity"`
+	WriterEpoch        uint64 `json:"writer_epoch"`
+	WriterState        string `json:"writer_state"`
+	CanonicalDirectory []byte `json:"canonical_directory"`
+	DirectorySHA256    string `json:"directory_sha256"`
+	Revision           uint64 `json:"revision"`
 }
 
 type WorkerBootstrapV1 struct {
-	WorkerIdentity            string
-	CanonicalCapacity         []byte
-	CapacitySHA256            string
-	CapacityRevision          uint64
-	CanonicalKey              []byte
-	CanonicalRegistration     []byte
-	HostIdentity              string
-	ObserverIdentity          string
-	ObserverKeySHA256         string
-	RegistrationSHA256        string
-	RegistrationRevision      uint64
-	WorkerCapacitySHA256      string
-	BootstrapProvenanceSHA256 string
-	RegisteredAt              time.Time
+	WorkerIdentity            string    `json:"worker_identity"`
+	CanonicalCapacity         []byte    `json:"canonical_capacity"`
+	CapacitySHA256            string    `json:"capacity_sha256"`
+	CapacityRevision          uint64    `json:"capacity_revision"`
+	CanonicalKey              []byte    `json:"canonical_key"`
+	CanonicalRegistration     []byte    `json:"canonical_registration"`
+	HostIdentity              string    `json:"host_identity"`
+	ObserverIdentity          string    `json:"observer_identity"`
+	ObserverKeySHA256         string    `json:"observer_key_sha256"`
+	RegistrationSHA256        string    `json:"registration_sha256"`
+	RegistrationRevision      uint64    `json:"registration_revision"`
+	WorkerCapacitySHA256      string    `json:"worker_capacity_sha256"`
+	BootstrapProvenanceSHA256 string    `json:"bootstrap_provenance_sha256"`
+	RegisteredAt              time.Time `json:"registered_at"`
 }
 
 type ArtifactBootstrapV1 struct {
-	AuthorityDomain string
-	CanonicalBytes  []byte
-	CreatedAt       time.Time
+	AuthorityDomain string    `json:"authority_domain"`
+	CanonicalBytes  []byte    `json:"canonical_bytes"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type StageBootstrapV1 struct {
-	AuthorityDomain       string
-	LineageSHA256         string
-	Stage                 string
-	SubjectSHA256         string
-	SealState             string
-	NextOccurrenceOrdinal uint64
-	Revision              uint64
+	AuthorityDomain       string `json:"authority_domain"`
+	LineageSHA256         string `json:"lineage_sha256"`
+	Stage                 string `json:"stage"`
+	SubjectSHA256         string `json:"subject_sha256"`
+	SealState             string `json:"seal_state"`
+	NextOccurrenceOrdinal uint64 `json:"next_occurrence_ordinal"`
+	Revision              uint64 `json:"revision"`
 }
 
 // BootstrapV1 executes the frozen provisioner→migrator→hardener protocol.
@@ -108,9 +110,9 @@ func BootstrapV1(ctx context.Context, config BootstrapConfigV1) error {
 			provisioner.Close(context.Background())
 			return fmt.Errorf("PostgreSQL bootstrap phase P: %w", err)
 		}
-	} else if err := verifyProvisionedDomainRolesV1(phaseContext, provisioner, config); err != nil {
+	} else if err := verifyProvisionedRoleTopologyV1(phaseContext, provisioner, config); err != nil {
 		provisioner.Close(context.Background())
-		return fmt.Errorf("reconcile provisioned domain roles: %w", err)
+		return fmt.Errorf("reconcile provisioned role topology: %w", err)
 	}
 	provisioner.Close(context.Background())
 
@@ -124,6 +126,40 @@ func BootstrapV1(ctx context.Context, config BootstrapConfigV1) error {
 			return fmt.Errorf("PostgreSQL bootstrap phase M: %w", err)
 		}
 		migrator.Close(context.Background())
+	} else {
+		// A committed M is never trusted merely because the schema exists. If
+		// the migrator is still usable, replay reopens the exact M authority,
+		// verifies every configured bootstrap row byte-for-byte, and only then
+		// permits the separate provisioner to finalize H. A NOLOGIN migrator is
+		// accepted here only when a fresh catalog check proves H already
+		// completed atomically; configured rows are rechecked below through the
+		// domain runtimes after final hardening verification.
+		migrator, connectErr := connectBootstrapV1(phaseContext, config.MigratorConnectionString)
+		if connectErr == nil {
+			if err := verifyMigratorSetAuthorityV1(phaseContext, migrator); err != nil {
+				migrator.Close(context.Background())
+				return fmt.Errorf("reconcile committed phase-M authority: %w", err)
+			}
+			if err := verifyCommittedBootstrapRowsV1(phaseContext, migrator, config); err != nil {
+				migrator.Close(context.Background())
+				return fmt.Errorf("reconcile committed phase-M bootstrap rows: %w", err)
+			}
+			if err := VerifyFrozenCatalogV1(phaseContext, migrator); err != nil {
+				migrator.Close(context.Background())
+				return fmt.Errorf("reconcile committed phase-M catalog: %w", err)
+			}
+			migrator.Close(context.Background())
+		} else {
+			verifier, err := connectBootstrapV1(phaseContext, config.ProvisionerConnectionString)
+			if err != nil {
+				return fmt.Errorf("reconcile ambiguous phase-H verifier: %w", err)
+			}
+			if err := VerifyFinalHardeningV1(phaseContext, verifier); err != nil {
+				verifier.Close(context.Background())
+				return fmt.Errorf("migrator is unavailable before verified phase H: %w", errors.Join(connectErr, err))
+			}
+			verifier.Close(context.Background())
+		}
 	}
 
 	hardener, err := connectBootstrapV1(phaseContext, config.ProvisionerConnectionString)
@@ -146,6 +182,9 @@ func BootstrapV1(ctx context.Context, config BootstrapConfigV1) error {
 	}
 	if err := VerifyFrozenCatalogV1(phaseContext, verifier); err != nil {
 		return fmt.Errorf("fresh frozen-catalog verification: %w", err)
+	}
+	if err := verifyBootstrapRowsThroughRuntimeV1(phaseContext, config); err != nil {
+		return fmt.Errorf("fresh bootstrap-row verification: %w", err)
 	}
 	return nil
 }
@@ -249,6 +288,9 @@ func migrateV1(ctx context.Context, conn *pgx.Conn, config BootstrapConfigV1) er
 	if err := insertBootstrapRowsV1(ctx, tx, config); err != nil {
 		return err
 	}
+	if err := verifyBootstrapRowsV1(ctx, tx, config, ""); err != nil {
+		return fmt.Errorf("verify phase-M bootstrap rows: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `RESET ROLE`); err != nil {
 		return err
 	}
@@ -328,6 +370,173 @@ func insertBootstrapRowsV1(ctx context.Context, tx pgx.Tx, config BootstrapConfi
 	return nil
 }
 
+// verifyBootstrapRowsV1 proves that every configured create-or-verify row is
+// still byte-identical to the phase-M input. When authorityDomain is nonempty
+// it verifies only rows visible to that domain's hardened runtime role.
+func verifyBootstrapRowsV1(ctx context.Context, query catalogQuerierV1, config BootstrapConfigV1, authorityDomain string) error {
+	for _, domain := range config.Domains {
+		if authorityDomain != "" && domain.AuthorityDomain != authorityDomain {
+			continue
+		}
+		var runtimeRole, recoveryRole, provenance string
+		if err := query.QueryRow(ctx, `SELECT runtime_role::text,recovery_verifier_role::text,btrim(bootstrap_provenance_sha256) FROM abcp_v4.abcp_authority_domain_v1 WHERE authority_domain=$1`, domain.AuthorityDomain).Scan(&runtimeRole, &recoveryRole, &provenance); err != nil {
+			return fmt.Errorf("authority-domain bootstrap row %s: %w", domain.AuthorityDomain, err)
+		}
+		if runtimeRole != domain.RuntimeRole || recoveryRole != domain.RecoveryVerifierRole || provenance != domain.BootstrapProvenanceSHA256 {
+			return fmt.Errorf("authority-domain bootstrap row %s differs from configuration", domain.AuthorityDomain)
+		}
+		for _, workflow := range domain.Workflows {
+			var revision int64
+			var canonical []byte
+			var digest string
+			var updated time.Time
+			if err := query.QueryRow(ctx, `SELECT revision,canonical_state,btrim(state_sha256),updated_at FROM abcp_v4.abcp_workflow_authority_v1 WHERE authority_domain=$1 AND controller_identity=$2`, domain.AuthorityDomain, workflow.ControllerIdentity).Scan(&revision, &canonical, &digest, &updated); err != nil {
+				return fmt.Errorf("workflow bootstrap row %s: %w", workflow.ControllerIdentity, err)
+			}
+			if revision != int64(workflow.Revision) || !bytes.Equal(canonical, workflow.CanonicalState) || digest != sha256HexV1(workflow.CanonicalState) || !updated.Equal(canonicalSecondV1(workflow.UpdatedAt)) {
+				return fmt.Errorf("workflow bootstrap row %s differs from configuration", workflow.ControllerIdentity)
+			}
+		}
+		for _, directory := range domain.PredecessorDirectories {
+			var epoch, revision int64
+			var state, digest string
+			var canonical []byte
+			if err := query.QueryRow(ctx, `SELECT writer_epoch,writer_state,canonical_directory,btrim(directory_sha256),revision FROM abcp_v4.abcp_predecessor_directory_v1 WHERE authority_domain=$1 AND controller_identity=$2`, domain.AuthorityDomain, directory.ControllerIdentity).Scan(&epoch, &state, &canonical, &digest, &revision); err != nil {
+				return fmt.Errorf("predecessor-directory bootstrap row %s: %w", directory.ControllerIdentity, err)
+			}
+			if epoch != int64(directory.WriterEpoch) || state != directory.WriterState || !bytes.Equal(canonical, directory.CanonicalDirectory) || digest != directory.DirectorySHA256 || revision != int64(directory.Revision) {
+				return fmt.Errorf("predecessor-directory bootstrap row %s differs from configuration", directory.ControllerIdentity)
+			}
+		}
+	}
+	if authorityDomain != "" {
+		for _, artifact := range config.Artifacts {
+			if artifact.AuthorityDomain != authorityDomain {
+				continue
+			}
+			var canonical []byte
+			var size int64
+			var created time.Time
+			digest := sha256HexV1(artifact.CanonicalBytes)
+			if err := query.QueryRow(ctx, `SELECT canonical_bytes,byte_size,created_at FROM abcp_v4.abcp_artifact_blob_v1 WHERE authority_domain=$1 AND artifact_sha256=$2`, authorityDomain, digest).Scan(&canonical, &size, &created); err != nil {
+				return fmt.Errorf("artifact bootstrap row %s: %w", digest, err)
+			}
+			if !bytes.Equal(canonical, artifact.CanonicalBytes) || size != int64(len(artifact.CanonicalBytes)) || !created.Equal(canonicalSecondV1(artifact.CreatedAt)) {
+				return fmt.Errorf("artifact bootstrap row %s differs from configuration", digest)
+			}
+		}
+		for _, stage := range config.Stages {
+			if stage.AuthorityDomain != authorityDomain {
+				continue
+			}
+			var state string
+			var ordinal, revision int64
+			if err := query.QueryRow(ctx, `SELECT seal_state,next_occurrence_ordinal,revision FROM abcp_v4.abcp_stage_seal_v1 WHERE authority_domain=$1 AND lineage_sha256=$2 AND stage=$3 AND subject_sha256=$4`, stage.AuthorityDomain, stage.LineageSHA256, stage.Stage, stage.SubjectSHA256).Scan(&state, &ordinal, &revision); err != nil {
+				return fmt.Errorf("stage bootstrap row %s/%s: %w", stage.Stage, stage.SubjectSHA256, err)
+			}
+			if state != stage.SealState || ordinal != int64(stage.NextOccurrenceOrdinal) || revision != int64(stage.Revision) {
+				return fmt.Errorf("stage bootstrap row %s/%s differs from configuration", stage.Stage, stage.SubjectSHA256)
+			}
+		}
+		return nil
+	}
+	for _, worker := range config.Workers {
+		var capacity []byte
+		var capacityDigest string
+		var capacityRevision int64
+		if err := query.QueryRow(ctx, `SELECT canonical_capacity,btrim(capacity_sha256),revision FROM abcp_v4.abcp_worker_capacity_v1 WHERE worker_identity=$1`, worker.WorkerIdentity).Scan(&capacity, &capacityDigest, &capacityRevision); err != nil {
+			return fmt.Errorf("worker-capacity bootstrap row %s: %w", worker.WorkerIdentity, err)
+		}
+		if !bytes.Equal(capacity, worker.CanonicalCapacity) || capacityDigest != worker.CapacitySHA256 || capacityRevision != int64(worker.CapacityRevision) {
+			return fmt.Errorf("worker-capacity bootstrap row %s differs from configuration", worker.WorkerIdentity)
+		}
+		var host, observer, keyDigest, registrationDigest, workerCapacityDigest, provenance string
+		var registrationRevision int64
+		var registration, key []byte
+		var registered time.Time
+		if err := query.QueryRow(ctx, `SELECT btrim(host_identity),btrim(observer_identity),btrim(observer_key_sha256),btrim(registration_sha256),registration_revision,btrim(worker_capacity_sha256),btrim(bootstrap_provenance_sha256),canonical_registration,canonical_key,registered_at FROM abcp_v4.abcp_worker_observation_key_registration_v1 WHERE worker_identity=$1`, worker.WorkerIdentity).Scan(&host, &observer, &keyDigest, &registrationDigest, &registrationRevision, &workerCapacityDigest, &provenance, &registration, &key, &registered); err != nil {
+			return fmt.Errorf("worker-registration bootstrap row %s: %w", worker.WorkerIdentity, err)
+		}
+		if host != worker.HostIdentity || observer != worker.ObserverIdentity || keyDigest != worker.ObserverKeySHA256 || registrationDigest != worker.RegistrationSHA256 || registrationRevision != int64(worker.RegistrationRevision) || workerCapacityDigest != worker.WorkerCapacitySHA256 || provenance != worker.BootstrapProvenanceSHA256 || !bytes.Equal(registration, worker.CanonicalRegistration) || !bytes.Equal(key, worker.CanonicalKey) || !registered.Equal(canonicalSecondV1(worker.RegisteredAt)) {
+			return fmt.Errorf("worker-registration bootstrap row %s differs from configuration", worker.WorkerIdentity)
+		}
+	}
+	for _, artifact := range config.Artifacts {
+		if err := verifyBootstrapRowsV1(ctx, query, BootstrapConfigV1{Domains: config.Domains, Artifacts: []ArtifactBootstrapV1{artifact}}, artifact.AuthorityDomain); err != nil {
+			return err
+		}
+	}
+	for _, stage := range config.Stages {
+		if err := verifyBootstrapRowsV1(ctx, query, BootstrapConfigV1{Domains: config.Domains, Stages: []StageBootstrapV1{stage}}, stage.AuthorityDomain); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// verifyCommittedBootstrapRowsV1 uses the temporary owner SET authority from
+// phase P inside an always-rolled-back transaction. FORCE RLS correctly
+// prevents that NOLOGIN table owner from reading rows in normal operation;
+// temporarily clearing FORCE inside this private reconciliation transaction
+// is therefore necessary to compare configured rows, and rollback restores
+// the byte-exact frozen catalog before phase H can begin.
+func verifyCommittedBootstrapRowsV1(ctx context.Context, conn *pgx.Conn, config BootstrapConfigV1) error {
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable, AccessMode: pgx.ReadWrite})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE abcp_v4_schema_owner`); err != nil {
+		return err
+	}
+	for _, table := range []string{
+		"abcp_authority_domain_v1", "abcp_workflow_authority_v1", "abcp_predecessor_directory_v1",
+		"abcp_worker_capacity_v1", "abcp_worker_observation_key_registration_v1", "abcp_artifact_blob_v1", "abcp_stage_seal_v1",
+	} {
+		if _, err := tx.Exec(ctx, `ALTER TABLE abcp_v4.`+table+` NO FORCE ROW LEVEL SECURITY`); err != nil {
+			return err
+		}
+	}
+	return verifyBootstrapRowsV1(ctx, tx, config, "")
+}
+
+func verifyBootstrapRowsThroughRuntimeV1(ctx context.Context, config BootstrapConfigV1) error {
+	for _, domain := range config.Domains {
+		connection, err := runtimeBootstrapConnectionV1(ctx, config.ProvisionerConnectionString, domain)
+		if err != nil {
+			return err
+		}
+		if err := verifyRuntimeSessionV1(ctx, connection, domain.AuthorityDomain); err != nil {
+			connection.Close(context.Background())
+			return err
+		}
+		if err := verifyBootstrapRowsV1(ctx, connection, config, domain.AuthorityDomain); err != nil {
+			connection.Close(context.Background())
+			return err
+		}
+		connection.Close(context.Background())
+	}
+	return nil
+}
+
+func runtimeBootstrapConnectionV1(ctx context.Context, source string, domain AuthorityDomainBootstrapV1) (*pgx.Conn, error) {
+	config, err := pgx.ParseConfig(source)
+	if err != nil {
+		return nil, err
+	}
+	config.User = domain.RuntimeRole
+	config.Password = domain.RuntimePassword
+	if config.RuntimeParams == nil {
+		config.RuntimeParams = make(map[string]string)
+	}
+	config.RuntimeParams["search_path"] = "pg_catalog,abcp_v4"
+	config.RuntimeParams["row_security"] = "on"
+	config.RuntimeParams["statement_timeout"] = "10s"
+	config.RuntimeParams["lock_timeout"] = "2s"
+	config.RuntimeParams["idle_in_transaction_session_timeout"] = "15s"
+	return pgx.ConnectConfig(ctx, config)
+}
+
 func createOrVerifyRoleV1(ctx context.Context, tx pgx.Tx, role string, login, createRole bool, password string) error {
 	identifier, err := quoteIdentifierV1(role)
 	if err != nil {
@@ -377,6 +586,12 @@ func verifyPhasePMembershipsV1(ctx context.Context, query catalogQuerierV1, conf
 
 func verifyProvisionedDomainRolesV1(ctx context.Context, query catalogQuerierV1, config BootstrapConfigV1) error {
 	for _, domain := range config.Domains {
+		if err := verifyLoginRoleAttributesV1(ctx, query, domain.RuntimeRole); err != nil {
+			return err
+		}
+		if err := verifyLoginRoleAttributesV1(ctx, query, domain.RecoveryVerifierRole); err != nil {
+			return err
+		}
 		groups, err := directMembershipsV1(ctx, query, domain.RuntimeRole)
 		if err != nil || len(groups) != 1 || groups[0] != RuntimeGroupRoleV1 {
 			return fmt.Errorf("runtime role %s has incorrect membership", domain.RuntimeRole)
@@ -385,6 +600,40 @@ func verifyProvisionedDomainRolesV1(ctx context.Context, query catalogQuerierV1,
 		if err != nil || len(groups) != 1 || groups[0] != RecoveryVerifierGroupRoleV1 {
 			return fmt.Errorf("recovery role %s has incorrect membership", domain.RecoveryVerifierRole)
 		}
+	}
+	return nil
+}
+
+func verifyProvisionedRoleTopologyV1(ctx context.Context, query catalogQuerierV1, config BootstrapConfigV1) error {
+	if err := verifyProvisionedDomainRolesV1(ctx, query, config); err != nil {
+		return err
+	}
+	for _, role := range []string{SchemaOwnerRoleV1, RuntimeGroupRoleV1, RecoveryVerifierGroupRoleV1, DomainFunctionOwnerRoleV1, WorkerFunctionOwnerRoleV1} {
+		var login, superuser, createDB, createRole, replication, bypassRLS bool
+		if err := query.QueryRow(ctx, `SELECT rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls FROM pg_catalog.pg_roles WHERE rolname=$1`, role).Scan(&login, &superuser, &createDB, &createRole, &replication, &bypassRLS); err != nil {
+			return fmt.Errorf("verify static role %s: %w", role, err)
+		}
+		if login || superuser || createDB || createRole || replication || bypassRLS {
+			return fmt.Errorf("static role %s has attributes outside the frozen topology", role)
+		}
+	}
+	var login, superuser, createDB, createRole, replication, bypassRLS bool
+	if err := query.QueryRow(ctx, `SELECT rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls FROM pg_catalog.pg_roles WHERE rolname=$1`, MigratorRoleV1).Scan(&login, &superuser, &createDB, &createRole, &replication, &bypassRLS); err != nil {
+		return fmt.Errorf("verify migrator replay state: %w", err)
+	}
+	if login != createRole || superuser || createDB || replication || bypassRLS {
+		return errors.New("migrator is neither exact phase-M authority nor exact phase-H hardened state")
+	}
+	return nil
+}
+
+func verifyLoginRoleAttributesV1(ctx context.Context, query catalogQuerierV1, role string) error {
+	var login, superuser, createDB, createRole, replication, bypassRLS bool
+	if err := query.QueryRow(ctx, `SELECT rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls FROM pg_catalog.pg_roles WHERE rolname=$1`, role).Scan(&login, &superuser, &createDB, &createRole, &replication, &bypassRLS); err != nil {
+		return fmt.Errorf("verify login role %s: %w", role, err)
+	}
+	if !login || superuser || createDB || createRole || replication || bypassRLS {
+		return fmt.Errorf("login role %s has attributes outside the frozen topology", role)
 	}
 	return nil
 }
@@ -486,8 +735,12 @@ func validateBootstrapConfigV1(config BootstrapConfigV1) error {
 			controllers[workflow.ControllerIdentity] = struct{}{}
 		}
 		for _, directory := range domain.PredecessorDirectories {
-			if validateDBIdentityV1(directory.ControllerIdentity) != nil || directory.WriterEpoch == 0 || directory.Revision == 0 || (directory.WriterState != "OPEN" && directory.WriterState != "TOMBSTONED") || validateCanonicalJSONV1(directory.CanonicalDirectory, MaxCanonicalRequestBytesV1) != nil || requireDigestV1(directory.CanonicalDirectory, directory.DirectorySHA256) != nil {
+			if validateDBIdentityV1(directory.ControllerIdentity) != nil || directory.WriterEpoch == 0 || directory.Revision == 0 || (directory.WriterState != "OPEN" && directory.WriterState != "TOMBSTONED") || validateCanonicalJSONV1(directory.CanonicalDirectory, MaxCanonicalRequestBytesV1) != nil {
 				return errors.New("predecessor-directory bootstrap row is invalid")
+			}
+			parsed, err := governance.ParsePredecessorAuthorityDirectoryV1(directory.CanonicalDirectory)
+			if err != nil || parsed.AuthorityDomain != domain.AuthorityDomain || parsed.ControllerIdentity != directory.ControllerIdentity || parsed.WriterEpoch != directory.WriterEpoch || string(parsed.WriterState) != directory.WriterState || parsed.DirectoryRevision != directory.Revision || parsed.DirectorySHA256 != directory.DirectorySHA256 {
+				return errors.New("predecessor-directory bootstrap bytes disagree with row identity/revision")
 			}
 		}
 	}

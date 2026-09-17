@@ -224,6 +224,13 @@ func (l *JSONLLedger) acquirePredecessorWriterV1(operation string) (authoritybac
 
 func (l *JSONLLedger) Path() string { return l.path }
 
+// PredecessorFencedV1 reports whether this ledger was opened through the
+// production predecessor-writer composition. It exposes no fence authority;
+// production constructors use it only to reject an unfenced ledger handle.
+func (l *JSONLLedger) PredecessorFencedV1() bool {
+	return l != nil && l.predecessorFence != nil && len(l.predecessorBindingIDs) != 0
+}
+
 // Snapshot returns one bounded, complete ledger image while holding the same
 // lock used by appenders. The returned identity is the cleaned physical path.
 func (l *JSONLLedger) Snapshot() ([]byte, string, error) {

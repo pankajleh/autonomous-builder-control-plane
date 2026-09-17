@@ -104,6 +104,15 @@ func TestPostgresDomainIsolationArtifactStore(t *testing.T) {
 	testPostgresDomainIsolation(t)
 }
 
+func TestPostgresBootstrapReplayStates(t *testing.T) {
+	t.Run("P-only-and-final-H-replay", testPostgresBootstrapPOnlyAndHReplay)
+	t.Run("committed-M-create-or-verify", testPostgresBootstrapCommittedMReplay)
+}
+
+func TestPostgresDurablePredecessorFence(t *testing.T) {
+	testPostgresDurablePredecessorFence(t)
+}
+
 func exactSQLBlock(t *testing.T, document, anchor string, skip int) string {
 	t.Helper()
 	anchorIndex := strings.Index(document, anchor)

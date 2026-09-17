@@ -52,8 +52,23 @@ type targetHTTPReservationStatus struct {
 }
 
 func New(config Config) (*Controller, error) {
+	return newController(config, false)
+}
+
+// NewProduction is the exported production composition. Retained V1 tests
+// may continue to use New, but no production merge admission or provider
+// write can be constructed without the shared durable fence and a ledger
+// opened through that same fencing boundary.
+func NewProduction(config Config) (*Controller, error) {
+	return newController(config, true)
+}
+
+func newController(config Config, production bool) (*Controller, error) {
 	if config.Ledger == nil || config.AuthoritySource == nil || config.Provider == nil {
 		return nil, errors.New("ledger, authority source, and network-free provider are required")
+	}
+	if production && (config.PredecessorFence == nil || len(config.PredecessorBindingIDs) == 0 || !config.Ledger.PredecessorFencedV1()) {
+		return nil, errors.New("production merge admission/provider requires a durable predecessor fence and fenced ledger")
 	}
 	limits := productionLimits()
 	store, err := newDurableStore(config.StateRoot, limits)
