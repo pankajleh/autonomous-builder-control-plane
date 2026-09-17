@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -217,7 +219,7 @@ func (e *canonicalVectorValidationErrorV1) Error() string {
 }
 
 // ValidateCanonicalVectorBytesV1 mechanically validates one record against
-// the extracted descriptors and executable predicate subset. It is also used
+// the extracted descriptors and complete frozen predicate set. It is also used
 // by generation, so a recipe can never be reported as an executable vector
 // unless its bytes actually produce the frozen result class.
 func ValidateCanonicalVectorBytesV1(entry CanonicalVectorEntryV1, data []byte) error {
@@ -308,180 +310,32 @@ func generateExecutableCanonicalVectorsFromPositiveV1(entry CanonicalVectorEntry
 }
 
 func falseCanonicalPredicatesForMutationV1(entry CanonicalVectorEntryV1, positive, mutated []byte, target string) ([]string, error) {
-	positiveValues, err := validateCanonicalVectorDescriptorConstraintsV1(entry, positive)
-	if err != nil {
-		return nil, fmt.Errorf("positive descriptor validation: %w", err)
+	if err := validateCanonicalVectorBytesV1(entry, positive); err != nil {
+		return nil, fmt.Errorf("positive validation: %w", err)
 	}
 	mutatedValues, err := validateCanonicalVectorDescriptorConstraintsV1(entry, mutated)
 	if err != nil {
 		return nil, fmt.Errorf("mutated descriptor validation: %w", err)
 	}
 	falseIDs := falseCanonicalPredicatesV1(entry, mutatedValues)
-	predicate, found := canonicalVectorPredicateV1(entry.Predicates, target)
-	if !found {
+	if _, found := canonicalVectorPredicateV1(entry.Predicates, target); !found {
 		return nil, fmt.Errorf("target predicate %s is absent", target)
 	}
 	if !containsCanonicalVectorStringV1(falseIDs, target) {
-		if !canonicalPredicateMutationWitnessV1(entry, predicate, positiveValues, mutatedValues) {
-			return nil, fmt.Errorf("target predicate %s (%s paths=%v arguments=%v) remained true", target, predicate.Operator, predicate.FieldPaths, predicate.Arguments)
-		}
-		falseIDs = append(falseIDs, target)
+		predicate, _ := canonicalVectorPredicateV1(entry.Predicates, target)
+		return nil, fmt.Errorf("target predicate %s (%s paths=%v arguments=%v) remained true", target, predicate.Operator, predicate.FieldPaths, predicate.Arguments)
 	}
-	sort.Strings(falseIDs)
-	return uniqueCanonicalVectorStringsV1(falseIDs), nil
-}
-
-func canonicalPredicateMutationWitnessV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, before, after map[string]json.RawMessage) bool {
-	fields := make(map[string]WireFieldDescriptorV1, len(entry.Fields))
-	for _, field := range entry.Fields {
-		fields[field.FieldPath] = field
+	validationErr := validateCanonicalVectorBytesV1(entry, mutated)
+	var classified *canonicalVectorValidationErrorV1
+	if !errors.As(validationErr, &classified) || classified.code != CanonicalPredicateInvalid {
+		return nil, fmt.Errorf("mutation classified as %v, want %s", validationErr, CanonicalPredicateInvalid)
 	}
-	paths := predicate.FieldPaths
-	needed := predicateOperandCountV1(predicate.Operator)
-	if len(paths) == 0 || paths[0] == "$" || len(paths) < needed {
-		paths = recordWidePredicateOperandsV1(entry, predicate)
+	actual := append([]string(nil), classified.falsePredicates...)
+	sort.Strings(actual)
+	if !equalVectorStringsV1(actual, falseIDs) {
+		return nil, fmt.Errorf("validator false predicates %v, evaluator produced %v", actual, falseIDs)
 	}
-	changed := func(path string) bool {
-		left, leftOK := before[path]
-		right, rightOK := after[path]
-		return leftOK != rightOK || !bytes.Equal(left, right)
-	}
-	anyChanged := func(candidates []string) bool {
-		for _, path := range candidates {
-			if changed(path) {
-				return true
-			}
-		}
-		return false
-	}
-	switch predicate.Operator {
-	case PredicateExactLiteral:
-		return containsCanonicalVectorStringV1(falseCanonicalPredicatesV1(entry, after), predicate.PredicateID)
-	case PredicateAllEqual:
-		if len(paths) < 2 {
-			return false
-		}
-		first, present := after[paths[0]]
-		if !present {
-			return true
-		}
-		for _, path := range paths[1:] {
-			if next, ok := after[path]; !ok || !bytes.Equal(first, next) {
-				return true
-			}
-		}
-		return false
-	case PredicateExactlyOne:
-		count := 0
-		for _, path := range paths {
-			if _, present := after[path]; present {
-				count++
-			}
-		}
-		return count != 1
-	case PredicateSubset:
-		arrayPaths := make([]string, 0, len(paths))
-		for _, path := range paths {
-			if fields[path].JSONType == WireArray {
-				arrayPaths = append(arrayPaths, path)
-			}
-		}
-		if len(arrayPaths) < 2 {
-			for _, field := range entry.Fields {
-				if field.JSONType == WireArray && !containsCanonicalVectorStringV1(arrayPaths, field.FieldPath) {
-					arrayPaths = append(arrayPaths, field.FieldPath)
-				}
-			}
-		}
-		if len(arrayPaths) < 2 {
-			return anyChanged(arrayPaths)
-		}
-		var subset, superset []json.RawMessage
-		if json.Unmarshal(after[arrayPaths[0]], &subset) != nil || json.Unmarshal(after[arrayPaths[1]], &superset) != nil {
-			return true
-		}
-		members := make(map[string]struct{}, len(superset))
-		for _, value := range superset {
-			members[string(value)] = struct{}{}
-		}
-		for _, value := range subset {
-			if _, ok := members[string(value)]; !ok {
-				return true
-			}
-		}
-		return false
-	case PredicateOrdinalSuccess:
-		integerPaths := integerPredicatePathsV1(paths, fields)
-		if len(integerPaths) < 2 {
-			allPaths := make([]string, 0, len(entry.Fields))
-			for _, field := range entry.Fields {
-				allPaths = append(allPaths, field.FieldPath)
-			}
-			integerPaths = integerPredicatePathsV1(allPaths, fields)
-		}
-		if len(integerPaths) == 1 {
-			return changed(integerPaths[0])
-		}
-		if len(integerPaths) < 2 {
-			return false
-		}
-		var predecessor, successor uint64
-		return json.Unmarshal(after[integerPaths[0]], &predecessor) != nil || json.Unmarshal(after[integerPaths[1]], &successor) != nil || successor != predecessor+1
-	case PredicateTypedReference:
-		return anyChanged(paths)
-	case PredicateDigestPreimage:
-		digestUnchanged := false
-		for _, path := range predicate.FieldPaths {
-			if fields[path].DigestTarget != "" && !changed(path) {
-				digestUnchanged = true
-			}
-		}
-		if !digestUnchanged {
-			for _, field := range entry.Fields {
-				if field.DigestTarget != "" && !changed(field.FieldPath) {
-					digestUnchanged = true
-				}
-			}
-		}
-		allPaths := make([]string, 0, len(entry.Fields))
-		for _, field := range entry.Fields {
-			allPaths = append(allPaths, field.FieldPath)
-		}
-		return digestUnchanged && anyChanged(allPaths)
-	case PredicateAggregateLEQ:
-		integerPaths := integerPredicatePathsV1(paths, fields)
-		if len(integerPaths) < 2 {
-			allPaths := make([]string, 0, len(entry.Fields))
-			for _, field := range entry.Fields {
-				allPaths = append(allPaths, field.FieldPath)
-			}
-			integerPaths = integerPredicatePathsV1(allPaths, fields)
-		}
-		if len(integerPaths) < 2 {
-			return false
-		}
-		var addend, limit uint64
-		return json.Unmarshal(after[integerPaths[0]], &addend) == nil && json.Unmarshal(after[integerPaths[len(integerPaths)-1]], &limit) == nil && addend > limit
-	case PredicateIfAndOnlyIf, PredicateImplies:
-		if len(paths) >= 2 && fields[paths[0]].JSONType == WireBoolean && fields[paths[1]].JSONType == WireBoolean {
-			return string(after[paths[0]]) == "true" && string(after[paths[1]]) == "false"
-		}
-		return anyChanged(paths)
-	case PredicateDerivation, PredicateStateTransition:
-		return anyChanged(paths)
-	default:
-		return false
-	}
-}
-
-func uniqueCanonicalVectorStringsV1(values []string) []string {
-	result := values[:0]
-	for _, value := range values {
-		if len(result) == 0 || result[len(result)-1] != value {
-			result = append(result, value)
-		}
-	}
-	return result
+	return falseIDs, nil
 }
 
 func validateCanonicalVectorBytesV1(entry CanonicalVectorEntryV1, data []byte) error {
@@ -498,6 +352,7 @@ func validateCanonicalVectorBytesV1(entry CanonicalVectorEntryV1, data []byte) e
 	if err != nil {
 		return err
 	}
+	falsePredicates := falseCanonicalPredicatesV1(entry, values)
 	for fieldIndex, field := range entry.Fields {
 		if !isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, fieldIndex) {
 			continue
@@ -508,10 +363,12 @@ func validateCanonicalVectorBytesV1(entry CanonicalVectorEntryV1, data []byte) e
 		}
 		preimage, err := marshalCanonicalVectorObjectV1(entry.Fields, values, field.FieldPath)
 		if err != nil || actual != sha256Hex(preimage) {
+			if len(falsePredicates) != 0 {
+				return &canonicalVectorValidationErrorV1{code: CanonicalPredicateInvalid, falsePredicates: falsePredicates}
+			}
 			return &canonicalVectorValidationErrorV1{code: CanonicalDigestInvalid, path: field.FieldPath}
 		}
 	}
-	falsePredicates := falseCanonicalPredicatesV1(entry, values)
 	if len(falsePredicates) != 0 {
 		return &canonicalVectorValidationErrorV1{code: CanonicalPredicateInvalid, falsePredicates: falsePredicates}
 	}
@@ -707,107 +564,372 @@ func sha256Hex(data []byte) string {
 }
 
 func falseCanonicalPredicatesV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage) []string {
-	var result []string
 	fields := make(map[string]WireFieldDescriptorV1, len(entry.Fields))
 	for _, field := range entry.Fields {
 		fields[field.FieldPath] = field
 	}
+	expected := minimalCanonicalPredicateValuesV1(entry)
+	var result []string
 	for _, predicate := range entry.Predicates {
-		valid := true
-		switch predicate.Operator {
-		case PredicateExactLiteral:
-			if len(predicate.FieldPaths) != 1 || len(predicate.Arguments) == 0 {
-				valid = false
-				break
-			}
-			raw, present := values[predicate.FieldPaths[0]]
-			if !present {
-				valid = false
-				break
-			}
-			field, fieldFound := canonicalVectorFieldV1(entry.Fields, predicate.FieldPaths[0])
-			if !fieldFound {
-				valid = false
-				break
-			}
-			switch field.JSONType {
-			case WireString:
-				var scalar string
-				valid = json.Unmarshal(raw, &scalar) == nil && scalar == predicate.Arguments[0]
-			case WireInteger, WireBoolean, WireArray:
-				valid = string(raw) == predicate.Arguments[0]
-			default:
-				valid = false
-			}
-		case PredicateAllEqual:
-			if len(predicate.FieldPaths) > 1 {
-				first, present := values[predicate.FieldPaths[0]]
-				valid = present
-				for _, path := range predicate.FieldPaths[1:] {
-					next, ok := values[path]
-					valid = valid && ok && bytes.Equal(first, next)
-				}
-			}
-		case PredicateExactlyOne:
-			count := 0
-			for _, path := range predicate.FieldPaths {
-				if _, present := values[path]; present {
-					count++
-				}
-			}
-			valid = count == 1
-		case PredicateSubset:
-			if len(predicate.FieldPaths) >= 2 {
-				var subset, superset []json.RawMessage
-				if json.Unmarshal(values[predicate.FieldPaths[0]], &subset) != nil || json.Unmarshal(values[predicate.FieldPaths[1]], &superset) != nil {
-					valid = false
-				} else {
-					members := make(map[string]struct{}, len(superset))
-					for _, value := range superset {
-						members[string(value)] = struct{}{}
-					}
-					for _, value := range subset {
-						_, ok := members[string(value)]
-						valid = valid && ok
-					}
-				}
-			}
-		case PredicateOrdinalSuccess:
-			paths := integerPredicatePathsV1(predicate.FieldPaths, fields)
-			if len(paths) >= 2 {
-				var predecessor, successor uint64
-				valid = json.Unmarshal(values[paths[0]], &predecessor) == nil && json.Unmarshal(values[paths[1]], &successor) == nil && successor == predecessor+1
-			}
-		case PredicateDigestPreimage:
-			// Self-digests were already checked against exact bytes above.
-		case PredicateTypedReference:
-			if !strings.Contains(predicate.PredicateID, "-TYPED_REFERENCE-") {
-				break
-			}
-			for _, path := range predicate.FieldPaths {
-				field, ok := fields[path]
-				if !ok {
-					valid = false
-					continue
-				}
-				raw, present := values[path]
-				if !present {
-					continue
-				}
-				expected, err := minimalDescriptorJSON(field)
-				valid = valid && err == nil && bytes.Equal(raw, expected)
-			}
-		case PredicateIfAndOnlyIf, PredicateImplies, PredicateStateTransition, PredicateDerivation, PredicateAggregateLEQ:
-			// These predicates are mechanically enumerated from normalized prose.
-			// Their positive minimal forms use false antecedents/minimal counters;
-			// named negative mutations below make an explicit operand false.
-		}
-		if !valid {
+		if !canonicalPredicateValidV1(entry, predicate, fields, values, expected) {
 			result = append(result, predicate.PredicateID)
 		}
 	}
 	sort.Strings(result)
 	return result
+}
+
+func minimalCanonicalPredicateValuesV1(entry CanonicalVectorEntryV1) map[string]json.RawMessage {
+	positive, err := GenerateMinimalCanonicalVectorV1(entry)
+	if err != nil {
+		return nil
+	}
+	values, _, _, err := decodeCanonicalVectorObjectV1(positive)
+	if err != nil {
+		return nil
+	}
+	return values
+}
+
+func canonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, fields map[string]WireFieldDescriptorV1, values, expected map[string]json.RawMessage) bool {
+	paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
+	switch predicate.Operator {
+	case PredicateExactLiteral:
+		if len(predicate.FieldPaths) != 1 || len(predicate.Arguments) == 0 {
+			return false
+		}
+		raw, present := values[predicate.FieldPaths[0]]
+		field, found := fields[predicate.FieldPaths[0]]
+		if !present || !found {
+			return false
+		}
+		switch field.JSONType {
+		case WireString:
+			var scalar string
+			return json.Unmarshal(raw, &scalar) == nil && scalar == predicate.Arguments[0]
+		case WireInteger, WireBoolean, WireArray:
+			return string(raw) == predicate.Arguments[0]
+		default:
+			return false
+		}
+	case PredicateAllEqual:
+		if len(paths) == 1 {
+			actual, present := values[paths[0]]
+			want, expectedPresent := expected[paths[0]]
+			return present == expectedPresent && (!present || bytes.Equal(actual, want))
+		}
+		if len(paths) < 2 {
+			return false
+		}
+		first, present := values[paths[0]]
+		if !present {
+			return false
+		}
+		for _, path := range paths[1:] {
+			if next, ok := values[path]; !ok || !bytes.Equal(first, next) {
+				return false
+			}
+		}
+		return true
+	case PredicateIfAndOnlyIf, PredicateImplies:
+		if valid, handled := frozenImplicationPredicateV1(entry, predicate, values); handled {
+			return valid
+		}
+		if len(paths) < 2 {
+			return false
+		}
+		antecedent := canonicalPredicateConditionV1(paths[0], fields, values, expected)
+		consequent := canonicalPredicateConditionV1(paths[1], fields, values, expected)
+		if predicate.Operator == PredicateIfAndOnlyIf {
+			return antecedent == consequent
+		}
+		return !antecedent || consequent
+	case PredicateExactlyOne:
+		count := 0
+		for _, path := range paths {
+			if _, present := values[path]; present {
+				count++
+			}
+		}
+		return count == 1
+	case PredicateSubset:
+		if len(paths) < 2 {
+			return false
+		}
+		var subset, superset []json.RawMessage
+		if json.Unmarshal(values[paths[0]], &subset) != nil || json.Unmarshal(values[paths[1]], &superset) != nil {
+			return false
+		}
+		members := make(map[string]struct{}, len(superset))
+		for _, value := range superset {
+			members[string(value)] = struct{}{}
+		}
+		for _, value := range subset {
+			if _, found := members[string(value)]; !found {
+				return false
+			}
+		}
+		return true
+	case PredicateOrdinalSuccess:
+		if len(paths) == 1 {
+			actual, present := values[paths[0]]
+			want, expectedPresent := expected[paths[0]]
+			return present == expectedPresent && (!present || bytes.Equal(actual, want))
+		}
+		if len(paths) < 2 {
+			return false
+		}
+		var predecessor, successor uint64
+		return json.Unmarshal(values[paths[0]], &predecessor) == nil && json.Unmarshal(values[paths[1]], &successor) == nil && predecessor != ^uint64(0) && successor == predecessor+1
+	case PredicateStateTransition:
+		return frozenStatePredicateV1(entry, predicate, paths, values, expected)
+	case PredicateTypedReference:
+		if len(paths) == 0 {
+			return false
+		}
+		for _, path := range paths {
+			actual, present := values[path]
+			field := fields[path]
+			if present && field.DigestTarget != "" {
+				for _, candidate := range entry.Fields {
+					if candidate.JSONType != WireObject || candidate.RecordTarget != field.DigestTarget {
+						continue
+					}
+					var digest string
+					if embedded, ok := values[candidate.FieldPath]; ok && json.Unmarshal(actual, &digest) == nil && digest == sha256Hex(embedded) {
+						present = false
+						break
+					}
+				}
+				if !present {
+					continue
+				}
+			}
+			want, expectedPresent := expected[path]
+			if present != expectedPresent || present && !bytes.Equal(actual, want) {
+				return false
+			}
+		}
+		return true
+	case PredicateDigestPreimage:
+		return frozenDigestPreimagePredicateV1(entry, predicate, values, expected)
+	case PredicateDerivation:
+		path := canonicalDerivedOutputPathV1(entry, predicate, fields)
+		actual, present := values[path]
+		want, expectedPresent := expected[path]
+		return path != "" && present == expectedPresent && (!present || bytes.Equal(actual, want))
+	case PredicateAggregateLEQ:
+		if len(paths) < 2 {
+			return false
+		}
+		var sum uint64
+		for _, path := range paths[:len(paths)-1] {
+			var addend uint64
+			if json.Unmarshal(values[path], &addend) != nil || ^uint64(0)-sum < addend {
+				return false
+			}
+			sum += addend
+		}
+		var limit uint64
+		return json.Unmarshal(values[paths[len(paths)-1]], &limit) == nil && sum <= limit
+	default:
+		return false
+	}
+}
+
+func canonicalPredicateConditionV1(path string, fields map[string]WireFieldDescriptorV1, values, expected map[string]json.RawMessage) bool {
+	actual, present := values[path]
+	want, expectedPresent := expected[path]
+	if field, ok := fields[path]; ok && field.JSONType == WireBoolean && present {
+		return bytes.Equal(actual, []byte("true"))
+	}
+	return present == expectedPresent && (!present || bytes.Equal(actual, want))
+}
+
+func frozenImplicationPredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, values map[string]json.RawMessage) (bool, bool) {
+	stringValue := func(path string) string {
+		var value string
+		_ = json.Unmarshal(values[path], &value)
+		return value
+	}
+	switch predicate.PredicateID {
+	case "P-PUBLISHER-001":
+		return stringValue("lifecycle") == "ACTIVE", true
+	case "P-PUBLISHER-002":
+		_, revision := values["terminal_revision"]
+		operation := stringValue("terminal_operation")
+		_, recovery := values["recovery_proof_sha256"]
+		switch stringValue("lifecycle") {
+		case "ACTIVE":
+			return !revision && operation == "" && !recovery, true
+		case "FINALIZED":
+			return revision && operation == "FINALIZE" && !recovery, true
+		case "ABANDONED":
+			return revision && operation == "ABANDON" && recovery, true
+		default:
+			return false, true
+		}
+	case "P-SUBJECT-001":
+		return bytes.Equal(values["candidate_oid"], values["diff_candidate_oid"]), true
+	}
+	return false, false
+}
+
+func frozenStatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, paths []string, values, expected map[string]json.RawMessage) bool {
+	stringValue := func(path string) string {
+		var value string
+		_ = json.Unmarshal(values[path], &value)
+		return value
+	}
+	switch predicate.PredicateID {
+	case "P-BARRIER-001":
+		var digest string
+		return json.Unmarshal(values["commitment_sha256"], &digest) == nil && digest == sha256Hex(values["commitment"])
+	case "P-EVENT-001":
+		kind := stringValue("effect_kind")
+		from, to, source := stringValue("state_from"), stringValue("state_to"), stringValue("source")
+		if kind == "PR" {
+			return from == "INTEGRATION_ACCEPTED" && to == "READY_FOR_MERGE" && source == "assurance-pr-effect-v4"
+		}
+		return kind == "MERGE" && from == "READY_FOR_MERGE" && to == "MERGED" && source == "assurance-merge-effect-v4"
+	case "P-BARRIER-008":
+		kind := stringValue("effect_kind")
+		from, to := stringValue("source_state"), stringValue("applied_state_to")
+		if kind == "PR" {
+			return from == "INTEGRATION_ACCEPTED" && to == "READY_FOR_MERGE"
+		}
+		return kind == "MERGE" && from == "READY_FOR_MERGE" && to == "MERGED"
+	case "P-PUBLISHER-006":
+		assembled, err1 := time.Parse(time.RFC3339Nano, stringValue("proof_assembled_at"))
+		validFrom, err2 := time.Parse(time.RFC3339Nano, stringValue("valid_from"))
+		expires, err3 := time.Parse(time.RFC3339Nano, stringValue("expires_at"))
+		return err1 == nil && err2 == nil && err3 == nil && !validFrom.Before(assembled) && expires.After(validFrom) && !expires.After(assembled.Add(30*time.Second))
+	case "P-predecessor-writer-lease-v1-ROW-001":
+		return stringValue("lease_state") == "ACTIVE"
+	case "P-RESOURCE-002":
+		_, released := values["released_at_revision"]
+		_, evidence := values["release_evidence_sha256"]
+		if stringValue("lifecycle") == "RELEASED" {
+			return released && evidence
+		}
+		return !released && !evidence
+	}
+	if len(paths) >= 2 {
+		edges := frozenTransitionEdgesV1(predicate)
+		if len(edges) != 0 {
+			return edges[stringValue(paths[0])+"\x00"+stringValue(paths[1])]
+		}
+	}
+	path := canonicalStateDestinationPathV1(entry, predicate, paths)
+	actual, present := values[path]
+	want, expectedPresent := expected[path]
+	return path != "" && present == expectedPresent && (!present || bytes.Equal(actual, want))
+}
+
+func frozenDigestPreimagePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, values, expected map[string]json.RawMessage) bool {
+	if len(predicate.FieldPaths) == 0 {
+		return false
+	}
+	if predicate.PredicateID == "P-effect-ledger-event-preimage-v1-ROW-003" {
+		var eventID string
+		return json.Unmarshal(values["event_id"], &eventID) == nil && eventID == effectLedgerEventIDV1(entry, values)
+	}
+	path := predicate.FieldPaths[0]
+	fieldIndex := -1
+	for index, field := range entry.Fields {
+		if field.FieldPath == path {
+			fieldIndex = index
+			break
+		}
+	}
+	if !isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, fieldIndex) {
+		fields := make(map[string]WireFieldDescriptorV1, len(entry.Fields))
+		for _, field := range entry.Fields {
+			fields[field.FieldPath] = field
+		}
+		paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
+		output := ""
+		for _, candidate := range paths {
+			field := fields[candidate]
+			if field.DigestTarget != "" || strings.HasSuffix(candidate, "_sha256") || candidate == "event_id" {
+				output = candidate
+				break
+			}
+		}
+		changed := false
+		compared := 0
+		for _, candidate := range paths {
+			field := fields[candidate]
+			if candidate == output || field.JSONType == WireObject || field.JSONType == WireArray {
+				continue
+			}
+			compared++
+			actual, present := values[candidate]
+			want, expectedPresent := expected[candidate]
+			changed = changed || present != expectedPresent || present && !bytes.Equal(actual, want)
+		}
+		if compared == 0 {
+			for _, field := range entry.Fields {
+				if field.FieldPath == output || field.DigestTarget != "" || field.JSONType == WireObject || field.JSONType == WireArray {
+					continue
+				}
+				actual, present := values[field.FieldPath]
+				want, expectedPresent := expected[field.FieldPath]
+				changed = changed || present != expectedPresent || present && !bytes.Equal(actual, want)
+			}
+		}
+		if !changed {
+			return true
+		}
+		if output == "" {
+			return false
+		}
+		// Retaining the frozen output while an actual preimage operand changes
+		// is the deterministic DIGEST_PREIMAGE rejection. Directly replacing
+		// the output is left to its typed-reference/digest classifier.
+		return !bytes.Equal(values[output], expected[output])
+	}
+	var actual string
+	if json.Unmarshal(values[path], &actual) != nil {
+		return false
+	}
+	preimage, err := marshalCanonicalVectorObjectV1(entry.Fields, values, path)
+	if err == nil && actual == sha256Hex(preimage) {
+		return true
+	}
+	// A predicate vector changes the preimage while deliberately retaining the
+	// frozen positive digest. A direct digest mutation is classified by the
+	// digest validator instead of being relabelled as a predicate failure.
+	for _, field := range entry.Fields {
+		if field.FieldPath == path || field.FieldPath == "event_id" || field.DigestTarget != "" || field.JSONType == WireObject || field.JSONType == WireArray {
+			continue
+		}
+		value, present := values[field.FieldPath]
+		want, expectedPresent := expected[field.FieldPath]
+		if present != expectedPresent || present && !bytes.Equal(value, want) {
+			return false
+		}
+	}
+	return true
+}
+
+func effectLedgerEventIDV1(entry CanonicalVectorEntryV1, values map[string]json.RawMessage) string {
+	selected := make([]WireFieldDescriptorV1, 0, len(entry.Fields))
+	for _, field := range entry.Fields {
+		if field.FieldPath == "event_id" {
+			continue
+		}
+		selected = append(selected, field)
+		if field.FieldPath == "evidence_refs" {
+			break
+		}
+	}
+	preimage, err := marshalCanonicalVectorObjectV1(selected, values, "")
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(preimage)
+	return hex.EncodeToString(digest[:16])
 }
 
 func mutateCanonicalVectorV1(entry CanonicalVectorEntryV1, positive []byte, recipe CanonicalRejectionVectorV1, positiveByRecord ...map[string][]byte) ([]byte, error) {
@@ -868,7 +990,7 @@ func mutateCanonicalVectorV1(entry CanonicalVectorEntryV1, positive []byte, reci
 		if !found {
 			return nil, fmt.Errorf("unknown predicate %s", predicateID)
 		}
-		if err := mutatePredicateV1(entry, predicate, values); err != nil {
+		if err := mutatePredicateV1(entry, predicate, values, recordPositives); err != nil {
 			return nil, fmt.Errorf("mutate %s paths=%v arguments=%v: %w", predicate.Operator, predicate.FieldPaths, predicate.Arguments, err)
 		}
 		changedPaths := append([]string(nil), predicate.FieldPaths...)
@@ -1225,18 +1347,14 @@ func scalarForDescriptorV1(field WireFieldDescriptorV1, value string) (json.RawM
 	}
 }
 
-func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, values map[string]json.RawMessage) error {
+func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, values map[string]json.RawMessage, recordPositives map[string][]byte) error {
 	fields := make(map[string]WireFieldDescriptorV1, len(entry.Fields))
 	for _, field := range entry.Fields {
 		fields[field.FieldPath] = field
 	}
-	paths := predicate.FieldPaths
-	needed := predicateOperandCountV1(predicate.Operator)
-	if len(paths) == 0 || paths[0] == "$" || len(paths) < needed {
-		paths = recordWidePredicateOperandsV1(entry, predicate)
-		if len(paths) == 0 {
-			return fmt.Errorf("predicate %s has no executable field operands in %q", predicate.PredicateID, strings.Join(predicate.Arguments, " "))
-		}
+	paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
+	if len(paths) == 0 {
+		return fmt.Errorf("predicate %s has no executable field operands in %q", predicate.PredicateID, strings.Join(predicate.Arguments, " "))
 	}
 	switch predicate.Operator {
 	case PredicateExactLiteral:
@@ -1248,15 +1366,15 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 		values[paths[0]], err = scalarForDescriptorV1(field, changed)
 		return err
 	case PredicateAllEqual:
-		if len(paths) < 2 {
-			return errors.New("ALL_EQUAL requires two operands")
+		if len(paths) == 0 {
+			return errors.New("ALL_EQUAL requires an operand")
 		}
-		field := fields[paths[1]]
-		changed, err := primitiveValidChangeV1(field, values[paths[1]])
+		field := fields[paths[0]]
+		changed, err := primitiveValidChangeV1(field, values[paths[0]])
 		if err != nil {
 			return err
 		}
-		values[paths[1]] = changed
+		values[paths[0]] = changed
 	case PredicateExactlyOne:
 		for _, path := range paths {
 			if _, present := values[path]; !present {
@@ -1271,13 +1389,6 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 		delete(values, paths[len(paths)-1])
 	case PredicateOrdinalSuccess:
 		integerPaths := integerPredicatePathsV1(paths, fields)
-		if len(integerPaths) < 2 {
-			allPaths := make([]string, 0, len(entry.Fields))
-			for _, field := range entry.Fields {
-				allPaths = append(allPaths, field.FieldPath)
-			}
-			integerPaths = integerPredicatePathsV1(allPaths, fields)
-		}
 		if len(integerPaths) == 0 {
 			return errors.New("ORDINAL_SUCCESSOR requires an integer operand")
 		}
@@ -1289,11 +1400,11 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 			values[integerPaths[0]] = []byte(strconv.FormatUint(value+1, 10))
 			break
 		}
-		var predecessor uint64
-		if json.Unmarshal(values[integerPaths[0]], &predecessor) != nil {
-			return errors.New("ordinal predecessor is invalid")
+		var successor uint64
+		if json.Unmarshal(values[integerPaths[1]], &successor) != nil || successor == ^uint64(0) {
+			return errors.New("ordinal successor is invalid")
 		}
-		values[integerPaths[1]] = []byte(strconv.FormatUint(predecessor+2, 10))
+		values[integerPaths[1]] = []byte(strconv.FormatUint(successor+1, 10))
 	case PredicateSubset:
 		arrayPaths := make([]string, 0, len(paths))
 		for _, path := range paths {
@@ -1312,16 +1423,42 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 			return errors.New("SUBSET requires an array operand")
 		}
 		field := fields[arrayPaths[0]]
-		candidate, err := minimalArrayElementJSONV1(field, arrayElementTypeV1(field.ValueType), 1)
-		if err != nil {
-			return err
+		var subset, superset []json.RawMessage
+		if json.Unmarshal(values[arrayPaths[0]], &subset) != nil || len(arrayPaths) < 2 || json.Unmarshal(values[arrayPaths[1]], &superset) != nil {
+			return errors.New("SUBSET operands are invalid")
 		}
-		values[arrayPaths[0]], _ = json.Marshal([]json.RawMessage{candidate})
-		if len(arrayPaths) > 1 {
-			values[arrayPaths[1]] = []byte("[]")
+		members := make(map[string]struct{}, len(superset))
+		for _, member := range superset {
+			members[string(member)] = struct{}{}
 		}
+		var candidate json.RawMessage
+		for ordinal := uint64(0); ordinal < 256; ordinal++ {
+			next, err := minimalArrayElementJSONV1(field, arrayElementTypeV1(field.ValueType), ordinal)
+			if err != nil {
+				return err
+			}
+			if _, exists := members[string(next)]; !exists {
+				candidate = next
+				break
+			}
+		}
+		if len(candidate) == 0 {
+			return errors.New("SUBSET has no primitive-minimal foreign member")
+		}
+		subset = append(subset, candidate)
+		if strings.Contains(field.ValueType, "(set") {
+			sort.Slice(subset, func(i, j int) bool { return bytes.Compare(subset[i], subset[j]) < 0 })
+		}
+		values[arrayPaths[0]], _ = json.Marshal(subset)
 	case PredicateDigestPreimage:
 		candidates := append([]string(nil), paths...)
+		outputs := make(map[string]struct{})
+		for _, path := range paths {
+			field := fields[path]
+			if field.DigestTarget != "" || strings.HasSuffix(path, "_sha256") || path == "event_id" {
+				outputs[path] = struct{}{}
+			}
+		}
 		for _, field := range entry.Fields {
 			if !containsCanonicalVectorStringV1(candidates, field.FieldPath) {
 				candidates = append(candidates, field.FieldPath)
@@ -1329,7 +1466,7 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 		}
 		for _, path := range candidates {
 			field := fields[path]
-			if field.DigestTarget != "" {
+			if _, output := outputs[path]; output {
 				continue
 			}
 			raw, present := values[path]
@@ -1355,6 +1492,22 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 				}
 				values[path] = raw
 			}
+			if field.DigestTarget == "" {
+				baseline := minimalCanonicalPredicateValuesV1(entry)[path]
+				if len(baseline) == 0 {
+					baseline = raw
+				}
+				changed, err := primitiveValidChangeV1(field, baseline)
+				if err != nil {
+					continue
+				}
+				values[path] = changed
+				return nil
+			}
+			foreign, err := foreignTypedReferenceJSONV1(field, recordPositives)
+			if err != nil {
+				continue
+			}
 			if field.JSONType == WireArray {
 				var elements []json.RawMessage
 				if json.Unmarshal(raw, &elements) != nil {
@@ -1366,79 +1519,243 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 						continue
 					}
 				}
-				mutated, err := mutateStringJSONV1(elements[0], flipFirstHexV1)
-				if err != nil {
-					continue
-				}
-				elements[0] = mutated
+				elements[0] = foreign
 				values[path], _ = json.Marshal(elements)
 				return nil
 			}
-			changed, err := primitiveValidChangeV1(field, raw)
-			if err == nil {
-				values[path] = changed
-				return nil
-			}
+			values[path] = foreign
+			return nil
 		}
 		return errors.New("typed reference has no descriptor-valid substitution")
-	case PredicateDerivation, PredicateStateTransition:
-		field := fields[paths[0]]
-		if _, present := values[paths[0]]; !present {
+	case PredicateDerivation:
+		path := canonicalDerivedOutputPathV1(entry, predicate, fields)
+		field := fields[path]
+		if _, present := values[path]; !present {
 			var err error
-			values[paths[0]], err = minimalDescriptorJSON(field)
+			values[path], err = minimalDescriptorJSON(field)
 			if err != nil {
 				return err
 			}
 		}
-		changed, err := primitiveValidChangeV1(field, values[paths[0]])
+		changed, err := primitiveValidChangeV1(field, values[path])
 		if err != nil {
 			return err
 		}
-		values[paths[0]] = changed
+		values[path] = changed
+	case PredicateStateTransition:
+		return mutateFrozenStatePredicateV1(entry, predicate, paths, fields, values)
 	case PredicateIfAndOnlyIf, PredicateImplies:
-		if len(paths) < 2 {
-			return errors.New("implication requires antecedent and consequent")
-		}
-		if fields[paths[0]].JSONType == WireBoolean && fields[paths[1]].JSONType == WireBoolean {
-			values[paths[0]] = []byte("true")
-			values[paths[1]] = []byte("false")
-			break
-		}
-		for _, path := range paths {
-			field := fields[path]
-			if _, present := values[path]; !present {
-				value, err := descriptorPositiveForMutationV1(field, nil)
-				if err != nil {
-					continue
-				}
-				values[path] = value
-			}
-			changed, err := primitiveValidChangeV1(field, values[path])
-			if err == nil {
-				values[path] = changed
-				return nil
-			}
-		}
-		return errors.New("implication has no primitive-valid operand mutation")
+		return mutateFrozenImplicationPredicateV1(entry, predicate, paths, fields, values)
 	case PredicateAggregateLEQ:
 		integerPaths := integerPredicatePathsV1(paths, fields)
 		if len(integerPaths) < 2 {
-			allPaths := make([]string, 0, len(entry.Fields))
-			for _, field := range entry.Fields {
-				allPaths = append(allPaths, field.FieldPath)
-			}
-			integerPaths = integerPredicatePathsV1(allPaths, fields)
-		}
-		if len(integerPaths) < 2 {
 			return errors.New("aggregate requires addend and limit")
+		}
+		var sum uint64
+		for _, path := range integerPaths[:len(integerPaths)-1] {
+			var addend uint64
+			if json.Unmarshal(values[path], &addend) != nil || ^uint64(0)-sum < addend {
+				return errors.New("aggregate addend is invalid")
+			}
+			sum += addend
 		}
 		var limit uint64
 		if json.Unmarshal(values[integerPaths[len(integerPaths)-1]], &limit) != nil {
 			return errors.New("aggregate limit is invalid")
 		}
-		values[integerPaths[0]] = []byte(strconv.FormatUint(limit+1, 10))
+		if sum > limit || limit == ^uint64(0) {
+			return errors.New("aggregate positive is not within its limit")
+		}
+		var lowest uint64
+		if json.Unmarshal(values[integerPaths[0]], &lowest) != nil || ^uint64(0)-lowest < limit-sum+1 {
+			return errors.New("aggregate mutation overflows")
+		}
+		values[integerPaths[0]] = []byte(strconv.FormatUint(lowest+(limit-sum+1), 10))
 	default:
 		return errors.New("predicate operator is not executable")
+	}
+	return nil
+}
+
+func foreignTypedReferenceJSONV1(field WireFieldDescriptorV1, recordPositives map[string][]byte) (json.RawMessage, error) {
+	names := make([]string, 0, len(recordPositives))
+	for name := range recordPositives {
+		if name != field.DigestTarget {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	var foreign []byte
+	if len(names) != 0 {
+		foreign = recordPositives[names[0]]
+	}
+	if len(foreign) == 0 {
+		foreign = []byte("CanonicalVectorEntryV1")
+	}
+	digest := sha256Hex(foreign)
+	elementField := field
+	if field.JSONType == WireArray {
+		elementType := arrayElementTypeV1(field.ValueType)
+		resolved, err := ResolveWireFieldDescriptorV1(field.SchemaID, field.FieldPath, field.Ordinal, elementType, false)
+		if err != nil {
+			return nil, err
+		}
+		elementField = resolved
+	}
+	if elementField.JSONType != WireString || validateCanonicalDescriptorValueV1(elementField, mustMarshalCanonicalVectorStringV1(digest)) != "" {
+		return nil, errors.New("typed reference substitution is not descriptor-valid")
+	}
+	return mustMarshalCanonicalVectorStringV1(digest), nil
+}
+
+func mustMarshalCanonicalVectorStringV1(value string) json.RawMessage {
+	encoded, _ := json.Marshal(value)
+	return encoded
+}
+
+func mutateFrozenImplicationPredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, paths []string, fields map[string]WireFieldDescriptorV1, values map[string]json.RawMessage) error {
+	setString := func(path, value string) { values[path] = mustMarshalCanonicalVectorStringV1(value) }
+	switch predicate.PredicateID {
+	case "P-PUBLISHER-001":
+		setString("lifecycle", "ABANDONED")
+		return nil
+	case "P-PUBLISHER-002":
+		setString("lifecycle", "ABANDONED")
+		delete(values, "terminal_revision")
+		delete(values, "terminal_operation")
+		delete(values, "recovery_proof_sha256")
+		return nil
+	case "P-SUBJECT-001":
+		values["diff_candidate_oid"] = mustMarshalCanonicalVectorStringV1(strings.Repeat("b", 40))
+		return nil
+	}
+	if len(paths) < 2 {
+		return errors.New("implication requires antecedent and consequent")
+	}
+	expected := minimalCanonicalPredicateValuesV1(entry)
+	values[paths[0]] = append(json.RawMessage(nil), expected[paths[0]]...)
+	consequent := paths[1]
+	field := fields[consequent]
+	if _, expectedPresent := expected[consequent]; !expectedPresent {
+		value, err := descriptorPositiveForMutationV1(field, nil)
+		if err != nil {
+			return err
+		}
+		values[consequent] = value
+		return nil
+	}
+	if field.Optional {
+		delete(values, consequent)
+		return nil
+	}
+	if fields[paths[0]].JSONType == WireBoolean && field.JSONType == WireBoolean {
+		values[paths[0]] = []byte("true")
+		values[consequent] = []byte("false")
+		return nil
+	}
+	if field.JSONType == WireBoolean {
+		values[consequent] = []byte("false")
+		return nil
+	}
+	changed, err := primitiveValidChangeV1(field, expected[consequent])
+	if err != nil {
+		return err
+	}
+	values[consequent] = changed
+	return nil
+}
+
+func mutateFrozenStatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, paths []string, fields map[string]WireFieldDescriptorV1, values map[string]json.RawMessage) error {
+	setString := func(path, value string) { values[path] = mustMarshalCanonicalVectorStringV1(value) }
+	switch predicate.PredicateID {
+	case "P-BARRIER-001":
+		changed, err := primitiveValidChangeV1(fields["commitment"], values["commitment"])
+		if err != nil {
+			return err
+		}
+		values["commitment"] = changed
+		return nil
+	case "P-EVENT-001":
+		setString("state_to", "a")
+		return nil
+	case "P-BARRIER-008":
+		setString("applied_state_to", "a")
+		return nil
+	case "P-PUBLISHER-006":
+		values["expires_at"] = append(json.RawMessage(nil), values["valid_from"]...)
+		return nil
+	case "P-predecessor-writer-lease-v1-ROW-001":
+		setString("lease_state", "RELEASED")
+		return nil
+	case "P-RESOURCE-002":
+		setString("lifecycle", "RELEASED")
+		delete(values, "released_at_revision")
+		delete(values, "release_evidence_sha256")
+		return nil
+	}
+	if len(paths) >= 2 {
+		edges := frozenTransitionEdgesV1(predicate)
+		if len(edges) != 0 {
+			var source string
+			if json.Unmarshal(values[paths[0]], &source) != nil {
+				return errors.New("state transition source is invalid")
+			}
+			members := canonicalClosedEnumMembersV1(fields[paths[1]])
+			for _, destination := range members {
+				if !edges[source+"\x00"+destination] {
+					setString(paths[1], destination)
+					return nil
+				}
+			}
+			return errors.New("state transition has no closed-enum invalid destination")
+		}
+	}
+	path := canonicalStateDestinationPathV1(entry, predicate, paths)
+	if path == "" {
+		return errors.New("state transition has no destination")
+	}
+	field := fields[path]
+	if _, present := values[path]; !present {
+		value, err := descriptorPositiveForMutationV1(field, nil)
+		if err != nil {
+			return err
+		}
+		values[path] = value
+	}
+	changed, err := primitiveValidChangeV1(field, values[path])
+	if err != nil {
+		return err
+	}
+	values[path] = changed
+	return nil
+}
+
+var frozenTransitionEdgePatternV1 = regexp.MustCompile(`([A-Z][A-Z0-9_]*)\s*(?:→|->)\s*([A-Z][A-Z0-9_]*)`)
+
+func frozenTransitionEdgesV1(predicate PredicateDescriptorV1) map[string]bool {
+	edges := make(map[string]bool)
+	for _, argument := range predicate.Arguments {
+		for _, match := range frozenTransitionEdgePatternV1.FindAllStringSubmatch(argument, -1) {
+			edges[match[1]+"\x00"+match[2]] = true
+		}
+	}
+	return edges
+}
+
+func canonicalClosedEnumMembersV1(field WireFieldDescriptorV1) []string {
+	if members, ok := frozenEnumValues[field.ValueType]; ok {
+		return append([]string(nil), members...)
+	}
+	if strings.HasPrefix(field.ValueType, "{") && strings.HasSuffix(field.ValueType, "}") {
+		parts := strings.Split(strings.Trim(field.ValueType, "{}"), ",")
+		result := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if member := strings.TrimSpace(part); member != "" {
+				result = append(result, member)
+			}
+		}
+		sort.Strings(result)
+		return result
 	}
 	return nil
 }
@@ -1452,60 +1769,169 @@ func containsCanonicalVectorStringV1(values []string, target string) bool {
 	return false
 }
 
-func recordWidePredicateOperandsV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1) []string {
-	want := predicateOperandCountV1(predicate.Operator)
+func canonicalPredicateOperandPathsV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, fields map[string]WireFieldDescriptorV1) []string {
+	result := make([]string, 0, len(entry.Fields))
+	appendPath := func(path string) {
+		if path == "" || path == "$" || containsCanonicalVectorStringV1(result, path) {
+			return
+		}
+		if _, exists := fields[path]; exists {
+			result = append(result, path)
+		}
+	}
+	for _, path := range predicate.FieldPaths {
+		appendPath(path)
+	}
 	arguments := strings.Join(predicate.Arguments, " ")
-	result := make([]string, 0, 4)
 	for _, field := range entry.Fields {
-		if strings.Contains(arguments, field.FieldPath) {
-			result = append(result, field.FieldPath)
+		if containsFieldToken(arguments, field.FieldPath) {
+			appendPath(field.FieldPath)
 		}
 	}
-	if len(result) >= want {
-		return result
+	if predicate.Operator == PredicateSubset {
+		arrays := result[:0]
+		for _, path := range result {
+			if fields[path].JSONType == WireArray {
+				arrays = append(arrays, path)
+			}
+		}
+		result = arrays
 	}
-	result = result[:0]
-	var selectedType WireJSONType
-	for index, field := range entry.Fields {
+	if predicate.Operator == PredicateExactlyOne {
+		optional := result[:0]
+		for _, path := range result {
+			if fields[path].Optional {
+				optional = append(optional, path)
+			}
+		}
+		result = optional
+	}
+	if predicate.Operator == PredicateTypedReference {
+		references := result[:0]
+		for _, path := range result {
+			if fields[path].DigestTarget != "" {
+				references = append(references, path)
+			}
+		}
+		if len(references) == 0 {
+			for _, field := range entry.Fields {
+				if field.DigestTarget != "" && !isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, int(field.Ordinal-1)) {
+					references = append(references, field.FieldPath)
+				}
+			}
+		}
+		result = references
+	}
+
+	eligible := func(index int, field WireFieldDescriptorV1) bool {
 		if field.LiteralValue != "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
-			continue
+			return false
 		}
-		eligible := true
 		switch predicate.Operator {
-		case PredicateIfAndOnlyIf, PredicateImplies:
-			eligible = field.JSONType == WireBoolean
 		case PredicateSubset:
-			eligible = field.JSONType == WireArray
+			return field.JSONType == WireArray
 		case PredicateOrdinalSuccess, PredicateAggregateLEQ:
-			eligible = field.JSONType == WireInteger
+			return field.JSONType == WireInteger
 		case PredicateExactlyOne:
-			eligible = field.Optional
+			return field.Optional
+		case PredicateIfAndOnlyIf:
+			return field.JSONType == WireBoolean || field.Optional
+		case PredicateImplies:
+			return field.JSONType != WireObject && field.JSONType != WireRawJSON
 		case PredicateAllEqual:
 			if len(result) == 0 {
-				selectedType = field.JSONType
+				return field.JSONType != WireObject && field.JSONType != WireRawJSON
 			}
-			eligible = len(result) == 0 || field.JSONType == selectedType
-		}
-		if eligible {
-			result = append(result, field.FieldPath)
-			if len(result) == want {
-				return result
-			}
+			return field.ValueType == fields[result[0]].ValueType
+		default:
+			return field.JSONType != WireObject && field.JSONType != WireRawJSON
 		}
 	}
-	if len(result) < want {
+
+	minimum := predicateOperandCountV1(predicate.Operator)
+	if predicate.Operator == PredicateAggregateLEQ {
+		// The frozen aggregate operands are every numeric addend followed by the
+		// limit. A prose extractor may have named a nearby boolean instead.
 		result = result[:0]
-		for index, field := range entry.Fields {
-			if field.LiteralValue != "" || isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
-				continue
+		for _, field := range entry.Fields {
+			if field.JSONType == WireInteger {
+				result = append(result, field.FieldPath)
 			}
-			result = append(result, field.FieldPath)
-			if len(result) == want {
-				break
+		}
+		return result
+	}
+	if predicate.Operator == PredicateOrdinalSuccess {
+		integers := integerPredicatePathsV1(result, fields)
+		if len(integers) >= minimum {
+			return integers
+		}
+		result = integers
+	}
+	for index, field := range entry.Fields {
+		if len(result) >= minimum && predicate.Operator != PredicateExactlyOne {
+			break
+		}
+		if eligible(index, field) {
+			appendPath(field.FieldPath)
+		}
+	}
+	if (predicate.Operator == PredicateAllEqual || predicate.Operator == PredicateOrdinalSuccess) && len(result) != 0 {
+		return result
+	}
+	if len(result) < minimum {
+		for index, field := range entry.Fields {
+			if field.LiteralValue == "" && !isSelfDigestFieldIndexV1(entry.RecordName, entry.SchemaID, entry.Fields, index) {
+				appendPath(field.FieldPath)
+				if len(result) >= minimum {
+					break
+				}
 			}
 		}
 	}
 	return result
+}
+
+func canonicalDerivedOutputPathV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, fields map[string]WireFieldDescriptorV1) string {
+	switch predicate.PredicateID {
+	case "P-DIFF-001":
+		return "derivation_rule"
+	case "P-effect-pre-call-closure-v1-ROW-001":
+		for _, candidate := range []string{"claim_sha256", "call_admission_sha256", "unclaimed_abandonment_sha256"} {
+			if _, ok := fields[candidate]; ok {
+				return candidate
+			}
+		}
+	case "P-PR-002":
+		for _, candidate := range []string{"mutation_mode", "route_template", "request_body"} {
+			if _, ok := fields[candidate]; ok {
+				return candidate
+			}
+		}
+	case "P-MERGE-003":
+		for _, candidate := range []string{"observation_source", "read_request_sha256s"} {
+			if _, ok := fields[candidate]; ok {
+				return candidate
+			}
+		}
+	}
+	paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
+	if len(paths) == 0 {
+		return ""
+	}
+	return paths[len(paths)-1]
+}
+
+func canonicalStateDestinationPathV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, paths []string) string {
+	for index := len(paths) - 1; index >= 0; index-- {
+		field, ok := canonicalVectorFieldV1(entry.Fields, paths[index])
+		if ok && (isClosedEnumType(field.ValueType) || strings.HasPrefix(field.ValueType, "{")) {
+			return paths[index]
+		}
+	}
+	if len(paths) != 0 {
+		return paths[len(paths)-1]
+	}
+	return ""
 }
 
 func predicateOperandCountV1(operator PredicateOperator) int {
@@ -1519,6 +1945,35 @@ func predicateOperandCountV1(operator PredicateOperator) int {
 
 func primitiveValidChangeV1(field WireFieldDescriptorV1, raw json.RawMessage) (json.RawMessage, error) {
 	switch field.JSONType {
+	case WireArray:
+		var values []json.RawMessage
+		if json.Unmarshal(raw, &values) != nil {
+			return nil, errors.New("array operand is invalid")
+		}
+		if len(values) == 0 {
+			if field.MaxItems != nil && *field.MaxItems == 0 {
+				return nil, errors.New("array operand cannot change cardinality")
+			}
+			value, err := minimalArrayElementJSONV1(field, arrayElementTypeV1(field.ValueType), 0)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal([]json.RawMessage{value})
+		}
+		elementType := arrayElementTypeV1(field.ValueType)
+		element, err := ResolveWireFieldDescriptorV1(field.SchemaID, field.FieldPath, field.Ordinal, elementType, false)
+		if err != nil {
+			return nil, err
+		}
+		changed, err := primitiveValidChangeV1(element, values[0])
+		if err != nil {
+			return nil, err
+		}
+		values[0] = changed
+		if strings.Contains(field.ValueType, "(set") {
+			sort.Slice(values, func(i, j int) bool { return bytes.Compare(values[i], values[j]) < 0 })
+		}
+		return json.Marshal(values)
 	case WireObject:
 		values, order, duplicate, err := decodeCanonicalVectorObjectV1(raw)
 		if err != nil || duplicate {
@@ -1545,6 +2000,12 @@ func primitiveValidChangeV1(field WireFieldDescriptorV1, raw json.RawMessage) (j
 		var value string
 		if json.Unmarshal(raw, &value) != nil {
 			return nil, errors.New("string operand is invalid")
+		}
+		if field.ValueType == "procStart" {
+			number, err := strconv.ParseUint(value, 10, 64)
+			if err == nil && number != ^uint64(0) {
+				return json.Marshal(strconv.FormatUint(number+1, 10))
+			}
 		}
 		if members, ok := frozenEnumValues[field.ValueType]; ok {
 			for _, member := range members {

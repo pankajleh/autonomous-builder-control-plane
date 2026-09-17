@@ -1238,18 +1238,25 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 	for _, field := range entry.Fields {
 		fields[field.FieldPath] = field
 	}
+	setString := func(path, value string) {
+		values[path], _ = json.Marshal(value)
+	}
 	for _, predicate := range entry.Predicates {
 		switch predicate.Operator {
-		case PredicateExactLiteral, PredicateTypedReference, PredicateDigestPreimage, PredicateDerivation, PredicateStateTransition, PredicateAggregateLEQ:
-			// Exact literals and digest/reference shapes are installed by field
-			// generation; minimal numeric values satisfy aggregate ceilings.
+		case PredicateExactLiteral, PredicateTypedReference, PredicateDerivation:
+			// Descriptor generation installs the frozen positive value.
+		case PredicateDigestPreimage:
+			if predicate.PredicateID == "P-effect-ledger-event-preimage-v1-ROW-003" {
+				setString("event_id", effectLedgerEventIDV1(entry, values))
+			}
 		case PredicateAllEqual:
-			if len(predicate.FieldPaths) < 2 {
+			paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
+			if len(paths) < 2 {
 				continue
 			}
-			value, ok := values[predicate.FieldPaths[0]]
+			value, ok := values[paths[0]]
 			if !ok {
-				descriptor, exists := fields[predicate.FieldPaths[0]]
+				descriptor, exists := fields[paths[0]]
 				if !exists {
 					return fmt.Errorf("predicate %s has no executable operand", predicate.PredicateID)
 				}
@@ -1258,20 +1265,21 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 				if err != nil {
 					return err
 				}
-				values[predicate.FieldPaths[0]] = value
+				values[paths[0]] = value
 			}
-			for _, path := range predicate.FieldPaths[1:] {
+			for _, path := range paths[1:] {
 				values[path] = append(json.RawMessage(nil), value...)
 			}
 		case PredicateExactlyOne:
+			paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
 			present := 0
-			for _, path := range predicate.FieldPaths {
+			for _, path := range paths {
 				if _, ok := values[path]; ok {
 					present++
 				}
 			}
-			if present == 0 && len(predicate.FieldPaths) != 0 {
-				descriptor, ok := fields[predicate.FieldPaths[0]]
+			if present == 0 && len(paths) != 0 {
+				descriptor, ok := fields[paths[0]]
 				if !ok {
 					return fmt.Errorf("predicate %s has no executable arm", predicate.PredicateID)
 				}
@@ -1279,10 +1287,10 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 				if err != nil {
 					return err
 				}
-				values[predicate.FieldPaths[0]] = value
+				values[paths[0]] = value
 			}
 		case PredicateOrdinalSuccess:
-			paths := integerPredicatePathsV1(predicate.FieldPaths, fields)
+			paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
 			if len(paths) >= 2 {
 				var predecessor uint64
 				if json.Unmarshal(values[paths[0]], &predecessor) == nil {
@@ -1290,12 +1298,82 @@ func applyPositivePredicatesV1(entry CanonicalVectorEntryV1, values map[string]j
 				}
 			}
 		case PredicateSubset:
-			if len(predicate.FieldPaths) >= 2 {
-				values[predicate.FieldPaths[0]] = []byte("[]")
+			paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
+			if len(paths) >= 2 {
+				values[paths[0]] = []byte("[]")
 			}
 		case PredicateIfAndOnlyIf, PredicateImplies:
-			// Optional operands are absent in the minimal record, making the
-			// implication antecedent false. Explicit boolean operands use false.
+			switch predicate.PredicateID {
+			case "P-PUBLISHER-001", "P-PUBLISHER-002":
+				setString("lifecycle", "ACTIVE")
+				delete(values, "terminal_revision")
+				delete(values, "terminal_operation")
+				delete(values, "recovery_proof_sha256")
+			case "P-SUBJECT-001":
+				values["diff_candidate_oid"] = append(json.RawMessage(nil), values["candidate_oid"]...)
+			}
+		case PredicateStateTransition:
+			switch predicate.PredicateID {
+			case "P-BARRIER-001":
+				if commitment, ok := values["commitment"]; ok {
+					setString("commitment_sha256", sha256Hex(commitment))
+				}
+			case "P-EVENT-001":
+				var kind string
+				_ = json.Unmarshal(values["effect_kind"], &kind)
+				if kind == "PR" {
+					setString("state_from", "INTEGRATION_ACCEPTED")
+					setString("state_to", "READY_FOR_MERGE")
+					setString("source", "assurance-pr-effect-v4")
+				} else {
+					setString("state_from", "READY_FOR_MERGE")
+					setString("state_to", "MERGED")
+					setString("source", "assurance-merge-effect-v4")
+				}
+			case "P-BARRIER-008":
+				var kind string
+				_ = json.Unmarshal(values["effect_kind"], &kind)
+				if kind == "PR" {
+					setString("source_state", "INTEGRATION_ACCEPTED")
+					setString("applied_state_to", "READY_FOR_MERGE")
+				} else {
+					setString("source_state", "READY_FOR_MERGE")
+					setString("applied_state_to", "MERGED")
+				}
+			case "P-PUBLISHER-006":
+				setString("proof_assembled_at", "2000-01-01T00:00:00Z")
+				setString("valid_from", "2000-01-01T00:00:00Z")
+				setString("expires_at", "2000-01-01T00:00:01Z")
+			case "P-predecessor-writer-lease-v1-ROW-001":
+				setString("lease_state", "ACTIVE")
+			default:
+				paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
+				edges := frozenTransitionEdgesV1(predicate)
+				if len(paths) >= 2 && len(edges) != 0 {
+					keys := make([]string, 0, len(edges))
+					for edge := range edges {
+						keys = append(keys, edge)
+					}
+					sort.Strings(keys)
+					parts := strings.SplitN(keys[0], "\x00", 2)
+					setString(paths[0], parts[0])
+					setString(paths[1], parts[1])
+				}
+			}
+		case PredicateAggregateLEQ:
+			paths := canonicalPredicateOperandPathsV1(entry, predicate, fields)
+			if len(paths) < 2 {
+				continue
+			}
+			var sum uint64
+			for _, path := range paths[:len(paths)-1] {
+				var addend uint64
+				if json.Unmarshal(values[path], &addend) != nil || ^uint64(0)-sum < addend {
+					return fmt.Errorf("predicate %s aggregate overflows", predicate.PredicateID)
+				}
+				sum += addend
+			}
+			values[paths[len(paths)-1]] = []byte(strconv.FormatUint(sum, 10))
 		}
 	}
 	return nil

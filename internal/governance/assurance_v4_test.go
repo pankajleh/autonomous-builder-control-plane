@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -251,6 +252,20 @@ func TestFrozenCatalogEveryPositiveRecipeProducesValidatedBytes(t *testing.T) {
 	if bytes.Equal(authority["repository"], []byte("{}")) || bytes.Equal(authority["actor"], []byte("{}")) {
 		t.Fatal("required nested records were replaced by empty objects")
 	}
+	var publisher map[string]json.RawMessage
+	if err := json.Unmarshal(positives["artifact-publisher-reservation-v1"], &publisher); err != nil {
+		t.Fatal(err)
+	}
+	var lifecycle string
+	_ = json.Unmarshal(publisher["lifecycle"], &lifecycle)
+	if lifecycle != "ACTIVE" {
+		t.Fatalf("ArtifactPublisherReservationV1 lifecycle = %q, want ACTIVE", lifecycle)
+	}
+	for _, terminal := range []string{"terminal_revision", "terminal_operation", "recovery_proof_sha256"} {
+		if _, present := publisher[terminal]; present {
+			t.Fatalf("ACTIVE ArtifactPublisherReservationV1 unexpectedly carries %s", terminal)
+		}
+	}
 }
 
 func TestFrozenCatalogEveryRejectionUsesRecursivePositiveAndValidates(t *testing.T) {
@@ -279,8 +294,21 @@ func TestFrozenCatalogEveryRejectionUsesRecursivePositiveAndValidates(t *testing
 		}
 		for _, vector := range set.Rejections {
 			covered[string(vector.RequiredError)+"/"+vectorMutationV1(vector.VectorID)] = true
-			if strings.Contains(vector.VectorID, "/PREDICATE_") && len(vector.FalsePredicateIDs) == 0 {
-				t.Fatalf("predicate vector %s omitted its complete false-predicate set", vector.VectorID)
+			if strings.Contains(vector.VectorID, "/PREDICATE_") {
+				var classified *canonicalVectorValidationErrorV1
+				validationErr := ValidateCanonicalVectorBytesV1(entry, vector.Bytes)
+				if !errors.As(validationErr, &classified) || classified.code != vector.RequiredError {
+					t.Fatalf("predicate vector %s classified as %v, want %s", vector.VectorID, validationErr, vector.RequiredError)
+				}
+				actual := append([]string(nil), classified.falsePredicates...)
+				sort.Strings(actual)
+				if !equalVectorStringsV1(actual, vector.FalsePredicateIDs) {
+					t.Fatalf("predicate vector %s false set = %v, generated %v", vector.VectorID, actual, vector.FalsePredicateIDs)
+				}
+				target := strings.TrimPrefix(vectorMutationV1(vector.VectorID), "PREDICATE_")
+				if !containsCanonicalVectorStringV1(actual, target) {
+					t.Fatalf("predicate vector %s left its named target true; false set %v", vector.VectorID, actual)
+				}
 			}
 		}
 	}
@@ -380,6 +408,107 @@ func TestFrozenCatalogEveryRejectionUsesRecursivePositiveAndValidates(t *testing
 	}
 	if !selfDigestFound {
 		t.Fatal("terminal self-digest rejection was not executed")
+	}
+}
+
+func TestCanonicalPredicateOperatorsEvaluateActualOperands(t *testing.T) {
+	type fixture struct {
+		name       string
+		schemaID   string
+		recordName string
+		fields     []WireFieldSpecV1
+		predicate  *WirePredicateSpecV1
+		target     string
+		assert     func(*testing.T, []byte, []byte)
+	}
+	baseFields := func(record, schema string) []WireFieldSpecV1 {
+		return []WireFieldSpecV1{{"kind", `id="` + record + `"`, false}, {"schema_version", `id="` + schema + `"`, false}}
+	}
+	withBase := func(record, schema string, fields ...WireFieldSpecV1) []WireFieldSpecV1 {
+		return append(baseFields(record, schema), fields...)
+	}
+	boolPair := func(t *testing.T, _ []byte, mutated []byte) {
+		t.Helper()
+		var values map[string]json.RawMessage
+		if err := json.Unmarshal(mutated, &values); err != nil {
+			t.Fatal(err)
+		}
+		if string(values["antecedent"]) != "true" || string(values["consequent"]) != "false" {
+			t.Fatalf("implication mutation = antecedent:%s consequent:%s", values["antecedent"], values["consequent"])
+		}
+	}
+	fixtures := []fixture{
+		{name: "EXACT_LITERAL", schemaID: "exact-op-v1", recordName: "ExactOpV1", fields: withBase("ExactOpV1", "exact-op-v1", WireFieldSpecV1{"mode", `id="ALPHA"`, false}), target: "P-exact-op-v1-EXACT_LITERAL-mode"},
+		{name: "ALL_EQUAL", schemaID: "all-equal-op-v1", recordName: "AllEqualOpV1", fields: withBase("AllEqualOpV1", "all-equal-op-v1", WireFieldSpecV1{"left", "id", false}, WireFieldSpecV1{"right", "id", false}), predicate: &WirePredicateSpecV1{"P-TEST-ALL-EQUAL", []string{"left", "right"}, PredicateAllEqual, []string{"left equals right"}}, target: "P-TEST-ALL-EQUAL"},
+		{name: "IF_AND_ONLY_IF", schemaID: "iff-op-v1", recordName: "IFFOpV1", fields: withBase("IFFOpV1", "iff-op-v1", WireFieldSpecV1{"antecedent", "bool", false}, WireFieldSpecV1{"consequent", "bool", false}), predicate: &WirePredicateSpecV1{"P-TEST-IFF", []string{"antecedent", "consequent"}, PredicateIfAndOnlyIf, []string{"antecedent iff consequent"}}, target: "P-TEST-IFF", assert: boolPair},
+		{name: "IMPLIES", schemaID: "implies-op-v1", recordName: "ImpliesOpV1", fields: withBase("ImpliesOpV1", "implies-op-v1", WireFieldSpecV1{"antecedent", "bool", false}, WireFieldSpecV1{"consequent", "bool", false}), predicate: &WirePredicateSpecV1{"P-TEST-IMPLIES", []string{"antecedent", "consequent"}, PredicateImplies, []string{"antecedent requires consequent"}}, target: "P-TEST-IMPLIES", assert: boolPair},
+		{name: "EXACTLY_ONE", schemaID: "one-op-v1", recordName: "OneOpV1", fields: withBase("OneOpV1", "one-op-v1", WireFieldSpecV1{"first", "id", true}, WireFieldSpecV1{"second", "id", true}), predicate: &WirePredicateSpecV1{"P-TEST-ONE", []string{"first", "second"}, PredicateExactlyOne, []string{"exactly one arm"}}, target: "P-TEST-ONE"},
+		{name: "SUBSET", schemaID: "subset-op-v1", recordName: "SubsetOpV1", fields: withBase("SubsetOpV1", "subset-op-v1", WireFieldSpecV1{"subset", "[]id(set,0..4)", false}, WireFieldSpecV1{"superset", "[]id(set,0..4)", false}), predicate: &WirePredicateSpecV1{"P-TEST-SUBSET", []string{"subset", "superset"}, PredicateSubset, []string{"subset must be a subset of superset"}}, target: "P-TEST-SUBSET"},
+		{name: "ORDINAL_SUCCESSOR", schemaID: "ordinal-op-v1", recordName: "OrdinalOpV1", fields: withBase("OrdinalOpV1", "ordinal-op-v1", WireFieldSpecV1{"predecessor", "u64", false}, WireFieldSpecV1{"successor", "u64", false}), predicate: &WirePredicateSpecV1{"P-TEST-ORDINAL", []string{"predecessor", "successor"}, PredicateOrdinalSuccess, []string{"successor ordinal"}}, target: "P-TEST-ORDINAL"},
+		{name: "STATE_TRANSITION", schemaID: "state-op-v1", recordName: "StateOpV1", fields: withBase("StateOpV1", "state-op-v1", WireFieldSpecV1{"source", "{A,B,C}", false}, WireFieldSpecV1{"destination", "{A,B,C}", false}), predicate: &WirePredicateSpecV1{"P-TEST-STATE", []string{"source", "destination"}, PredicateStateTransition, []string{"allowed transition A→B"}}, target: "P-TEST-STATE", assert: func(t *testing.T, positive, mutated []byte) {
+			var before, after map[string]json.RawMessage
+			_ = json.Unmarshal(positive, &before)
+			_ = json.Unmarshal(mutated, &after)
+			if string(before["destination"]) != `"B"` || string(after["destination"]) != `"A"` {
+				t.Fatalf("state destinations = %s -> %s, want B -> A", before["destination"], after["destination"])
+			}
+		}},
+		{name: "TYPED_REFERENCE", schemaID: "typed-op-v1", recordName: "TypedOpV1", fields: withBase("TypedOpV1", "typed-op-v1", WireFieldSpecV1{"reference_sha256", "sha256<ArtifactBlobV1>", false}), target: "P-typed-op-v1-TYPED_REFERENCE-reference_sha256", assert: func(t *testing.T, positive, mutated []byte) {
+			var before, after map[string]json.RawMessage
+			_ = json.Unmarshal(positive, &before)
+			_ = json.Unmarshal(mutated, &after)
+			if bytes.Equal(before["reference_sha256"], after["reference_sha256"]) {
+				t.Fatal("typed-reference mutation did not substitute a foreign catalog digest")
+			}
+		}},
+		{name: "DIGEST_PREIMAGE", schemaID: "digest-op-v1", recordName: "DigestOpV1", fields: withBase("DigestOpV1", "digest-op-v1", WireFieldSpecV1{"payload", "id", false}, WireFieldSpecV1{"record_sha256", "sha256<DigestOpV1>", false}), target: "P-digest-op-v1-DIGEST_PREIMAGE-record_sha256"},
+		{name: "DERIVATION", schemaID: "derivation-op-v1", recordName: "DerivationOpV1", fields: withBase("DerivationOpV1", "derivation-op-v1", WireFieldSpecV1{"input", "id", false}, WireFieldSpecV1{"output", "id", false}), predicate: &WirePredicateSpecV1{"P-TEST-DERIVATION", []string{"input", "output"}, PredicateDerivation, []string{"output derived from input"}}, target: "P-TEST-DERIVATION"},
+		{name: "AGGREGATE_LEQ", schemaID: "aggregate-op-v1", recordName: "AggregateOpV1", fields: withBase("AggregateOpV1", "aggregate-op-v1", WireFieldSpecV1{"first", "u64", false}, WireFieldSpecV1{"second", "u64", false}, WireFieldSpecV1{"limit", "u64", false}), predicate: &WirePredicateSpecV1{"P-TEST-AGGREGATE", []string{"first", "second", "limit"}, PredicateAggregateLEQ, []string{"sum addends <= limit"}}, target: "P-TEST-AGGREGATE", assert: func(t *testing.T, _, mutated []byte) {
+			var values struct {
+				First  uint64 `json:"first"`
+				Second uint64 `json:"second"`
+				Limit  uint64 `json:"limit"`
+			}
+			if err := json.Unmarshal(mutated, &values); err != nil {
+				t.Fatal(err)
+			}
+			if values.First != values.Limit-values.Second+1 {
+				t.Fatalf("aggregate first = %d, want limit-sum+1 = %d", values.First, values.Limit-values.Second+1)
+			}
+		}},
+	}
+
+	for _, test := range fixtures {
+		t.Run(test.name, func(t *testing.T) {
+			definition := WireSchemaDefinitionV1{SchemaID: test.schemaID, RecordName: test.recordName, Fields: test.fields}
+			if test.predicate != nil {
+				definition.Predicates = []WirePredicateSpecV1{*test.predicate}
+			}
+			entry, err := buildCanonicalVectorEntry(definition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			set, err := GenerateExecutableCanonicalVectorsV1(entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var selected *ExecutableCanonicalVectorV1
+			for index := range set.Rejections {
+				if set.Rejections[index].RequiredError == CanonicalPredicateInvalid && vectorMutationV1(set.Rejections[index].VectorID) == "PREDICATE_"+test.target {
+					selected = &set.Rejections[index]
+					break
+				}
+			}
+			if selected == nil {
+				t.Fatalf("target rejection %s is missing", test.target)
+			}
+			if !containsCanonicalVectorStringV1(selected.FalsePredicateIDs, test.target) {
+				t.Fatalf("false set %v omits target %s", selected.FalsePredicateIDs, test.target)
+			}
+			if test.assert != nil {
+				test.assert(t, set.Positive, selected.Bytes)
+			}
+		})
 	}
 }
 
