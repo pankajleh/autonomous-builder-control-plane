@@ -107,6 +107,7 @@ func TestPostgresDomainIsolationArtifactStore(t *testing.T) {
 func TestPostgresBootstrapReplayStates(t *testing.T) {
 	t.Run("P-only-and-final-H-replay", testPostgresBootstrapPOnlyAndHReplay)
 	t.Run("committed-M-create-or-verify", testPostgresBootstrapCommittedMReplay)
+	t.Run("hardened-worker-create-or-verify", testPostgresHardenedWorkerReplay)
 }
 
 func TestPostgresDurablePredecessorFence(t *testing.T) {

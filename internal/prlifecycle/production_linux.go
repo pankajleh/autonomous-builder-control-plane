@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
+	postgresbackend "github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
 
@@ -33,8 +34,9 @@ func NewProductionController(config ProductionControllerConfig) (*Controller, er
 	if config.PredecessorFence == nil || len(config.PredecessorBindingIDs) == 0 {
 		return nil, errors.New("production PR admission/provider requires the durable predecessor fence")
 	}
-	if config.AuthoritativeLedger == nil || !config.AuthoritativeLedger.PredecessorFencedV1() {
-		return nil, errors.New("production PR admission/provider requires a fenced authoritative ledger")
+	postgresFence, ok := config.PredecessorFence.(*postgresbackend.PostgresPredecessorDirectoryFenceV1)
+	if !ok || postgresFence == nil || config.AuthoritativeLedger == nil || !config.AuthoritativeLedger.UsesProductionPostgresFenceV1(postgresFence) {
+		return nil, errors.New("production PR admission/provider requires the same durable PostgreSQL fence as the authoritative ledger")
 	}
 	store, err := newPRWriteAdmissionStore(productionAdmissionRoot)
 	if err != nil {

@@ -252,7 +252,11 @@ func parseWireFieldList(list string) ([]WireFieldSpecV1, error) {
 			literal := strings.Trim(strings.TrimSpace(token[equal+1:]), `"`)
 			if values, enum := frozenEnumValues[baseType]; enum {
 				index := sort.SearchStrings(values, literal)
-				if index >= len(values) || values[index] != literal {
+				// An exact literal must retain a descriptor-valid alternative for
+				// CONSTANT_CHANGED. A singleton semantic enum cannot provide one,
+				// so the exact predicate carries the singleton restriction while
+				// the scalar keeps the ordinary text mutation domain.
+				if len(values) == 1 || index >= len(values) || values[index] != literal {
 					baseType = "text"
 				}
 			}

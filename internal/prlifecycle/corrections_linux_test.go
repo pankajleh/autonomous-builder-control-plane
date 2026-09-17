@@ -30,7 +30,7 @@ func (f requestAuthenticatorFunc) AuthenticateGitHubRequest(request *http.Reques
 	return f(request)
 }
 
-func TestProductionConstructionPinsHostRootAndExactLedger(t *testing.T) {
+func TestProductionConstructionRejectsNonPostgresFenceAndUnfencedLedger(t *testing.T) {
 	first := provisionStore(t)
 	old := productionAdmissionRoot
 	productionAdmissionRoot = first.Root()
@@ -60,21 +60,11 @@ func TestProductionConstructionPinsHostRootAndExactLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := ProductionControllerConfig{GitHub: adapter, Artifacts: artifacts, AuthoritativeLedger: authoritative, PredecessorFence: fence, PredecessorBindingIDs: []string{"pr-admission"}}
-	one, err := NewProductionController(config)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := NewProductionController(config); err == nil || !strings.Contains(err.Error(), "same durable PostgreSQL fence") {
+		t.Fatalf("production PR controller accepted an interface fake/process-local composition: %v", err)
 	}
-	secondRoot := provisionStore(t).Root()
-	t.Setenv("ABCP_PR_ADMISSION_ROOT", secondRoot)
-	two, err := NewProductionController(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if one.store.Root() != first.Root() || two.store.Root() != first.Root() {
-		t.Fatal("process-startup admission identity was re-keyed by later host input")
-	}
-	if one.ledger.path != authoritative.Path() || two.ledger.path != authoritative.Path() {
-		t.Fatal("production recorder did not derive the exact authoritative ledger path")
+	if _, err := ledger.NewProductionFencedJSONLLedger(filepath.Join(ledgerParent, "fake-production.jsonl"), fence, []string{"ledger-production-run"}); err == nil {
+		t.Fatal("production ledger accepted an interface fake predecessor fence")
 	}
 	config.AuthoritativeLedger = nil
 	if _, err := NewProductionController(config); err == nil {

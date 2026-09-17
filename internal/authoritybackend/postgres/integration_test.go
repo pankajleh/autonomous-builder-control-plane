@@ -294,6 +294,75 @@ func testPostgresBootstrapCommittedMReplay(t *testing.T) {
 	}
 }
 
+func testPostgresHardenedWorkerReplay(t *testing.T) {
+	harness := newPostgresHarnessV1(t)
+	config := harness.bootstrapConfigV1(false)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := BootstrapV1(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+	if err := BootstrapV1(ctx, config); err != nil {
+		t.Fatalf("exact already-hardened worker replay: %v", err)
+	}
+	admin, err := pgx.Connect(ctx, harness.dsnV1("postgres", harness.adminPassword, "abcp_test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(context.Background())
+	worker := config.Workers[0]
+	type driftCase struct {
+		name, table, column string
+		drift, exact        any
+	}
+	cases := []driftCase{
+		{"capacity-bytes", "abcp_worker_capacity_v1", "canonical_capacity", []byte(`{}`), worker.CanonicalCapacity},
+		{"capacity-digest", "abcp_worker_capacity_v1", "capacity_sha256", strings.Repeat("a", 64), worker.CapacitySHA256},
+		{"capacity-revision", "abcp_worker_capacity_v1", "revision", int64(2), int64(worker.CapacityRevision)},
+		{"registration-host", "abcp_worker_observation_key_registration_v1", "host_identity", strings.Repeat("a", 64), worker.HostIdentity},
+		{"registration-observer", "abcp_worker_observation_key_registration_v1", "observer_identity", strings.Repeat("b", 64), worker.ObserverIdentity},
+		{"registration-key-digest", "abcp_worker_observation_key_registration_v1", "observer_key_sha256", strings.Repeat("c", 64), worker.ObserverKeySHA256},
+		{"registration-digest", "abcp_worker_observation_key_registration_v1", "registration_sha256", strings.Repeat("d", 64), worker.RegistrationSHA256},
+		{"registration-capacity-digest", "abcp_worker_observation_key_registration_v1", "worker_capacity_sha256", strings.Repeat("e", 64), worker.WorkerCapacitySHA256},
+		{"registration-provenance", "abcp_worker_observation_key_registration_v1", "bootstrap_provenance_sha256", strings.Repeat("f", 64), worker.BootstrapProvenanceSHA256},
+		{"registration-bytes", "abcp_worker_observation_key_registration_v1", "canonical_registration", []byte(`{}`), worker.CanonicalRegistration},
+		{"registration-key-bytes", "abcp_worker_observation_key_registration_v1", "canonical_key", []byte(`{}`), worker.CanonicalKey},
+		{"registration-timestamp", "abcp_worker_observation_key_registration_v1", "registered_at", worker.RegisteredAt.Add(time.Second), worker.RegisteredAt},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			statement := `UPDATE abcp_v4.` + test.table + ` SET ` + test.column + `=$2 WHERE worker_identity=$1`
+			if _, err := admin.Exec(ctx, statement, worker.WorkerIdentity, test.drift); err != nil {
+				t.Fatal(err)
+			}
+			if err := BootstrapV1(ctx, config); err == nil || !strings.Contains(err.Error(), "worker bootstrap-row verification") {
+				t.Fatalf("hardened worker drift was not rejected: %v", err)
+			}
+			if _, err := admin.Exec(ctx, statement, worker.WorkerIdentity, test.exact); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	if _, err := admin.Exec(ctx, `UPDATE abcp_v4.abcp_worker_observation_key_registration_v1 SET registration_revision=2 WHERE worker_identity=$1`, worker.WorkerIdentity); err == nil {
+		t.Fatal("registration revision drift escaped the immutable schema constraint")
+	}
+	var setOption bool
+	if err := admin.QueryRow(ctx, `
+		SELECT m.set_option
+		FROM pg_catalog.pg_auth_members m
+		JOIN pg_catalog.pg_roles parent ON parent.oid=m.roleid
+		JOIN pg_catalog.pg_roles child ON child.oid=m.member
+		WHERE parent.rolname='abcp_v4_worker_fn' AND child.rolname='abcp_bootstrap_provisioner'`).Scan(&setOption); err != nil {
+		t.Fatal(err)
+	}
+	if setOption {
+		t.Fatal("post-H worker verification left provisioner SET authority behind")
+	}
+	if err := BootstrapV1(ctx, config); err != nil {
+		t.Fatalf("exact worker replay after drift restoration: %v", err)
+	}
+}
+
 func testPostgresDurablePredecessorFence(t *testing.T) {
 	harness := newPostgresHarnessV1(t)
 	config := harness.bootstrapConfigV1(false)
@@ -343,6 +412,15 @@ func testPostgresDurablePredecessorFence(t *testing.T) {
 	fenceB, err := NewPostgresPredecessorDirectoryFenceV1(backendB, PredecessorFenceConfigV1{ControllerIdentity: controllerID, OwnerInstanceSHA256: strings.Repeat("f", 64), LeaseDuration: time.Minute, Now: clock, Probes: probes})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := NewProductionFencedWorkflowAuthorityBackendV1(backendA, fenceA, "workflow", identity); err != nil {
+		t.Fatalf("exact PostgreSQL production workflow composition: %v", err)
+	}
+	if _, err := NewProductionFencedWorkflowAuthorityBackendV1(backendB, fenceA, "workflow", identity); err == nil {
+		t.Fatal("production workflow accepted a fence owned by a different PostgreSQL backend instance")
+	}
+	if _, err := NewProductionFencedWorkflowAuthorityBackendV1(backendA, fenceB, "workflow", identity); err == nil {
+		t.Fatal("production workflow accepted a mismatched durable PostgreSQL fence instance")
 	}
 	var wait sync.WaitGroup
 	leases := make(chan authoritybackend.PredecessorWriterLeaseHandleV1, 16)
@@ -510,8 +588,36 @@ func (h *postgresHarnessV1) bootstrapConfigV1(twoDomains bool) BootstrapConfigV1
 	return BootstrapConfigV1{
 		ProvisionerConnectionString: h.dsnV1("abcp_bootstrap_provisioner", h.provisionerPassword, "abcp_test"),
 		MigratorConnectionString:    h.dsnV1(MigratorRoleV1, h.migratorPassword, "abcp_test"), MigratorPassword: h.migratorPassword,
-		DatabaseName: "abcp_test", Domains: domains,
+		DatabaseName: "abcp_test", Domains: domains, Workers: []WorkerBootstrapV1{postgresWorkerBootstrapV1()},
 	}
+}
+
+func postgresWorkerBootstrapV1() WorkerBootstrapV1 {
+	workerIdentity := strings.Repeat("6", 64)
+	hostIdentity := strings.Repeat("7", 64)
+	keyID := strings.Repeat("8", 64)
+	observerPreimage := []byte("ABCP-WORKER-OBSERVER-V1\x00" + workerIdentity + "\x00" + hostIdentity + "\x00" + keyID)
+	observerIdentity := sha256HexV1(observerPreimage)
+	capacityPrefix := fmt.Sprintf(`{"kind":"WorkerCapacityV1","schema_version":"worker-capacity-v1","worker_identity":"%s","aggregate_memory_bytes":12884901888,"aggregate_pids":384,"aggregate_cpu_micros_per_period":600000,"aggregate_cpu_period_micros":100000,"nofile":4096,"combined_cache_image_daemon_bytes":4294967296,"container_tmpfs_bytes":2147483648,"container_shm_bytes":268435456,"combined_container_daemon_log_bytes":67108864,"container_image_bytes":2147483648`, workerIdentity)
+	capacity, capacityDigest := sealPostgresBootstrapRecordV1(capacityPrefix, "capacity_sha256")
+	keyPrefix := fmt.Sprintf(`{"kind":"WorkerObservationKeyV1","schema_version":"worker-observation-key-v1","worker_identity":"%s","host_identity":"%s","observer_identity":"%s","key_id":"%s","algorithm":"ED25519","public_key_hex":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","valid_from":"2000-01-01T00:00:00Z","valid_through":"2100-01-01T00:00:00Z","registration_revision":1`, workerIdentity, hostIdentity, observerIdentity, keyID)
+	key, keyDigest := sealPostgresBootstrapRecordV1(keyPrefix, "key_sha256")
+	registeredAt := time.Date(2000, 1, 2, 0, 0, 0, 0, time.UTC)
+	provenance := strings.Repeat("5", 64)
+	registrationPrefix := fmt.Sprintf(`{"kind":"WorkerObservationKeyRegistrationV1","schema_version":"worker-observation-key-registration-v1","worker_identity":"%s","host_identity":"%s","observer_identity":"%s","observer_key_sha256":"%s","worker_capacity_sha256":"%s","bootstrap_provenance_sha256":"%s","registration_revision":1,"registered_at":"2000-01-02T00:00:00Z"`, workerIdentity, hostIdentity, observerIdentity, keyDigest, capacityDigest, provenance)
+	registration, registrationDigest := sealPostgresBootstrapRecordV1(registrationPrefix, "registration_sha256")
+	return WorkerBootstrapV1{
+		WorkerIdentity: workerIdentity, CanonicalCapacity: capacity, CapacitySHA256: capacityDigest, CapacityRevision: 1,
+		CanonicalKey: key, CanonicalRegistration: registration, HostIdentity: hostIdentity, ObserverIdentity: observerIdentity,
+		ObserverKeySHA256: keyDigest, RegistrationSHA256: registrationDigest, RegistrationRevision: 1,
+		WorkerCapacitySHA256: capacityDigest, BootstrapProvenanceSHA256: provenance, RegisteredAt: registeredAt,
+	}
+}
+
+func sealPostgresBootstrapRecordV1(prefix, field string) ([]byte, string) {
+	preimage := []byte(prefix + `}`)
+	digest := sha256HexV1(preimage)
+	return []byte(prefix + `,"` + field + `":"` + digest + `"}`), digest
 }
 
 func (h *postgresHarnessV1) dsnV1(user, password, database string) string {

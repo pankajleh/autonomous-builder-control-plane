@@ -180,6 +180,9 @@ func BootstrapV1(ctx context.Context, config BootstrapConfigV1) error {
 	if err := VerifyFinalHardeningV1(phaseContext, verifier); err != nil {
 		return fmt.Errorf("fresh phase-H verification: %w", err)
 	}
+	if err := verifyWorkerBootstrapRowsAfterHardeningV1(phaseContext, verifier, config); err != nil {
+		return fmt.Errorf("fresh worker bootstrap-row verification: %w", err)
+	}
 	if err := VerifyFrozenCatalogV1(phaseContext, verifier); err != nil {
 		return fmt.Errorf("fresh frozen-catalog verification: %w", err)
 	}
@@ -440,7 +443,24 @@ func verifyBootstrapRowsV1(ctx context.Context, query catalogQuerierV1, config B
 		}
 		return nil
 	}
-	for _, worker := range config.Workers {
+	if err := verifyWorkerBootstrapRowsV1(ctx, query, config.Workers); err != nil {
+		return err
+	}
+	for _, artifact := range config.Artifacts {
+		if err := verifyBootstrapRowsV1(ctx, query, BootstrapConfigV1{Domains: config.Domains, Artifacts: []ArtifactBootstrapV1{artifact}}, artifact.AuthorityDomain); err != nil {
+			return err
+		}
+	}
+	for _, stage := range config.Stages {
+		if err := verifyBootstrapRowsV1(ctx, query, BootstrapConfigV1{Domains: config.Domains, Stages: []StageBootstrapV1{stage}}, stage.AuthorityDomain); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyWorkerBootstrapRowsV1(ctx context.Context, query catalogQuerierV1, workers []WorkerBootstrapV1) error {
+	for _, worker := range workers {
 		var capacity []byte
 		var capacityDigest string
 		var capacityRevision int64
@@ -461,17 +481,45 @@ func verifyBootstrapRowsV1(ctx context.Context, query catalogQuerierV1, config B
 			return fmt.Errorf("worker-registration bootstrap row %s differs from configuration", worker.WorkerIdentity)
 		}
 	}
-	for _, artifact := range config.Artifacts {
-		if err := verifyBootstrapRowsV1(ctx, query, BootstrapConfigV1{Domains: config.Domains, Artifacts: []ArtifactBootstrapV1{artifact}}, artifact.AuthorityDomain); err != nil {
-			return err
-		}
-	}
-	for _, stage := range config.Stages {
-		if err := verifyBootstrapRowsV1(ctx, query, BootstrapConfigV1{Domains: config.Domains, Stages: []StageBootstrapV1{stage}}, stage.AuthorityDomain); err != nil {
-			return err
-		}
-	}
 	return nil
+}
+
+// verifyWorkerBootstrapRowsAfterHardeningV1 uses the frozen worker-function
+// SELECT grants and forced-RLS policies. PostgreSQL 17 gives a role creator
+// ADMIN but SET=false membership; the external provisioner enables SET only
+// inside this always-rolled-back transaction, reads every configured worker
+// field through abcp_v4_worker_fn, and leaves no post-H membership change.
+func verifyWorkerBootstrapRowsAfterHardeningV1(ctx context.Context, conn *pgx.Conn, config BootstrapConfigV1) error {
+	if len(config.Workers) == 0 {
+		return nil
+	}
+	var sessionUser, currentUser string
+	var createRole, superuser, bypassRLS bool
+	if err := conn.QueryRow(ctx, `SELECT session_user::text,current_user::text,rolcreaterole,rolsuper,rolbypassrls FROM pg_catalog.pg_roles WHERE rolname=session_user`).Scan(&sessionUser, &currentUser, &createRole, &superuser, &bypassRLS); err != nil {
+		return err
+	}
+	if sessionUser != currentUser || isStaticRoleV1(sessionUser) || !createRole || superuser || bypassRLS {
+		return errors.New("post-H worker verifier is not the external bootstrap provisioner")
+	}
+	provisionerID, err := quoteIdentifierV1(sessionUser)
+	if err != nil {
+		return err
+	}
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable, AccessMode: pgx.ReadWrite})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `GRANT abcp_v4_worker_fn TO `+provisionerID+` WITH SET TRUE`); err != nil {
+		return fmt.Errorf("enable rolled-back worker verifier SET authority: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE abcp_v4_worker_fn`); err != nil {
+		return fmt.Errorf("enter worker verifier role: %w", err)
+	}
+	if err := verifyWorkerBootstrapRowsV1(ctx, tx, config.Workers); err != nil {
+		return err
+	}
+	return tx.Rollback(ctx)
 }
 
 // verifyCommittedBootstrapRowsV1 uses the temporary owner SET authority from

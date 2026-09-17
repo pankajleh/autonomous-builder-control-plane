@@ -253,6 +253,144 @@ func TestFrozenCatalogEveryPositiveRecipeProducesValidatedBytes(t *testing.T) {
 	}
 }
 
+func TestFrozenCatalogEveryRejectionUsesRecursivePositiveAndValidates(t *testing.T) {
+	extraction, err := ExtractFrozenCanonicalVectorCatalogV1(readFrozenAssuranceModel(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vectors, err := GenerateExecutableCanonicalCatalogVectorsV1(extraction.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vectors) != len(extraction.Catalog.Entries) {
+		t.Fatalf("materialized %d catalog entries, want %d", len(vectors), len(extraction.Catalog.Entries))
+	}
+
+	covered := map[string]bool{}
+	for _, entry := range extraction.Catalog.Entries {
+		set, ok := vectors[entry.SchemaID]
+		if entry.RecordName == "ArtifactBlobV1" {
+			if !ok || string(set.Positive) != "a" {
+				t.Fatal("raw ArtifactBlobV1 positive was not preserved")
+			}
+		}
+		if !ok || len(set.Rejections) != len(entry.Rejections) {
+			t.Fatalf("entry %s has %d executable rejections, want %d", entry.SchemaID, len(set.Rejections), len(entry.Rejections))
+		}
+		for _, vector := range set.Rejections {
+			covered[string(vector.RequiredError)+"/"+vectorMutationV1(vector.VectorID)] = true
+			if strings.Contains(vector.VectorID, "/PREDICATE_") && len(vector.FalsePredicateIDs) == 0 {
+				t.Fatalf("predicate vector %s omitted its complete false-predicate set", vector.VectorID)
+			}
+		}
+	}
+
+	for _, schemaID := range []string{"pr-publication-authority-v1", "nested:CanonicalVectorEntryV1"} {
+		var decoded map[string]json.RawMessage
+		if err := json.Unmarshal(vectors[schemaID].Positive, &decoded); err != nil {
+			t.Fatalf("decode %s positive: %v", schemaID, err)
+		}
+		for name, raw := range decoded {
+			if bytes.Equal(raw, []byte("{}")) {
+				t.Fatalf("%s.%s retained placeholder object", schemaID, name)
+			}
+			var elements []json.RawMessage
+			if len(raw) != 0 && raw[0] == '[' && json.Unmarshal(raw, &elements) == nil {
+				for index, element := range elements {
+					if bytes.Equal(element, []byte("{}")) {
+						t.Fatalf("%s.%s[%d] retained placeholder record", schemaID, name, index)
+					}
+				}
+			}
+		}
+	}
+
+	required := []string{
+		string(CanonicalNonCanonical) + "/INVALID_UTF8",
+		string(CanonicalBoundInvalid) + "/BAD_CHAR",
+		string(CanonicalDigestInvalid) + "/SELF_DIGEST_MISMATCH",
+		string(CanonicalBoundInvalid) + "/SHORT",
+		string(CanonicalBoundInvalid) + "/UPPERCASE",
+	}
+	for _, key := range required {
+		if !covered[key] {
+			t.Fatalf("full frozen rejection corpus omitted %s", key)
+		}
+	}
+	for _, schemaID := range []string{"path-set-v1", "nested:PathIdentityV1"} {
+		found := false
+		for _, vector := range vectors[schemaID].Rejections {
+			found = found || vectorMutationV1(vector.VectorID) == "BAD_CHAR"
+		}
+		if !found {
+			t.Fatalf("%s omitted required path BAD_CHAR rejection", schemaID)
+		}
+	}
+
+	var keyValues map[string]json.RawMessage
+	if err := json.Unmarshal(vectors["worker-observation-key-v1"].Positive, &keyValues); err != nil {
+		t.Fatal(err)
+	}
+	var publicKey string
+	if json.Unmarshal(keyValues["public_key_hex"], &publicKey) != nil || publicKey != "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a" {
+		t.Fatalf("frozen RFC 8032 public key = %q", publicKey)
+	}
+	var observationEntry CanonicalVectorEntryV1
+	for _, entry := range extraction.Catalog.Entries {
+		if entry.SchemaID == "process-absence-observation-v1" {
+			observationEntry = entry
+			break
+		}
+	}
+	if observationEntry.SchemaID == "" {
+		t.Fatal("process absence observation entry is missing")
+	}
+	var observationValues map[string]json.RawMessage
+	if err := json.Unmarshal(vectors[observationEntry.SchemaID].Positive, &observationValues); err != nil {
+		t.Fatal(err)
+	}
+	var signature string
+	if json.Unmarshal(observationValues["signature_hex"], &signature) != nil {
+		t.Fatal("process absence signature is not a string")
+	}
+	message, err := marshalCanonicalVectorObjectV1(observationEntry.Fields, observationValues, "signature_hex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyEd25519CanonicalVectorV1(publicKey, signature, message); err != nil {
+		t.Fatalf("frozen Ed25519 positive did not verify: %v", err)
+	}
+	for _, target := range []string{"public_key_hex", "signature_hex"} {
+		for _, mutation := range []string{"SHORT", "UPPERCASE", "BAD_CHAR"} {
+			found := false
+			sets := []ExecutableCanonicalVectorSetV1{vectors["worker-observation-key-v1"], vectors["process-absence-observation-v1"]}
+			for _, set := range sets {
+				for _, vector := range set.Rejections {
+					found = found || strings.Contains(vector.VectorID, "/"+target+"/"+mutation)
+				}
+			}
+			if !found {
+				t.Fatalf("Ed25519 %s omitted %s rejection", target, mutation)
+			}
+		}
+	}
+	selfDigestFound := false
+	for _, vector := range vectors["worker-observation-key-v1"].Rejections {
+		selfDigestFound = selfDigestFound || strings.Contains(vector.VectorID, "/key_sha256/SELF_DIGEST_MISMATCH") && vector.RequiredError == CanonicalDigestInvalid
+	}
+	if !selfDigestFound {
+		t.Fatal("terminal self-digest rejection was not executed")
+	}
+}
+
+func vectorMutationV1(vectorID string) string {
+	index := strings.LastIndexByte(vectorID, '/')
+	if index < 0 {
+		return vectorID
+	}
+	return vectorID[index+1:]
+}
+
 func TestCanonicalPositiveEvaluatesSelfDigestAndNonCanonicalAbsolutePath(t *testing.T) {
 	definition := WireSchemaDefinitionV1{
 		SchemaID: "self-digest-vector-v1", RecordName: "SelfDigestVectorV1",

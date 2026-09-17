@@ -79,6 +79,26 @@ func NewPostgresPredecessorDirectoryFenceV1(backend *PostgresWorkflowAuthorityBa
 	return fence, nil
 }
 
+// NewProductionFencedWorkflowAuthorityBackendV1 is the production-only
+// workflow composition. It requires the PostgreSQL backend instance that
+// owns the exact durable fence; a second backend handle, a process-local
+// fence, or an interface fake cannot be substituted at this boundary.
+func NewProductionFencedWorkflowAuthorityBackendV1(
+	backend *PostgresWorkflowAuthorityBackendV1,
+	fence *PostgresPredecessorDirectoryFenceV1,
+	bindingID string,
+	identity governance.WorkflowBackendIdentityV1,
+) (*authoritybackend.FencedWorkflowAuthorityBackendV1, error) {
+	if backend == nil || fence == nil || fence.backend != backend {
+		return nil, errors.New("production workflow authority requires the exact PostgreSQL backend and durable predecessor fence")
+	}
+	expected, err := backend.WorkflowBackendIdentityV1(identity.ControllerIdentity)
+	if err != nil || expected != identity {
+		return nil, errors.Join(errors.New("production workflow backend identity does not match the PostgreSQL composition"), err)
+	}
+	return authoritybackend.NewFencedWorkflowAuthorityBackendV1(backend, fence, bindingID, identity)
+}
+
 // WorkflowBackendIdentityV1 returns the frozen production identity for this
 // PostgreSQL backend/controller pair. Bootstrap and runtime composition use
 // the same derivation so the directory cannot be rebound to another backend.

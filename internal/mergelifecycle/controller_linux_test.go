@@ -35,7 +35,7 @@ func TestProductionControllerRequiresDurablePredecessorComposition(t *testing.T)
 	if controller != nil {
 		_ = controller.Close()
 	}
-	if err == nil || !strings.Contains(err.Error(), "durable predecessor fence") {
+	if err == nil || !strings.Contains(err.Error(), "same durable PostgreSQL fence") {
 		t.Fatalf("production merge controller accepted an unfenced composition: %v", err)
 	}
 }

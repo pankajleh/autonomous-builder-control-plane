@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
+	postgresbackend "github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 )
 
 const (
@@ -34,6 +36,7 @@ type JSONLLedger struct {
 	mu                    sync.Mutex
 	predecessorFence      authoritybackend.PredecessorWriterFenceV1
 	predecessorBindingIDs []string
+	productionFence       *postgresbackend.PostgresPredecessorDirectoryFenceV1
 }
 
 func NewJSONLLedger(path string) (*JSONLLedger, error) {
@@ -100,6 +103,35 @@ func NewFencedJSONLLedger(path string, fence authoritybackend.PredecessorWriterF
 	}
 	value.predecessorFence = fence
 	value.predecessorBindingIDs = append([]string(nil), bindingIDs...)
+	return value, nil
+}
+
+// NewProductionFencedJSONLLedger admits only the durable PostgreSQL fence.
+// The generic fenced constructor remains for retained unit tests and
+// historical non-production compositions.
+func NewProductionFencedJSONLLedger(path string, fence authoritybackend.PredecessorWriterFenceV1, bindingIDs []string) (*JSONLLedger, error) {
+	postgresFence, ok := fence.(*postgresbackend.PostgresPredecessorDirectoryFenceV1)
+	if !ok || postgresFence == nil {
+		return nil, errors.New("production ledger requires the durable PostgreSQL predecessor fence")
+	}
+	directory, err := postgresFence.DirectoryV1()
+	if err != nil {
+		return nil, fmt.Errorf("verify production PostgreSQL predecessor fence: %w", err)
+	}
+	registered := make(map[string]governance.PredecessorBindingKind, len(directory.Bindings))
+	for _, binding := range directory.Bindings {
+		registered[binding.BindingID] = binding.BindingKind
+	}
+	for _, bindingID := range bindingIDs {
+		if registered[bindingID] != governance.PredecessorBindingLedger {
+			return nil, fmt.Errorf("production ledger binding %q is not the registered durable ledger", bindingID)
+		}
+	}
+	value, err := NewFencedJSONLLedger(path, postgresFence, bindingIDs)
+	if err != nil {
+		return nil, err
+	}
+	value.productionFence = postgresFence
 	return value, nil
 }
 
@@ -229,6 +261,12 @@ func (l *JSONLLedger) Path() string { return l.path }
 // production constructors use it only to reject an unfenced ledger handle.
 func (l *JSONLLedger) PredecessorFencedV1() bool {
 	return l != nil && l.predecessorFence != nil && len(l.predecessorBindingIDs) != 0
+}
+
+// UsesProductionPostgresFenceV1 proves pointer-identical production
+// composition without exposing a generic fence capability.
+func (l *JSONLLedger) UsesProductionPostgresFenceV1(fence *postgresbackend.PostgresPredecessorDirectoryFenceV1) bool {
+	return l != nil && fence != nil && l.productionFence == fence && l.predecessorFence == fence && len(l.predecessorBindingIDs) != 0
 }
 
 // Snapshot returns one bounded, complete ledger image while holding the same

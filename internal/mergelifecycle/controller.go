@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
+	postgresbackend "github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -67,8 +68,11 @@ func newController(config Config, production bool) (*Controller, error) {
 	if config.Ledger == nil || config.AuthoritySource == nil || config.Provider == nil {
 		return nil, errors.New("ledger, authority source, and network-free provider are required")
 	}
-	if production && (config.PredecessorFence == nil || len(config.PredecessorBindingIDs) == 0 || !config.Ledger.PredecessorFencedV1()) {
-		return nil, errors.New("production merge admission/provider requires a durable predecessor fence and fenced ledger")
+	if production {
+		postgresFence, ok := config.PredecessorFence.(*postgresbackend.PostgresPredecessorDirectoryFenceV1)
+		if !ok || postgresFence == nil || len(config.PredecessorBindingIDs) == 0 || !config.Ledger.UsesProductionPostgresFenceV1(postgresFence) {
+			return nil, errors.New("production merge admission/provider requires the same durable PostgreSQL fence as the authoritative ledger")
+		}
 	}
 	limits := productionLimits()
 	store, err := newDurableStore(config.StateRoot, limits)

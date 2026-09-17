@@ -203,7 +203,7 @@ func openProductionPostgresCompositionV1(ctx context.Context, repository string,
 	if err != nil {
 		return nil, err
 	}
-	workflow, err := authoritybackend.NewFencedWorkflowAuthorityBackendV1(backend, fence, options.workflowBinding, identity)
+	workflow, err := postgresbackend.NewProductionFencedWorkflowAuthorityBackendV1(backend, fence, options.workflowBinding, identity)
 	if err != nil {
 		return nil, err
 	}
@@ -726,7 +726,7 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	events, err := ledger.NewFencedJSONLLedger(canonicalLedger, composition.fence, []string{*ledgerBinding})
+	events, err := ledger.NewProductionFencedJSONLLedger(canonicalLedger, composition.fence, []string{*ledgerBinding})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1

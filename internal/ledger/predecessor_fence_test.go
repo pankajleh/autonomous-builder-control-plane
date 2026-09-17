@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
+	postgresbackend "github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 )
@@ -69,6 +70,36 @@ func TestPredecessorFenceTombstoneBlocksLateLedgerWriter(t *testing.T) {
 	after, _, err := fenced.Snapshot()
 	if err != nil || !bytes.Equal(before, after) {
 		t.Fatalf("late ledger writer changed bytes: err=%v", err)
+	}
+}
+
+func TestProductionLedgerRejectsProcessLocalFence(t *testing.T) {
+	directory := ledgerTestDirectory(t, strings.Repeat("9", 64))
+	probes := make(map[string]authoritybackend.PredecessorDrainProbeV1, len(directory.Bindings))
+	for _, binding := range directory.Bindings {
+		digest := binding.BarrierStateSHA256
+		probes[binding.BindingID] = func(governance.PredecessorStoreBindingV1) (string, error) { return digest, nil }
+	}
+	fence, err := authoritybackend.NewSharedPredecessorWriterFenceV1(directory, strings.Repeat("e", 64), time.Minute, time.Now, probes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewProductionFencedJSONLLedger(t.TempDir()+"/events.jsonl", fence, []string{"ledger-run-1"}); err == nil || !strings.Contains(err.Error(), "durable PostgreSQL") {
+		t.Fatalf("production ledger accepted process-local fence: %v", err)
+	}
+}
+
+func TestProductionLedgerFenceIdentityIsExact(t *testing.T) {
+	fence := &postgresbackend.PostgresPredecessorDirectoryFenceV1{}
+	other := &postgresbackend.PostgresPredecessorDirectoryFenceV1{}
+	value := &JSONLLedger{
+		predecessorFence: fence, predecessorBindingIDs: []string{"ledger-run-1"}, productionFence: fence,
+	}
+	if !value.UsesProductionPostgresFenceV1(fence) {
+		t.Fatal("pointer-identical PostgreSQL production fence was rejected")
+	}
+	if value.UsesProductionPostgresFenceV1(other) {
+		t.Fatal("mismatched PostgreSQL production fence instance was accepted")
 	}
 }
 

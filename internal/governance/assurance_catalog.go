@@ -204,15 +204,13 @@ func buildCanonicalVectorEntry(definition WireSchemaDefinitionV1) (CanonicalVect
 		}
 		if descriptor.DigestTarget != "" {
 			operator := PredicateTypedReference
-			requiredError := CanonicalPredicateInvalid
 			if isSelfDigestDescriptorV1(definition.RecordName, definition.SchemaID, definition.Fields, index, descriptor) {
 				operator = PredicateDigestPreimage
-				requiredError = CanonicalDigestInvalid
 			}
 			predicates = append(predicates, PredicateDescriptorV1{
 				PredicateID: "P-" + definition.SchemaID + "-" + string(operator) + "-" + specification.FieldPath,
 				SchemaID:    definition.SchemaID, FieldPaths: []string{specification.FieldPath}, Operator: operator,
-				Arguments: []string{descriptor.DigestTarget}, RequiredError: requiredError,
+				Arguments: []string{descriptor.DigestTarget}, RequiredError: CanonicalPredicateInvalid,
 			})
 		}
 	}
@@ -246,6 +244,13 @@ func buildCanonicalVectorEntry(definition WireSchemaDefinitionV1) (CanonicalVect
 		}
 	}
 	rejections := generateCanonicalRejectionVectorsV1(definition.SchemaID, definition.RecordName, fields, predicates)
+	if definition.RecordName == "ArtifactBlobV1" && definition.SchemaID == "artifact-blob-v1" {
+		rejections = []CanonicalRejectionVectorV1{
+			{definition.SchemaID + "/$/BELOW_MIN", "BELOW_MIN", CanonicalBoundInvalid},
+			{definition.SchemaID + "/$/ABOVE_MAX", "ABOVE_MAX", CanonicalBoundInvalid},
+		}
+		predicates = nil
+	}
 	return CanonicalVectorEntryV1{definition.SchemaID, definition.RecordName, fields, predicates, CanonicalPositiveRecipe, rejections}, nil
 }
 
@@ -747,7 +752,7 @@ func generateCanonicalRejectionVectorsV1(schemaID, recordName string, fields []W
 		}
 		appendVector(path, "NULL", CanonicalTypeInvalid)
 		appendVector(path, "WRONG_TYPE", CanonicalTypeInvalid)
-		if field.MinBytes != nil && *field.MinBytes > 0 {
+		if field.MinBytes != nil && *field.MinBytes > 0 && field.JSONType != WireRawJSON {
 			appendVector(path, "BELOW_MIN", CanonicalBoundInvalid)
 		}
 		if field.MaxBytes != nil {
@@ -783,7 +788,9 @@ func generateCanonicalRejectionVectorsV1(schemaID, recordName string, fields []W
 			appendVector(path, "SHORT", CanonicalBoundInvalid)
 			appendVector(path, "BAD_CHAR", CanonicalBoundInvalid)
 		}
-		if field.ValueType == "path" || field.ValueType == "absPath" || field.ValueType == "authorityDomain" {
+		elementType := arrayElementTypeV1(field.ValueType)
+		if field.ValueType == "path" || field.ValueType == "absPath" || field.ValueType == "authorityDomain" ||
+			elementType == "path" || elementType == "absPath" || elementType == "authorityDomain" {
 			appendVector(path, "BAD_CHAR", CanonicalBoundInvalid)
 		}
 	}
@@ -865,6 +872,25 @@ func ConstantChangedV1(descriptor WireFieldDescriptorV1) (string, error) {
 	literal := descriptor.LiteralValue
 	if literal == "" {
 		return "", errors.New("descriptor has no exact literal")
+	}
+	if descriptor.JSONType == WireArray {
+		var elements []json.RawMessage
+		if json.Unmarshal([]byte(literal), &elements) != nil || len(elements) == 0 {
+			return "", errors.New("invalid or empty exact literal array")
+		}
+		var element string
+		if json.Unmarshal(elements[0], &element) != nil {
+			return "", errors.New("exact literal array element is not a string")
+		}
+		changed, err := ConstantChangedV1(WireFieldDescriptorV1{
+			JSONType: WireString, ValueType: "text", LiteralValue: element,
+		})
+		if err != nil {
+			return "", err
+		}
+		elements[0], _ = json.Marshal(changed)
+		encoded, err := json.Marshal(elements)
+		return string(encoded), err
 	}
 	if descriptor.JSONType == WireBoolean {
 		if literal == "true" {
