@@ -7,12 +7,44 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 )
+
+type frozenCrossRecordCatalogBindingTestV1 struct {
+	entry     CanonicalVectorEntryV1
+	predicate PredicateDescriptorV1
+}
+
+func frozenCrossRecordCatalogBindingsForTestV1(t *testing.T) map[string]frozenCrossRecordCatalogBindingTestV1 {
+	t.Helper()
+	extraction, err := ExtractFrozenCanonicalVectorCatalogV1(readFrozenAssuranceModel(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings := make(map[string]frozenCrossRecordCatalogBindingTestV1)
+	for _, entry := range extraction.Catalog.Entries {
+		for _, predicate := range entry.Predicates {
+			key := frozenCrossRecordSemanticKeyV1(entry.RecordName, predicate.PredicateID)
+			if _, registered := frozenCrossRecordSemanticRegistryV1[key]; registered {
+				bindings[key] = frozenCrossRecordCatalogBindingTestV1{entry: entry, predicate: predicate}
+			}
+		}
+	}
+	return bindings
+}
+
+func cloneRawMessageMapForTestV1(values map[string]json.RawMessage) map[string]json.RawMessage {
+	clone := make(map[string]json.RawMessage, len(values))
+	for path, value := range values {
+		clone[path] = append(json.RawMessage(nil), value...)
+	}
+	return clone
+}
 
 func TestEffectLedgerEventIDUsesFrozenDomainTuple(t *testing.T) {
 	payload := json.RawMessage(`{"effect_kind":"PR","effect_ordinal":1,"evidence_sha256":"` + strings.Repeat("3", 64) + `","intent_sha256":"` + strings.Repeat("1", 64) + `","provider_request_sha256":"` + strings.Repeat("4", 64) + `","winning_outcome_sha256":"` + strings.Repeat("2", 64) + `"}`)
@@ -484,6 +516,18 @@ func TestFrozenPredicateMutationHasNoFallbackPathSearch(t *testing.T) {
 	if err := mutatePredicateV1(entry, predicate, values, nil, newEmptyCanonicalPredicateContextV1()); err == nil || !strings.Contains(err.Error(), "no explicit frozen semantic evaluator") {
 		t.Fatalf("unresolved predicate used a fallback descriptor path: %v", err)
 	}
+
+	registered := frozenCrossRecordCatalogBindingsForTestV1(t)[frozenCrossRecordSemanticKeyV1("CandidateDiffArtifactV1", "P-DIFF-003")]
+	drifted := registered.predicate
+	drifted.FieldPaths = []string{"repository_identity"}
+	values = map[string]json.RawMessage{"repository_identity": json.RawMessage(`"unchanged"`)}
+	before := cloneRawMessageMapForTestV1(values)
+	if err := mutateFrozenCrossRecordSemanticV1(registered.entry, drifted, values, newEmptyCanonicalPredicateContextV1()); err == nil || !strings.Contains(err.Error(), "do not match frozen rejection paths") {
+		t.Fatalf("registered predicate used a path fallback after descriptor drift: %v", err)
+	}
+	if !reflect.DeepEqual(values, before) {
+		t.Fatal("descriptor drift mutated a fallback field before failing closed")
+	}
 }
 
 func TestFrozenCatalogFailsClosedWithoutIncompleteSemanticAuthority(t *testing.T) {
@@ -541,6 +585,203 @@ func TestEveryFrozenCrossRecordPredicateHasExplicitSemanticEvaluator(t *testing.
 	}
 }
 
+func frozenCrossRecordMutationFixtureForTestV1(t *testing.T, key string, entry CanonicalVectorEntryV1) (map[string]json.RawMessage, *canonicalPredicateContextV1) {
+	t.Helper()
+	context := newEmptyCanonicalPredicateContextV1()
+	switch key {
+	case frozenCrossRecordSemanticKeyV1("CandidateDiffArtifactV1", "P-DIFF-003"):
+		lineage := []byte(`{"repository_identity":"repo","accepted_a_lineage_sha256":"` + strings.Repeat("1", 64) + `","base_oid":"` + strings.Repeat("2", 40) + `","candidate_oid":"` + strings.Repeat("3", 40) + `"}`)
+		context.addRecord("StageDiffLineageV1", lineage)
+		subject := []byte(`{"repository_identity":"repo","accepted_a_lineage_sha256":"` + strings.Repeat("1", 64) + `","diff_base_oid":"` + strings.Repeat("2", 40) + `","diff_candidate_oid":"` + strings.Repeat("3", 40) + `","diff_lineage_sha256":"` + sha256Hex(lineage) + `"}`)
+		context.addRecord("StageSubjectV1", subject)
+		return map[string]json.RawMessage{
+			"repository_identity":       mustMarshalCanonicalVectorStringV1("repo"),
+			"accepted_a_lineage_sha256": mustMarshalCanonicalVectorStringV1(strings.Repeat("1", 64)),
+			"stage_subject_sha256":      mustMarshalCanonicalVectorStringV1(sha256Hex(subject)),
+			"diff_lineage_sha256":       mustMarshalCanonicalVectorStringV1(sha256Hex(lineage)),
+			"base_oid":                  mustMarshalCanonicalVectorStringV1(strings.Repeat("2", 40)),
+			"candidate_oid":             mustMarshalCanonicalVectorStringV1(strings.Repeat("3", 40)),
+		}, context
+	case frozenCrossRecordSemanticKeyV1("CheckpointGrantParentV2", "P-PARENT-001"):
+		positive, err := GenerateMinimalCanonicalVectorV1(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		values, _, duplicate, err := decodeCanonicalVectorObjectV1(positive)
+		if err != nil || duplicate {
+			t.Fatalf("decode checkpoint parent fixture: %v", err)
+		}
+		context.checkpointProjection = cloneRawMessageMapForTestV1(values)
+		return values, context
+	case frozenCrossRecordSemanticKeyV1("ProcessAbsenceObservationV1", "P-process-absence-observation-v1-ROW-001"):
+		return map[string]json.RawMessage{
+			"expected_pid": []byte("7"), "proc_stat_path": json.RawMessage(`"/proc/7/stat"`),
+		}, context
+	case frozenCrossRecordSemanticKeyV1("PublisherAbandonAuthorizationV1", "P-PUBLISHER-006"):
+		return map[string]json.RawMessage{
+			"proof_assembled_at": json.RawMessage(`"2026-09-17T00:00:00Z"`),
+			"valid_from":         json.RawMessage(`"2026-09-17T00:00:00Z"`),
+			"expires_at":         json.RawMessage(`"2026-09-17T00:00:01Z"`),
+		}, context
+	case frozenCrossRecordSemanticKeyV1("StageDiffLineageV1", "P-DIFF-002"):
+		grant := []byte(`{"base_sha":"` + strings.Repeat("2", 40) + `"}`)
+		context.addRecord("StageGrantV2", grant)
+		return map[string]json.RawMessage{
+			"stage":                       json.RawMessage(`"B_IMPLEMENTATION"`),
+			"derivation_authority_sha256": mustMarshalCanonicalVectorStringV1(sha256Hex(grant)),
+			"base_oid":                    mustMarshalCanonicalVectorStringV1(strings.Repeat("2", 40)),
+			"candidate_oid":               mustMarshalCanonicalVectorStringV1(strings.Repeat("3", 40)),
+		}, context
+	case frozenCrossRecordSemanticKeyV1("StageSubjectV1", "P-SUBJECT-002"):
+		lineage := []byte(`{"repository_identity":"repo","accepted_a_lineage_sha256":"` + strings.Repeat("1", 64) + `","stage":"B_IMPLEMENTATION","base_oid":"` + strings.Repeat("2", 40) + `","candidate_oid":"` + strings.Repeat("3", 40) + `"}`)
+		context.addRecord("StageDiffLineageV1", lineage)
+		return map[string]json.RawMessage{
+			"diff_lineage_sha256":       mustMarshalCanonicalVectorStringV1(sha256Hex(lineage)),
+			"repository_identity":       mustMarshalCanonicalVectorStringV1("repo"),
+			"accepted_a_lineage_sha256": mustMarshalCanonicalVectorStringV1(strings.Repeat("1", 64)),
+			"stage":                     json.RawMessage(`"B_IMPLEMENTATION"`),
+			"diff_base_oid":             mustMarshalCanonicalVectorStringV1(strings.Repeat("2", 40)),
+			"diff_candidate_oid":        mustMarshalCanonicalVectorStringV1(strings.Repeat("3", 40)),
+		}, context
+	case frozenCrossRecordSemanticKeyV1("WorkerObservationKeyV1", "P-worker-observation-key-v1-ROW-002"):
+		values := map[string]json.RawMessage{
+			"worker_identity": json.RawMessage(`"worker"`), "host_identity": json.RawMessage(`"host"`), "key_id": json.RawMessage(`"key"`),
+		}
+		digest := sha256.Sum256([]byte("ABCP-WORKER-OBSERVER-V1\x00worker\x00host\x00key"))
+		values["observer_identity"] = mustMarshalCanonicalVectorStringV1(hex.EncodeToString(digest[:]))
+		return values, context
+	default:
+		t.Fatalf("no cross-record mutation fixture for %q", key)
+		return nil, nil
+	}
+}
+
+func TestEveryExecutableCrossRecordSemanticHasExactDeterministicMutation(t *testing.T) {
+	type expectedBinding struct {
+		family   frozenCrossRecordSemanticFamilyV1
+		operator PredicateOperator
+		kind     frozenCrossRecordMutationKindV1
+		operand  string
+		source   string
+	}
+	expected := map[string]expectedBinding{
+		frozenCrossRecordSemanticKeyV1("CandidateDiffArtifactV1", "P-DIFF-003"): {
+			frozenCrossDiffArtifactV1, PredicateImplies, frozenCrossConsequentFalseV1, "base_oid", "",
+		},
+		frozenCrossRecordSemanticKeyV1("CheckpointGrantParentV2", "P-PARENT-001"): {
+			frozenCrossCheckpointV1, PredicateDerivation, frozenCrossDerivedOutputV1, "kind", "",
+		},
+		frozenCrossRecordSemanticKeyV1("ProcessAbsenceObservationV1", "P-process-absence-observation-v1-ROW-001"): {
+			frozenCrossProcessProbeV1, PredicateImplies, frozenCrossConsequentFalseV1, "proc_stat_path", "",
+		},
+		frozenCrossRecordSemanticKeyV1("PublisherAbandonAuthorizationV1", "P-PUBLISHER-006"): {
+			frozenCrossPublisherTimeV1, PredicateStateTransition, frozenCrossStateDestinationV1, "expires_at", "valid_from",
+		},
+		frozenCrossRecordSemanticKeyV1("StageDiffLineageV1", "P-DIFF-002"): {
+			frozenCrossStageLineageV1, PredicateImplies, frozenCrossConsequentFalseV1, "base_oid", "",
+		},
+		frozenCrossRecordSemanticKeyV1("StageSubjectV1", "P-SUBJECT-002"): {
+			frozenCrossStageSubjectV1, PredicateImplies, frozenCrossConsequentFalseV1, "repository_identity", "",
+		},
+		frozenCrossRecordSemanticKeyV1("WorkerObservationKeyV1", "P-worker-observation-key-v1-ROW-002"): {
+			frozenCrossWorkerKeyV1, PredicateImplies, frozenCrossConsequentFalseV1, "observer_identity", "",
+		},
+	}
+	bindings := frozenCrossRecordCatalogBindingsForTestV1(t)
+	for key, family := range frozenCrossRecordSemanticRegistryV1 {
+		_, executable := frozenCrossRecordMutationRegistryV1[key]
+		if family == frozenCrossFailClosedV1 && executable {
+			t.Errorf("fail-closed semantic %q received a rejection mutator", key)
+		}
+		if family != frozenCrossFailClosedV1 && !executable {
+			t.Errorf("executable semantic %q has no rejection mutator", key)
+		}
+	}
+	if len(frozenCrossRecordMutationRegistryV1) != len(expected) {
+		t.Fatalf("executable mutation registry has %d entries, want %d", len(frozenCrossRecordMutationRegistryV1), len(expected))
+	}
+	for key, want := range expected {
+		t.Run(strings.ReplaceAll(key, "\x00", "/"), func(t *testing.T) {
+			binding, present := bindings[key]
+			if !present {
+				t.Fatal("executable semantic is absent from the frozen catalog")
+			}
+			spec, present := frozenCrossRecordMutationRegistryV1[key]
+			if !present {
+				t.Fatal("executable semantic has no bound mutation")
+			}
+			if spec.family != want.family || spec.operator != want.operator || spec.mutationKind != want.kind || spec.mutationOperand != want.operand || spec.mutationSource != want.source {
+				t.Fatalf("mutation binding = family:%s operator:%s kind:%s operand:%s source:%s, want %+v", spec.family, spec.operator, spec.mutationKind, spec.mutationOperand, spec.mutationSource, want)
+			}
+			if err := validateFrozenCrossRecordMutationSpecV1(binding.entry, binding.predicate, spec); err != nil {
+				t.Fatal(err)
+			}
+			values, context := frozenCrossRecordMutationFixtureForTestV1(t, key, binding.entry)
+			if !frozenCrossRecordSemanticValidV1(binding.entry, binding.predicate, values, context) {
+				t.Fatal("fixture does not satisfy the exact frozen formula")
+			}
+			before := cloneRawMessageMapForTestV1(values)
+			first := cloneRawMessageMapForTestV1(values)
+			second := cloneRawMessageMapForTestV1(values)
+			if err := mutateFrozenCrossRecordSemanticV1(binding.entry, binding.predicate, first, context); err != nil {
+				t.Fatal(err)
+			}
+			if err := mutateFrozenCrossRecordSemanticV1(binding.entry, binding.predicate, second, context); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(first, second) {
+				t.Fatal("exact bound rejection mutation is not deterministic")
+			}
+			for path, original := range before {
+				changed := !bytes.Equal(first[path], original)
+				if path == spec.mutationOperand && !changed {
+					t.Fatalf("bound operand %s did not change", path)
+				}
+				if path != spec.mutationOperand && changed {
+					t.Fatalf("unbound operand %s changed", path)
+				}
+			}
+			var exactChange json.RawMessage
+			if spec.mutationKind == frozenCrossStateDestinationV1 {
+				exactChange = before[spec.mutationSource]
+			} else {
+				field, _ := canonicalVectorFieldV1(binding.entry.Fields, spec.mutationOperand)
+				exactChange, _ = primitiveValidChangeV1(field, before[spec.mutationOperand])
+			}
+			if !bytes.Equal(first[spec.mutationOperand], exactChange) {
+				t.Fatalf("bound operand %s = %s, want frozen operator result %s", spec.mutationOperand, first[spec.mutationOperand], exactChange)
+			}
+			if frozenCrossRecordSemanticValidV1(binding.entry, binding.predicate, first, context) {
+				t.Fatal("exact bound rejection left the target formula true")
+			}
+		})
+	}
+}
+
+func TestEveryIncompleteCrossRecordSemanticFailsClosedBeforeMutation(t *testing.T) {
+	bindings := frozenCrossRecordCatalogBindingsForTestV1(t)
+	for key, family := range frozenCrossRecordSemanticRegistryV1 {
+		if family != frozenCrossFailClosedV1 {
+			continue
+		}
+		t.Run(strings.ReplaceAll(key, "\x00", "/"), func(t *testing.T) {
+			binding, present := bindings[key]
+			if !present {
+				t.Fatal("fail-closed semantic is absent from the frozen catalog")
+			}
+			values := map[string]json.RawMessage{"sentinel": json.RawMessage(`"unchanged"`)}
+			before := cloneRawMessageMapForTestV1(values)
+			err := mutateFrozenCrossRecordSemanticV1(binding.entry, binding.predicate, values, newEmptyCanonicalPredicateContextV1())
+			if err == nil || !strings.Contains(err.Error(), "no complete explicit frozen rejection mutator") {
+				t.Fatalf("incomplete semantic did not fail closed: %v", err)
+			}
+			if !reflect.DeepEqual(values, before) {
+				t.Fatal("incomplete semantic mutated values before failing closed")
+			}
+		})
+	}
+}
+
 func TestCandidateDiffFullRelationUsesSubjectAndLineageRecords(t *testing.T) {
 	context := newEmptyCanonicalPredicateContextV1()
 	lineage := []byte(`{"repository_identity":"repo","accepted_a_lineage_sha256":"` + strings.Repeat("1", 64) + `","base_oid":"` + strings.Repeat("2", 40) + `","candidate_oid":"` + strings.Repeat("3", 40) + `"}`)
@@ -566,22 +807,18 @@ func TestCandidateDiffFullRelationUsesSubjectAndLineageRecords(t *testing.T) {
 		}
 		values[path] = original
 	}
-	entry, err := buildCanonicalVectorEntry(WireSchemaDefinitionV1{
-		SchemaID: "candidate-diff-fixture-v1", RecordName: "CandidateDiffArtifactV1",
-		Fields: []WireFieldSpecV1{
-			{"kind", `id="CandidateDiffArtifactV1"`, false}, {"schema_version", `id="candidate-diff-fixture-v1"`, false},
-			{"repository_identity", "identity", false}, {"accepted_a_lineage_sha256", "sha256<AcceptedALineageV1>", false},
-			{"stage_subject_sha256", "sha256<StageSubjectV1>", false}, {"diff_lineage_sha256", "sha256<StageDiffLineageV1>", false},
-			{"base_oid", "gitOID", false}, {"candidate_oid", "gitOID", false},
-		},
-		Predicates: []WirePredicateSpecV1{{"P-DIFF-003", []string{"base_oid", "candidate_oid"}, PredicateImplies, []string{"exact subject and lineage relation"}}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	predicate, _ := canonicalVectorPredicateV1(entry.Predicates, "P-DIFF-003")
+	binding := frozenCrossRecordCatalogBindingsForTestV1(t)[frozenCrossRecordSemanticKeyV1("CandidateDiffArtifactV1", "P-DIFF-003")]
+	entry, predicate := binding.entry, binding.predicate
+	repositoryBefore := append(json.RawMessage(nil), values["repository_identity"]...)
+	baseBefore := append(json.RawMessage(nil), values["base_oid"]...)
 	if err := mutatePredicateV1(entry, predicate, values, nil, context); err != nil {
 		t.Fatal(err)
+	}
+	if !bytes.Equal(values["repository_identity"], repositoryBefore) {
+		t.Fatal("P-DIFF-003 rejection searched the earlier repository field instead of its bound derived output")
+	}
+	if bytes.Equal(values["base_oid"], baseBefore) {
+		t.Fatal("P-DIFF-003 rejection did not mutate its exact frozen base_oid output")
 	}
 	if frozenCandidateDiffRelationValidV1(values, context) {
 		t.Fatal("formula-derived P-DIFF-003 mutation left the relation true")

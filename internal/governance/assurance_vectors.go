@@ -1334,6 +1334,8 @@ func frozenCanonicalPredicateValidV1(entry CanonicalVectorEntryV1, predicate Pre
 
 type frozenCrossRecordSemanticFamilyV1 string
 
+type frozenCrossRecordMutationKindV1 string
+
 const (
 	frozenCrossFailClosedV1    frozenCrossRecordSemanticFamilyV1 = "FAIL_CLOSED_NO_LITERAL_FROZEN_FORMULA"
 	frozenCrossDiffArtifactV1  frozenCrossRecordSemanticFamilyV1 = "CANDIDATE_DIFF_RELATION"
@@ -1343,7 +1345,22 @@ const (
 	frozenCrossProcessProbeV1  frozenCrossRecordSemanticFamilyV1 = "PROCESS_PROBE_RELATION"
 	frozenCrossWorkerKeyV1     frozenCrossRecordSemanticFamilyV1 = "WORKER_KEY_DERIVATION"
 	frozenCrossPublisherTimeV1 frozenCrossRecordSemanticFamilyV1 = "PUBLISHER_TIME_AUTHORITY"
+
+	frozenCrossConsequentFalseV1  frozenCrossRecordMutationKindV1 = "IMPLIES_CONSEQUENT_FALSE"
+	frozenCrossDerivedOutputV1    frozenCrossRecordMutationKindV1 = "DERIVATION_LOWEST_OUTPUT"
+	frozenCrossStateDestinationV1 frozenCrossRecordMutationKindV1 = "STATE_TRANSITION_DESTINATION"
 )
+
+type frozenCrossRecordMutationSpecV1 struct {
+	family           frozenCrossRecordSemanticFamilyV1
+	operator         PredicateOperator
+	predicatePaths   []string
+	argumentsSHA256  string
+	semanticOperands []string
+	mutationKind     frozenCrossRecordMutationKindV1
+	mutationOperand  string
+	mutationSource   string
+}
 
 func frozenCrossRecordSemanticKeyV1(recordName, predicateID string) string {
 	return recordName + "\x00" + predicateID
@@ -1409,6 +1426,76 @@ var frozenCrossRecordSemanticRegistryV1 = map[string]frozenCrossRecordSemanticFa
 	"StageSubjectV1\x00P-stage-subject-v1-ROW-002":                                               frozenCrossFailClosedV1,
 	"TargetSubmissionV1\x00P-MERGE-000":                                                          frozenCrossFailClosedV1,
 	"WorkerObservationKeyV1\x00P-worker-observation-key-v1-ROW-002":                              frozenCrossWorkerKeyV1,
+}
+
+// frozenCrossRecordMutationRegistryV1 binds every executable semantic family
+// to the exact extracted operator, predicate paths, normalized argument digest,
+// semantic operands, and one deterministic frozen-table mutation. Entries that
+// fail closed are deliberately absent: they have no authority to invent a
+// rejection vector.
+var frozenCrossRecordMutationRegistryV1 = map[string]frozenCrossRecordMutationSpecV1{
+	"CandidateDiffArtifactV1\x00P-DIFF-003": {
+		family: frozenCrossDiffArtifactV1, operator: PredicateImplies,
+		predicatePaths:  []string{"base_oid", "candidate_oid"},
+		argumentsSHA256: "06ec1232e26d12fa01115506767a9bfb83d4bbcc809c6aeac65bf1bce781f70d",
+		semanticOperands: []string{
+			"stage_subject_sha256", "diff_lineage_sha256", "repository_identity",
+			"accepted_a_lineage_sha256", "base_oid", "candidate_oid",
+		},
+		mutationKind: frozenCrossConsequentFalseV1, mutationOperand: "base_oid",
+	},
+	"CheckpointGrantParentV2\x00P-PARENT-001": {
+		family: frozenCrossCheckpointV1, operator: PredicateDerivation,
+		predicatePaths:  []string{"$"},
+		argumentsSHA256: "6bf7f6e68e25cea38782b7ca0bf65765ae069c8c3a1f7247cf000b0f1b3460ff",
+		semanticOperands: []string{
+			"kind", "repository", "capsule_file_sha256", "capsule_sha256", "candidate_sha", "operation", "verdict",
+			"evidence", "controller_policy_identity", "sequence", "predecessor_checkpoint_sha256", "controller_event_identity",
+			"semantic_registry_sha256", "review_scope_tip_sha256", "acceptance_result_sha256", "review_critical",
+			"review_major", "reviewed_blocking_scope_ids", "lifecycle", "schema_version", "repository_identity",
+			"accepted_a_lineage_sha256", "stage", "candidate_tree_oid", "ledger_event_sha256", "policy_manifest_sha256",
+			"assurance_model_sha256", "proof_obligation_set_sha256", "evidence_matrix_sha256", "resource_profile_set_sha256",
+			"canonical_vector_catalog_sha256", "work_classification_sha256", "final_review_profile_sha256", "evidence_selection_sha256",
+		},
+		mutationKind: frozenCrossDerivedOutputV1, mutationOperand: "kind",
+	},
+	"ProcessAbsenceObservationV1\x00P-process-absence-observation-v1-ROW-001": {
+		family: frozenCrossProcessProbeV1, operator: PredicateImplies,
+		predicatePaths:   []string{"proc_stat_path", "expected_pid", "signature_hex"},
+		argumentsSHA256:  "e4efed1b461d2146e8d0badcf29c6e1183a481e67150b14624f3bdd52bfba694",
+		semanticOperands: []string{"expected_pid", "proc_stat_path"},
+		mutationKind:     frozenCrossConsequentFalseV1, mutationOperand: "proc_stat_path",
+	},
+	"PublisherAbandonAuthorizationV1\x00P-PUBLISHER-006": {
+		family: frozenCrossPublisherTimeV1, operator: PredicateStateTransition,
+		predicatePaths:   []string{"capability_id", "proof_assembled_at", "valid_from", "expires_at"},
+		argumentsSHA256:  "5d32ec30867cf8abf23422b49abdcbdf42748c3c280060519133625b3f24f775",
+		semanticOperands: []string{"proof_assembled_at", "valid_from", "expires_at"},
+		mutationKind:     frozenCrossStateDestinationV1, mutationOperand: "expires_at", mutationSource: "valid_from",
+	},
+	"StageDiffLineageV1\x00P-DIFF-002": {
+		family: frozenCrossStageLineageV1, operator: PredicateImplies,
+		predicatePaths:   []string{"$"},
+		argumentsSHA256:  "868adf7023d19cae2cb67edd8eb47125b4b4ddf07835049a40b99506d8be74ea",
+		semanticOperands: []string{"stage", "derivation_authority_sha256", "base_oid", "candidate_oid"},
+		mutationKind:     frozenCrossConsequentFalseV1, mutationOperand: "base_oid",
+	},
+	"StageSubjectV1\x00P-SUBJECT-002": {
+		family: frozenCrossStageSubjectV1, operator: PredicateImplies,
+		predicatePaths:  []string{"stage"},
+		argumentsSHA256: "a27c1e89c3e33883dcee970d5d15833cc158beab11167c6b5a6ace5f6ed7e86f",
+		semanticOperands: []string{
+			"diff_lineage_sha256", "repository_identity", "accepted_a_lineage_sha256", "stage", "diff_base_oid", "diff_candidate_oid",
+		},
+		mutationKind: frozenCrossConsequentFalseV1, mutationOperand: "repository_identity",
+	},
+	"WorkerObservationKeyV1\x00P-worker-observation-key-v1-ROW-002": {
+		family: frozenCrossWorkerKeyV1, operator: PredicateImplies,
+		predicatePaths:   []string{"worker_identity", "host_identity", "observer_identity", "key_id"},
+		argumentsSHA256:  "035307ef6296ae6592b45020dfa192ee339a8c20ef6514d7bbee9e9e239b5894",
+		semanticOperands: []string{"worker_identity", "host_identity", "key_id", "observer_identity"},
+		mutationKind:     frozenCrossConsequentFalseV1, mutationOperand: "observer_identity",
+	},
 }
 
 func frozenCrossRecordSemanticValidV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) bool {
@@ -2985,34 +3072,92 @@ func mutatePredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescript
 }
 
 func mutateFrozenCrossRecordSemanticV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) error {
-	if _, explicit := frozenCrossRecordSemanticRegistryV1[frozenCrossRecordSemanticKeyV1(entry.RecordName, predicate.PredicateID)]; !explicit {
+	key := frozenCrossRecordSemanticKeyV1(entry.RecordName, predicate.PredicateID)
+	family, explicit := frozenCrossRecordSemanticRegistryV1[key]
+	if !explicit {
 		return fmt.Errorf("predicate %s has no explicit frozen semantic evaluator", predicate.PredicateID)
+	}
+	spec, executable := frozenCrossRecordMutationRegistryV1[key]
+	if family == frozenCrossFailClosedV1 || !executable {
+		return fmt.Errorf("predicate %s for %s has no complete explicit frozen rejection mutator", predicate.PredicateID, entry.RecordName)
+	}
+	if spec.family != family {
+		return fmt.Errorf("predicate %s rejection family %s does not match evaluator family %s", predicate.PredicateID, spec.family, family)
+	}
+	if err := validateFrozenCrossRecordMutationSpecV1(entry, predicate, spec); err != nil {
+		return err
 	}
 	if !frozenCrossRecordSemanticValidV1(entry, predicate, values, context) {
 		return fmt.Errorf("predicate %s positive does not satisfy its frozen formula", predicate.PredicateID)
 	}
-	for _, pass := range []bool{false, true} {
-		for _, field := range entry.Fields {
-			isTypedDigest := field.DigestTarget != ""
-			if field.LiteralValue != "" || field.JSONType == WireObject || field.JSONType == WireRawJSON || !pass && isTypedDigest || pass && !isTypedDigest {
-				continue
-			}
-			raw, present := values[field.FieldPath]
-			if !present {
-				continue
-			}
-			changed, err := primitiveValidChangeV1(field, raw)
-			if err != nil || bytes.Equal(changed, raw) {
-				continue
-			}
-			values[field.FieldPath] = changed
-			if !frozenCrossRecordSemanticValidV1(entry, predicate, values, context) {
-				return nil
-			}
-			values[field.FieldPath] = raw
+	field, _ := canonicalVectorFieldV1(entry.Fields, spec.mutationOperand)
+	original, present := values[spec.mutationOperand]
+	if !present {
+		return fmt.Errorf("predicate %s bound mutation operand %s is absent", predicate.PredicateID, spec.mutationOperand)
+	}
+	var changed json.RawMessage
+	var err error
+	switch spec.mutationKind {
+	case frozenCrossConsequentFalseV1, frozenCrossDerivedOutputV1:
+		changed, err = primitiveValidChangeV1(field, original)
+	case frozenCrossStateDestinationV1:
+		changed = append(json.RawMessage(nil), values[spec.mutationSource]...)
+	default:
+		err = fmt.Errorf("predicate %s has unknown frozen rejection mutator %s", predicate.PredicateID, spec.mutationKind)
+	}
+	if err != nil {
+		return fmt.Errorf("predicate %s mutate bound operand %s: %w", predicate.PredicateID, spec.mutationOperand, err)
+	}
+	if len(changed) == 0 || bytes.Equal(changed, original) {
+		return fmt.Errorf("predicate %s bound mutation operand %s did not change", predicate.PredicateID, spec.mutationOperand)
+	}
+	values[spec.mutationOperand] = changed
+	if frozenCrossRecordSemanticValidV1(entry, predicate, values, context) {
+		values[spec.mutationOperand] = original
+		return fmt.Errorf("predicate %s exact bound mutation left its frozen formula true", predicate.PredicateID)
+	}
+	return nil
+}
+
+func validateFrozenCrossRecordMutationSpecV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, spec frozenCrossRecordMutationSpecV1) error {
+	if predicate.Operator != spec.operator {
+		return fmt.Errorf("predicate %s operator %s does not match frozen rejection operator %s", predicate.PredicateID, predicate.Operator, spec.operator)
+	}
+	if !equalVectorStringsV1(predicate.FieldPaths, spec.predicatePaths) {
+		return fmt.Errorf("predicate %s paths %v do not match frozen rejection paths %v", predicate.PredicateID, predicate.FieldPaths, spec.predicatePaths)
+	}
+	arguments, err := json.Marshal(predicate.Arguments)
+	if err != nil || sha256Hex(arguments) != spec.argumentsSHA256 {
+		return fmt.Errorf("predicate %s normalized arguments do not match its frozen rejection formula", predicate.PredicateID)
+	}
+	if !containsCanonicalVectorStringV1(spec.semanticOperands, spec.mutationOperand) {
+		return fmt.Errorf("predicate %s mutation operand %s is not a named semantic operand", predicate.PredicateID, spec.mutationOperand)
+	}
+	for _, path := range spec.semanticOperands {
+		if _, present := canonicalVectorFieldV1(entry.Fields, path); !present {
+			return fmt.Errorf("predicate %s semantic operand %s is not a descriptor field", predicate.PredicateID, path)
 		}
 	}
-	return fmt.Errorf("predicate %s has no formula-derived descriptor-valid rejection", predicate.PredicateID)
+	switch spec.mutationKind {
+	case frozenCrossConsequentFalseV1:
+		if spec.operator != PredicateImplies {
+			return fmt.Errorf("predicate %s consequent mutation is not bound to IMPLIES", predicate.PredicateID)
+		}
+	case frozenCrossDerivedOutputV1:
+		if spec.operator != PredicateDerivation {
+			return fmt.Errorf("predicate %s derived-output mutation is not bound to DERIVATION", predicate.PredicateID)
+		}
+	case frozenCrossStateDestinationV1:
+		if spec.operator != PredicateStateTransition || spec.mutationSource == "" {
+			return fmt.Errorf("predicate %s state-destination mutation is incomplete", predicate.PredicateID)
+		}
+		if _, present := canonicalVectorFieldV1(entry.Fields, spec.mutationSource); !present || !containsCanonicalVectorStringV1(spec.semanticOperands, spec.mutationSource) {
+			return fmt.Errorf("predicate %s state source %s is not a named semantic operand", predicate.PredicateID, spec.mutationSource)
+		}
+	default:
+		return fmt.Errorf("predicate %s has no frozen rejection mutation", predicate.PredicateID)
+	}
+	return nil
 }
 
 func mutateFrozenDerivationPredicateV1(entry CanonicalVectorEntryV1, predicate PredicateDescriptorV1, fields map[string]WireFieldDescriptorV1, values map[string]json.RawMessage, context *canonicalPredicateContextV1) error {
