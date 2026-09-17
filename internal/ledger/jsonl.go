@@ -12,6 +12,8 @@ import (
 	"reflect"
 	"sync"
 	"time"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
 )
 
 const (
@@ -22,14 +24,16 @@ const (
 )
 
 type JSONLLedger struct {
-	path       string
-	parentPath string
-	file       *os.File
-	parent     *os.File
-	fileInfo   os.FileInfo
-	parentInfo os.FileInfo
-	physicalID string
-	mu         sync.Mutex
+	path                  string
+	parentPath            string
+	file                  *os.File
+	parent                *os.File
+	fileInfo              os.FileInfo
+	parentInfo            os.FileInfo
+	physicalID            string
+	mu                    sync.Mutex
+	predecessorFence      authoritybackend.PredecessorWriterFenceV1
+	predecessorBindingIDs []string
 }
 
 func NewJSONLLedger(path string) (*JSONLLedger, error) {
@@ -82,6 +86,23 @@ func NewJSONLLedger(path string) (*JSONLLedger, error) {
 	return result, nil
 }
 
+// NewFencedJSONLLedger binds every retained ledger transition and run-wide
+// operation to the shared predecessor cutover fence. NewJSONLLedger remains
+// available to read historical/unactivated stores without reinterpreting
+// their bytes.
+func NewFencedJSONLLedger(path string, fence authoritybackend.PredecessorWriterFenceV1, bindingIDs []string) (*JSONLLedger, error) {
+	if fence == nil || len(bindingIDs) == 0 {
+		return nil, errors.New("predecessor writer fence and ledger binding IDs are required")
+	}
+	value, err := NewJSONLLedger(path)
+	if err != nil {
+		return nil, err
+	}
+	value.predecessorFence = fence
+	value.predecessorBindingIDs = append([]string(nil), bindingIDs...)
+	return value, nil
+}
+
 func (l *JSONLLedger) Append(event Event) error {
 	return l.appendOrVerify(event, "", false)
 }
@@ -114,12 +135,23 @@ func (l *JSONLLedger) AppendOrVerifyLeased(event Event, lease *RunTransitionLeas
 	return l.appendOrVerify(event, leasedAppendSentinel, true)
 }
 
-func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyExisting bool) error {
+func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyExisting bool) (resultErr error) {
 	if l == nil {
 		return errors.New("ledger is required")
 	}
 	if err := event.Validate(); err != nil {
 		return fmt.Errorf("validate event: %w", err)
+	}
+	var predecessorLease authoritybackend.PredecessorWriterLeaseHandleV1
+	if barrierSHA256 != leasedAppendSentinel {
+		var err error
+		predecessorLease, err = l.acquirePredecessorWriterV1("maintenance")
+		if err != nil {
+			return err
+		}
+		if predecessorLease != nil {
+			defer func() { resultErr = errors.Join(resultErr, predecessorLease.Release()) }()
+		}
 	}
 	if err := l.ensurePhysicalIdentity(true); err != nil {
 		return err
@@ -181,6 +213,13 @@ func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyEx
 		}
 		return nil
 	})
+}
+
+func (l *JSONLLedger) acquirePredecessorWriterV1(operation string) (authoritybackend.PredecessorWriterLeaseHandleV1, error) {
+	if l == nil || l.predecessorFence == nil {
+		return nil, nil
+	}
+	return l.predecessorFence.AcquirePredecessorWriterV1(l.predecessorBindingIDs, operation)
 }
 
 func (l *JSONLLedger) Path() string { return l.path }

@@ -14,6 +14,9 @@ type inventory struct{}
 
 func newDurableStore(string, Limits) (*durableStore, error) { return nil, errUnsupportedDurability }
 func (*durableStore) close() error                          { return nil }
+func (*durableStore) predecessorDrainSnapshotV1() (string, error) {
+	return "", errUnsupportedDurability
+}
 func (*durableStore) openAttempt(string) (*attemptStore, error) {
 	return nil, errUnsupportedDurability
 }

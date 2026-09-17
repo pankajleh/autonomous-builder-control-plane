@@ -4,6 +4,8 @@ package prlifecycle
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"sync"
 	"syscall"
@@ -400,6 +403,89 @@ func (s *PRWriteAdmissionStore) inventory() (inventory, error) {
 		}
 	}
 	return result, nil
+}
+
+// predecessorDrainSnapshotV1 validates every retained PR resource under its
+// exact resource lock. Only the two existing decisive applied dispositions
+// are drainable; partial generations, submitted-without-terminal records and
+// remote divergence remain operational blockers.
+func (s *PRWriteAdmissionStore) predecessorDrainSnapshotV1() (string, error) {
+	if s == nil {
+		return "", errors.New("V3_DRAIN_REQUIRED: PR admission store is required")
+	}
+	capacity, err := s.lockCapacity()
+	if err != nil {
+		return "", fmt.Errorf("V3_DRAIN_REQUIRED: PR admission inventory is active: %w", err)
+	}
+	defer unlockClose(capacity)
+	if _, err := s.inventory(); err != nil {
+		return "", fmt.Errorf("V3_DRAIN_REQUIRED: scan PR admission root: %w", err)
+	}
+	entries, err := s.readDir()
+	if err != nil {
+		return "", err
+	}
+	resourceSet := make(map[string]struct{})
+	for _, entry := range entries {
+		match := admissionName.FindStringSubmatch(entry.Name())
+		if match != nil {
+			resourceSet[match[1]] = struct{}{}
+		}
+	}
+	resources := make([]string, 0, len(resourceSet))
+	for resource := range resourceSet {
+		resources = append(resources, resource)
+	}
+	sort.Strings(resources)
+	type drainedResource struct {
+		ResourceKey    string      `json:"resource_key"`
+		TerminalSHA256 string      `json:"terminal_sha256,omitempty"`
+		Disposition    Disposition `json:"disposition,omitempty"`
+	}
+	drained := make([]drainedResource, 0, len(resources))
+	for _, resource := range resources {
+		key := PRResourceKeyV1(resource)
+		var record drainedResource
+		err := s.withResource(key, func(tx *resourceTxn) error {
+			state, err := scanResource(tx)
+			if err != nil {
+				return err
+			}
+			record.ResourceKey = resource
+			if state.maxOrdinal == 0 {
+				return nil
+			}
+			if state.unresolved() || !state.has(state.maxOrdinal, kindTerminal) {
+				return errors.New("current PR revision is not terminal")
+			}
+			terminal, err := readTerminal(tx, recordPrefix(key, state.maxOrdinal)+"terminal.json")
+			if err != nil {
+				return err
+			}
+			if terminal.Core.ResultCore.Disposition != AppliedConfirmed && terminal.Core.ResultCore.Disposition != AppliedReconciled {
+				return errors.New("current PR terminal disposition is unresolved")
+			}
+			record.TerminalSHA256 = terminal.TerminalCoreSHA256
+			record.Disposition = terminal.Core.ResultCore.Disposition
+			return nil
+		})
+		if err != nil {
+			return "", fmt.Errorf("V3_DRAIN_REQUIRED: PR resource %s: %w", resource, err)
+		}
+		drained = append(drained, record)
+	}
+	snapshot := struct {
+		Kind          string            `json:"kind"`
+		SchemaVersion string            `json:"schema_version"`
+		Resources     []drainedResource `json:"resources"`
+		BarrierState  string            `json:"barrier_state"`
+	}{"PredecessorPRDrainSnapshotV1", "predecessor-pr-drain-snapshot-v1", drained, "DRAINED"}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func (s *PRWriteAdmissionStore) readDir() ([]os.DirEntry, error) {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
@@ -22,19 +23,23 @@ type ArtifactWriter interface {
 }
 
 type ControllerConfig struct {
-	Store     *PRWriteAdmissionStore
-	GitHub    *GitHubAdapter
-	Artifacts ArtifactWriter
-	Ledger    *MaterialLedgerRecorder
-	Now       func() time.Time
+	Store                 *PRWriteAdmissionStore
+	GitHub                *GitHubAdapter
+	Artifacts             ArtifactWriter
+	Ledger                *MaterialLedgerRecorder
+	Now                   func() time.Time
+	PredecessorFence      authoritybackend.PredecessorWriterFenceV1
+	PredecessorBindingIDs []string
 }
 
 type Controller struct {
-	store     *PRWriteAdmissionStore
-	github    *GitHubAdapter
-	artifacts ArtifactWriter
-	ledger    *MaterialLedgerRecorder
-	now       func() time.Time
+	store                 *PRWriteAdmissionStore
+	github                *GitHubAdapter
+	artifacts             ArtifactWriter
+	ledger                *MaterialLedgerRecorder
+	now                   func() time.Time
+	predecessorFence      authoritybackend.PredecessorWriterFenceV1
+	predecessorBindingIDs []string
 	// postSubmitFailure is an unexported deterministic fault boundary used by
 	// same-package adversarial tests to prove submitted error provenance.
 	postSubmitFailure func(stage string) error
@@ -53,7 +58,11 @@ func newController(config ControllerConfig) (*Controller, error) {
 	if !limitsAllowed(config.GitHub.limits) {
 		return nil, errors.New(CodePolicyMismatch)
 	}
-	return &Controller{store: config.Store, github: config.GitHub, artifacts: config.Artifacts, ledger: config.Ledger, now: config.Now}, nil
+	if (config.PredecessorFence == nil) != (len(config.PredecessorBindingIDs) == 0) {
+		return nil, errors.New("PR predecessor fence and binding IDs must be supplied together")
+	}
+	return &Controller{store: config.Store, github: config.GitHub, artifacts: config.Artifacts, ledger: config.Ledger, now: config.Now,
+		predecessorFence: config.PredecessorFence, predecessorBindingIDs: append([]string(nil), config.PredecessorBindingIDs...)}, nil
 }
 
 type Request struct {
@@ -252,12 +261,31 @@ func (c *Controller) Upsert(ctx context.Context, request Request) (PRLifecycleRe
 	if err != nil {
 		return result, err
 	}
+	var predecessorLease authoritybackend.PredecessorWriterLeaseHandleV1
+	if c.predecessorFence != nil {
+		predecessorLease, err = c.predecessorFence.AcquirePredecessorWriterV1(c.predecessorBindingIDs, "pr-publication")
+		if err != nil {
+			return result, err
+		}
+	}
 	err = c.store.withResource(key, func(tx *resourceTxn) error {
 		var runErr error
 		result, runErr = c.upsertLocked(ctx, tx, request, requestSHA)
 		return runErr
 	})
+	if predecessorLease != nil {
+		err = errors.Join(err, predecessorLease.Release())
+	}
 	return result, err
+}
+
+// PredecessorDrainSnapshotV1 is the trusted directory probe for the
+// process-startup PR admission root. It performs no provider call.
+func (c *Controller) PredecessorDrainSnapshotV1() (string, error) {
+	if c == nil || c.store == nil {
+		return "", errors.New("V3_DRAIN_REQUIRED: PR controller store is unavailable")
+	}
+	return c.store.predecessorDrainSnapshotV1()
 }
 
 func (c *Controller) upsertLocked(ctx context.Context, tx *resourceTxn, request Request, requestSHA string) (PRLifecycleResultV1, error) {

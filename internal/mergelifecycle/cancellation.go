@@ -16,7 +16,7 @@ import (
 // Cancel authenticates one controller-resolved source request and either
 // selects CANCELLED at a proven safe boundary or durably records precedence
 // while an earlier target submission remains UNKNOWN.
-func (c *Controller) Cancel(ctx context.Context, request CancelRequest) (Result, error) {
+func (c *Controller) Cancel(ctx context.Context, request CancelRequest) (result Result, resultErr error) {
 	if c == nil || c.store == nil || ctx == nil || request.RunID == "" || request.SourceRequestID == "" {
 		return Result{}, errors.New("controller, context, run ID, and source request ID are required")
 	}
@@ -25,6 +25,13 @@ func (c *Controller) Cancel(ctx context.Context, request CancelRequest) (Result,
 	}
 	invocation, cancel := context.WithTimeout(ctx, c.limits.invocationTimeout)
 	defer cancel()
+	predecessorLease, err := c.acquirePredecessorWriterV1()
+	if err != nil {
+		return Result{}, err
+	}
+	if predecessorLease != nil {
+		defer func() { resultErr = errors.Join(resultErr, predecessorLease.Release()) }()
+	}
 	lease, err := c.ledger.AcquireRunTransition(request.RunID)
 	if err != nil {
 		return Result{}, err

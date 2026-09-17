@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
 
@@ -15,10 +16,12 @@ import (
 var productionAdmissionRoot = os.Getenv("ABCP_PR_ADMISSION_ROOT")
 
 type ProductionControllerConfig struct {
-	GitHub              *GitHubAdapter
-	Artifacts           ArtifactWriter
-	AuthoritativeLedger *ledger.JSONLLedger
-	Now                 func() time.Time
+	GitHub                *GitHubAdapter
+	Artifacts             ArtifactWriter
+	AuthoritativeLedger   *ledger.JSONLLedger
+	Now                   func() time.Time
+	PredecessorFence      authoritybackend.PredecessorWriterFenceV1
+	PredecessorBindingIDs []string
 }
 
 // NewProductionController is the only exported production construction path.
@@ -35,5 +38,6 @@ func NewProductionController(config ProductionControllerConfig) (*Controller, er
 	if err != nil {
 		return nil, err
 	}
-	return newController(ControllerConfig{Store: store, GitHub: config.GitHub, Artifacts: config.Artifacts, Ledger: recorder, Now: config.Now})
+	return newController(ControllerConfig{Store: store, GitHub: config.GitHub, Artifacts: config.Artifacts, Ledger: recorder, Now: config.Now,
+		PredecessorFence: config.PredecessorFence, PredecessorBindingIDs: config.PredecessorBindingIDs})
 }
