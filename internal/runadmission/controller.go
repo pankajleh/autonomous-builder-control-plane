@@ -24,6 +24,7 @@ const (
 	MaxProfiles              = 32
 	MaxReceiptBytes          = 16 << 10
 	MaxBindingBytes          = 32 << 10
+	MaxLaunchIntentBytes     = 4 << 10
 	ReceiptLockTimeout       = 2 * time.Second
 )
 
@@ -94,6 +95,18 @@ type AdmissionBindingV1 struct {
 	CgroupRoot                    string `json:"cgroup_root"`
 	WorkflowAuthorityConfigPath   string `json:"workflow_authority_config_path"`
 	WorkflowAuthorityConfigSHA256 string `json:"workflow_authority_config_sha256"`
+}
+
+// AdmissionLaunchIntentV1 durably records that the controller crossed the
+// launch boundary. An unregistered run with this record is ambiguous and may
+// not be launched again by admission replay.
+type AdmissionLaunchIntentV1 struct {
+	Kind                   string `json:"kind"`
+	SchemaVersion          int    `json:"schema_version"`
+	PrincipalID            string `json:"principal_id"`
+	RequestID              string `json:"request_id"`
+	RunID                  string `json:"run_id"`
+	AdmissionBindingSHA256 string `json:"admission_binding_sha256"`
 }
 
 type loadedProfile struct {

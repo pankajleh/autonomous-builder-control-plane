@@ -141,7 +141,7 @@ func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
 	}
 }
 
-func TestAdmissionMaterializationIsDeterministicAcrossRelaunch(t *testing.T) {
+func TestAdmissionMaterializationIsDeterministicAfterAmbiguousLaunch(t *testing.T) {
 	fixture := newAdmissionFixture(t, true)
 	response, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
 	if err != nil {
@@ -161,8 +161,8 @@ func TestAdmissionMaterializationIsDeterministicAcrossRelaunch(t *testing.T) {
 	if err := firstLock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); err != nil {
-		t.Fatalf("relaunch admission: %v", err)
+	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrReconciliationRequired) {
+		t.Fatalf("ambiguous launch replay = %v", err)
 	}
 	for name, expected := range before {
 		observed, err := os.ReadFile(filepath.Join(runDirectory, name))
@@ -175,7 +175,7 @@ func TestAdmissionMaterializationIsDeterministicAcrossRelaunch(t *testing.T) {
 	}
 }
 
-func TestAdmissionConcurrentDuplicateSuppressionAndDeadLauncherRetry(t *testing.T) {
+func TestAdmissionConcurrentDuplicateSuppressionAndExitedLauncherReconciliation(t *testing.T) {
 	fixture := newAdmissionFixture(t, true)
 	defer fixture.closeLocks()
 	const callers = 16
@@ -224,26 +224,22 @@ func TestAdmissionConcurrentDuplicateSuppressionAndDeadLauncherRetry(t *testing.
 	if err := deadLock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); err != nil {
-		t.Fatalf("retry after dead pre-registration launcher: %v", err)
+	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrReconciliationRequired) {
+		t.Fatalf("replay after exited pre-registration launcher = %v", err)
 	}
 	fixture.mu.Lock()
-	if len(fixture.starts) != 2 {
+	if len(fixture.starts) != 1 {
 		fixture.mu.Unlock()
-		t.Fatalf("dead launcher retry starts = %d", len(fixture.starts))
+		t.Fatalf("exited launcher replay starts = %d", len(fixture.starts))
 	}
-	secondLock := fixture.locks[1]
 	fixture.mu.Unlock()
-	if err := secondLock.Close(); err != nil {
-		t.Fatal(err)
-	}
 	registerFixtureRun(t, fixture, want)
 	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); err != nil {
 		t.Fatalf("registered replay: %v", err)
 	}
 	fixture.mu.Lock()
 	defer fixture.mu.Unlock()
-	if len(fixture.starts) != 2 {
+	if len(fixture.starts) != 1 {
 		t.Fatalf("registered run was relaunched: %d", len(fixture.starts))
 	}
 }
@@ -749,9 +745,9 @@ func TestAdmissionRegisteredExactReplaySurvivesPrivateProfileRemoval(t *testing.
 	}
 }
 
-func TestAdmissionBoundRelaunchSurvivesPrivateProfileChange(t *testing.T) {
+func TestAdmissionBoundLaunchRequiresReconciliationAfterPrivateProfileChange(t *testing.T) {
 	fixture := newAdmissionFixture(t, true)
-	response, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	_, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,9 +785,9 @@ func TestAdmissionBoundRelaunchSurvivesPrivateProfileChange(t *testing.T) {
 		starts++
 		return nil
 	}
-	replayed, err := restarted.AdmitRun(context.Background(), fixture.principal, fixture.request)
-	if err != nil || replayed != response || starts != 1 {
-		t.Fatalf("bound relaunch after private profile change = %+v, %v, starts=%d", replayed, err, starts)
+	_, err = restarted.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if !errors.Is(err, serviceapi.ErrReconciliationRequired) || starts != 0 {
+		t.Fatalf("bound ambiguous replay after private profile change = %v, starts=%d", err, starts)
 	}
 }
 

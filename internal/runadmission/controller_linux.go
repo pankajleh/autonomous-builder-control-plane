@@ -349,6 +349,16 @@ func (c *Controller) admitRun(ctx context.Context, principal serviceapi.Principa
 	} else if registered {
 		return response, nil
 	}
+	launchAttempted, err := c.readAdmissionLaunchIntent(binding)
+	if err != nil {
+		return serviceapi.RunAdmissionResponseV1{}, err
+	}
+	if launchAttempted {
+		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrReconciliationRequired
+	}
+	if err := c.createAdmissionLaunchIntent(binding); err != nil {
+		return serviceapi.RunAdmissionResponseV1{}, err
+	}
 	args := []string{
 		"run", "--manifest", binding.ManifestPath, "--ledger", binding.CanonicalLedgerPath,
 		"--evidence-root", binding.EvidenceRoot, "--cgroup-root", binding.CgroupRoot,
@@ -356,6 +366,9 @@ func (c *Controller) admitRun(ctx context.Context, principal serviceapi.Principa
 		"--workflow-authority-config-file", binding.WorkflowAuthorityConfigPath,
 	}
 	if err := c.start(c.executable, args, lock); err != nil {
+		if clearErr := c.clearAdmissionLaunchIntent(binding); clearErr != nil {
+			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrReconciliationRequired
+		}
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
 	}
 	started = true
@@ -498,6 +511,72 @@ func (c *Controller) createOrVerifyAdmissionBinding(expected AdmissionBindingV1)
 		return nil
 	}
 	if err := writeNewAtomicAt(c.admissionsFD, name, data); err != nil {
+		return serviceapi.ErrAdmissionUnavailable
+	}
+	return nil
+}
+
+func launchIntentName(binding AdmissionBindingV1) string {
+	return receiptKey(binding.PrincipalID, binding.RequestID) + ".launch.json"
+}
+
+func admissionLaunchIntent(binding AdmissionBindingV1) AdmissionLaunchIntentV1 {
+	data, _ := json.Marshal(binding)
+	return AdmissionLaunchIntentV1{
+		Kind: "AdmissionLaunchIntentV1", SchemaVersion: 1,
+		PrincipalID: binding.PrincipalID, RequestID: binding.RequestID, RunID: binding.RunID,
+		AdmissionBindingSHA256: digest(data),
+	}
+}
+
+func (c *Controller) readAdmissionLaunchIntent(binding AdmissionBindingV1) (bool, error) {
+	expected := admissionLaunchIntent(binding)
+	data, found, err := readRegularAt(c.admissionsFD, launchIntentName(binding), MaxLaunchIntentBytes)
+	if err != nil {
+		return false, serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	if !found {
+		return false, nil
+	}
+	var observed AdmissionLaunchIntentV1
+	if strictJSON(data, &observed) != nil || observed != expected {
+		return false, serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	canonical, _ := json.Marshal(observed)
+	if !bytes.Equal(data, canonical) {
+		return false, serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	return true, nil
+}
+
+func (c *Controller) createAdmissionLaunchIntent(binding AdmissionBindingV1) error {
+	intent := admissionLaunchIntent(binding)
+	data, err := json.Marshal(intent)
+	if err != nil || len(data) > MaxLaunchIntentBytes {
+		return serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	if err := writeNewAtomicAt(c.admissionsFD, launchIntentName(binding), data); err != nil {
+		return serviceapi.ErrAdmissionUnavailable
+	}
+	found, err := c.readAdmissionLaunchIntent(binding)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return serviceapi.ErrAdmissionUnavailable
+	}
+	return nil
+}
+
+func (c *Controller) clearAdmissionLaunchIntent(binding AdmissionBindingV1) error {
+	found, err := c.readAdmissionLaunchIntent(binding)
+	if err != nil || !found {
+		return serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	if err := syscall.Unlinkat(c.admissionsFD, launchIntentName(binding)); err != nil {
+		return serviceapi.ErrAdmissionUnavailable
+	}
+	if err := syscall.Fsync(c.admissionsFD); err != nil {
 		return serviceapi.ErrAdmissionUnavailable
 	}
 	return nil
