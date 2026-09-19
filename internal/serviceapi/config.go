@@ -3,18 +3,17 @@
 package serviceapi
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/strictjson"
 )
 
 const (
@@ -245,83 +244,10 @@ func (m *AuthorityMatcher) valid() bool {
 }
 
 func decodeStrictJSON(data []byte, target any) error {
-	if err := rejectDuplicateJSONFields(data); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return errors.New("multiple JSON values")
-		}
-		return err
-	}
-	return nil
+	return strictjson.Decode(data, target)
 }
 
 func rejectDuplicateJSONFields(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	var parse func() error
-	parse = func() error {
-		token, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		delimiter, ok := token.(json.Delim)
-		if !ok {
-			return nil
-		}
-		switch delimiter {
-		case '{':
-			seen := map[string]struct{}{}
-			for decoder.More() {
-				keyToken, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := keyToken.(string)
-				if !ok {
-					return errors.New("invalid JSON object key")
-				}
-				if _, duplicate := seen[key]; duplicate {
-					return fmt.Errorf("duplicate JSON field")
-				}
-				seen[key] = struct{}{}
-				if err := parse(); err != nil {
-					return err
-				}
-			}
-			closing, err := decoder.Token()
-			if err != nil || closing != json.Delim('}') {
-				return errors.New("unterminated JSON object")
-			}
-		case '[':
-			for decoder.More() {
-				if err := parse(); err != nil {
-					return err
-				}
-			}
-			closing, err := decoder.Token()
-			if err != nil || closing != json.Delim(']') {
-				return errors.New("unterminated JSON array")
-			}
-		default:
-			return errors.New("unexpected JSON delimiter")
-		}
-		return nil
-	}
-	if err := parse(); err != nil {
-		return err
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		if err == nil {
-			return errors.New("multiple JSON values")
-		}
-		return err
-	}
-	return nil
+	var value json.RawMessage
+	return strictjson.Decode(data, &value)
 }

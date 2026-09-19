@@ -1849,6 +1849,15 @@ func (c *ControllerV1) ControllerIdentity() string {
 	return c.identity
 }
 
+// RepositoryIdentity returns the repository identity derived from the
+// canonical origin by trusted controller composition.
+func (c *ControllerV1) RepositoryIdentity() string {
+	if c == nil {
+		return ""
+	}
+	return c.repositoryIdentity
+}
+
 // Snapshot returns a detached copy of the durable controller state.
 func (c *ControllerV1) Snapshot() (ControllerStateV1, error) {
 	var result ControllerStateV1

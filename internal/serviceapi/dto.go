@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	MaxCommandReasonBytes = 1 << 10
-	MaxActionPayloadBytes = 16 << 10
-	MaxActionPayloadDepth = 8
+	MaxCommandReasonBytes   = 1 << 10
+	MaxActionPayloadBytes   = 16 << 10
+	MaxActionPayloadDepth   = 8
+	MaxRunTaskMarkdownBytes = 64 << 10
 )
 
 var stateNamePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,127}$`)
@@ -47,6 +48,48 @@ type ActionStatusV1 struct {
 	AuthoritativeEventIDs []string `json:"authoritative_event_ids,omitempty"`
 }
 
+// RunAdmissionRequestV1 is the complete product-visible run admission shape.
+// Execution policy and controller filesystem details deliberately have no
+// representation in this DTO.
+type RunAdmissionRequestV1 struct {
+	SchemaVersion          int              `json:"schema_version"`
+	RequestID              string           `json:"request_id"`
+	ProfileID              string           `json:"profile_id"`
+	ProductAuthorizationID string           `json:"product_authorization_id"`
+	ProductTaskID          string           `json:"product_task_id"`
+	ProductVersionID       string           `json:"product_version_id"`
+	ProductManifestSHA256  string           `json:"product_manifest_sha256"`
+	RepositoryBaseSHA      string           `json:"repository_base_sha"`
+	TaskMarkdown           string           `json:"task_markdown"`
+	DelegatedActor         DelegatedActorV1 `json:"delegated_actor"`
+}
+
+type RunAdmissionResponseV1 struct {
+	RunID  string `json:"run_id"`
+	RunURL string `json:"run_url"`
+}
+
+func ValidateRunAdmissionRequestV1(request RunAdmissionRequestV1) error {
+	if request.SchemaVersion != 1 || ValidatePrincipalID(request.RequestID) != nil ||
+		runtimecatalog.ValidateIdentifier(request.ProfileID) != nil || len(request.ProfileID) > 128 ||
+		ValidatePrincipalID(request.ProductAuthorizationID) != nil || ValidatePrincipalID(request.ProductTaskID) != nil ||
+		ValidatePrincipalID(request.ProductVersionID) != nil {
+		return errors.New("invalid run admission identity")
+	}
+	if !isLowerSHA256(request.ProductManifestSHA256) || !isLowerGitObjectID(request.RepositoryBaseSHA) {
+		return errors.New("invalid run admission digest")
+	}
+	if request.TaskMarkdown == "" || len(request.TaskMarkdown) > MaxRunTaskMarkdownBytes ||
+		!utf8.ValidString(request.TaskMarkdown) || strings.ContainsRune(request.TaskMarkdown, 0) {
+		return errors.New("invalid run task markdown")
+	}
+	if ValidatePrincipalID(request.DelegatedActor.SubjectID) != nil ||
+		(request.DelegatedActor.SubjectType != PrincipalUser && request.DelegatedActor.SubjectType != PrincipalOperator) {
+		return errors.New("invalid delegated actor")
+	}
+	return nil
+}
+
 func ValidateCommandEnvelopeV1(command CommandEnvelopeV1, delegatedActorRequired bool) error {
 	if command.SchemaVersion != 1 || ValidatePrincipalID(command.RequestID) != nil || runtimecatalog.ValidateIdentifier(command.AttemptID) != nil {
 		return errors.New("invalid command identity")
@@ -73,6 +116,14 @@ func ValidateCommandEnvelopeV1(command CommandEnvelopeV1, delegatedActorRequired
 
 func isLowerSHA256(value string) bool {
 	if len(value) != 64 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func isLowerGitObjectID(value string) bool {
+	if (len(value) != 40 && len(value) != 64) || strings.ToLower(value) != value {
 		return false
 	}
 	_, err := hex.DecodeString(value)

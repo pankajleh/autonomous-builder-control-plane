@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +23,32 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 )
+
+type recordingWorkflowAuthorityBackend struct {
+	controllerIdentity string
+	repositoryIdentity string
+	initializeErr      error
+}
+
+func (*recordingWorkflowAuthorityBackend) AuthorityDomainV1() (string, error) {
+	return strings.Repeat("d", 64), nil
+}
+
+func (*recordingWorkflowAuthorityBackend) LoadWorkflowStateV1(string) ([]byte, uint64, error) {
+	return nil, 0, errors.New("not reached")
+}
+
+func (*recordingWorkflowAuthorityBackend) CompareAndSwapWorkflowStateV1(string, uint64, []byte) (bool, error) {
+	return false, errors.New("not reached")
+}
+
+func (b *recordingWorkflowAuthorityBackend) EnsureInitialized(_ context.Context, controllerIdentity, repositoryIdentity string) error {
+	b.controllerIdentity = controllerIdentity
+	b.repositoryIdentity = repositoryIdentity
+	return b.initializeErr
+}
+
+func (*recordingWorkflowAuthorityBackend) Close() {}
 
 func TestRunCLIRejectsAutonomousWorkflowWithoutAuthorityBackend(t *testing.T) {
 	repository := filepath.Join(t.TempDir(), "repository")
@@ -101,6 +129,16 @@ func TestRunCLIRejectsAutonomousWorkflowWithoutAuthorityBackend(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(evidenceRoot, "cli-run", "authority.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("backendless admission created authority evidence: %v", err)
 	}
+
+	stderr.Reset()
+	missingWorkflowConfig := filepath.Join(t.TempDir(), "private-workflow-authority.json")
+	code = runCLI([]string{
+		"run", "--manifest", manifestPath, "--ledger", ledgerPath, "--evidence-root", evidenceRoot,
+		"--workflow-authority-config-file", missingWorkflowConfig,
+	}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "open workflow authority backend") || strings.Contains(stderr.String(), missingWorkflowConfig) {
+		t.Fatalf("workflow authority config failure = %d %q", code, stderr.String())
+	}
 }
 
 func TestRunCommandRequiresEveryExplicitPath(t *testing.T) {
@@ -112,6 +150,51 @@ func TestRunCommandRequiresEveryExplicitPath(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "--evidence-root") {
 		t.Fatalf("usage does not name required evidence root: %q", stderr.String())
+	}
+}
+
+func TestRunCommandInitializesWorkflowAuthorityWithControllerDerivedRepositoryIdentity(t *testing.T) {
+	repository := filepath.Join(t.TempDir(), "repository")
+	gitCommand(t, "", "init", "-b", "main", repository)
+	gitCommand(t, repository, "config", "user.email", "workflow@example.test")
+	gitCommand(t, repository, "config", "user.name", "Workflow Test")
+	gitCommand(t, repository, "remote", "add", "origin", "https://example.test/example/canonical.git")
+	writeCLIFile(t, filepath.Join(repository, "tracked"), []byte("tracked\n"), 0o600)
+	gitCommand(t, repository, "add", "tracked")
+	gitCommand(t, repository, "commit", "-m", "initial")
+	controller, err := governancev3.OpenControllerWithAuthorityBackendV1(repository, &recordingWorkflowAuthorityBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	writeProtectedJSON := func(path string, value any) {
+		data, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		writeCLIFile(t, path, data, 0o600)
+	}
+	writeProtectedJSON(manifestPath, authority.Manifest{Repository: authority.RepositoryManifest{
+		Path: repository, Identity: "caller/poisoned-manifest-identity",
+	}})
+	stop := errors.New("stop after initialization capture")
+	backend := &recordingWorkflowAuthorityBackend{initializeErr: stop}
+	previousOpen := openWorkflowAuthorityBackend
+	openWorkflowAuthorityBackend = func(context.Context, string) (workflowAuthorityBackend, error) { return backend, nil }
+	t.Cleanup(func() { openWorkflowAuthorityBackend = previousOpen })
+	var stderr bytes.Buffer
+	code := runCLI([]string{
+		"run", "--manifest", manifestPath, "--ledger", filepath.Join(t.TempDir(), "events.jsonl"),
+		"--evidence-root", filepath.Join(t.TempDir(), "evidence"), "--workflow-authority-config-file", filepath.Join(t.TempDir(), "workflow.json"),
+	}, io.Discard, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), stop.Error()) {
+		t.Fatalf("run initialization stop = %d %q", code, stderr.String())
+	}
+	if backend.controllerIdentity != controller.ControllerIdentity() || backend.repositoryIdentity != controller.RepositoryIdentity() {
+		t.Fatalf("workflow initialization = controller %q repository %q, want %q %q", backend.controllerIdentity, backend.repositoryIdentity, controller.ControllerIdentity(), controller.RepositoryIdentity())
+	}
+	if backend.repositoryIdentity == "caller/poisoned-manifest-identity" {
+		t.Fatal("workflow authority was initialized from caller manifest identity")
 	}
 }
 
@@ -144,6 +227,30 @@ func TestServeCommandRejectsNonLoopbackAndMissingProtectedConfiguration(t *testi
 	}, io.Discard, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), "load bearer authentication configuration") || strings.Contains(stderr.String(), secretPath) {
 		t.Fatalf("missing protected config = %d %q", code, stderr.String())
+	}
+}
+
+func TestServeCommandAdmissionProfileIsOptionalAndFailsClosedWhenConfigured(t *testing.T) {
+	root := t.TempDir()
+	tokenPath := filepath.Join(root, "token")
+	writeCLIFile(t, tokenPath, []byte(strings.Repeat("t", 32)), 0o600)
+	cursorPath := filepath.Join(root, "cursor")
+	cursor, err := json.Marshal(map[string]string{"key_id": "key-1", "key_base64": base64.StdEncoding.EncodeToString(make([]byte, 32))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCLIFile(t, cursorPath, cursor, 0o600)
+	grantsPath := filepath.Join(root, "grants")
+	writeCLIFile(t, grantsPath, []byte(`{"principals":[]}`), 0o600)
+	missingProfile := filepath.Join(root, "private-admission-profile")
+	var stderr bytes.Buffer
+	code := runCLI([]string{
+		"serve", "--service-root", filepath.Join(root, "service"), "--listen", "127.0.0.1:0",
+		"--token-file", tokenPath, "--principal-id", "service", "--cursor-key-file", cursorPath,
+		"--authority-grants-file", grantsPath, "--admission-profile-file", missingProfile,
+	}, io.Discard, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "load run admission configuration") || strings.Contains(stderr.String(), missingProfile) {
+		t.Fatalf("configured admission failure = %d %q", code, stderr.String())
 	}
 }
 
