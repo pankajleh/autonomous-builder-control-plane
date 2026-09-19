@@ -126,28 +126,26 @@ Classified pre-existing/flaky exceptions: none.
 - `internal/workflowauthoritypg/schema.sql` SHA-256: `373aceffb999dfdb999254abd5c7ed909a947e992cd98d23643ff31207dc8ec0`
 - `internal/strictjson/strictjson.go` SHA-256: `59f5d7da17bb7f864b0222eebcbb78133ca8094e0a127c29c918f7eb082a4481`
 
-## Authorized review sequence
+## Task-phase self-verification before the Ralphex review loop
 
-Review 1 result: accepted findings.
+The coding/task phase performed an internal bounded self-verification before handing control to the Ralphex review phase. Its first self-check found the following in-scope coverage gaps. These self-checks are implementation verification, not additional Ralphex review-loop attempts.
+
+Self-verification result: accepted findings.
 
 Accepted findings:
 
 - Required failure-matrix coverage needed explicit durable catalog/receipt failure and launch-failure replay tests.
 - Machine-service enforcement needed a regression proving that a non-service principal remains denied even when a delegation grant exists.
 
-Review-1 corrections were test-only additions; all affected focused/race gates and every required broad gate were rerun against correction executable SHA `3cdda8adc92756fa14e87af7d4e83cda2d95b943`.
+Task-phase self-verification corrections were test-only additions; all affected focused/race gates and every required broad gate were rerun against correction executable SHA `3cdda8adc92756fa14e87af7d4e83cda2d95b943`.
 
 OUT_OF_SCOPE_REVIEW suggestions: none.
 
-Review 2 authorized: yes.
+The task phase then performed a second internal verification and reported no remaining task-phase findings. The wording used in the task log called these checks "Review 1/Review 2"; that wording was misleading because the actual Ralphex review loop had not started yet. This evidence corrects that orchestration terminology explicitly.
 
-Review 2 final result: `<<<RALPHEX:REVIEW_DONE>>>`.
+## Ralphex Review 1 — comprehensive bounded review
 
-Remaining accepted findings: none. No third review was performed.
-
-## User-authorized bounded PRG review
-
-This later bounded PRG review was explicitly requested by the user and is recorded separately from the already completed pack Review 1 / Review 2 sequence above; it is not represented as a third pack review.
+This was the first actual Ralphex review-loop pass (`--- review 0: all findings ---` in the runner log). It reviewed the complete base-to-head diff against the frozen architecture and pack.
 
 Accepted findings and corrections:
 
@@ -159,15 +157,15 @@ Correction executable SHA: `8a4ef3cd0a4a450cd924666682c850278fe9ace5`.
 
 Required focused, focused-race, broad, broad-race, vet, cross-platform build, and diff-check gates all passed against that exact executable SHA. `ABCP_WORKFLOW_AUTHORITY_PG_TEST_DSN` was unavailable, so the PostgreSQL integration test skipped exactly as coded; no infrastructure was provisioned.
 
-## Second and final bounded PRG verification review
+## Ralphex Review 2 — final verification
 
-One major frozen-contract defect remained: after a successfully started child released its inherited launch lock without registering in the catalog, exact replay reacquired the lock and started the run again. This violated the prohibition on duplicate execution and implicitly enabled unapproved recovery from an ambiguous launch outcome.
+This was the second and final actual Ralphex review-loop pass (`--- review 1: critical/major ---` in the runner log). One major frozen-contract defect remained: after a successfully started child released its inherited launch lock without registering in the catalog, exact replay reacquired the lock and started the run again. This violated the prohibition on duplicate execution and implicitly enabled unapproved recovery from an ambiguous launch outcome.
 
 The correction writes and fsyncs a binding-specific durable launch intent before calling process start. An unregistered run with that intent returns `reconciliation_required` and cannot be relaunched by admission replay. A definite process-start failure clears and fsyncs the intent, preserving the existing safe retry behavior when no process was created.
 
 Correction executable SHA: `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7`.
 
-All focused, focused-race, broad, broad-race, vet, cross-platform build, scope, and diff-check gates passed. `ABCP_WORKFLOW_AUTHORITY_PG_TEST_DSN` remained unavailable, so the PostgreSQL integration test skipped exactly as authorized. The corrected area was re-read in full and no unresolved critical/major finding remains. No third review was performed or authorized.
+All focused, focused-race, broad, broad-race, vet, cross-platform build, scope, and diff-check gates passed. `ABCP_WORKFLOW_AUTHORITY_PG_TEST_DSN` remained unavailable, so the PostgreSQL integration test skipped exactly as authorized. The corrected area was re-read in full and no unresolved critical/major finding remains. No third Ralphex review-loop pass was performed or authorized. The runner stopped at its configured review limit after this correction.
 
 ## Final scope and delivery checks
 
@@ -176,7 +174,7 @@ All focused, focused-race, broad, broad-race, vet, cross-platform build, scope, 
 - Executable diff: 1,400 insertions and 334 deletions; PASS against the active bounded wrapper.
 - Executable worktree before evidence: clean.
 - Prior bounded correction delivery push: PASS; the remote branch includes executable correction `8a4ef3cd0a4a450cd924666682c850278fe9ace5`, evidence successor `6b08ac4eb09947421ddbba5884086cf28e25681a`, and the identity-only successor.
-- Final bounded correction delivery refresh: PENDING; executable correction `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` and its evidence-only successors are local and unpushed.
+- Final bounded correction delivery refresh: PASS; executable correction `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` and evidence successors through `cf8a79a34e0c5b73283ce084901c15305f8e7f54` are pushed on `origin/feature/abcp-rc-p01-run-admission-20260919`.
 - Draft PR targets `main`: PASS (`#22`, exact required title, Draft).
 - Executable SHA named by evidence: PASS (`38eda0c3ce489dbe5e51ad297ac3374d98fadcd7`).
 - Evidence-only successor explicitly distinguished: PASS (`6b08ac4eb09947421ddbba5884086cf28e25681a`); it changes no executable behavior, and the follow-up identity-only commit only binds that SHA.
@@ -186,6 +184,8 @@ All focused, focused-race, broad, broad-race, vet, cross-platform build, scope, 
 
 ## Completion claim
 
-Withheld until the final bounded correction and evidence successors are pushed to the Draft PR branch.
+`ABCP_RC_P01_RUN_ADMISSION_COMPLETE`
+
+The executable correction chain and evidence successors are pushed to the Draft PR branch, all required gates recorded above are green (with the explicitly permitted PostgreSQL integration skip), the official Ralphex review loop stopped after exactly two passes, the worktree/scope/diff checks pass, and merge remains a human gate.
 
 This evidence document does not authorize merge or live infrastructure mutation.
