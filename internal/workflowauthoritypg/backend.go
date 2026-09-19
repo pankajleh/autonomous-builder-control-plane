@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"math"
 	"strings"
 	"time"
@@ -20,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/strictjson"
 )
 
 const (
@@ -298,17 +298,8 @@ func reconcileCAS(observed, desired storedRecord) (bool, error) {
 
 func parseConfiguration(data []byte) (configurationV1, error) {
 	var configuration configurationV1
-	if len(data) == 0 || len(data) > MaxConfigBytes || rejectDuplicateFields(data) != nil {
+	if len(data) == 0 || len(data) > MaxConfigBytes || strictjson.Decode(data, &configuration) != nil {
 		return configuration, errConfiguration
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&configuration); err != nil {
-		return configurationV1{}, errConfiguration
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return configurationV1{}, errConfiguration
 	}
 	if configuration.SchemaVersion != 1 || configuration.ConnectionString == "" || len(configuration.ConnectionString) > 16<<10 ||
 		strings.ContainsRune(configuration.ConnectionString, 0) || !lowerSHA256(configuration.AuthorityDomainSHA256) {
@@ -316,62 +307,6 @@ func parseConfiguration(data []byte) (configurationV1, error) {
 	}
 	return configuration, nil
 }
-
-func rejectDuplicateFields(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	var parse func() error
-	parse = func() error {
-		token, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		delimiter, ok := token.(json.Delim)
-		if !ok {
-			return nil
-		}
-		switch delimiter {
-		case '{':
-			seen := make(map[string]struct{})
-			for decoder.More() {
-				keyToken, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := keyToken.(string)
-				if !ok {
-					return errConfiguration
-				}
-				if _, duplicate := seen[key]; duplicate {
-					return errConfiguration
-				}
-				seen[key] = struct{}{}
-				if err := parse(); err != nil {
-					return err
-				}
-			}
-			_, err = decoder.Token()
-			return err
-		case '[':
-			for decoder.More() {
-				if err := parse(); err != nil {
-					return err
-				}
-			}
-			_, err = decoder.Token()
-			return err
-		default:
-			return errConfiguration
-		}
-	}
-	if err := parse(); err != nil {
-		return err
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		return errConfiguration
-	}
-	return nil
-}
-
 func loadConfiguration(path string) (configurationV1, error) {
 	data, err := readProtectedConfiguration(path, MaxConfigBytes)
 	if err != nil {

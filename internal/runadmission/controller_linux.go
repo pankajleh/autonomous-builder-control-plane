@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,13 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/workflowauthoritypg"
 )
+
+type runBinding struct {
+	repositoryIdentityDigest string
+	authorityDigest          string
+	ledgerPath               string
+	evidenceRoot             string
+}
 
 func NewController(config Config) (*Controller, error) {
 	if config.ProfileFile == "" || config.Catalog == nil || !canonicalAbsolute(config.ServiceRoot) {
@@ -154,14 +162,21 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 	}
 	syscall.Close(inputFD)
 	for _, root := range []struct {
-		path   string
-		create bool
-	}{{configuration.LedgerRoot, true}, {configuration.EvidenceRoot, true}, {configuration.CgroupRoot, false}} {
+		path    string
+		create  bool
+		private bool
+	}{{configuration.LedgerRoot, true, true}, {configuration.EvidenceRoot, true, true}, {configuration.CgroupRoot, false, false}} {
 		fd, err := openAbsoluteDirectory(root.path, root.create)
 		if err != nil {
 			return loadedProfile{}, err
 		}
+		if root.private {
+			err = validatePrivateDirectoryFD(fd)
+		}
 		syscall.Close(fd)
+		if err != nil {
+			return loadedProfile{}, err
+		}
 	}
 	if pathsOverlap(configuration.LedgerRoot, configuration.EvidenceRoot) {
 		return loadedProfile{}, errors.New("ledger and evidence roots overlap")
@@ -234,12 +249,22 @@ func (c *Controller) admitRun(ctx context.Context, principal serviceapi.Principa
 	if err := c.createOrVerifyReceipt(ctx, receipt); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	}
+	if registered, err := c.registeredReplay(profile, principal, request, runID); err != nil {
+		return serviceapi.RunAdmissionResponseV1{}, err
+	} else if registered {
+		return response, nil
+	}
 	lock, acquired, err := acquireLaunchLock(c.launchesFD, runID)
 	if err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
 	}
 	if !acquired {
-		return response, nil
+		if registered, readErr := c.registeredReplay(profile, principal, request, runID); readErr != nil {
+			return serviceapi.RunAdmissionResponseV1{}, readErr
+		} else if registered {
+			return response, nil
+		}
+		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrReconciliationRequired
 	}
 	started := false
 	defer func() {
@@ -247,7 +272,7 @@ func (c *Controller) admitRun(ctx context.Context, principal serviceapi.Principa
 			lock.Close()
 		}
 	}()
-	if registered, err := c.runRegistered(runID); err != nil {
+	if registered, err := c.registeredReplay(profile, principal, request, runID); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	} else if registered {
 		return response, nil
@@ -259,17 +284,17 @@ func (c *Controller) admitRun(ctx context.Context, principal serviceapi.Principa
 	if head != request.RepositoryBaseSHA {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrRepositoryBaseMismatch
 	}
-	manifestPath, ledgerPath, err := materialize(profile, principal, request, runID)
+	manifestPath, binding, err := materialize(profile, principal, request, runID)
 	if err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrUnsafeAdmissionMaterialization
 	}
-	if registered, err := c.runRegistered(runID); err != nil {
+	if registered, err := c.runRegistered(runID, binding); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	} else if registered {
 		return response, nil
 	}
 	args := []string{
-		"run", "--manifest", manifestPath, "--ledger", ledgerPath,
+		"run", "--manifest", manifestPath, "--ledger", binding.ledgerPath,
 		"--evidence-root", profile.evidenceRoot, "--cgroup-root", profile.cgroupRoot,
 		"--service-root", c.serviceRoot,
 		"--workflow-authority-config-file", profile.workflowAuthorityConfigPath,
@@ -284,15 +309,39 @@ func (c *Controller) admitRun(ctx context.Context, principal serviceapi.Principa
 	return response, nil
 }
 
-func (c *Controller) runRegistered(runID string) (bool, error) {
-	_, err := c.catalog.ReadRun(runID)
+func (c *Controller) registeredReplay(profile loadedProfile, principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1, runID string) (bool, error) {
+	registration, err := c.catalog.ReadRun(runID)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, serviceapi.ErrAdmissionUnavailable
+	}
+	binding, err := existingRunBinding(profile, principal, request, runID)
+	if err != nil || !registrationMatches(registration, runID, binding) {
+		return false, serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	return true, nil
+}
+
+func (c *Controller) runRegistered(runID string, expected runBinding) (bool, error) {
+	registration, err := c.catalog.ReadRun(runID)
 	if err == nil {
+		if !registrationMatches(registration, runID, expected) {
+			return false, serviceapi.ErrUnsafeAdmissionMaterialization
+		}
 		return true, nil
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	return false, serviceapi.ErrAdmissionUnavailable
+}
+
+func registrationMatches(registration runtimecatalog.RunRegistrationV1, runID string, expected runBinding) bool {
+	return registration.RunID == runID && registration.RepositoryIdentityDigest == expected.repositoryIdentityDigest &&
+		registration.AuthorityDigest == expected.authorityDigest && registration.CanonicalLedgerPath == expected.ledgerPath &&
+		registration.CanonicalEvidenceRoot == expected.evidenceRoot
 }
 
 func (c *Controller) createOrVerifyReceipt(ctx context.Context, expected AdmissionReceiptV1) error {
@@ -358,36 +407,141 @@ func validateReceipt(receipt AdmissionReceiptV1, name string) error {
 	return nil
 }
 
-func materialize(profile loadedProfile, principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1, runID string) (string, string, error) {
+func materialize(profile loadedProfile, principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1, runID string) (string, runBinding, error) {
+	for _, root := range []string{profile.ledgerRoot, profile.evidenceRoot} {
+		fd, err := openAbsoluteDirectory(root, false)
+		if err != nil {
+			return "", runBinding{}, err
+		}
+		err = validatePrivateDirectoryFD(fd)
+		syscall.Close(fd)
+		if err != nil {
+			return "", runBinding{}, err
+		}
+	}
 	repositoryFD, err := openAbsoluteDirectory(profile.configuration.RepositoryPath, false)
 	if err != nil {
-		return "", "", err
+		return "", runBinding{}, err
 	}
 	defer syscall.Close(repositoryFD)
 	inputFD, err := openRelativeDirectory(repositoryFD, profile.configuration.InputDirectory, false)
 	if err != nil {
-		return "", "", err
+		return "", runBinding{}, err
 	}
 	defer syscall.Close(inputFD)
 	runFD, err := openChildDirectory(inputFD, runID, true)
 	if err != nil {
-		return "", "", err
+		return "", runBinding{}, err
 	}
 	defer syscall.Close(runFD)
 	if err := validatePrivateDirectoryFD(runFD); err != nil {
-		return "", "", err
+		return "", runBinding{}, err
 	}
 	runDirectory := filepath.Join(profile.inputPath, runID)
 	planPath := filepath.Join(runDirectory, "plan.md")
 	planRelative := profile.configuration.InputDirectory + "/" + runID + "/plan.md"
-	plan := []byte(fmt.Sprintf("# Product run admission\n\n- Request ID: `%s`\n- Product authorization ID: `%s`\n- Product task ID: `%s`\n- Product version ID: `%s`\n- Product manifest SHA-256: `%s`\n- Repository base SHA: `%s`\n- Authenticated principal: `%s` (`%s`)\n- Delegated actor: `%s` (`%s`)\n\n## Task\n\n%s\n",
+	plan := admissionPlan(principal, request)
+	if err := createOrVerifyAt(runFD, "plan.md", plan); err != nil {
+		return "", runBinding{}, err
+	}
+	spec := admissionCapsuleSpec(profile, request, planRelative)
+	_, capsuleData, err := contextcapsule.Build(profile.configuration.RepositoryPath, spec)
+	if err != nil {
+		return "", runBinding{}, err
+	}
+	if err := createOrVerifyAt(runFD, "context-capsule.json", capsuleData); err != nil {
+		return "", runBinding{}, err
+	}
+	capsulePath := filepath.Join(runDirectory, "context-capsule.json")
+	manifestData, err := derivedManifestData(profile, request, runID, planPath, capsulePath, plan, capsuleData)
+	if err != nil || len(manifestData) > MaxManifestTemplateBytes {
+		return "", runBinding{}, errors.New("derived manifest exceeds bounds")
+	}
+	if err := createOrVerifyAt(runFD, "manifest.json", manifestData); err != nil {
+		return "", runBinding{}, err
+	}
+	return filepath.Join(runDirectory, "manifest.json"), bindingFor(profile, runID, manifestData), nil
+}
+
+func existingRunBinding(profile loadedProfile, principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1, runID string) (runBinding, error) {
+	for _, root := range []string{profile.ledgerRoot, profile.evidenceRoot} {
+		fd, err := openAbsoluteDirectory(root, false)
+		if err != nil {
+			return runBinding{}, err
+		}
+		err = validatePrivateDirectoryFD(fd)
+		syscall.Close(fd)
+		if err != nil {
+			return runBinding{}, err
+		}
+	}
+	repositoryFD, err := openAbsoluteDirectory(profile.configuration.RepositoryPath, false)
+	if err != nil {
+		return runBinding{}, err
+	}
+	defer syscall.Close(repositoryFD)
+	inputFD, err := openRelativeDirectory(repositoryFD, profile.configuration.InputDirectory, false)
+	if err != nil {
+		return runBinding{}, err
+	}
+	defer syscall.Close(inputFD)
+	runFD, err := openChildDirectory(inputFD, runID, false)
+	if err != nil {
+		return runBinding{}, err
+	}
+	defer syscall.Close(runFD)
+	if err := validatePrivateDirectoryFD(runFD); err != nil {
+		return runBinding{}, err
+	}
+	runDirectory := filepath.Join(profile.inputPath, runID)
+	planPath := filepath.Join(runDirectory, "plan.md")
+	planRelative := profile.configuration.InputDirectory + "/" + runID + "/plan.md"
+	plan := admissionPlan(principal, request)
+	observedPlan, found, err := readRegularAt(runFD, "plan.md", MaxManifestTemplateBytes)
+	if err != nil || !found || !bytes.Equal(observedPlan, plan) {
+		return runBinding{}, errors.New("existing admission plan is invalid")
+	}
+	capsuleData, found, err := readRegularAt(runFD, "context-capsule.json", MaxManifestTemplateBytes)
+	if err != nil || !found {
+		return runBinding{}, errors.New("existing admission context capsule is invalid")
+	}
+	capsule, err := contextcapsule.Parse(capsuleData)
+	if err != nil {
+		return runBinding{}, err
+	}
+	spec := admissionCapsuleSpec(profile, request, planRelative)
+	expectedCapsule := contextcapsule.Capsule{
+		PolicyVersion: spec.PolicyVersion, Project: spec.Project, Plan: spec.Plan, RoadmapPhase: spec.RoadmapPhase,
+		ExecutionPack: spec.ExecutionPack, Task: spec.Task, OperationContext: spec.OperationContext, PhaseAuthority: spec.PhaseAuthority,
+		Repository: spec.Repository, BaseSHA: spec.BaseSHA, Invariants: spec.Invariants, NonGoals: spec.NonGoals,
+		PredecessorOutcomes: spec.PredecessorOutcomes,
+		Sources:             []contextcapsule.Source{{Path: planRelative, SHA256: digest(plan)}},
+		CapsuleSHA256:       capsule.CapsuleSHA256,
+	}
+	if !reflect.DeepEqual(capsule, expectedCapsule) {
+		return runBinding{}, errors.New("existing admission context capsule differs")
+	}
+	capsulePath := filepath.Join(runDirectory, "context-capsule.json")
+	manifestData, err := derivedManifestData(profile, request, runID, planPath, capsulePath, plan, capsuleData)
+	if err != nil {
+		return runBinding{}, err
+	}
+	observedManifest, found, err := readRegularAt(runFD, "manifest.json", MaxManifestTemplateBytes)
+	if err != nil || !found || !bytes.Equal(observedManifest, manifestData) {
+		return runBinding{}, errors.New("existing admission manifest is invalid")
+	}
+	return bindingFor(profile, runID, manifestData), nil
+}
+
+func admissionPlan(principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1) []byte {
+	return []byte(fmt.Sprintf("# Product run admission\n\n- Request ID: `%s`\n- Product authorization ID: `%s`\n- Product task ID: `%s`\n- Product version ID: `%s`\n- Product manifest SHA-256: `%s`\n- Repository base SHA: `%s`\n- Authenticated principal: `%s` (`%s`)\n- Delegated actor: `%s` (`%s`)\n\n## Task\n\n%s\n",
 		request.RequestID, request.ProductAuthorizationID, request.ProductTaskID, request.ProductVersionID,
 		request.ProductManifestSHA256, request.RepositoryBaseSHA, principal.PrincipalID, principal.PrincipalType,
 		request.DelegatedActor.SubjectID, request.DelegatedActor.SubjectType, request.TaskMarkdown))
-	if err := createOrVerifyAt(runFD, "plan.md", plan); err != nil {
-		return "", "", err
-	}
-	spec := contextcapsule.Spec{
+}
+
+func admissionCapsuleSpec(profile loadedProfile, request serviceapi.RunAdmissionRequestV1, planRelative string) contextcapsule.Spec {
+	return contextcapsule.Spec{
 		PolicyVersion: contextcapsule.PolicyVersionV2,
 		Project:       request.ProductAuthorizationID, Plan: request.ProductTaskID,
 		RoadmapPhase: "product-run-admission", ExecutionPack: request.ProductVersionID, Task: request.RequestID,
@@ -401,31 +555,28 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, request 
 		NonGoals:            []string{"Do not alter controller-owned execution policy."},
 		PredecessorOutcomes: []contextcapsule.Outcome{}, Sources: []string{planRelative},
 	}
-	_, capsuleData, err := contextcapsule.Build(profile.configuration.RepositoryPath, spec)
-	if err != nil {
-		return "", "", err
-	}
-	if err := createOrVerifyAt(runFD, "context-capsule.json", capsuleData); err != nil {
-		return "", "", err
-	}
-	capsulePath := filepath.Join(runDirectory, "context-capsule.json")
+}
+
+func derivedManifestData(profile loadedProfile, request serviceapi.RunAdmissionRequestV1, runID, planPath, capsulePath string, plan, capsuleData []byte) ([]byte, error) {
 	manifest, err := cloneManifest(profile.template)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	manifest.RunID = runID
 	manifest.Repository.StartSHA = request.RepositoryBaseSHA
 	manifest.Plan = authority.PlanManifest{Path: planPath, SHA256: digest(plan)}
 	manifest.ContextCapsule = &authority.ContextCapsuleManifest{Path: capsulePath, SHA256: digest(capsuleData)}
 	manifest.Worktree.Branch = "abcp/" + runID
-	manifestData, err := json.Marshal(manifest)
-	if err != nil || len(manifestData) > MaxManifestTemplateBytes {
-		return "", "", errors.New("derived manifest exceeds bounds")
+	return json.Marshal(manifest)
+}
+
+func bindingFor(profile loadedProfile, runID string, manifestData []byte) runBinding {
+	return runBinding{
+		repositoryIdentityDigest: runtimecatalog.RepositoryIdentityDigest(profile.configuration.RepositoryIdentity),
+		authorityDigest:          digest(manifestData),
+		ledgerPath:               filepath.Join(profile.ledgerRoot, runID, "events.jsonl"),
+		evidenceRoot:             filepath.Join(profile.evidenceRoot, runID),
 	}
-	if err := createOrVerifyAt(runFD, "manifest.json", manifestData); err != nil {
-		return "", "", err
-	}
-	return filepath.Join(runDirectory, "manifest.json"), filepath.Join(profile.ledgerRoot, runID, "events.jsonl"), nil
 }
 
 func cloneManifest(input authority.Manifest) (authority.Manifest, error) {

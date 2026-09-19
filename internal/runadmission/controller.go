@@ -4,19 +4,18 @@
 package runadmission
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"os"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/strictjson"
 )
 
 const (
@@ -105,80 +104,7 @@ func receiptKey(principalID, requestID string) string {
 }
 
 func strictJSON(data []byte, target any) error {
-	if err := rejectDuplicateFields(data); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return errors.New("multiple JSON values")
-		}
-		return err
-	}
-	return nil
-}
-
-func rejectDuplicateFields(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	var parse func() error
-	parse = func() error {
-		token, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		delimiter, ok := token.(json.Delim)
-		if !ok {
-			return nil
-		}
-		switch delimiter {
-		case '{':
-			seen := make(map[string]struct{})
-			for decoder.More() {
-				keyToken, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := keyToken.(string)
-				if !ok {
-					return errors.New("invalid object key")
-				}
-				if _, duplicate := seen[key]; duplicate {
-					return errors.New("duplicate JSON field")
-				}
-				seen[key] = struct{}{}
-				if err := parse(); err != nil {
-					return err
-				}
-			}
-			_, err = decoder.Token()
-			return err
-		case '[':
-			for decoder.More() {
-				if err := parse(); err != nil {
-					return err
-				}
-			}
-			_, err = decoder.Token()
-			return err
-		default:
-			return errors.New("invalid JSON delimiter")
-		}
-	}
-	if err := parse(); err != nil {
-		return err
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		if err == nil {
-			return errors.New("multiple JSON values")
-		}
-		return err
-	}
-	return nil
+	return strictjson.Decode(data, target)
 }
 
 func (c *Controller) Close() error {

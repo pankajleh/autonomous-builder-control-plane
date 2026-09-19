@@ -152,7 +152,15 @@ func (testAuthenticator) Authenticate(request *http.Request) (Principal, error) 
 	if request.Header.Get("Authorization") != "Bearer valid" {
 		return Principal{}, ErrUnauthenticated
 	}
-	return Principal{PrincipalID: "test", PrincipalType: PrincipalTest, AuthnMethod: "test-v1"}, nil
+	return Principal{PrincipalID: "test", PrincipalType: PrincipalService, AuthnMethod: "test-v1"}, nil
+}
+
+type fixedAuthenticator struct{ principal Principal }
+
+func (a fixedAuthenticator) Authenticate(*http.Request) (Principal, error) { return a.principal, nil }
+
+func grantRunAdmission(server *Server) {
+	server.authority.grants["test"] = authorityGrant{authorities: map[string]struct{}{}, mayDelegate: true}
 }
 
 type testCatalog struct {
@@ -250,6 +258,7 @@ func TestRunAdmissionCapabilityAuthenticationAndAcceptedResponse(t *testing.T) {
 	controller := &testRunAdmissionController{response: RunAdmissionResponseV1{RunID: "admission-run-1", RunURL: "/v1/runs/admission-run-1"}}
 	server := newTestServer(t, &testCatalog{}, time.Now().UTC())
 	server.reserved.RunAdmission = controller
+	grantRunAdmission(server)
 
 	capabilities := httptest.NewRecorder()
 	server.Handler().ServeHTTP(capabilities, authenticatedRequest(http.MethodGet, "/v1/capabilities", nil))
@@ -276,6 +285,7 @@ func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
 	controller := &testRunAdmissionController{response: RunAdmissionResponseV1{RunID: "admission-run-1", RunURL: "/v1/runs/admission-run-1"}}
 	server := newTestServer(t, &testCatalog{}, time.Now().UTC())
 	server.reserved.RunAdmission = controller
+	grantRunAdmission(server)
 	valid := validRunAdmissionJSON("request-1", "task")
 	for name, body := range map[string]string{
 		"unknown field":   strings.TrimSuffix(valid, "}") + `,"manifest_path":"/private"}`,
@@ -291,6 +301,18 @@ func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
 			}
 		})
 	}
+	for name, body := range map[string][]byte{
+		"case alias":    bytes.Replace([]byte(valid), []byte(`"schema_version"`), []byte(`"Schema_Version"`), 1),
+		"invalid UTF-8": bytes.Replace([]byte(valid), []byte(`"task"`), []byte{'"', 't', 'a', 0xff, 's', 'k', '"'}, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, authenticatedRequest(http.MethodPost, "/v1/runs", bytes.NewReader(body)))
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"code":"invalid_request"`) {
+				t.Fatalf("strict admission = %d %q", response.Code, response.Body.String())
+			}
+		})
+	}
 	for _, test := range []struct {
 		err    error
 		status int
@@ -299,6 +321,7 @@ func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
 		{ErrRequestIDConflict, http.StatusConflict, "request_id_conflict"},
 		{ErrUnknownAdmissionProfile, http.StatusNotFound, "unknown_profile"},
 		{ErrRepositoryBaseMismatch, http.StatusConflict, "repository_base_mismatch"},
+		{ErrReconciliationRequired, http.StatusConflict, "reconciliation_required"},
 		{ErrAdmissionUnavailable, http.StatusServiceUnavailable, "admission_unavailable"},
 		{ErrUnsafeAdmissionMaterialization, http.StatusInternalServerError, "unsafe_admission_materialization"},
 	} {
@@ -308,6 +331,30 @@ func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
 		if response.Code != test.status || !strings.Contains(response.Body.String(), `"code":"`+test.code+`"`) || strings.Contains(response.Body.String(), "/private") {
 			t.Fatalf("mapped admission error %v = %d %q", test.err, response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestRunAdmissionRequiresMachineServiceDelegationGrant(t *testing.T) {
+	controller := &testRunAdmissionController{response: RunAdmissionResponseV1{RunID: "admission-run-1", RunURL: "/v1/runs/admission-run-1"}}
+	server := newTestServer(t, &testCatalog{}, time.Now().UTC())
+	server.reserved.RunAdmission = controller
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, authenticatedRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(validRunAdmissionJSON("request-1", "task")))))
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), `"code":"authority_denied"`) || controller.calls != 0 {
+		t.Fatalf("ungranted delegated admission = %d %q, calls=%d", response.Code, response.Body.String(), controller.calls)
+	}
+}
+
+func TestRunAdmissionRejectsGrantedNonServicePrincipal(t *testing.T) {
+	controller := &testRunAdmissionController{response: RunAdmissionResponseV1{RunID: "admission-run-1", RunURL: "/v1/runs/admission-run-1"}}
+	server := newTestServer(t, &testCatalog{}, time.Now().UTC())
+	server.reserved.RunAdmission = controller
+	server.authenticator = fixedAuthenticator{principal: Principal{PrincipalID: "test", PrincipalType: PrincipalUser, AuthnMethod: "test-v1"}}
+	grantRunAdmission(server)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, authenticatedRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(validRunAdmissionJSON("request-1", "task")))))
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), `"code":"authority_denied"`) || controller.calls != 0 {
+		t.Fatalf("non-service admission = %d %q, calls=%d", response.Code, response.Body.String(), controller.calls)
 	}
 }
 

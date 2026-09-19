@@ -526,7 +526,7 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		defer workflowBackend.Close()
 		controller, err = governancev3.OpenControllerWithAuthorityBackendV1(manifest.Repository.Path, workflowBackend)
 		if err == nil {
-			err = workflowBackend.EnsureInitialized(context.Background(), controller.ControllerIdentity(), manifest.Repository.Identity)
+			err = workflowBackend.EnsureInitialized(context.Background(), controller.ControllerIdentity(), controller.RepositoryIdentity())
 		}
 	} else {
 		controller, err = governancev3.OpenControllerV1(manifest.Repository.Path)

@@ -18,9 +18,11 @@ func TestParseConfigurationStrict(t *testing.T) {
 		t.Fatalf("valid config = %+v, %v", configuration, err)
 	}
 	for name, data := range map[string][]byte{
-		"duplicate":  []byte(`{"schema_version":1,"schema_version":1,"connection_string":"x","authority_domain_sha256":"` + strings.Repeat("a", 64) + `"}`),
-		"unknown":    []byte(`{"schema_version":1,"connection_string":"x","authority_domain_sha256":"` + strings.Repeat("a", 64) + `","extra":true}`),
-		"bad-domain": []byte(`{"schema_version":1,"connection_string":"x","authority_domain_sha256":"ABC"}`),
+		"duplicate":    []byte(`{"schema_version":1,"schema_version":1,"connection_string":"x","authority_domain_sha256":"` + strings.Repeat("a", 64) + `"}`),
+		"unknown":      []byte(`{"schema_version":1,"connection_string":"x","authority_domain_sha256":"` + strings.Repeat("a", 64) + `","extra":true}`),
+		"case-alias":   []byte(`{"Schema_Version":1,"connection_string":"x","authority_domain_sha256":"` + strings.Repeat("a", 64) + `"}`),
+		"invalid-utf8": append([]byte(`{"schema_version":1,"connection_string":"postgres://exa`), append([]byte{0xff}, []byte(`mple.test/abcp","authority_domain_sha256":"`+strings.Repeat("a", 64)+`"}`)...)...),
+		"bad-domain":   []byte(`{"schema_version":1,"connection_string":"x","authority_domain_sha256":"ABC"}`),
 	} {
 		if _, err := parseConfiguration(data); err == nil {
 			t.Fatalf("%s config accepted", name)

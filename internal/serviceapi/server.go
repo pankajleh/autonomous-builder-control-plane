@@ -607,6 +607,10 @@ func (s *Server) runAdmission(writer http.ResponseWriter, request *http.Request,
 		s.writeError(writer, http.StatusNotImplemented, ErrorV1{Code: "unsupported_capability", Message: "run admission is not available", RequestID: requestID})
 		return
 	}
+	if principal.PrincipalType != PrincipalService || !s.authority.MayAssertDelegatedActor(principal) {
+		s.writeDependencyError(writer, requestID, ErrAuthorityDenied)
+		return
+	}
 	if request.URL.RawQuery != "" {
 		s.writeError(writer, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid run admission request", RequestID: requestID})
 		return

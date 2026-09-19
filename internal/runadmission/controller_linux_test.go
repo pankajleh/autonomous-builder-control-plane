@@ -26,9 +26,9 @@ import (
 )
 
 type admissionTestCatalog struct {
-	mu         sync.Mutex
-	registered map[string]bool
-	err        error
+	mu      sync.Mutex
+	records map[string]runtimecatalog.RunRegistrationV1
+	err     error
 }
 
 func (c *admissionTestCatalog) ReadRun(runID string) (runtimecatalog.RunRegistrationV1, error) {
@@ -37,8 +37,8 @@ func (c *admissionTestCatalog) ReadRun(runID string) (runtimecatalog.RunRegistra
 	if c.err != nil {
 		return runtimecatalog.RunRegistrationV1{}, c.err
 	}
-	if c.registered[runID] {
-		return runtimecatalog.RunRegistrationV1{RunID: runID}, nil
+	if record, ok := c.records[runID]; ok {
+		return record, nil
 	}
 	return runtimecatalog.RunRegistrationV1{}, os.ErrNotExist
 }
@@ -123,6 +123,7 @@ func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
 		t.Fatalf("receipt is not strict canonical JSON: %q", receiptData)
 	}
 
+	registerFixtureRun(t, fixture, expectedRunID)
 	replayed, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
 	if err != nil || replayed != response {
 		t.Fatalf("same-request replay = %+v, %v", replayed, err)
@@ -193,14 +194,23 @@ func TestAdmissionConcurrentDuplicateSuppressionAndDeadLauncherRetry(t *testing.
 	wait.Wait()
 	close(errorsSeen)
 	close(responses)
+	successes, reconciliations := 0, 0
 	for err := range errorsSeen {
-		if err != nil {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, serviceapi.ErrReconciliationRequired):
+			reconciliations++
+		default:
 			t.Fatalf("concurrent admission: %v", err)
 		}
 	}
+	if successes != 1 || reconciliations != callers-1 {
+		t.Fatalf("concurrent outcomes: success=%d reconciliation=%d", successes, reconciliations)
+	}
 	want := DeriveRunID(fixture.principal.PrincipalID, fixture.request.RequestID)
 	for response := range responses {
-		if response.RunID != want {
+		if response.RunID != "" && response.RunID != want {
 			t.Fatalf("concurrent response = %+v", response)
 		}
 	}
@@ -227,9 +237,7 @@ func TestAdmissionConcurrentDuplicateSuppressionAndDeadLauncherRetry(t *testing.
 	if err := secondLock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	fixture.catalog.mu.Lock()
-	fixture.catalog.registered[want] = true
-	fixture.catalog.mu.Unlock()
+	registerFixtureRun(t, fixture, want)
 	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); err != nil {
 		t.Fatalf("registered replay: %v", err)
 	}
@@ -302,6 +310,34 @@ func TestAdmissionProfileParsingRejectsUnsafeProtectedFiles(t *testing.T) {
 					t.Fatal(err)
 				}
 				data = bytes.Replace(data, []byte(`{"schema_version":1`), []byte(`{"schema_version":1,"schema_version":1`), 1)
+				if err := os.WriteFile(path, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+		{
+			name: "case-alias JSON field",
+			mutate: func(t *testing.T, path string) string {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data = bytes.Replace(data, []byte(`"schema_version"`), []byte(`"Schema_Version"`), 1)
+				if err := os.WriteFile(path, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+		{
+			name: "invalid UTF-8",
+			mutate: func(t *testing.T, path string) string {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data = bytes.Replace(data, []byte("example/product"), []byte{'e', 'x', 'a', 'm', 'p', 'l', 'e', '/', 0xff}, 1)
 				if err := os.WriteFile(path, data, 0o600); err != nil {
 					t.Fatal(err)
 				}
@@ -460,6 +496,177 @@ func TestAdmissionPersistsReceiptBeforeBaseMismatch(t *testing.T) {
 	}
 }
 
+func TestAdmissionFailsClosedOnDurableCatalogAndReceiptFailures(t *testing.T) {
+	t.Run("catalog read", func(t *testing.T) {
+		fixture := newAdmissionFixture(t, true)
+		fixture.catalog.mu.Lock()
+		fixture.catalog.err = errors.New("catalog unavailable")
+		fixture.catalog.mu.Unlock()
+		if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrAdmissionUnavailable) {
+			t.Fatalf("catalog read failure = %v", err)
+		}
+	})
+	t.Run("corrupt receipt", func(t *testing.T) {
+		fixture := newAdmissionFixture(t, true)
+		receiptPath := filepath.Join(fixture.service, "admissions", receiptKey(fixture.principal.PrincipalID, fixture.request.RequestID)+".json")
+		if err := os.WriteFile(receiptPath, []byte(`{"kind":"tampered"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrUnsafeAdmissionMaterialization) {
+			t.Fatalf("corrupt receipt = %v", err)
+		}
+	})
+}
+
+func TestAdmissionLaunchFailurePreservesOneDurableIdentity(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	starts := 0
+	fixture.controller.start = func(string, []string, *os.File) error {
+		starts++
+		return errors.New("launch failed")
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrAdmissionUnavailable) {
+			t.Fatalf("launch attempt %d = %v", attempt+1, err)
+		}
+	}
+	if starts != 2 {
+		t.Fatalf("launch attempts = %d", starts)
+	}
+	receiptPath := filepath.Join(fixture.service, "admissions", receiptKey(fixture.principal.PrincipalID, fixture.request.RequestID)+".json")
+	data, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt AdmissionReceiptV1
+	if err := strictJSON(data, &receipt); err != nil || receipt.RunID != DeriveRunID(fixture.principal.PrincipalID, fixture.request.RequestID) {
+		t.Fatalf("durable launch-failure receipt = %+v, %v", receipt, err)
+	}
+	conflict := fixture.request
+	conflict.TaskMarkdown = "conflicting reuse"
+	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, conflict); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
+		t.Fatalf("conflicting reuse after launch failure = %v", err)
+	}
+}
+
+func TestAdmissionHeldLaunchRequiresRegisteredExactBinding(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	defer fixture.closeLocks()
+	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrReconciliationRequired) {
+		t.Fatalf("ambiguous replay = %v", err)
+	}
+}
+
+func TestAdmissionRejectsConflictingRegisteredRunBinding(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	runID := DeriveRunID(fixture.principal.PrincipalID, fixture.request.RequestID)
+	fixture.catalog.mu.Lock()
+	fixture.catalog.records[runID] = runtimecatalog.RunRegistrationV1{
+		RunID: runID, RepositoryIdentityDigest: strings.Repeat("f", 64), AuthorityDigest: strings.Repeat("e", 64),
+		CanonicalLedgerPath:   filepath.Join(filepath.Dir(filepath.Dir(fixture.input)), "foreign-ledger"),
+		CanonicalEvidenceRoot: filepath.Join(filepath.Dir(filepath.Dir(fixture.input)), "foreign-evidence"),
+	}
+	fixture.catalog.mu.Unlock()
+	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrUnsafeAdmissionMaterialization) {
+		t.Fatalf("conflicting registered binding = %v", err)
+	}
+}
+
+func TestAdmissionRegisteredExactReplaySurvivesRepositoryHeadAdvance(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	defer fixture.closeLocks()
+	response, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerFixtureRun(t, fixture, response.RunID)
+	if err := os.WriteFile(filepath.Join(fixture.repository, "advance.txt"), []byte("advance\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, fixture.repository, "add", "advance.txt")
+	git(t, fixture.repository, "commit", "-m", "advance")
+	replayed, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if err != nil || replayed != response {
+		t.Fatalf("registered exact replay after HEAD advance = %+v, %v", replayed, err)
+	}
+}
+
+func TestAdmissionRejectsModeWidenedPrivateRoots(t *testing.T) {
+	for _, rootName := range []string{"ledger", "evidence"} {
+		t.Run(rootName, func(t *testing.T) {
+			root, repository, head := makeRepository(t, true)
+			profilePath, catalog := writeAdmissionConfiguration(t, root, repository, head)
+			if err := os.Chmod(filepath.Join(root, rootName), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			service := filepath.Join(root, "service")
+			if err := os.Mkdir(service, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			controller, err := NewController(Config{ProfileFile: profilePath, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog})
+			if err == nil {
+				controller.Close()
+				t.Fatal("mode-widened private root was accepted")
+			}
+		})
+	}
+}
+
+func TestAdmissionRevalidatesPrivateRootsBeforeMaterialization(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	root := filepath.Dir(filepath.Dir(fixture.input))
+	if err := os.Chmod(filepath.Join(root, "ledger"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrUnsafeAdmissionMaterialization) {
+		t.Fatalf("mode-widened private root at admission = %v", err)
+	}
+}
+
+func TestAdmissionManifestTemplateRequiresStrictJSON(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{name: "case alias", mutate: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"policy_version"`), []byte(`"Policy_Version"`), 1)
+		}},
+		{name: "invalid UTF-8", mutate: func(data []byte) []byte {
+			return bytes.Replace(data, []byte("product-v1"), []byte{'p', 'r', 'o', 'd', 'u', 'c', 't', '-', 0xff}, 1)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, repository, head := makeRepository(t, true)
+			profilePath, catalog := writeAdmissionConfiguration(t, root, repository, head)
+			var profiles ProfileFileV1
+			profileData, err := os.ReadFile(profilePath)
+			if err != nil || json.Unmarshal(profileData, &profiles) != nil {
+				t.Fatalf("read profile: %v", err)
+			}
+			templatePath := profiles.Profiles[0].ManifestTemplatePath
+			templateData, err := os.ReadFile(templatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(templatePath, test.mutate(templateData), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			service := filepath.Join(root, "service")
+			if err := os.Mkdir(service, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			controller, err := NewController(Config{ProfileFile: profilePath, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog})
+			if err == nil {
+				controller.Close()
+				t.Fatal("unsafe admission manifest template was accepted")
+			}
+		})
+	}
+}
+
 func newAdmissionFixture(t *testing.T, ignored bool) *admissionFixture {
 	t.Helper()
 	root, repository, head := makeRepository(t, ignored)
@@ -563,7 +770,26 @@ func writeAdmissionConfiguration(t *testing.T, root, repository, _ string) (stri
 	}}}
 	profilePath := filepath.Join(root, "admission-profiles.json")
 	writeProtectedJSON(t, profilePath, profile)
-	return profilePath, &admissionTestCatalog{registered: make(map[string]bool)}
+	return profilePath, &admissionTestCatalog{records: make(map[string]runtimecatalog.RunRegistrationV1)}
+}
+
+func registerFixtureRun(t *testing.T, fixture *admissionFixture, runID string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(fixture.input, runID, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest authority.Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Dir(filepath.Dir(fixture.input))
+	fixture.catalog.mu.Lock()
+	fixture.catalog.records[runID] = runtimecatalog.RunRegistrationV1{
+		RunID: runID, RepositoryIdentityDigest: runtimecatalog.RepositoryIdentityDigest("example/product"), AuthorityDigest: digest(data),
+		CanonicalLedgerPath: filepath.Join(root, "ledger", runID, "events.jsonl"), CanonicalEvidenceRoot: filepath.Join(root, "evidence", runID),
+	}
+	fixture.catalog.mu.Unlock()
 }
 
 func testAdmissionRequest(baseSHA string) serviceapi.RunAdmissionRequestV1 {
