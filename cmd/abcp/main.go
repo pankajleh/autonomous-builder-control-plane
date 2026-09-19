@@ -38,6 +38,16 @@ import (
 
 const version = "0.1.0-dev"
 
+type workflowAuthorityBackend interface {
+	governancev3.WorkflowAuthorityBackendV1
+	EnsureInitialized(context.Context, string, string) error
+	Close()
+}
+
+var openWorkflowAuthorityBackend = func(ctx context.Context, path string) (workflowAuthorityBackend, error) {
+	return workflowauthoritypg.Open(ctx, path)
+}
+
 func main() {
 	if platformbridge.IsContainmentChildV1(os.Args[1:]) {
 		os.Exit(platformbridge.RunContainmentChildV1(os.Args[1:]))
@@ -516,9 +526,9 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	var controller *governancev3.ControllerV1
-	var workflowBackend *workflowauthoritypg.Backend
+	var workflowBackend workflowAuthorityBackend
 	if *workflowAuthorityConfigFile != "" {
-		workflowBackend, err = workflowauthoritypg.Open(context.Background(), *workflowAuthorityConfigFile)
+		workflowBackend, err = openWorkflowAuthorityBackend(context.Background(), *workflowAuthorityConfigFile)
 		if err != nil {
 			fmt.Fprintln(stderr, "open workflow authority backend")
 			return 1

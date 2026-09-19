@@ -20,6 +20,7 @@ import (
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
+	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/workflowauthoritypg"
@@ -145,6 +146,10 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 	if err != nil || root != configuration.RepositoryPath {
 		return loadedProfile{}, errors.New("repository path is not the Git root")
 	}
+	repositoryController, err := governancev3.OpenControllerV1(configuration.RepositoryPath)
+	if err != nil || repositoryController.RepositoryIdentity() != configuration.RepositoryIdentity {
+		return loadedProfile{}, errors.New("repository identity is not the controller-derived canonical origin")
+	}
 	if !canonicalRelativeDirectory(configuration.InputDirectory) {
 		return loadedProfile{}, errors.New("input directory must be repository-relative")
 	}
@@ -184,6 +189,10 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 	if err := workflowauthoritypg.ValidateConfigFile(configuration.WorkflowAuthorityConfigPath); err != nil {
 		return loadedProfile{}, errors.New("workflow authority configuration is invalid")
 	}
+	workflowConfiguration, err := readProtectedFile(configuration.WorkflowAuthorityConfigPath, workflowauthoritypg.MaxConfigBytes)
+	if err != nil {
+		return loadedProfile{}, errors.New("workflow authority configuration is invalid")
+	}
 	templateData, err := readProtectedFile(configuration.ManifestTemplatePath, MaxManifestTemplateBytes)
 	if err != nil {
 		return loadedProfile{}, err
@@ -221,11 +230,23 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 	manifest.Plan = authority.PlanManifest{}
 	manifest.ContextCapsule = nil
 	manifest.Worktree.Branch = ""
+	profileBindingData, err := json.Marshal(struct {
+		Configuration                 ProfileV1 `json:"configuration"`
+		ManifestTemplateSHA256        string    `json:"manifest_template_sha256"`
+		WorkflowAuthorityConfigSHA256 string    `json:"workflow_authority_config_sha256"`
+	}{
+		Configuration: configuration, ManifestTemplateSHA256: digest(templateData),
+		WorkflowAuthorityConfigSHA256: digest(workflowConfiguration),
+	})
+	if err != nil {
+		return loadedProfile{}, errors.New("profile binding is invalid")
+	}
 	return loadedProfile{
 		configuration: configuration, template: manifest,
 		inputPath:  filepath.Join(configuration.RepositoryPath, filepath.FromSlash(configuration.InputDirectory)),
 		ledgerRoot: configuration.LedgerRoot, evidenceRoot: configuration.EvidenceRoot, cgroupRoot: configuration.CgroupRoot,
-		workflowAuthorityConfigPath: configuration.WorkflowAuthorityConfigPath,
+		workflowAuthorityConfigPath:   configuration.WorkflowAuthorityConfigPath,
+		workflowAuthorityConfigSHA256: digest(workflowConfiguration), profileBindingSHA256: digest(profileBindingData),
 	}, nil
 }
 
@@ -233,10 +254,6 @@ func (c *Controller) admitRun(ctx context.Context, principal serviceapi.Principa
 	if c == nil || c.admissionsFD < 0 || c.launchesFD < 0 || c.start == nil || serviceapi.ValidateRunAdmissionRequestV1(request) != nil ||
 		serviceapi.ValidatePrincipalID(principal.PrincipalID) != nil {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
-	}
-	profile, ok := c.profiles[request.ProfileID]
-	if !ok {
-		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrUnknownAdmissionProfile
 	}
 	digest := RequestDigest(request)
 	runID := DeriveRunID(principal.PrincipalID, request.RequestID)
@@ -246,20 +263,38 @@ func (c *Controller) admitRun(ctx context.Context, principal serviceapi.Principa
 		CanonicalRequestSHA256: digest, RunID: runID, ProfileID: request.ProfileID,
 		CreatedAt: c.clock().UTC().Format(time.RFC3339Nano),
 	}
-	if err := c.createOrVerifyReceipt(ctx, receipt); err != nil {
+	observedReceipt, foundReceipt, err := c.readAdmissionReceipt(receipt)
+	if err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	}
-	if registered, err := c.registeredReplay(profile, principal, request, runID); err != nil {
+	if foundReceipt {
+		receipt = observedReceipt
+	} else {
+		profile, ok := c.profiles[request.ProfileID]
+		if !ok {
+			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrUnknownAdmissionProfile
+		}
+		receipt.ProfileBindingSHA256 = profile.profileBindingSHA256
+		receipt, err = c.createOrVerifyReceipt(ctx, receipt)
+		if err != nil {
+			return serviceapi.RunAdmissionResponseV1{}, err
+		}
+	}
+	if registered, err := c.registeredReplay(receipt, principal, request); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	} else if registered {
 		return response, nil
+	}
+	binding, bindingFound, err := c.readAdmissionBinding(receipt)
+	if err != nil {
+		return serviceapi.RunAdmissionResponseV1{}, err
 	}
 	lock, acquired, err := acquireLaunchLock(c.launchesFD, runID)
 	if err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
 	}
 	if !acquired {
-		if registered, readErr := c.registeredReplay(profile, principal, request, runID); readErr != nil {
+		if registered, readErr := c.registeredReplay(receipt, principal, request); readErr != nil {
 			return serviceapi.RunAdmissionResponseV1{}, readErr
 		} else if registered {
 			return response, nil
@@ -272,32 +307,53 @@ func (c *Controller) admitRun(ctx context.Context, principal serviceapi.Principa
 			lock.Close()
 		}
 	}()
-	if registered, err := c.registeredReplay(profile, principal, request, runID); err != nil {
+	if registered, err := c.registeredReplay(receipt, principal, request); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	} else if registered {
 		return response, nil
 	}
-	head, err := gitOutput(profile.configuration.RepositoryPath, "rev-parse", "--verify", "HEAD^{commit}")
-	if err != nil {
-		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
+	// Another request may have frozen the binding before this caller acquired
+	// the launch lock. Prefer that durable binding over mutable profile state.
+	if !bindingFound {
+		binding, bindingFound, err = c.readAdmissionBinding(receipt)
+		if err != nil {
+			return serviceapi.RunAdmissionResponseV1{}, err
+		}
 	}
-	if head != request.RepositoryBaseSHA {
-		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrRepositoryBaseMismatch
+	if !bindingFound {
+		profile, ok := c.profiles[request.ProfileID]
+		if !ok || profile.profileBindingSHA256 != receipt.ProfileBindingSHA256 {
+			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrReconciliationRequired
+		}
+		head, headErr := gitOutput(profile.configuration.RepositoryPath, "rev-parse", "--verify", "HEAD^{commit}")
+		if headErr != nil {
+			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
+		}
+		if head != request.RepositoryBaseSHA {
+			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrRepositoryBaseMismatch
+		}
+		manifestPath, materialized, materializeErr := materialize(profile, principal, request, runID)
+		if materializeErr != nil {
+			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrUnsafeAdmissionMaterialization
+		}
+		binding = admissionBinding(receipt, profile, manifestPath, materialized)
+		if err := c.createOrVerifyAdmissionBinding(binding); err != nil {
+			return serviceapi.RunAdmissionResponseV1{}, err
+		}
 	}
-	manifestPath, binding, err := materialize(profile, principal, request, runID)
-	if err != nil {
+	if err := validateAdmissionBindingMaterial(binding, principal, request); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrUnsafeAdmissionMaterialization
 	}
-	if registered, err := c.runRegistered(runID, binding); err != nil {
+	if registered, err := c.runRegistered(runID, binding.runBinding()); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	} else if registered {
 		return response, nil
 	}
 	args := []string{
-		"run", "--manifest", manifestPath, "--ledger", binding.ledgerPath,
-		"--evidence-root", profile.evidenceRoot, "--cgroup-root", profile.cgroupRoot,
+		"run", "--manifest", binding.ManifestPath, "--ledger", binding.CanonicalLedgerPath,
+		"--evidence-root", binding.EvidenceRoot, "--cgroup-root", binding.CgroupRoot,
 		"--service-root", c.serviceRoot,
-		"--workflow-authority-config-file", profile.workflowAuthorityConfigPath,
+		"--workflow-authority-config-file", binding.WorkflowAuthorityConfigPath,
 	}
 	if err := c.start(c.executable, args, lock); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
@@ -309,16 +365,17 @@ func (c *Controller) admitRun(ctx context.Context, principal serviceapi.Principa
 	return response, nil
 }
 
-func (c *Controller) registeredReplay(profile loadedProfile, principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1, runID string) (bool, error) {
-	registration, err := c.catalog.ReadRun(runID)
+func (c *Controller) registeredReplay(receipt AdmissionReceiptV1, principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1) (bool, error) {
+	registration, err := c.catalog.ReadRun(receipt.RunID)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
 		return false, serviceapi.ErrAdmissionUnavailable
 	}
-	binding, err := existingRunBinding(profile, principal, request, runID)
-	if err != nil || !registrationMatches(registration, runID, binding) {
+	binding, found, err := c.readAdmissionBinding(receipt)
+	if err != nil || !found || !registrationMatches(registration, receipt.RunID, binding.runBinding()) ||
+		validateAdmissionBindingMaterial(binding, principal, request) != nil {
 		return false, serviceapi.ErrUnsafeAdmissionMaterialization
 	}
 	return true, nil
@@ -344,39 +401,101 @@ func registrationMatches(registration runtimecatalog.RunRegistrationV1, runID st
 		registration.CanonicalEvidenceRoot == expected.evidenceRoot
 }
 
-func (c *Controller) createOrVerifyReceipt(ctx context.Context, expected AdmissionReceiptV1) error {
-	lockFD, err := syscall.Openat(c.admissionsFD, ".lock", syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+func admissionBinding(receipt AdmissionReceiptV1, profile loadedProfile, manifestPath string, binding runBinding) AdmissionBindingV1 {
+	return AdmissionBindingV1{
+		Kind: "AdmissionBindingV1", SchemaVersion: 1,
+		PrincipalID: receipt.Principal.PrincipalID, RequestID: receipt.RequestID,
+		CanonicalRequestSHA256: receipt.CanonicalRequestSHA256, RunID: receipt.RunID, ProfileID: receipt.ProfileID,
+		ProfileBindingSHA256: receipt.ProfileBindingSHA256,
+		RepositoryPath:       profile.configuration.RepositoryPath, RepositoryIdentity: profile.configuration.RepositoryIdentity,
+		RepositoryIdentityDigest: binding.repositoryIdentityDigest, AuthorityDigest: binding.authorityDigest,
+		InputDirectory:     profile.configuration.InputDirectory,
+		PlanPath:           filepath.Join(filepath.Dir(manifestPath), "plan.md"),
+		ContextCapsulePath: filepath.Join(filepath.Dir(manifestPath), "context-capsule.json"), ManifestPath: manifestPath,
+		LedgerRoot: profile.ledgerRoot, CanonicalLedgerPath: binding.ledgerPath,
+		EvidenceRoot: profile.evidenceRoot, CanonicalEvidenceRoot: binding.evidenceRoot,
+		CgroupRoot: profile.cgroupRoot, WorkflowAuthorityConfigPath: profile.workflowAuthorityConfigPath,
+		WorkflowAuthorityConfigSHA256: profile.workflowAuthorityConfigSHA256,
+	}
+}
+
+func (b AdmissionBindingV1) runBinding() runBinding {
+	return runBinding{
+		repositoryIdentityDigest: b.RepositoryIdentityDigest, authorityDigest: b.AuthorityDigest,
+		ledgerPath: b.CanonicalLedgerPath, evidenceRoot: b.CanonicalEvidenceRoot,
+	}
+}
+
+func bindingName(principalID, requestID string) string {
+	return receiptKey(principalID, requestID) + ".binding.json"
+}
+
+func validateAdmissionBinding(binding AdmissionBindingV1, receipt AdmissionReceiptV1) error {
+	if binding.Kind != "AdmissionBindingV1" || binding.SchemaVersion != 1 ||
+		binding.PrincipalID != receipt.Principal.PrincipalID || binding.RequestID != receipt.RequestID ||
+		binding.CanonicalRequestSHA256 != receipt.CanonicalRequestSHA256 || binding.RunID != receipt.RunID || binding.ProfileID != receipt.ProfileID ||
+		binding.ProfileBindingSHA256 != receipt.ProfileBindingSHA256 || !lowerSHA256(binding.ProfileBindingSHA256) ||
+		!lowerSHA256(binding.RepositoryIdentityDigest) || !lowerSHA256(binding.AuthorityDigest) ||
+		binding.RepositoryIdentity == "" || runtimecatalog.RepositoryIdentityDigest(binding.RepositoryIdentity) != binding.RepositoryIdentityDigest ||
+		!canonicalAbsolute(binding.RepositoryPath) || !canonicalRelativeDirectory(binding.InputDirectory) ||
+		!canonicalAbsolute(binding.PlanPath) || !canonicalAbsolute(binding.ContextCapsulePath) || !canonicalAbsolute(binding.ManifestPath) ||
+		!canonicalAbsolute(binding.LedgerRoot) || !canonicalAbsolute(binding.CanonicalLedgerPath) ||
+		!canonicalAbsolute(binding.EvidenceRoot) || !canonicalAbsolute(binding.CanonicalEvidenceRoot) ||
+		!canonicalAbsolute(binding.CgroupRoot) || !canonicalAbsolute(binding.WorkflowAuthorityConfigPath) ||
+		!lowerSHA256(binding.WorkflowAuthorityConfigSHA256) ||
+		binding.CanonicalLedgerPath != filepath.Join(binding.LedgerRoot, binding.RunID, "events.jsonl") ||
+		binding.CanonicalEvidenceRoot != filepath.Join(binding.EvidenceRoot, binding.RunID) ||
+		binding.PlanPath != filepath.Join(binding.RepositoryPath, filepath.FromSlash(binding.InputDirectory), binding.RunID, "plan.md") ||
+		binding.ContextCapsulePath != filepath.Join(binding.RepositoryPath, filepath.FromSlash(binding.InputDirectory), binding.RunID, "context-capsule.json") ||
+		binding.ManifestPath != filepath.Join(binding.RepositoryPath, filepath.FromSlash(binding.InputDirectory), binding.RunID, "manifest.json") {
+		return errors.New("invalid admission binding")
+	}
+	return nil
+}
+
+func (c *Controller) readAdmissionBinding(receipt AdmissionReceiptV1) (AdmissionBindingV1, bool, error) {
+	name := bindingName(receipt.Principal.PrincipalID, receipt.RequestID)
+	data, found, err := readRegularAt(c.admissionsFD, name, MaxBindingBytes)
 	if err != nil {
-		return serviceapi.ErrAdmissionUnavailable
+		return AdmissionBindingV1{}, false, serviceapi.ErrUnsafeAdmissionMaterialization
 	}
-	defer syscall.Close(lockFD)
-	if err := boundedFlock(ctx, lockFD, ReceiptLockTimeout); err != nil {
-		return serviceapi.ErrAdmissionUnavailable
+	if !found {
+		return AdmissionBindingV1{}, false, nil
 	}
-	defer syscall.Flock(lockFD, syscall.LOCK_UN)
-	name := receiptKey(expected.Principal.PrincipalID, expected.RequestID) + ".json"
-	data, found, err := readRegularAt(c.admissionsFD, name, MaxReceiptBytes)
+	var binding AdmissionBindingV1
+	if strictJSON(data, &binding) != nil || validateAdmissionBinding(binding, receipt) != nil {
+		return AdmissionBindingV1{}, false, serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	canonical, _ := json.Marshal(binding)
+	if !bytes.Equal(data, canonical) {
+		return AdmissionBindingV1{}, false, serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	return binding, true, nil
+}
+
+func (c *Controller) createOrVerifyAdmissionBinding(expected AdmissionBindingV1) error {
+	receipt := AdmissionReceiptV1{
+		Principal: serviceapi.Principal{PrincipalID: expected.PrincipalID}, RequestID: expected.RequestID,
+		CanonicalRequestSHA256: expected.CanonicalRequestSHA256, RunID: expected.RunID, ProfileID: expected.ProfileID,
+		ProfileBindingSHA256: expected.ProfileBindingSHA256,
+	}
+	if validateAdmissionBinding(expected, receipt) != nil {
+		return serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	data, err := json.Marshal(expected)
+	if err != nil || len(data) > MaxBindingBytes {
+		return serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	name := bindingName(expected.PrincipalID, expected.RequestID)
+	observed, found, err := readRegularAt(c.admissionsFD, name, MaxBindingBytes)
 	if err != nil {
 		return serviceapi.ErrUnsafeAdmissionMaterialization
 	}
 	if found {
-		var observed AdmissionReceiptV1
-		if strictJSON(data, &observed) != nil || validateReceipt(observed, name) != nil {
+		if !bytes.Equal(observed, data) {
 			return serviceapi.ErrUnsafeAdmissionMaterialization
-		}
-		canonical, _ := json.Marshal(observed)
-		if !bytes.Equal(data, canonical) {
-			return serviceapi.ErrUnsafeAdmissionMaterialization
-		}
-		if observed.Principal != expected.Principal || observed.RequestID != expected.RequestID ||
-			observed.CanonicalRequestSHA256 != expected.CanonicalRequestSHA256 || observed.RunID != expected.RunID || observed.ProfileID != expected.ProfileID {
-			return serviceapi.ErrRequestIDConflict
 		}
 		return nil
-	}
-	data, err = json.Marshal(expected)
-	if err != nil || len(data) > MaxReceiptBytes {
-		return serviceapi.ErrUnsafeAdmissionMaterialization
 	}
 	if err := writeNewAtomicAt(c.admissionsFD, name, data); err != nil {
 		return serviceapi.ErrAdmissionUnavailable
@@ -384,12 +503,144 @@ func (c *Controller) createOrVerifyReceipt(ctx context.Context, expected Admissi
 	return nil
 }
 
+func validateAdmissionBindingMaterial(binding AdmissionBindingV1, principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1) error {
+	for _, root := range []string{binding.LedgerRoot, binding.EvidenceRoot} {
+		fd, err := openAbsoluteDirectory(root, false)
+		if err != nil {
+			return err
+		}
+		err = validatePrivateDirectoryFD(fd)
+		syscall.Close(fd)
+		if err != nil {
+			return err
+		}
+	}
+	repositoryFD, err := openAbsoluteDirectory(binding.RepositoryPath, false)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(repositoryFD)
+	inputFD, err := openRelativeDirectory(repositoryFD, binding.InputDirectory, false)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(inputFD)
+	runFD, err := openChildDirectory(inputFD, binding.RunID, false)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(runFD)
+	err = validatePrivateDirectoryFD(runFD)
+	if err != nil {
+		return err
+	}
+	plan, found, err := readRegularAt(runFD, "plan.md", MaxManifestTemplateBytes)
+	if err != nil || !found || !bytes.Equal(plan, admissionPlan(principal, request)) {
+		return errors.New("admission plan binding is invalid")
+	}
+	capsuleData, found, err := readRegularAt(runFD, "context-capsule.json", MaxManifestTemplateBytes)
+	if err != nil || !found {
+		return errors.New("admission context capsule binding is invalid")
+	}
+	capsule, err := contextcapsule.Parse(capsuleData)
+	if err != nil {
+		return errors.New("admission context capsule binding is invalid")
+	}
+	planRelative := binding.InputDirectory + "/" + binding.RunID + "/plan.md"
+	spec := admissionCapsuleSpecForIdentity(binding.RepositoryIdentity, request, planRelative)
+	expectedCapsule := contextcapsule.Capsule{
+		PolicyVersion: spec.PolicyVersion, Project: spec.Project, Plan: spec.Plan, RoadmapPhase: spec.RoadmapPhase,
+		ExecutionPack: spec.ExecutionPack, Task: spec.Task, OperationContext: spec.OperationContext, PhaseAuthority: spec.PhaseAuthority,
+		Repository: spec.Repository, BaseSHA: spec.BaseSHA, Invariants: spec.Invariants, NonGoals: spec.NonGoals,
+		PredecessorOutcomes: spec.PredecessorOutcomes,
+		Sources:             []contextcapsule.Source{{Path: planRelative, SHA256: digest(plan)}}, CapsuleSHA256: capsule.CapsuleSHA256,
+	}
+	if !reflect.DeepEqual(capsule, expectedCapsule) {
+		return errors.New("admission context capsule binding differs")
+	}
+	manifestData, found, err := readRegularAt(runFD, "manifest.json", MaxManifestTemplateBytes)
+	if err != nil || !found || digest(manifestData) != binding.AuthorityDigest {
+		return errors.New("admission manifest binding is invalid")
+	}
+	var manifest authority.Manifest
+	if strictJSON(manifestData, &manifest) != nil || manifest.RunID != binding.RunID ||
+		manifest.Repository.Path != binding.RepositoryPath || manifest.Repository.Identity != binding.RepositoryIdentity ||
+		manifest.Repository.StartSHA != request.RepositoryBaseSHA || manifest.Plan.Path != binding.PlanPath ||
+		manifest.Plan.SHA256 != digest(plan) || manifest.ContextCapsule == nil ||
+		manifest.ContextCapsule.Path != binding.ContextCapsulePath || manifest.ContextCapsule.SHA256 != digest(capsuleData) {
+		return errors.New("admission manifest content is invalid")
+	}
+	workflowConfiguration, err := readProtectedFile(binding.WorkflowAuthorityConfigPath, workflowauthoritypg.MaxConfigBytes)
+	if err != nil || digest(workflowConfiguration) != binding.WorkflowAuthorityConfigSHA256 ||
+		workflowauthoritypg.ValidateConfigFile(binding.WorkflowAuthorityConfigPath) != nil {
+		return errors.New("workflow authority configuration binding is invalid")
+	}
+	cgroupFD, err := openAbsoluteDirectory(binding.CgroupRoot, false)
+	if err != nil {
+		return err
+	}
+	return syscall.Close(cgroupFD)
+}
+
+func (c *Controller) readAdmissionReceipt(expected AdmissionReceiptV1) (AdmissionReceiptV1, bool, error) {
+	name := receiptKey(expected.Principal.PrincipalID, expected.RequestID) + ".json"
+	data, found, err := readRegularAt(c.admissionsFD, name, MaxReceiptBytes)
+	if err != nil {
+		return AdmissionReceiptV1{}, false, serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	if !found {
+		return AdmissionReceiptV1{}, false, nil
+	}
+	var observed AdmissionReceiptV1
+	if strictJSON(data, &observed) != nil || validateReceipt(observed, name) != nil {
+		return AdmissionReceiptV1{}, false, serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	canonical, _ := json.Marshal(observed)
+	if !bytes.Equal(data, canonical) {
+		return AdmissionReceiptV1{}, false, serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	if observed.Principal != expected.Principal || observed.RequestID != expected.RequestID ||
+		observed.CanonicalRequestSHA256 != expected.CanonicalRequestSHA256 || observed.RunID != expected.RunID || observed.ProfileID != expected.ProfileID {
+		return AdmissionReceiptV1{}, false, serviceapi.ErrRequestIDConflict
+	}
+	return observed, true, nil
+}
+
+func (c *Controller) createOrVerifyReceipt(ctx context.Context, expected AdmissionReceiptV1) (AdmissionReceiptV1, error) {
+	lockFD, err := syscall.Openat(c.admissionsFD, ".lock", syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return AdmissionReceiptV1{}, serviceapi.ErrAdmissionUnavailable
+	}
+	defer syscall.Close(lockFD)
+	if err := boundedFlock(ctx, lockFD, ReceiptLockTimeout); err != nil {
+		return AdmissionReceiptV1{}, serviceapi.ErrAdmissionUnavailable
+	}
+	defer syscall.Flock(lockFD, syscall.LOCK_UN)
+	observed, found, err := c.readAdmissionReceipt(expected)
+	if err != nil {
+		return AdmissionReceiptV1{}, err
+	}
+	if found {
+		return observed, nil
+	}
+	name := receiptKey(expected.Principal.PrincipalID, expected.RequestID) + ".json"
+	data, err := json.Marshal(expected)
+	if err != nil || len(data) > MaxReceiptBytes {
+		return AdmissionReceiptV1{}, serviceapi.ErrUnsafeAdmissionMaterialization
+	}
+	if err := writeNewAtomicAt(c.admissionsFD, name, data); err != nil {
+		return AdmissionReceiptV1{}, serviceapi.ErrAdmissionUnavailable
+	}
+	return expected, nil
+}
+
 func validateReceipt(receipt AdmissionReceiptV1, name string) error {
 	if receipt.Kind != "AdmissionReceiptV1" || receipt.SchemaVersion != 1 ||
 		serviceapi.ValidatePrincipalID(receipt.Principal.PrincipalID) != nil || serviceapi.ValidatePrincipalID(receipt.RequestID) != nil ||
 		runtimecatalog.ValidateIdentifier(receipt.RunID) != nil || runtimecatalog.ValidateIdentifier(receipt.ProfileID) != nil ||
 		receipt.RunID != DeriveRunID(receipt.Principal.PrincipalID, receipt.RequestID) ||
-		name != receiptKey(receipt.Principal.PrincipalID, receipt.RequestID)+".json" || !lowerSHA256(receipt.CanonicalRequestSHA256) {
+		name != receiptKey(receipt.Principal.PrincipalID, receipt.RequestID)+".json" || !lowerSHA256(receipt.CanonicalRequestSHA256) ||
+		!lowerSHA256(receipt.ProfileBindingSHA256) {
 		return errors.New("invalid admission receipt")
 	}
 	switch receipt.Principal.PrincipalType {
@@ -463,76 +714,6 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, request 
 	return filepath.Join(runDirectory, "manifest.json"), bindingFor(profile, runID, manifestData), nil
 }
 
-func existingRunBinding(profile loadedProfile, principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1, runID string) (runBinding, error) {
-	for _, root := range []string{profile.ledgerRoot, profile.evidenceRoot} {
-		fd, err := openAbsoluteDirectory(root, false)
-		if err != nil {
-			return runBinding{}, err
-		}
-		err = validatePrivateDirectoryFD(fd)
-		syscall.Close(fd)
-		if err != nil {
-			return runBinding{}, err
-		}
-	}
-	repositoryFD, err := openAbsoluteDirectory(profile.configuration.RepositoryPath, false)
-	if err != nil {
-		return runBinding{}, err
-	}
-	defer syscall.Close(repositoryFD)
-	inputFD, err := openRelativeDirectory(repositoryFD, profile.configuration.InputDirectory, false)
-	if err != nil {
-		return runBinding{}, err
-	}
-	defer syscall.Close(inputFD)
-	runFD, err := openChildDirectory(inputFD, runID, false)
-	if err != nil {
-		return runBinding{}, err
-	}
-	defer syscall.Close(runFD)
-	if err := validatePrivateDirectoryFD(runFD); err != nil {
-		return runBinding{}, err
-	}
-	runDirectory := filepath.Join(profile.inputPath, runID)
-	planPath := filepath.Join(runDirectory, "plan.md")
-	planRelative := profile.configuration.InputDirectory + "/" + runID + "/plan.md"
-	plan := admissionPlan(principal, request)
-	observedPlan, found, err := readRegularAt(runFD, "plan.md", MaxManifestTemplateBytes)
-	if err != nil || !found || !bytes.Equal(observedPlan, plan) {
-		return runBinding{}, errors.New("existing admission plan is invalid")
-	}
-	capsuleData, found, err := readRegularAt(runFD, "context-capsule.json", MaxManifestTemplateBytes)
-	if err != nil || !found {
-		return runBinding{}, errors.New("existing admission context capsule is invalid")
-	}
-	capsule, err := contextcapsule.Parse(capsuleData)
-	if err != nil {
-		return runBinding{}, err
-	}
-	spec := admissionCapsuleSpec(profile, request, planRelative)
-	expectedCapsule := contextcapsule.Capsule{
-		PolicyVersion: spec.PolicyVersion, Project: spec.Project, Plan: spec.Plan, RoadmapPhase: spec.RoadmapPhase,
-		ExecutionPack: spec.ExecutionPack, Task: spec.Task, OperationContext: spec.OperationContext, PhaseAuthority: spec.PhaseAuthority,
-		Repository: spec.Repository, BaseSHA: spec.BaseSHA, Invariants: spec.Invariants, NonGoals: spec.NonGoals,
-		PredecessorOutcomes: spec.PredecessorOutcomes,
-		Sources:             []contextcapsule.Source{{Path: planRelative, SHA256: digest(plan)}},
-		CapsuleSHA256:       capsule.CapsuleSHA256,
-	}
-	if !reflect.DeepEqual(capsule, expectedCapsule) {
-		return runBinding{}, errors.New("existing admission context capsule differs")
-	}
-	capsulePath := filepath.Join(runDirectory, "context-capsule.json")
-	manifestData, err := derivedManifestData(profile, request, runID, planPath, capsulePath, plan, capsuleData)
-	if err != nil {
-		return runBinding{}, err
-	}
-	observedManifest, found, err := readRegularAt(runFD, "manifest.json", MaxManifestTemplateBytes)
-	if err != nil || !found || !bytes.Equal(observedManifest, manifestData) {
-		return runBinding{}, errors.New("existing admission manifest is invalid")
-	}
-	return bindingFor(profile, runID, manifestData), nil
-}
-
 func admissionPlan(principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1) []byte {
 	return []byte(fmt.Sprintf("# Product run admission\n\n- Request ID: `%s`\n- Product authorization ID: `%s`\n- Product task ID: `%s`\n- Product version ID: `%s`\n- Product manifest SHA-256: `%s`\n- Repository base SHA: `%s`\n- Authenticated principal: `%s` (`%s`)\n- Delegated actor: `%s` (`%s`)\n\n## Task\n\n%s\n",
 		request.RequestID, request.ProductAuthorizationID, request.ProductTaskID, request.ProductVersionID,
@@ -541,6 +722,10 @@ func admissionPlan(principal serviceapi.Principal, request serviceapi.RunAdmissi
 }
 
 func admissionCapsuleSpec(profile loadedProfile, request serviceapi.RunAdmissionRequestV1, planRelative string) contextcapsule.Spec {
+	return admissionCapsuleSpecForIdentity(profile.configuration.RepositoryIdentity, request, planRelative)
+}
+
+func admissionCapsuleSpecForIdentity(repositoryIdentity string, request serviceapi.RunAdmissionRequestV1, planRelative string) contextcapsule.Spec {
 	return contextcapsule.Spec{
 		PolicyVersion: contextcapsule.PolicyVersionV2,
 		Project:       request.ProductAuthorizationID, Plan: request.ProductTaskID,
@@ -550,7 +735,7 @@ func admissionCapsuleSpec(profile loadedProfile, request serviceapi.RunAdmission
 			OwnedScope:       []string{"Product task " + request.ProductTaskID},
 			BlockingCriteria: []string{"Current owned-scope Critical or Major findings."},
 		},
-		Repository: profile.configuration.RepositoryIdentity, BaseSHA: request.RepositoryBaseSHA,
+		Repository: repositoryIdentity, BaseSHA: request.RepositoryBaseSHA,
 		Invariants:          []string{"Preserve the admitted product and repository binding."},
 		NonGoals:            []string{"Do not alter controller-owned execution policy."},
 		PredecessorOutcomes: []contextcapsule.Outcome{}, Sources: []string{planRelative},

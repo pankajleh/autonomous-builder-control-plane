@@ -23,6 +23,7 @@ const (
 	MaxManifestTemplateBytes = 256 << 10
 	MaxProfiles              = 32
 	MaxReceiptBytes          = 16 << 10
+	MaxBindingBytes          = 32 << 10
 	ReceiptLockTimeout       = 2 * time.Second
 )
 
@@ -63,17 +64,48 @@ type AdmissionReceiptV1 struct {
 	CanonicalRequestSHA256 string               `json:"canonical_request_sha256"`
 	RunID                  string               `json:"run_id"`
 	ProfileID              string               `json:"profile_id"`
+	ProfileBindingSHA256   string               `json:"profile_binding_sha256"`
 	CreatedAt              string               `json:"created_at"`
 }
 
+// AdmissionBindingV1 freezes the private controller-owned materialization and
+// launch binding selected for one durable receipt. It is never service-visible.
+type AdmissionBindingV1 struct {
+	Kind                          string `json:"kind"`
+	SchemaVersion                 int    `json:"schema_version"`
+	PrincipalID                   string `json:"principal_id"`
+	RequestID                     string `json:"request_id"`
+	CanonicalRequestSHA256        string `json:"canonical_request_sha256"`
+	RunID                         string `json:"run_id"`
+	ProfileID                     string `json:"profile_id"`
+	ProfileBindingSHA256          string `json:"profile_binding_sha256"`
+	RepositoryPath                string `json:"repository_path"`
+	RepositoryIdentity            string `json:"repository_identity"`
+	RepositoryIdentityDigest      string `json:"repository_identity_digest"`
+	AuthorityDigest               string `json:"authority_digest"`
+	InputDirectory                string `json:"input_directory"`
+	PlanPath                      string `json:"plan_path"`
+	ContextCapsulePath            string `json:"context_capsule_path"`
+	ManifestPath                  string `json:"manifest_path"`
+	LedgerRoot                    string `json:"ledger_root"`
+	CanonicalLedgerPath           string `json:"canonical_ledger_path"`
+	EvidenceRoot                  string `json:"evidence_root"`
+	CanonicalEvidenceRoot         string `json:"canonical_evidence_root"`
+	CgroupRoot                    string `json:"cgroup_root"`
+	WorkflowAuthorityConfigPath   string `json:"workflow_authority_config_path"`
+	WorkflowAuthorityConfigSHA256 string `json:"workflow_authority_config_sha256"`
+}
+
 type loadedProfile struct {
-	configuration               ProfileV1
-	template                    authority.Manifest
-	inputPath                   string
-	ledgerRoot                  string
-	evidenceRoot                string
-	cgroupRoot                  string
-	workflowAuthorityConfigPath string
+	configuration                 ProfileV1
+	template                      authority.Manifest
+	inputPath                     string
+	ledgerRoot                    string
+	evidenceRoot                  string
+	cgroupRoot                    string
+	workflowAuthorityConfigPath   string
+	workflowAuthorityConfigSHA256 string
+	profileBindingSHA256          string
 }
 
 type Controller struct {

@@ -450,6 +450,35 @@ func TestAdmissionProfileRequiresCanonicalProtectedWorkflowAuthorityConfig(t *te
 	}
 }
 
+func TestAdmissionProfileRejectsRepositoryIdentityThatIsNotCanonicalOrigin(t *testing.T) {
+	root, repository, head := makeRepository(t, true)
+	profilePath, catalog := writeAdmissionConfiguration(t, root, repository, head)
+	git(t, repository, "remote", "add", "upstream", "https://example.test/example/other.git")
+	var profiles ProfileFileV1
+	data, err := os.ReadFile(profilePath)
+	if err != nil || json.Unmarshal(data, &profiles) != nil {
+		t.Fatalf("read profile: %v", err)
+	}
+	profiles.Profiles[0].RepositoryIdentity = "example/other"
+	writeProtectedJSON(t, profilePath, profiles)
+	var template authority.Manifest
+	data, err = os.ReadFile(profiles.Profiles[0].ManifestTemplatePath)
+	if err != nil || json.Unmarshal(data, &template) != nil {
+		t.Fatalf("read template: %v", err)
+	}
+	template.Repository.Remotes["upstream"] = "https://example.test/example/other.git"
+	writeProtectedJSON(t, profiles.Profiles[0].ManifestTemplatePath, template)
+	service := filepath.Join(root, "service")
+	if err := os.Mkdir(service, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := NewController(Config{ProfileFile: profilePath, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog})
+	if err == nil {
+		controller.Close()
+		t.Fatal("non-origin repository identity was accepted")
+	}
+}
+
 func TestAdmissionCreateOrVerifyRejectsMaterialDrift(t *testing.T) {
 	fixture := newAdmissionFixture(t, true)
 	response, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
@@ -468,6 +497,21 @@ func TestAdmissionCreateOrVerifyRejectsMaterialDrift(t *testing.T) {
 	}
 	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrUnsafeAdmissionMaterialization) {
 		t.Fatalf("drifted material retry = %v", err)
+	}
+}
+
+func TestAdmissionRegisteredReplayRejectsFrozenMaterialDrift(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	response, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerFixtureRun(t, fixture, response.RunID)
+	if err := os.WriteFile(filepath.Join(fixture.input, response.RunID, "plan.md"), []byte("drift"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrUnsafeAdmissionMaterialization) {
+		t.Fatalf("registered replay with drifted material = %v", err)
 	}
 }
 
@@ -493,6 +537,44 @@ func TestAdmissionPersistsReceiptBeforeBaseMismatch(t *testing.T) {
 	defer fixture.mu.Unlock()
 	if len(fixture.starts) != 0 {
 		t.Fatalf("base mismatch launched %d processes", len(fixture.starts))
+	}
+}
+
+func TestAdmissionUnboundReceiptDoesNotAdoptChangedPrivateProfile(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	request := fixture.request
+	request.RepositoryBaseSHA = strings.Repeat("b", 40)
+	if request.RepositoryBaseSHA == fixture.request.RepositoryBaseSHA {
+		request.RepositoryBaseSHA = strings.Repeat("c", 40)
+	}
+	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, request); !errors.Is(err, serviceapi.ErrRepositoryBaseMismatch) {
+		t.Fatalf("base mismatch = %v", err)
+	}
+	root := filepath.Dir(filepath.Dir(fixture.input))
+	templatePath := filepath.Join(root, "manifest-template.json")
+	data, err := os.ReadFile(templatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var template authority.Manifest
+	if err := json.Unmarshal(data, &template); err != nil {
+		t.Fatal(err)
+	}
+	template.Acceptance[0].Name = "changed-after-receipt"
+	writeProtectedJSON(t, templatePath, template)
+	if err := fixture.controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewController(Config{
+		ProfileFile: filepath.Join(root, "admission-profiles.json"), ServiceRoot: fixture.service,
+		Executable: testExecutable(t), Catalog: fixture.catalog,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if _, err := restarted.AdmitRun(context.Background(), fixture.principal, request); !errors.Is(err, serviceapi.ErrReconciliationRequired) {
+		t.Fatalf("changed-profile unbound replay = %v", err)
 	}
 }
 
@@ -591,6 +673,125 @@ func TestAdmissionRegisteredExactReplaySurvivesRepositoryHeadAdvance(t *testing.
 	replayed, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
 	if err != nil || replayed != response {
 		t.Fatalf("registered exact replay after HEAD advance = %+v, %v", replayed, err)
+	}
+}
+
+func TestAdmissionRegisteredExactReplaySurvivesPrivateProfileChange(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	defer fixture.closeLocks()
+	response, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerFixtureRun(t, fixture, response.RunID)
+
+	root := filepath.Dir(filepath.Dir(fixture.input))
+	templatePath := filepath.Join(root, "manifest-template.json")
+	data, err := os.ReadFile(templatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var template authority.Manifest
+	if err := json.Unmarshal(data, &template); err != nil {
+		t.Fatal(err)
+	}
+	template.Acceptance[0].Name = "changed-after-admission"
+	writeProtectedJSON(t, templatePath, template)
+	if err := fixture.controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewController(Config{
+		ProfileFile: filepath.Join(root, "admission-profiles.json"), ServiceRoot: fixture.service,
+		Executable: testExecutable(t), Catalog: fixture.catalog,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+
+	replayed, err := restarted.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if err != nil || replayed != response {
+		t.Fatalf("registered exact replay after private profile change = %+v, %v", replayed, err)
+	}
+}
+
+func TestAdmissionRegisteredExactReplaySurvivesPrivateProfileRemoval(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	defer fixture.closeLocks()
+	response, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerFixtureRun(t, fixture, response.RunID)
+	root := filepath.Dir(filepath.Dir(fixture.input))
+	profilePath := filepath.Join(root, "admission-profiles.json")
+	data, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profiles ProfileFileV1
+	if err := json.Unmarshal(data, &profiles); err != nil {
+		t.Fatal(err)
+	}
+	profiles.Profiles[0].ProfileID = "replacement"
+	writeProtectedJSON(t, profilePath, profiles)
+	if err := fixture.controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewController(Config{ProfileFile: profilePath, ServiceRoot: fixture.service, Executable: testExecutable(t), Catalog: fixture.catalog})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	replayed, err := restarted.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if err != nil || replayed != response {
+		t.Fatalf("registered exact replay after private profile removal = %+v, %v", replayed, err)
+	}
+}
+
+func TestAdmissionBoundRelaunchSurvivesPrivateProfileChange(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	response, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.mu.Lock()
+	lock := fixture.locks[0]
+	fixture.mu.Unlock()
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Dir(filepath.Dir(fixture.input))
+	templatePath := filepath.Join(root, "manifest-template.json")
+	data, err := os.ReadFile(templatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var template authority.Manifest
+	if err := json.Unmarshal(data, &template); err != nil {
+		t.Fatal(err)
+	}
+	template.Acceptance[0].Name = "changed-after-bound-launch"
+	writeProtectedJSON(t, templatePath, template)
+	if err := fixture.controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewController(Config{
+		ProfileFile: filepath.Join(root, "admission-profiles.json"), ServiceRoot: fixture.service,
+		Executable: testExecutable(t), Catalog: fixture.catalog,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	starts := 0
+	restarted.start = func(string, []string, *os.File) error {
+		starts++
+		return nil
+	}
+	replayed, err := restarted.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if err != nil || replayed != response || starts != 1 {
+		t.Fatalf("bound relaunch after private profile change = %+v, %v, starts=%d", replayed, err, starts)
 	}
 }
 
