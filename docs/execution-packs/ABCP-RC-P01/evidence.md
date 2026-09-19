@@ -26,6 +26,7 @@ All Repo C hashes above were recomputed from exact commit `b5de18b79765be089317d
 - Final bounded PRG correction executable SHA: `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7`
 - Prior evidence-only successor SHA: `e895e8b7010176c8aa45d6f836912344b1be1865`
 - Bounded PRG evidence-only successor SHA: `6b08ac4eb09947421ddbba5884086cf28e25681a`
+- Final bounded PRG evidence-only successor SHA: `368d1cacbf8933cb044ae63db42f2f063221d238`
 - Draft PR: `#22`, `https://github.com/pankajleh/autonomous-builder-control-plane/pull/22`
 - PR base: `main`
 - PR state at evidence preparation: open Draft, merge state `CLEAN`
@@ -35,7 +36,7 @@ Commit `e895e8b7010176c8aa45d6f836912344b1be1865` is the first evidence-only suc
 
 Commit `8a4ef3cd0a4a450cd924666682c850278fe9ace5` is the exact executable correction tested for the later user-authorized bounded PRG review. Evidence-only successor `6b08ac4eb09947421ddbba5884086cf28e25681a` records those results and changes no executable behavior. The follow-up identity-only commit binds that now-known evidence SHA and likewise changes no executable behavior.
 
-Commit `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` is the exact executable correction tested for the second and final bounded PRG verification review. The evidence-only successor containing this update changes no executable behavior; its now-known identity is recorded by a follow-up identity-only commit.
+Commit `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` is the exact executable correction tested for the second and final bounded PRG verification review. Evidence-only successor `368d1cacbf8933cb044ae63db42f2f063221d238` records those results and changes no executable behavior. This follow-up identity-only commit binds that now-known evidence SHA and likewise changes no executable behavior.
 
 ## Implementation summary
 
@@ -179,6 +180,7 @@ All focused, focused-race, broad, broad-race, vet, cross-platform build, scope, 
 - Draft PR targets `main`: PASS (`#22`, exact required title, Draft).
 - Executable SHA named by evidence: PASS (`38eda0c3ce489dbe5e51ad297ac3374d98fadcd7`).
 - Evidence-only successor explicitly distinguished: PASS (`6b08ac4eb09947421ddbba5884086cf28e25681a`); it changes no executable behavior, and the follow-up identity-only commit only binds that SHA.
+- Final evidence-only successor explicitly distinguished: PASS (`368d1cacbf8933cb044ae63db42f2f063221d238`); it changes no executable behavior, and this follow-up identity-only commit only binds that SHA.
 - Unresolved scope-crossing finding: none.
 - Merge: **NOT DONE — HUMAN GATE**.
 
