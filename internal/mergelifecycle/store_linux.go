@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,7 +19,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
 
@@ -329,52 +327,6 @@ func (s *durableStore) openAttempt(id string) (*attemptStore, error) {
 		lock: lock, rootInfo: rootInfo, recordsInfo: recordsInfo, temporaryInfo: temporaryInfo}
 	if _, err := attempt.inventory(); err != nil {
 		attempt.close()
-		return nil, err
-	}
-	return attempt, nil
-}
-
-// openExistingAttemptForDrainV1 opens no path and creates no control file. The
-// caller must hold the store lock, which freezes the complete attempt set.
-func (s *durableStore) openExistingAttemptForDrainV1(id string) (*attemptStore, error) {
-	if s == nil || s.rootDir == nil || !validDigest(id) {
-		return nil, errors.New("valid existing attempt identity and open store are required")
-	}
-	if err := s.checkRoot(); err != nil {
-		return nil, err
-	}
-	root := filepath.Join(s.root, "attempts", id)
-	records := filepath.Join(root, "records")
-	temporary := filepath.Join(root, "tmp")
-	if err := verifyDirectory(root, 0o700); err != nil {
-		return nil, err
-	}
-	if err := verifyDirectory(records, 0o700); err != nil {
-		return nil, err
-	}
-	if err := verifyDirectory(temporary, 0o700); err != nil {
-		return nil, err
-	}
-	lock, err := openNoFollow(filepath.Join(root, "attempt.lock"), false, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	if err := flock(lock, true); err != nil {
-		_ = lock.Close()
-		return nil, errors.New("merge attempt is already active")
-	}
-	rootInfo, rootErr := os.Lstat(root)
-	recordsInfo, recordsErr := os.Lstat(records)
-	temporaryInfo, temporaryErr := os.Lstat(temporary)
-	if err := errors.Join(rootErr, recordsErr, temporaryErr); err != nil {
-		_ = funlock(lock)
-		_ = lock.Close()
-		return nil, err
-	}
-	attempt := &attemptStore{store: s, id: id, root: root, records: records, temporary: temporary,
-		lock: lock, rootInfo: rootInfo, recordsInfo: recordsInfo, temporaryInfo: temporaryInfo}
-	if _, err := attempt.inventory(); err != nil {
-		_ = attempt.close()
 		return nil, err
 	}
 	return attempt, nil
@@ -970,24 +922,6 @@ func (a *attemptStore) currentCounters() (Counters, error) {
 	return readCounters(file, a.id, a.store.limits)
 }
 
-func (a *attemptStore) currentCountersForDrainV1() (Counters, error) {
-	if a == nil || a.closed {
-		return Counters{}, errors.New("attempt store is closed")
-	}
-	if err := a.checkIdentity(); err != nil {
-		return Counters{}, err
-	}
-	file, err := openNoFollow(filepath.Join(a.root, "counters.jsonl"), false, 0o600)
-	if errors.Is(err, os.ErrNotExist) {
-		return Counters{Schema: "merge-counters-v1"}, nil
-	}
-	if err != nil {
-		return Counters{}, err
-	}
-	defer file.Close()
-	return readCounters(file, a.id, a.store.limits)
-}
-
 func (a *attemptStore) providerBudget() (ProviderBudgetV1, error) {
 	counters, err := a.currentCounters()
 	if err != nil {
@@ -1304,102 +1238,6 @@ func (s *durableStore) inventoryGlobal() error {
 		return errors.New("global merge storage budget exhausted")
 	}
 	return nil
-}
-
-// predecessorDrainSnapshotV1 validates the exact retained merge attempt
-// inventory while the caller holds the exclusive predecessor fence. Any
-// admitted target request must have decisive APPLIED/NOT_APPLIED evidence and
-// no provider-accounting continuation may remain pending.
-func (s *durableStore) predecessorDrainSnapshotV1() (snapshotSHA256 string, resultErr error) {
-	if s == nil {
-		return "", errors.New("V3_DRAIN_REQUIRED: merge state store is required")
-	}
-	if err := flock(s.lock, true); err != nil {
-		return "", fmt.Errorf("V3_DRAIN_REQUIRED: merge store operation remains active: %w", err)
-	}
-	defer func() { resultErr = errors.Join(resultErr, funlock(s.lock)) }()
-	if err := s.inventoryGlobal(); err != nil {
-		return "", fmt.Errorf("V3_DRAIN_REQUIRED: merge store inventory: %w", err)
-	}
-	entries, err := os.ReadDir(filepath.Join(s.root, "attempts"))
-	if err != nil {
-		return "", err
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	type drainedAttempt struct {
-		AttemptID        string                                    `json:"attempt_id"`
-		SubmissionSHA256 string                                    `json:"submission_sha256,omitempty"`
-		OutcomeSHA256    string                                    `json:"outcome_sha256,omitempty"`
-		Disposition      githublifecycle.ReconciliationDisposition `json:"disposition,omitempty"`
-	}
-	drained := make([]drainedAttempt, 0, len(entries))
-	for _, entry := range entries {
-		attempt, err := s.openExistingAttemptForDrainV1(entry.Name())
-		if err != nil {
-			return "", fmt.Errorf("V3_DRAIN_REQUIRED: open merge attempt %s: %w", entry.Name(), err)
-		}
-		record := drainedAttempt{AttemptID: entry.Name()}
-		counters, counterErr := attempt.currentCountersForDrainV1()
-		if counterErr != nil || counters.ProviderAccountingPending {
-			_ = attempt.close()
-			return "", errors.Join(errors.New("V3_DRAIN_REQUIRED: merge provider accounting is unresolved"), counterErr)
-		}
-		submission, submitted, readErr := attempt.read("target-submission.json")
-		if readErr != nil {
-			_ = attempt.close()
-			return "", readErr
-		}
-		outcomeBytes, outcomeFound, readErr := attempt.read("target-outcome.json")
-		if readErr != nil {
-			_ = attempt.close()
-			return "", readErr
-		}
-		reconciliationBytes, reconciliationFound, readErr := attempt.read("target-reconciliation.json")
-		if readErr != nil {
-			_ = attempt.close()
-			return "", readErr
-		}
-		found := outcomeFound || reconciliationFound
-		if submitted {
-			record.SubmissionSHA256 = digest(submission)
-			if !found {
-				_ = attempt.close()
-				return "", errors.New("V3_DRAIN_REQUIRED: target submission has no terminal outcome or reconciliation")
-			}
-			if reconciliationFound {
-				// The per-attempt reconciliation file is the later, directly
-				// canonical target-outcome observation (the wrapper record is
-				// stored only in the global reconciliation channel).
-				outcomeBytes = reconciliationBytes
-			}
-			var outcome targetOutcomeRecordV1
-			if err := strictCanonical(outcomeBytes, &outcome); err != nil || outcome.Schema != "merge-target-outcome-v1" ||
-				(outcome.Disposition != githublifecycle.ReconciliationApplied && outcome.Disposition != githublifecycle.ReconciliationNotApplied) {
-				_ = attempt.close()
-				return "", errors.Join(errors.New("V3_DRAIN_REQUIRED: merge target outcome is unknown or malformed"), err)
-			}
-			record.OutcomeSHA256 = digest(outcomeBytes)
-			record.Disposition = outcome.Disposition
-		} else if found {
-			_ = attempt.close()
-			return "", errors.New("V3_DRAIN_REQUIRED: merge target outcome exists without a target submission")
-		}
-		if err := attempt.close(); err != nil {
-			return "", err
-		}
-		drained = append(drained, record)
-	}
-	snapshot := struct {
-		Kind          string           `json:"kind"`
-		SchemaVersion string           `json:"schema_version"`
-		Attempts      []drainedAttempt `json:"attempts"`
-		BarrierState  string           `json:"barrier_state"`
-	}{"PredecessorMergeDrainSnapshotV1", "predecessor-merge-drain-snapshot-v1", drained, "DRAINED"}
-	data, err := json.Marshal(snapshot)
-	if err != nil {
-		return "", err
-	}
-	return digest(data), nil
 }
 
 func (s *durableStore) validateStorageReservationsLocked(published map[string]storageReservationV1, temporaryFiles map[string]int, temporaryBytes map[string]int64) error {

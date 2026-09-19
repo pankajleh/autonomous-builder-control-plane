@@ -5,6 +5,7 @@ package run
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/acceptance"
@@ -26,6 +28,7 @@ import (
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
 )
 
@@ -33,7 +36,182 @@ const (
 	eventStateTransition     = "STATE_TRANSITION"
 	actorController          = "control-plane"
 	ralphexEnvironmentPolicy = "ralphex-env-v2"
+	runnerSnapshotCloseWait  = 2 * time.Second
 )
+
+const apiCancelEventDomain = "ep006-api-cancel-request-v1"
+
+// APICancelProvenanceV1 is the only controller provenance attached to a
+// service-caused CANCELLED transition.
+type APICancelProvenanceV1 struct {
+	OperationID  string
+	OwnerLeaseID string
+}
+
+type apiCancelCause struct{ provenance APICancelProvenanceV1 }
+
+func (c *apiCancelCause) Error() string { return "service API cancellation requested" }
+
+// NewAPICancelCause constructs the typed, generation-bound cancellation cause
+// used by the in-process owner watcher. It carries no caller-selected path,
+// process identity, or recovery authority.
+func NewAPICancelCause(operationID, ownerLeaseID string) error {
+	if runtimecatalog.ValidateIdentifier(operationID) != nil || !validLowerDigest(ownerLeaseID) {
+		return errors.New("invalid service API cancellation provenance")
+	}
+	return &apiCancelCause{provenance: APICancelProvenanceV1{OperationID: operationID, OwnerLeaseID: ownerLeaseID}}
+}
+
+func APICancelProvenance(ctx context.Context) (APICancelProvenanceV1, bool) {
+	if ctx == nil {
+		return APICancelProvenanceV1{}, false
+	}
+	var cause *apiCancelCause
+	if !errors.As(context.Cause(ctx), &cause) || cause == nil {
+		return APICancelProvenanceV1{}, false
+	}
+	return cause.provenance, true
+}
+
+func validLowerDigest(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && hex.EncodeToString(decoded) == value
+}
+
+type eventSnapshotter interface {
+	Snapshot() ([]byte, string, error)
+}
+
+type atomicTransitionEventAppender interface {
+	eventSnapshotter
+	AcquireRunTransition(string) (*ledger.RunTransitionLease, error)
+	AppendOrVerifyLeased(ledger.Event, *ledger.RunTransitionLease) error
+}
+
+// FinalizationHook freezes any external admission surface before Runner makes
+// a successful terminal selection. BeginClose must not wait for external work
+// to drain: Runner may still need the transition lease to append its selected
+// lifecycle edge.
+type FinalizationHook interface {
+	BeginClose(context.Context) error
+}
+
+// SnapshotCoordinator reserves one service-root-wide authoritative-snapshot
+// slot around a complete transition decision. Service-root runners configure
+// it before Run starts; standalone runners leave it unset.
+type SnapshotCoordinator interface {
+	WithSnapshot(context.Context, func() error) error
+}
+
+type apiCancellationSelected struct{ cause error }
+
+func (e *apiCancellationSelected) Error() string {
+	return "service API cancellation won transition selection"
+}
+func (e *apiCancellationSelected) Unwrap() error { return e.cause }
+
+func (r *Runner) cancellationPayload(ctx context.Context, base map[string]any) (map[string]any, error) {
+	provenance, api := APICancelProvenance(ctx)
+	if !api {
+		return base, nil
+	}
+	requestEventID, err := r.proveAPICancelRequest(provenance)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]any, len(base)+3)
+	for key, value := range base {
+		result[key] = value
+	}
+	result["operation_id"] = provenance.OperationID
+	result["owner_lease_id"] = provenance.OwnerLeaseID
+	result["request_event_id"] = requestEventID
+	return result, nil
+}
+
+func (r *Runner) proveAPICancelRequest(provenance APICancelProvenanceV1) (string, error) {
+	snapshotter, ok := r.events.(eventSnapshotter)
+	if !ok {
+		return "", errors.New("durable API cancellation request proof is unavailable")
+	}
+	data, _, err := snapshotter.Snapshot()
+	if err != nil || len(data) == 0 || data[len(data)-1] != '\n' {
+		return "", errors.Join(errors.New("durable API cancellation request proof is unavailable"), err)
+	}
+	sum := sha256.Sum256([]byte(apiCancelEventDomain + "\x00" + provenance.OperationID))
+	expectedID := hex.EncodeToString(sum[:])
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 4096), 256<<10)
+	found := false
+	for scanner.Scan() {
+		var event ledger.Event
+		if json.Unmarshal(scanner.Bytes(), &event) != nil || event.Validate() != nil {
+			return "", errors.New("durable API cancellation request proof is invalid")
+		}
+		if event.EventID != expectedID {
+			continue
+		}
+		if found || !r.validAPICancelRequestEvent(event, provenance) {
+			return "", errors.New("durable API cancellation request proof conflicts")
+		}
+		found = true
+	}
+	if scanner.Err() != nil || !found {
+		return "", errors.Join(fmt.Errorf("durable API cancellation request event is absent"), scanner.Err())
+	}
+	return expectedID, nil
+}
+
+func (r *Runner) validAPICancelRequestEvent(event ledger.Event, provenance APICancelProvenanceV1) bool {
+	if event.SchemaVersion != ledger.CurrentSchemaVersion || event.RunID != r.governed.RunID() || event.AttemptID != r.provenance.AttemptID ||
+		event.ProjectID != r.provenance.ProjectID || event.PlanID != r.provenance.PlanID || event.TaskID != "" || event.AgentSessionID != "" ||
+		event.CorrelationID != "" || event.EventType != "API_CANCEL_REQUESTED" || event.StateFrom != "" || event.StateTo != "" ||
+		event.Actor != "control-plane" || event.Source != "service-action-watcher" || len(event.EvidenceRefs) != 0 ||
+		payloadNumber(event.Payload, "record_schema_version") != 1 || payloadText(event.Payload, "action") != "cancel" ||
+		payloadText(event.Payload, "operation_id") != provenance.OperationID || payloadText(event.Payload, "owner_lease_id") != provenance.OwnerLeaseID ||
+		runtimecatalog.ValidateIdentifier(payloadText(event.Payload, "principal_id")) != nil || runtimecatalog.ValidateIdentifier(payloadText(event.Payload, "request_id")) != nil ||
+		!validLowerDigest(payloadText(event.Payload, "request_sha256")) || payloadText(event.Payload, "expected_state") == "" ||
+		!validLowerDigest(payloadText(event.Payload, "expected_revision")) || runtimecatalog.ValidateIdentifier(payloadText(event.Payload, "admitted_state_transition_event_id")) != nil {
+		return false
+	}
+	principalType := payloadText(event.Payload, "principal_type")
+	if principalType != "service" && principalType != "user" && principalType != "operator" && principalType != "test" {
+		return false
+	}
+	_, delegatedID := event.Payload["delegated_actor_id"]
+	_, delegatedType := event.Payload["delegated_actor_type"]
+	if delegatedID != delegatedType {
+		return false
+	}
+	wantFields := 12
+	if delegatedID {
+		wantFields = 14
+		actorType := payloadText(event.Payload, "delegated_actor_type")
+		if runtimecatalog.ValidateIdentifier(payloadText(event.Payload, "delegated_actor_id")) != nil || (actorType != "user" && actorType != "operator") {
+			return false
+		}
+	}
+	return len(event.Payload) == wantFields
+}
+
+func payloadText(payload map[string]any, key string) string {
+	value, _ := payload[key].(string)
+	return value
+}
+
+func payloadNumber(payload map[string]any, key string) int {
+	switch value := payload[key].(type) {
+	case float64:
+		return int(value)
+	case int:
+		return value
+	default:
+		return 0
+	}
+}
 
 // EventAppender is the durable, append-only operation required by a Runner.
 // ledger.JSONLLedger satisfies this interface.
@@ -106,6 +284,10 @@ type Runner struct {
 	processes     CommandRunner
 	controller    *governancev3.ControllerV1
 	parsedCapsule contextcapsule.Capsule
+	lifecycleMu   sync.Mutex
+	started       bool
+	finalization  FinalizationHook
+	snapshots     SnapshotCoordinator
 }
 
 // New constructs an EP-002 runner from validated authority and explicit
@@ -174,6 +356,43 @@ func newRunner(governed authority.Authority, provenance TransitionProvenance, ev
 	return &Runner{governed: governed, capsule: capsule, provenance: provenance, events: events, artifacts: artifacts, processes: processes, controller: controller, parsedCapsule: parsedCapsule}, nil
 }
 
+// SetFinalizationHook binds the service-owned admission freeze used by the
+// successful return edges. It must be configured before Run starts.
+func (r *Runner) SetFinalizationHook(hook FinalizationHook) error {
+	if r == nil || hook == nil {
+		return errors.New("finalization hook is required")
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.started {
+		return errors.New("runner has already started")
+	}
+	if r.finalization != nil {
+		return errors.New("finalization hook is already configured")
+	}
+	r.finalization = hook
+	return nil
+}
+
+// SetSnapshotCoordinator binds the service-root-wide snapshot authority used
+// by every transition-state reconstruction and API-cancellation proof. It must
+// be configured before Run starts.
+func (r *Runner) SetSnapshotCoordinator(coordinator SnapshotCoordinator) error {
+	if r == nil || coordinator == nil {
+		return errors.New("snapshot coordinator is required")
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.started {
+		return errors.New("runner has already started")
+	}
+	if r.snapshots != nil {
+		return errors.New("snapshot coordinator is already configured")
+	}
+	r.snapshots = coordinator
+	return nil
+}
+
 func autonomousDevelopmentCapsule(capsule contextcapsule.Capsule) bool {
 	if capsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
 		return true
@@ -196,11 +415,25 @@ func autonomousDevelopmentCapsule(capsule contextcapsule.Capsule) bool {
 // Run executes exactly one governed implementation and branch-acceptance
 // lifecycle. Process and acceptance failures are represented in Result;
 // errors indicate that the controller itself could not preserve governance.
-func (r *Runner) Run(ctx context.Context) (Result, error) {
-	var result Result
+func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if ctx == nil {
 		return result, errors.New("context is required")
 	}
+	r.lifecycleMu.Lock()
+	if r.started {
+		r.lifecycleMu.Unlock()
+		return result, errors.New("runner can execute only once")
+	}
+	r.started = true
+	r.lifecycleMu.Unlock()
+	defer func() {
+		var selected *apiCancellationSelected
+		if errors.As(runErr, &selected) {
+			result.State = domain.StateCancelled
+			result.FailureReason = selected.cause.Error()
+			runErr = nil
+		}
+	}()
 
 	authorityRef, err := r.artifacts.WriteBytes("authority.json", "validated-authority", r.governed.CanonicalJSON())
 	if err != nil {
@@ -215,11 +448,11 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	validation, err := validatePinnedIdentity(ctx, r.governed)
 	if err != nil {
 		if ctx.Err() != nil {
-			return r.cancel(result, domain.StateRunCreated, "authority-validator", err, []ledger.EvidenceRef{authorityRef})
+			return r.cancel(ctx, result, domain.StateRunCreated, "authority-validator", err, []ledger.EvidenceRef{authorityRef})
 		}
 		result.State = domain.StateFailed
 		result.FailureReason = err.Error()
-		if appendErr := r.transition(domain.StateRunCreated, domain.StateFailed, "authority-validator", map[string]any{"reason": err.Error()}, []ledger.EvidenceRef{authorityRef}); appendErr != nil {
+		if appendErr := r.transition(ctx, domain.StateRunCreated, domain.StateFailed, "authority-validator", map[string]any{"reason": err.Error()}, []ledger.EvidenceRef{authorityRef}); appendErr != nil {
 			return result, errors.Join(err, appendErr)
 		}
 		return result, fmt.Errorf("validate pinned authority: %w", err)
@@ -229,7 +462,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		return result, fmt.Errorf("publish authority validation evidence: %w", err)
 	}
 	result.ValidationEvidenceRef = validationRef
-	if err := r.transition(domain.StateRunCreated, domain.StateAuthorityValidated, "authority-validator", map[string]any{
+	if err := r.transition(ctx, domain.StateRunCreated, domain.StateAuthorityValidated, "authority-validator", map[string]any{
 		"authority_sha256": r.governed.SHA256(),
 	}, []ledger.EvidenceRef{authorityRef, validationRef}); err != nil {
 		return result, err
@@ -238,28 +471,28 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 
 	configDir, err := os.MkdirTemp("", "abcp-ralphex-config-")
 	if err != nil {
-		return r.fail(result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("create isolated Ralphex config directory: %w", err), nil)
+		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("create isolated Ralphex config directory: %w", err), nil)
 	}
 	defer os.RemoveAll(configDir)
 	invocation, err := r.invocation(configDir)
 	if err != nil {
-		return r.fail(result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
+		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
 	argv, err := invocation.Argv()
 	if err != nil {
-		return r.fail(result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
+		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
 	ralphexTimeout, err := time.ParseDuration(r.governed.Ralphex().Timeout)
 	if err != nil {
-		return r.fail(result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("parse governed Ralphex timeout: %w", err), nil)
+		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("parse governed Ralphex timeout: %w", err), nil)
 	}
-	if err := r.transition(domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner", map[string]any{
+	if err := r.transition(ctx, domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner", map[string]any{
 		"argv": argv, "timeout": r.governed.Ralphex().Timeout, "environment_policy": ralphexEnvironmentPolicy,
 	}, nil); err != nil {
 		return result, err
 	}
 	result.State = domain.StateExecutionStarting
-	if err := r.transition(domain.StateExecutionStarting, domain.StateImplementing, "ralphex-adapter", map[string]any{"argv": argv}, nil); err != nil {
+	if err := r.transition(ctx, domain.StateExecutionStarting, domain.StateImplementing, "ralphex-adapter", map[string]any{"argv": argv}, nil); err != nil {
 		return result, err
 	}
 	result.State = domain.StateImplementing
@@ -277,7 +510,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		admission, _ := r.governed.Governance()
 		reservation, err = r.controller.ReserveRalphexInvocationV1(r.parsedCapsule, admission.Operation, admission.Mutation, admission.LeaseSHA256)
 		if err != nil {
-			return r.fail(result, domain.StateImplementing, "governance-controller", err, nil)
+			return r.fail(ctx, result, domain.StateImplementing, "governance-controller", err, nil)
 		}
 	}
 	var process supervisor.Result
@@ -286,7 +519,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	if invocation.Bounds != nil {
 		contained, ok := r.processes.(ContainedCommandRunner)
 		if !ok {
-			return r.fail(result, domain.StateImplementing, "ralphex-adapter", errors.New("EXECUTION_BOUNDS_INVALID: Linux containment handoff is unavailable"), nil)
+			return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", errors.New("EXECUTION_BOUNDS_INVALID: Linux containment handoff is unavailable"), nil)
 		}
 		evidence, containedErr := ContainmentEvidenceV1{}, error(nil)
 		process, evidence, containedErr = contained.RunContained(ctx, command, ContainmentRequestV1{
@@ -312,7 +545,10 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	}
 	result.Ralphex = process
 	if processErr != nil {
-		return r.fail(result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
+		if _, api := APICancelProvenance(ctx); api {
+			return r.cancel(ctx, result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
+		}
+		return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
 	}
 	metadataRef, err := r.writeJSON("ralphex-process.json", "ralphex-process-metadata", struct {
 		Process           supervisor.Result      `json:"process"`
@@ -321,22 +557,24 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		Containment       *ContainmentEvidenceV1 `json:"containment,omitempty"`
 	}{Process: process, EnvironmentPolicy: ralphexEnvironmentPolicy, EvidenceRefs: processRefs(process), Containment: containment})
 	if err != nil {
-		return r.fail(result, domain.StateImplementing, "ralphex-adapter", err, processRefs(process))
+		return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", err, processRefs(process))
 	}
 	result.RalphexMetadataRef = metadataRef
 	implementationRefs := append(processRefs(process), metadataRef)
 
-	if process.Outcome != supervisor.OutcomeSucceeded {
+	_, apiCancelActive := APICancelProvenance(ctx)
+	if process.Outcome != supervisor.OutcomeSucceeded || apiCancelActive {
 		terminal := domain.StateFailed
-		if process.Outcome == supervisor.OutcomeCanceled {
+		if process.Outcome == supervisor.OutcomeCanceled || apiCancelActive {
 			terminal = domain.StateCancelled
 		}
 		reason := fmt.Sprintf("Ralphex ended with outcome %s", process.Outcome)
 		result.State = terminal
 		result.FailureReason = reason
-		if err := r.transition(domain.StateImplementing, terminal, "ralphex-adapter", map[string]any{
+		payload := map[string]any{
 			"outcome": process.Outcome, "exit_code": process.ExitCode, "signal": process.TerminatingSignal,
-		}, implementationRefs); err != nil {
+		}
+		if err := r.transition(ctx, domain.StateImplementing, terminal, "ralphex-adapter", payload, implementationRefs); err != nil {
 			return result, err
 		}
 		return result, nil
@@ -346,22 +584,26 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		if admission.Operation == contextcapsule.OperationImplementationReview && admission.Mutation {
 			candidateSHA, headErr := gitOutput(ctx, r.governed.Repository().Path, "rev-parse", "--verify", "HEAD^{commit}")
 			if headErr != nil {
-				return r.fail(result, domain.StateImplementing, "governance-controller", fmt.Errorf("resolve mutation result HEAD: %w", headErr), implementationRefs)
+				return r.fail(ctx, result, domain.StateImplementing, "governance-controller", fmt.Errorf("resolve mutation result HEAD: %w", headErr), implementationRefs)
 			}
 			receipt, receiptErr := r.controller.CompleteMutationReceiptV1(r.governed.Repository().Path, r.parsedCapsule, admission.LeaseSHA256, candidateSHA)
 			if receiptErr != nil {
-				return r.fail(result, domain.StateImplementing, "governance-controller", receiptErr, implementationRefs)
+				return r.fail(ctx, result, domain.StateImplementing, "governance-controller", receiptErr, implementationRefs)
 			}
 			receiptRef, writeErr := r.writeJSON("mutation-receipt.json", "mutation-receipt", receipt)
 			if writeErr != nil {
-				return r.fail(result, domain.StateImplementing, "governance-controller", writeErr, implementationRefs)
+				return r.fail(ctx, result, domain.StateImplementing, "governance-controller", writeErr, implementationRefs)
 			}
 			result.MutationReceiptRef = receiptRef
 			implementationRefs = append(implementationRefs, receiptRef)
 		}
 	}
 
-	if err := r.transition(domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter", map[string]any{
+	transition := r.transition
+	if invocation.Bounds != nil {
+		transition = r.finalTransition
+	}
+	if err := transition(ctx, domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter", map[string]any{
 		"outcome": process.Outcome, "exit_code": process.ExitCode,
 	}, implementationRefs); err != nil {
 		return result, err
@@ -375,18 +617,18 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	target, cleanup, err := r.prepareAcceptanceTarget(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
-			return r.cancel(result, domain.StateImplementationCompleted, "acceptance-controller", err, implementationRefs)
+			return r.cancel(ctx, result, domain.StateImplementationCompleted, "acceptance-controller", err, implementationRefs)
 		}
-		return r.fail(result, domain.StateImplementationCompleted, "acceptance-controller", err, implementationRefs)
+		return r.fail(ctx, result, domain.StateImplementationCompleted, "acceptance-controller", err, implementationRefs)
 	}
 	candidateRef, err := r.writeJSON("candidate-branch.json", "candidate-branch", target)
 	if err != nil {
 		cleanupErr := cleanup()
-		return r.fail(result, domain.StateImplementationCompleted, "acceptance-controller", errors.Join(err, cleanupErr), implementationRefs)
+		return r.fail(ctx, result, domain.StateImplementationCompleted, "acceptance-controller", errors.Join(err, cleanupErr), implementationRefs)
 	}
 	result.CandidateEvidenceRef = candidateRef
 	implementationRefs = append(implementationRefs, candidateRef)
-	if err := r.transition(domain.StateImplementationCompleted, domain.StateBranchAcceptancePending, "acceptance-controller", nil, implementationRefs); err != nil {
+	if err := r.transition(ctx, domain.StateImplementationCompleted, domain.StateBranchAcceptancePending, "acceptance-controller", nil, implementationRefs); err != nil {
 		return result, errors.Join(err, cleanup())
 	}
 	result.State = domain.StateBranchAcceptancePending
@@ -402,9 +644,10 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	if ctx.Err() != nil {
 		result.State = domain.StateCancelled
 		result.FailureReason = ctx.Err().Error()
-		if err := r.transition(domain.StateBranchAcceptancePending, domain.StateCancelled, "acceptance-controller", map[string]any{
+		payload := map[string]any{
 			"status": accepted.Status(), "reason": result.FailureReason,
-		}, acceptanceRefs); err != nil {
+		}
+		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateCancelled, "acceptance-controller", payload, acceptanceRefs); err != nil {
 			return result, errors.Join(acceptanceErr, err)
 		}
 		return result, cleanupErr
@@ -415,7 +658,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		if result.FailureReason == "" {
 			result.FailureReason = acceptanceErr.Error()
 		}
-		if err := r.transition(domain.StateBranchAcceptancePending, domain.StateValidationUnavailable, "acceptance-controller", map[string]any{
+		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateValidationUnavailable, "acceptance-controller", map[string]any{
 			"status": accepted.Status(), "reason": result.FailureReason,
 		}, acceptanceRefs); err != nil {
 			return result, errors.Join(acceptanceErr, err)
@@ -425,7 +668,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	if !accepted.Passed() {
 		result.State = domain.StateFailed
 		result.FailureReason = accepted.FailureReason()
-		if err := r.transition(domain.StateBranchAcceptancePending, domain.StateFailed, "acceptance-controller", map[string]any{
+		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateFailed, "acceptance-controller", map[string]any{
 			"status": accepted.Status(), "reason": result.FailureReason,
 		}, acceptanceRefs); err != nil {
 			return result, err
@@ -433,7 +676,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		return result, nil
 	}
 
-	if err := r.transition(domain.StateBranchAcceptancePending, domain.StateBranchAccepted, "acceptance-controller", map[string]any{
+	if err := r.finalTransition(ctx, domain.StateBranchAcceptancePending, domain.StateBranchAccepted, "acceptance-controller", map[string]any{
 		"status": accepted.Status(),
 	}, acceptanceRefs); err != nil {
 		return result, err
@@ -510,12 +753,88 @@ func (r *Runner) appendCreated(authorityRef ledger.EvidenceRef) error {
 	return nil
 }
 
-func (r *Runner) transition(from, to domain.State, source string, payload map[string]any, refs []ledger.EvidenceRef) error {
+func (r *Runner) transition(ctx context.Context, from, to domain.State, source string, payload map[string]any, refs []ledger.EvidenceRef) error {
+	return r.transitionWithFinalization(ctx, from, to, source, payload, refs, false)
+}
+
+func (r *Runner) finalTransition(ctx context.Context, from, to domain.State, source string, payload map[string]any, refs []ledger.EvidenceRef) error {
+	return r.transitionWithFinalization(ctx, from, to, source, payload, refs, true)
+}
+
+func (r *Runner) transitionWithFinalization(ctx context.Context, from, to domain.State, source string, payload map[string]any, refs []ledger.EvidenceRef, successfulReturn bool) (resultErr error) {
+	if ctx == nil {
+		return errors.New("transition context is required")
+	}
 	if !ep002State(to) {
 		return fmt.Errorf("EP-002 runner cannot transition to %s", to)
 	}
 	if err := domain.ValidateTransition(from, to); err != nil {
 		return fmt.Errorf("validate %s -> %s transition: %w", from, to, err)
+	}
+	r.lifecycleMu.Lock()
+	snapshots := r.snapshots
+	r.lifecycleMu.Unlock()
+	if snapshots != nil {
+		// Cancellation is part of the durable transition being selected, not a
+		// reason to abandon its authoritative reconstruction. Acquisition starts
+		// with the caller context; if cancellation wins before the operation is
+		// invoked, one bounded close-out attempt can still select the durable
+		// terminal edge. Acquiring before the transition lease preserves the
+		// service action lock order.
+		invoked := false
+		operation := func() error {
+			invoked = true
+			return r.transitionWithReservedSnapshot(ctx, from, to, source, payload, refs, successfulReturn)
+		}
+		if ctx.Err() == nil {
+			err := snapshots.WithSnapshot(ctx, operation)
+			if invoked || ctx.Err() == nil || (!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+				return err
+			}
+		}
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runnerSnapshotCloseWait)
+		defer cancel()
+		return snapshots.WithSnapshot(closeCtx, operation)
+	}
+	return r.transitionWithReservedSnapshot(ctx, from, to, source, payload, refs, successfulReturn)
+}
+
+func (r *Runner) transitionWithReservedSnapshot(ctx context.Context, from, to domain.State, source string, payload map[string]any, refs []ledger.EvidenceRef, successfulReturn bool) (resultErr error) {
+	atomic, ok := r.events.(atomicTransitionEventAppender)
+	if !ok {
+		return errors.New("atomic run-transition appender is required")
+	}
+	lease, err := atomic.AcquireRunTransition(r.governed.RunID())
+	if err != nil {
+		return fmt.Errorf("acquire %s transition selection: %w", to, err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, lease.Close()) }()
+	current, err := r.currentStateUnderTransitionLease(atomic)
+	if err != nil {
+		return err
+	}
+	if current != from {
+		return fmt.Errorf("run transition selection advanced from %s to %s", from, current)
+	}
+	selectedCancellation := false
+	if _, api := APICancelProvenance(ctx); api {
+		if to != domain.StateCancelled {
+			selectedCancellation = true
+			to = domain.StateCancelled
+			payload = map[string]any{"reason": context.Cause(ctx).Error()}
+			if err := domain.ValidateTransition(from, to); err != nil {
+				return fmt.Errorf("select API cancellation from %s: %w", from, err)
+			}
+		}
+		payload, err = r.cancellationPayload(ctx, payload)
+		if err != nil {
+			return err
+		}
+	}
+	if successfulReturn && !selectedCancellation && r.finalization != nil {
+		if err := r.finalization.BeginClose(ctx); err != nil {
+			return fmt.Errorf("freeze successful run finalization: %w", err)
+		}
 	}
 	event, err := ledger.NewEvent(r.governed.RunID(), eventStateTransition, actorController, source)
 	if err != nil {
@@ -526,10 +845,52 @@ func (r *Runner) transition(from, to domain.State, source string, payload map[st
 	r.applyTransitionProvenance(&event)
 	event.Payload = payload
 	event.EvidenceRefs = append([]ledger.EvidenceRef(nil), refs...)
-	if err := r.events.Append(event); err != nil {
+	if err := atomic.AppendOrVerifyLeased(event, lease); err != nil {
 		return fmt.Errorf("append %s transition: %w", to, err)
 	}
+	if selectedCancellation {
+		return &apiCancellationSelected{cause: context.Cause(ctx)}
+	}
 	return nil
+}
+
+func (r *Runner) currentStateUnderTransitionLease(snapshotter eventSnapshotter) (domain.State, error) {
+	data, _, err := snapshotter.Snapshot()
+	if err != nil || len(data) == 0 || data[len(data)-1] != '\n' {
+		return "", errors.Join(errors.New("atomic run-transition history is unavailable"), err)
+	}
+	current := domain.State("")
+	seen := make(map[string]struct{})
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 4096), 256<<10)
+	for scanner.Scan() {
+		var event ledger.Event
+		if json.Unmarshal(scanner.Bytes(), &event) != nil || event.Validate() != nil || event.RunID != r.governed.RunID() {
+			return "", errors.New("atomic run-transition history is invalid")
+		}
+		if _, duplicate := seen[event.EventID]; duplicate {
+			return "", errors.New("atomic run-transition history contains a duplicate event")
+		}
+		seen[event.EventID] = struct{}{}
+		if event.StateFrom == "" {
+			if event.EventType == string(domain.StateRunCreated) {
+				state, _ := event.Payload["state"].(string)
+				if current != "" || state != string(domain.StateRunCreated) {
+					return "", errors.New("atomic run-transition initial state is invalid")
+				}
+				current = domain.StateRunCreated
+			}
+			continue
+		}
+		if current == "" || event.StateFrom != current {
+			return "", errors.New("atomic run-transition chronology is invalid")
+		}
+		current = event.StateTo
+	}
+	if scanner.Err() != nil || current == "" {
+		return "", errors.Join(errors.New("atomic run-transition history is incomplete"), scanner.Err())
+	}
+	return current, nil
 }
 
 func (r *Runner) applyTransitionProvenance(event *ledger.Event) {
@@ -547,19 +908,19 @@ func validateTransitionProvenance(value TransitionProvenance) error {
 	return nil
 }
 
-func (r *Runner) fail(result Result, from domain.State, source string, cause error, refs []ledger.EvidenceRef) (Result, error) {
+func (r *Runner) fail(ctx context.Context, result Result, from domain.State, source string, cause error, refs []ledger.EvidenceRef) (Result, error) {
 	result.State = domain.StateFailed
 	result.FailureReason = cause.Error()
-	if err := r.transition(from, domain.StateFailed, source, map[string]any{"reason": cause.Error()}, refs); err != nil {
+	if err := r.transition(ctx, from, domain.StateFailed, source, map[string]any{"reason": cause.Error()}, refs); err != nil {
 		return result, errors.Join(cause, err)
 	}
 	return result, cause
 }
 
-func (r *Runner) cancel(result Result, from domain.State, source string, cause error, refs []ledger.EvidenceRef) (Result, error) {
+func (r *Runner) cancel(ctx context.Context, result Result, from domain.State, source string, cause error, refs []ledger.EvidenceRef) (Result, error) {
 	result.State = domain.StateCancelled
 	result.FailureReason = cause.Error()
-	if err := r.transition(from, domain.StateCancelled, source, map[string]any{"reason": cause.Error()}, refs); err != nil {
+	if err := r.transition(ctx, from, domain.StateCancelled, source, map[string]any{"reason": cause.Error()}, refs); err != nil {
 		return result, errors.Join(cause, err)
 	}
 	return result, nil

@@ -18,7 +18,6 @@ The system should minimize human intervention without removing human authority w
 8. **Cross-model review is risk-triggered.** Deterministic acceptance has higher priority than model diversity.
 9. **The dashboard is a view.** The event ledger is the source of truth.
 10. **Do not duplicate proven inner capabilities.** Keep the outer layer small and governance-focused.
-11. **Assurance before implementation.** Every code-bearing build freezes invariants, failure/threat model, proof obligations, and required smoke/integration/adversarial evidence before implementation authority. Final review verifies this model; it is not the primary discovery mechanism.
 
 ## 3. Logical components
 
@@ -107,7 +106,6 @@ Runs required commands independently from the coding agent.
 
 It owns:
 
-- proof-obligation/evidence-matrix execution and traceability;
 - command execution;
 - timeout;
 - exit code;
@@ -180,7 +178,7 @@ Actual merge may remain human-approved initially.
 
 ### 3.12 Risk / Assurance Policy
 
-`ASSURANCE_MODEL_AND_PROOF_OBLIGATION_POLICY.md` defines the mandatory assurance floor for every code-bearing ABCP build. Capsule A freezes the failure model, numbered proof obligations, required evidence classes, and critical smoke/integration journeys before implementation. The risk policy additionally determines whether native Ralphex review is sufficient or whether independent cross-model review is required.
+Determines whether native Ralphex review is sufficient or whether independent cross-model review is required.
 
 Likely triggers:
 
@@ -301,7 +299,7 @@ Implementation + native review complete.
 
 ### Level 3: controller branch acceptance
 
-The controller independently executes the exact A-frozen cells assigned to `C_BRANCH_ACCEPTANCE` for the unchanged candidate and validates required predecessor B evidence. Required branch-stage deterministic commands, smoke/integration journeys, adversarial/failure evidence, and traceability are captured. Integration, post-merge, and production cells remain owned by Levels 4–6 and are bound to their own exact result/deployment identities. Missing required evidence for the current level blocks acceptance.
+Required deterministic commands rerun independently. Evidence captured.
 
 ### Level 4: integration acceptance
 

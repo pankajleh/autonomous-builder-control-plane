@@ -10,21 +10,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
-	postgresbackend "github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/githublifecycle"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 )
 
 type Config struct {
-	StateRoot             string
-	Ledger                *ledger.JSONLLedger
-	AuthoritySource       AuthoritySource
-	CancellationSource    CancellationSource
-	Provider              Provider
-	PredecessorFence      authoritybackend.PredecessorWriterFenceV1
-	PredecessorBindingIDs []string
+	StateRoot          string
+	Ledger             *ledger.JSONLLedger
+	AuthoritySource    AuthoritySource
+	CancellationSource CancellationSource
+	Provider           Provider
 }
 
 type Controller struct {
@@ -41,8 +37,6 @@ type Controller struct {
 	afterTerminalEvent       func(TerminalCoreV1) error
 	afterCancellationIndexed func() error
 	afterTargetOutcome       func(TargetOutcome) error
-	predecessorFence         authoritybackend.PredecessorWriterFenceV1
-	predecessorBindingIDs    []string
 }
 
 var errProviderBudgetExhausted = errors.New("provider cumulative budget exhausted")
@@ -53,39 +47,16 @@ type targetHTTPReservationStatus struct {
 }
 
 func New(config Config) (*Controller, error) {
-	return newController(config, false)
-}
-
-// NewProduction is the exported production composition. Retained V1 tests
-// may continue to use New, but no production merge admission or provider
-// write can be constructed without the shared durable fence and a ledger
-// opened through that same fencing boundary.
-func NewProduction(config Config) (*Controller, error) {
-	return newController(config, true)
-}
-
-func newController(config Config, production bool) (*Controller, error) {
 	if config.Ledger == nil || config.AuthoritySource == nil || config.Provider == nil {
 		return nil, errors.New("ledger, authority source, and network-free provider are required")
-	}
-	if production {
-		postgresFence, ok := config.PredecessorFence.(*postgresbackend.PostgresPredecessorDirectoryFenceV1)
-		if !ok || postgresFence == nil || len(config.PredecessorBindingIDs) == 0 || !config.Ledger.UsesProductionPostgresFenceV1(postgresFence) {
-			return nil, errors.New("production merge admission/provider requires the same durable PostgreSQL fence as the authoritative ledger")
-		}
 	}
 	limits := productionLimits()
 	store, err := newDurableStore(config.StateRoot, limits)
 	if err != nil {
 		return nil, wrapUnsupported(err)
 	}
-	if (config.PredecessorFence == nil) != (len(config.PredecessorBindingIDs) == 0) {
-		_ = store.close()
-		return nil, errors.New("merge predecessor fence and binding IDs must be supplied together")
-	}
 	return &Controller{ledger: config.Ledger, source: config.AuthoritySource, cancellations: config.CancellationSource, provider: config.Provider,
-		store: store, limits: limits, contracts: githublifecycle.DefaultLimits(), now: func() time.Time { return time.Now().UTC() },
-		predecessorFence: config.PredecessorFence, predecessorBindingIDs: append([]string(nil), config.PredecessorBindingIDs...)}, nil
+		store: store, limits: limits, contracts: githublifecycle.DefaultLimits(), now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
 func (c *Controller) Close() error {
@@ -95,33 +66,16 @@ func (c *Controller) Close() error {
 	return c.store.close()
 }
 
-// PredecessorDrainSnapshotV1 is the trusted directory probe for the bound
-// merge state root. Ledger barrier/terminal state is independently covered by
-// the registered ledger binding for every run.
-func (c *Controller) PredecessorDrainSnapshotV1() (string, error) {
-	if c == nil || c.store == nil {
-		return "", errors.New("V3_DRAIN_REQUIRED: merge controller store is unavailable")
-	}
-	return c.store.predecessorDrainSnapshotV1()
-}
-
 // Execute admits or recovers exactly one controller-selected merge attempt.
 // The request contains only a run identity and cannot inject repository,
 // method, actor, policy, cancellation authority, or provider capability.
-func (c *Controller) Execute(ctx context.Context, request ExecuteRequest) (result Result, resultErr error) {
+func (c *Controller) Execute(ctx context.Context, request ExecuteRequest) (Result, error) {
 	var zero Result
 	if c == nil || c.store == nil || ctx == nil || request.RunID == "" {
 		return zero, errors.New("controller, context, and run ID are required")
 	}
 	invocation, cancel := context.WithTimeout(ctx, c.limits.invocationTimeout)
 	defer cancel()
-	predecessorLease, err := c.acquirePredecessorWriterV1()
-	if err != nil {
-		return zero, err
-	}
-	if predecessorLease != nil {
-		defer func() { resultErr = errors.Join(resultErr, predecessorLease.Release()) }()
-	}
 	lease, err := c.ledger.AcquireRunTransition(request.RunID)
 	if err != nil {
 		return zero, err
@@ -177,13 +131,6 @@ func (c *Controller) Execute(ctx context.Context, request ExecuteRequest) (resul
 	}
 	defer attempt.close()
 	return c.executeAttempt(invocation, lease, assembled, attempt, writeID)
-}
-
-func (c *Controller) acquirePredecessorWriterV1() (authoritybackend.PredecessorWriterLeaseHandleV1, error) {
-	if c == nil || c.predecessorFence == nil {
-		return nil, nil
-	}
-	return c.predecessorFence.AcquirePredecessorWriterV1(c.predecessorBindingIDs, "merge-authorization")
 }
 
 func (c *Controller) executeAttempt(ctx context.Context, lease *ledger.RunTransitionLease, assembled assembledAuthority, attempt *attemptStore, writeID string) (Result, error) {
