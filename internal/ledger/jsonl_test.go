@@ -4,9 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -17,6 +22,167 @@ func TestEventValidationRejectsMissingIdentity(t *testing.T) {
 	if err := e.Validate(); err == nil {
 		t.Fatal("expected missing required identity fields to fail validation")
 	}
+}
+
+func TestRejectedRegisteredLedgerOpensReleasePersistentDescriptors(t *testing.T) {
+	if attack := os.Getenv("ABCP_REJECTED_LEDGER_OPEN_HELPER"); attack != "" {
+		runRejectedRegisteredLedgerOpenDescriptorHelper(t, attack)
+		return
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("process descriptor accounting requires Linux procfs")
+	}
+	for _, attack := range []string{"file", "parent"} {
+		t.Run(attack, func(t *testing.T) {
+			command := exec.Command(os.Args[0], "-test.run=^TestRejectedRegisteredLedgerOpensReleasePersistentDescriptors$")
+			command.Env = append(os.Environ(), "ABCP_REJECTED_LEDGER_OPEN_HELPER="+attack)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("descriptor helper failed: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
+func runRejectedRegisteredLedgerOpenDescriptorHelper(t *testing.T, attack string) {
+	t.Helper()
+	const (
+		serviceLedgerObjectLimit = 8
+		rejectionWorkers         = 8
+		rejectionsPerWorker      = 16
+	)
+	if attack != "file" && attack != "parent" {
+		t.Fatalf("unknown replacement attack %q", attack)
+	}
+	parent := filepath.Join(t.TempDir(), "ledger")
+	path := filepath.Join(parent, "events.jsonl")
+	creator, err := NewJSONLLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, _ := NewEvent("registered-descriptor-limit", "RUN_CREATED", "controller", "test")
+	event.Payload = map[string]any{"state": "RUN_CREATED"}
+	if err := creator.Append(event); err != nil {
+		_ = creator.Close()
+		t.Fatal(err)
+	}
+	generation, err := creator.PhysicalGeneration()
+	if err != nil {
+		_ = creator.Close()
+		t.Fatal(err)
+	}
+	if err := creator.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attack == "file" {
+		if err := os.Rename(path, path+".original"); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if err := os.Rename(parent, parent+".original"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(parent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	baseline := countProcessFileDescriptors(t)
+	held := make([]*ReadOnlyJSONLLedger, 0, serviceLedgerObjectLimit)
+	defer func() {
+		for _, value := range held {
+			_ = value.Close()
+		}
+	}()
+	for range serviceLedgerObjectLimit {
+		value, err := OpenExistingReadOnlyJSONLLedger(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, value)
+	}
+	if got, want := countProcessFileDescriptors(t), baseline+2*serviceLedgerObjectLimit; got != want {
+		t.Fatalf("eight ledger objects hold %d descriptors above baseline, want %d", got-baseline, want-baseline)
+	}
+
+	openers := []struct {
+		name string
+		open func() error
+	}{
+		{name: "read-only", open: func() error {
+			value, err := OpenRegisteredReadOnlyJSONLLedger(path, generation)
+			if value != nil {
+				_ = value.Close()
+			}
+			return err
+		}},
+		{name: "writable", open: func() error {
+			value, err := OpenRegisteredJSONLLedger(path, generation)
+			if value != nil {
+				_ = value.Close()
+			}
+			return err
+		}},
+		{name: "coordinated-writable", open: func() error {
+			value, err := OpenRegisteredJSONLLedgerWithSnapshotCoordinator(path, generation, func(operation func() error) error {
+				return operation()
+			})
+			if value != nil {
+				_ = value.Close()
+			}
+			return err
+		}},
+	}
+	start := make(chan struct{})
+	results := make(chan error, rejectionWorkers)
+	for range rejectionWorkers {
+		go func() {
+			<-start
+			for attempt := 0; attempt < rejectionsPerWorker; attempt++ {
+				for _, opener := range openers {
+					if err := opener.open(); !errors.Is(err, ErrRegisteredGenerationChanged) {
+						results <- fmt.Errorf("%s rejection %d: %w", opener.name, attempt, err)
+						return
+					}
+				}
+			}
+			results <- nil
+		}()
+	}
+	close(start)
+	for range rejectionWorkers {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := countProcessFileDescriptors(t), baseline+2*serviceLedgerObjectLimit; got != want {
+		t.Fatalf("rejected opens bypassed the eight-ledger descriptor ceiling: got %d descriptors above baseline, want %d", got-baseline, want-baseline)
+	}
+
+	for _, value := range held {
+		if err := value.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held = nil
+	if got := countProcessFileDescriptors(t); got != baseline {
+		t.Fatalf("rejected registered opens leaked descriptors: before=%d after=%d", baseline, got)
+	}
+}
+
+func countProcessFileDescriptors(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(entries)
 }
 
 func TestCorrectionM07DescriptorRelativeDurability(t *testing.T) {
@@ -242,6 +408,173 @@ func stringsRepeat(value string, count int) string {
 		result += value
 	}
 	return result
+}
+
+func TestJSONLLedgerConcurrentCloseSnapshotAndAppendFailClosed(t *testing.T) {
+	for iteration := 0; iteration < 32; iteration++ {
+		value, err := NewJSONLLedger(filepath.Join(t.TempDir(), "events.jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		initial, err := NewEvent("close-race", "RUN_CREATED", "controller", "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		initial.Payload = map[string]any{"state": "RUN_CREATED"}
+		if err := value.Append(initial); err != nil {
+			t.Fatal(err)
+		}
+		observed, err := NewEvent("close-race", "OBSERVATION", "controller", "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		closeResult := make(chan error, 1)
+		var group sync.WaitGroup
+		group.Add(3)
+		go func() {
+			defer group.Done()
+			<-start
+			_, _, snapshotErr := value.Snapshot()
+			results <- snapshotErr
+		}()
+		go func() {
+			defer group.Done()
+			<-start
+			results <- value.Append(observed)
+		}()
+		go func() {
+			defer group.Done()
+			<-start
+			closeResult <- value.Close()
+		}()
+		close(start)
+		group.Wait()
+		close(results)
+		for range results {
+		}
+		if err := <-closeResult; err != nil {
+			t.Fatalf("concurrent close failed: %v", err)
+		}
+		if _, _, err := value.Snapshot(); err == nil {
+			t.Fatal("snapshot succeeded after close")
+		}
+		if err := value.Append(observed); err == nil {
+			t.Fatal("append succeeded after close")
+		}
+		if _, err := value.PhysicalIdentity(); err == nil {
+			t.Fatal("physical identity succeeded after close")
+		}
+	}
+}
+
+func TestJSONLLedgerReplacementAfterPrecheckFailsSnapshotAndAppend(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux advisory file locking")
+	}
+	newFixture := func(t *testing.T) (*JSONLLedger, string) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "events.jsonl")
+		value, err := NewJSONLLedger(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		initial, err := NewEvent("replacement-race", "RUN_CREATED", "controller", "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		initial.Payload = map[string]any{"state": "RUN_CREATED"}
+		if err := value.Append(initial); err != nil {
+			t.Fatal(err)
+		}
+		return value, path
+	}
+	blockOperation := func(t *testing.T, value *JSONLLedger, path string) *os.File {
+		t.Helper()
+		blocker, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := lockLedgerFile(blocker, ledgerFileLockWait); err != nil {
+			_ = blocker.Close()
+			t.Fatal(err)
+		}
+		return blocker
+	}
+	waitForPrecheck := func(t *testing.T, value *JSONLLedger) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if !value.mu.TryLock() {
+				return
+			}
+			value.mu.Unlock()
+			runtime.Gosched()
+		}
+		t.Fatal("ledger operation did not reach the locked precheck")
+	}
+	replacePath := func(t *testing.T, path string) {
+		t.Helper()
+		if err := os.Rename(path, path+".old"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	releaseBlocker := func(t *testing.T, blocker *os.File) {
+		t.Helper()
+		if err := unlockLedgerFile(blocker); err != nil {
+			t.Fatal(err)
+		}
+		if err := blocker.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("snapshot", func(t *testing.T) {
+		value, path := newFixture(t)
+		defer value.Close()
+		blocker := blockOperation(t, value, path)
+		result := make(chan error, 1)
+		go func() {
+			_, _, err := value.Snapshot()
+			result <- err
+		}()
+		waitForPrecheck(t, value)
+		replacePath(t, path)
+		releaseBlocker(t, blocker)
+		if err := <-result; err == nil {
+			t.Fatal("snapshot of replaced pathname returned success")
+		}
+	})
+
+	t.Run("append", func(t *testing.T) {
+		value, path := newFixture(t)
+		defer value.Close()
+		observed, err := NewEvent("replacement-race", "OBSERVATION", "controller", "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocker := blockOperation(t, value, path)
+		result := make(chan error, 1)
+		go func() { result <- value.Append(observed) }()
+		waitForPrecheck(t, value)
+		replacePath(t, path)
+		releaseBlocker(t, blocker)
+		if err := <-result; err == nil {
+			t.Fatal("append to replaced pathname returned success")
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) != 0 {
+			t.Fatal("replacement pathname received bytes intended for the old ledger")
+		}
+	})
 }
 
 func TestJSONLLedgerAppendsAndPreservesPriorLines(t *testing.T) {

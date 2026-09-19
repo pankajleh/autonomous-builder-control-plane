@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,11 +14,12 @@ import (
 	"testing"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
-	postgresbackend "github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 )
 
 func TestRunCLIRejectsAutonomousWorkflowWithoutAuthorityBackend(t *testing.T) {
@@ -87,7 +89,7 @@ func TestRunCLIRejectsAutonomousWorkflowWithoutAuthorityBackend(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("run CLI without authority backend exited %d: %s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "stateful command requires --postgres-dsn") {
+	if !strings.Contains(stderr.String(), "workflow-wide authority backend is required") {
 		t.Fatalf("missing fail-closed backend error: %q", stderr.String())
 	}
 	if stdout.Len() != 0 {
@@ -111,6 +113,107 @@ func TestRunCommandRequiresEveryExplicitPath(t *testing.T) {
 	if !strings.Contains(stderr.String(), "--evidence-root") {
 		t.Fatalf("usage does not name required evidence root: %q", stderr.String())
 	}
+}
+
+func TestRunCommandAcceptsOptionalServiceRootFlagWithoutWeakeningRequiredInputs(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runCLI([]string{"run", "--manifest", "manifest.json", "--ledger", "events.jsonl", "--service-root", filepath.Join(t.TempDir(), "service")}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "--evidence-root") {
+		t.Fatalf("optional service root weakened required run inputs: code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestServeCommandRejectsNonLoopbackAndMissingProtectedConfiguration(t *testing.T) {
+	root := t.TempDir()
+	var stderr bytes.Buffer
+	code := runCLI([]string{
+		"serve", "--service-root", filepath.Join(root, "service"), "--listen", "0.0.0.0:8080",
+		"--token-file", filepath.Join(root, "secret-token"), "--principal-id", "service",
+		"--cursor-key-file", filepath.Join(root, "cursor-key"), "--authority-grants-file", filepath.Join(root, "grants"),
+	}, io.Discard, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "not loopback") {
+		t.Fatalf("non-loopback serve = %d %q", code, stderr.String())
+	}
+	stderr.Reset()
+	secretPath := filepath.Join(root, "do-not-disclose-secret-path")
+	code = runCLI([]string{
+		"serve", "--service-root", filepath.Join(root, "service"), "--listen", "127.0.0.1:0",
+		"--token-file", secretPath, "--principal-id", "service",
+		"--cursor-key-file", filepath.Join(root, "cursor-key"), "--authority-grants-file", filepath.Join(root, "grants"),
+	}, io.Discard, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "load bearer authentication configuration") || strings.Contains(stderr.String(), secretPath) {
+		t.Fatalf("missing protected config = %d %q", code, stderr.String())
+	}
+}
+
+func TestServiceRootRuntimeRegistrationInstallsAndRetiresExactOwner(t *testing.T) {
+	repository := filepath.Join(t.TempDir(), "repository")
+	gitCommand(t, "", "init", "-b", "main", repository)
+	gitCommand(t, repository, "config", "user.email", "service-registration@example.test")
+	gitCommand(t, repository, "config", "user.name", "Service Registration Test")
+	remoteURL := "https://example.test/example/service-registration.git"
+	gitCommand(t, repository, "remote", "add", "origin", remoteURL)
+	planPath := filepath.Join(repository, "plan.md")
+	writeCLIFile(t, planPath, []byte("# plan\n"), 0o600)
+	gitCommand(t, repository, "add", "plan.md")
+	gitCommand(t, repository, "commit", "-m", "plan")
+	startSHA := gitCommand(t, repository, "rev-parse", "HEAD")
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := authority.Manifest{
+		RunID:         "registered-run",
+		Repository:    authority.RepositoryManifest{Path: repository, Identity: "example/service-registration", Remotes: map[string]string{"origin": remoteURL}, DefaultBranch: "main", StartSHA: startSHA},
+		Plan:          authority.PlanManifest{Path: planPath, SHA256: cliFileHash(t, planPath)},
+		Ralphex:       authority.RalphexManifest{BinaryPath: truePath, BinarySHA256: cliFileHash(t, truePath), Mode: ralphex.ModeFull, Timeout: "5s", WaitOnLimit: "0s"},
+		Acceptance:    []authority.AcceptanceCommand{{Required: true, Timeout: "5s", Argv: []string{truePath}}},
+		PolicyVersion: "service-registration-v1",
+	}
+	governed, err := authority.New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeRoot := t.TempDir()
+	ledgerPath := filepath.Join(runtimeRoot, "events.jsonl")
+	events, err := ledger.NewJSONLLedger(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	evidenceRunRoot := filepath.Join(runtimeRoot, "evidence", governed.RunID())
+	if err := os.MkdirAll(evidenceRunRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	serviceRoot := filepath.Join(runtimeRoot, "service")
+	catalog, owner, err := registerRuntimeOwner(serviceRoot, governed, events, evidenceRunRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration, err := catalog.ReadRun(governed.RunID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registration.RepositoryIdentityDigest != runtimecatalog.RepositoryIdentityDigest(governed.Repository().Identity) || registration.CanonicalLedgerPath != ledgerPath || registration.CanonicalEvidenceRoot != evidenceRunRoot {
+		t.Fatalf("runtime registration = %+v", registration)
+	}
+	if owner.State != runtimecatalog.OwnerLeaseActive || runtimecatalog.VerifyLiveOwner(owner) != nil {
+		t.Fatalf("runtime owner = %+v", owner)
+	}
+	if err := retireRuntimeOwner(catalog, owner); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := catalog.AcquireOwnerLeaseGuard(governed.RunID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired, err := guard.Lease()
+	guard.Close()
+	if err != nil || retired.State != runtimecatalog.OwnerLeaseRetired {
+		t.Fatalf("retired runtime owner = %+v, err=%v", retired, err)
+	}
+	catalog.Close()
 }
 
 func TestContextBuildAndVerifyCLI(t *testing.T) {
@@ -247,33 +350,6 @@ func TestGovernanceCLIRejectsCallerSelectedStatePaths(t *testing.T) {
 	stderr.Reset()
 	if code := runCLI([]string{"run", "--manifest", path, "--ledger", "ledger", "--evidence-root", "evidence", "--governance-state", filepath.Join(t.TempDir(), "state.json")}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "flag provided but not defined") {
 		t.Fatalf("caller-selected run state exited %d: %s", code, stderr.String())
-	}
-}
-
-func TestTask1PostgresCommandsArePresentAndFailClosed(t *testing.T) {
-	bootstrap := postgresbackend.BootstrapConfigV1{}
-	bootstrapBytes, err := json.Marshal(bootstrap)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bootstrapPath := filepath.Join(t.TempDir(), "bootstrap.json")
-	writeCLIFile(t, bootstrapPath, bootstrapBytes, 0o600)
-	var stdout, stderr bytes.Buffer
-	if code := runCLI([]string{"governance-backend-bootstrap", "--input", bootstrapPath}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "bootstrap connections") {
-		t.Fatalf("bootstrap command exited %d: %s", code, stderr.String())
-	}
-
-	request := stateUpgradeRequestV1{Repository: "/repository", ExpectedDirectoryRevision: 1, ExpectedStateRevision: 1, ActivationV2SHA256: strings.Repeat("a", 64), DrainChecks: []stateUpgradeDrainCheckV1{}}
-	requestBytes, err := json.Marshal(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	requestPath := filepath.Join(t.TempDir(), "upgrade.json")
-	writeCLIFile(t, requestPath, requestBytes, 0o600)
-	stdout.Reset()
-	stderr.Reset()
-	if code := runCLI([]string{"governance-state-upgrade", "--input", requestPath}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "--postgres-dsn") {
-		t.Fatalf("state-upgrade command exited %d: %s", code, stderr.String())
 	}
 }
 

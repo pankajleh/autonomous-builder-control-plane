@@ -86,6 +86,28 @@ func TestRunnerSuccessReachesBranchAcceptedWithOrderedEvidence(t *testing.T) {
 	}
 }
 
+func TestRunnerSuccessfulReturnInvokesFinalizationBeforeBranchAccepted(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	runner := fixture.runner(t)
+	hook := &testFinalizationHook{begin: func(context.Context) error {
+		events := readEvents(t, fixture.ledgerPath)
+		if len(events) == 0 || events[len(events)-1].StateTo != domain.StateBranchAcceptancePending {
+			t.Fatalf("history at finalization = %#v", eventStates(events))
+		}
+		return nil
+	}}
+	if err := runner.SetFinalizationHook(hook); err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background())
+	if err != nil || !result.Accepted() {
+		t.Fatalf("finalized runner result = %#v, err=%v", result, err)
+	}
+	if hook.calls != 1 {
+		t.Fatalf("finalization calls = %d, want 1", hook.calls)
+	}
+}
+
 func TestAutonomousRunnerRequiresExactRepositoryController(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	artifacts, err := evidence.NewStore(t.TempDir(), "controller-gate")
@@ -190,12 +212,25 @@ func TestV3BReusesCapsuleAtDescendantAndStopsBeforeCAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	hook := &testFinalizationHook{begin: func(context.Context) error {
+		history := readEvents(t, fixture.ledgerPath)
+		if len(history) == 0 || history[len(history)-1].StateTo != domain.StateImplementing {
+			t.Fatalf("bounded history at finalization = %#v", eventStates(history))
+		}
+		return nil
+	}}
+	if err := runner.SetFinalizationHook(hook); err != nil {
+		t.Fatal(err)
+	}
 	result, err := runner.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.State != domain.StateImplementationCompleted || result.Accepted() || len(result.Acceptance.Commands()) != 0 {
 		t.Fatalf("B crossed into C-only acceptance: %#v", result)
+	}
+	if hook.calls != 1 {
+		t.Fatalf("bounded finalization calls = %d, want 1", hook.calls)
 	}
 	for _, state := range eventStates(readEvents(t, fixture.ledgerPath)) {
 		if state == domain.StateBranchAcceptancePending || state == domain.StateBranchAccepted {
@@ -926,15 +961,426 @@ func TestRunnerRejectsUnsafeRepositoryLocalRalphexBoundary(t *testing.T) {
 func TestRunnerTransitionRejectsInvalidDomainEdgeBeforeAppend(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	events := &recordingEventAppender{}
-	runner := &Runner{governed: fixture.authority, events: events}
+	runner := &Runner{governed: fixture.authority, provenance: DerivedTransitionProvenance(fixture.authority), events: events}
 
-	err := runner.transition(domain.StateRunCreated, domain.StateImplementing, "test", nil, nil)
+	err := runner.transition(context.Background(), domain.StateRunCreated, domain.StateImplementing, "test", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "transition RUN_CREATED -> IMPLEMENTING is not allowed") {
 		t.Fatalf("expected invalid domain transition rejection, got %v", err)
 	}
 	if len(events.events) != 0 {
 		t.Fatalf("invalid transition appended %d events", len(events.events))
 	}
+}
+
+func TestAPICancelProvenanceRequiresExactDurableRequestEvent(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	events, err := ledger.NewJSONLLedger(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	operationID := "api-cancel-operation"
+	ownerLeaseID := strings.Repeat("a", 64)
+	cause := NewAPICancelCause(operationID, ownerLeaseID)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(cause)
+	runner := &Runner{governed: fixture.authority, provenance: DerivedTransitionProvenance(fixture.authority), events: events}
+	if _, err := runner.cancellationPayload(ctx, map[string]any{"reason": "cancel"}); err == nil {
+		t.Fatal("typed cancellation without its durable request event was accepted")
+	}
+	event, err := ledger.NewEvent(fixture.authority.RunID(), "API_CANCEL_REQUESTED", "control-plane", "service-action-watcher")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(apiCancelEventDomain + "\x00" + operationID))
+	event.EventID = hex.EncodeToString(sum[:])
+	provenance := DerivedTransitionProvenance(fixture.authority)
+	event.ProjectID, event.PlanID, event.AttemptID = provenance.ProjectID, provenance.PlanID, provenance.AttemptID
+	event.Payload = map[string]any{
+		"record_schema_version": 1, "action": "cancel", "operation_id": operationID, "principal_id": "service-principal",
+		"principal_type": "service", "request_id": "cancel-request", "request_sha256": strings.Repeat("b", 64),
+		"expected_state": string(domain.StateImplementing), "expected_revision": strings.Repeat("c", 64), "reason": "cancel",
+		"admitted_state_transition_event_id": "admitted-transition", "owner_lease_id": ownerLeaseID,
+	}
+	if err := events.Append(event); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := runner.cancellationPayload(ctx, map[string]any{"reason": "cancel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload["operation_id"] != operationID || payload["owner_lease_id"] != ownerLeaseID || payload["request_event_id"] != event.EventID {
+		t.Fatalf("API cancellation payload = %#v", payload)
+	}
+	ordinary, ordinaryCancel := context.WithCancel(context.Background())
+	ordinaryCancel()
+	payload, err = runner.cancellationPayload(ordinary, map[string]any{"reason": "cancel"})
+	if err != nil || len(payload) != 1 {
+		t.Fatalf("ordinary cancellation behavior changed: %#v, err=%v", payload, err)
+	}
+}
+
+func TestRunnerSnapshotCoordinatorCoversStateAndCancelProofOnce(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	events, err := ledger.NewJSONLLedger(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	counted := &countingTransitionAppender{base: events}
+	runner := &Runner{governed: fixture.authority, provenance: DerivedTransitionProvenance(fixture.authority), events: counted}
+	coordinator := &recordingSnapshotCoordinator{}
+	if err := runner.SetSnapshotCoordinator(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	admitted := seedRunnerState(t, events, runner, domain.StateImplementing)
+	operationID := "coordinated-cancel-operation"
+	ownerLeaseID := digestForRunTest("coordinated-cancel-owner")
+	request := apiCancelRequestForRunner(t, runner, operationID, ownerLeaseID, admitted, domain.StateImplementing)
+	if err := events.Append(request); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(NewAPICancelCause(operationID, ownerLeaseID))
+	err = runner.transition(ctx, domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter", map[string]any{"outcome": "SUCCEEDED"}, nil)
+	var selected *apiCancellationSelected
+	if !errors.As(err, &selected) {
+		t.Fatalf("coordinated cancellation result = %v", err)
+	}
+	coordinator.mu.Lock()
+	scopes, maximum, sawCancelled := coordinator.scopes, coordinator.maximum, coordinator.sawCancelled
+	coordinator.mu.Unlock()
+	counted.mu.Lock()
+	snapshots := counted.snapshots
+	counted.mu.Unlock()
+	if scopes != 1 || maximum != 1 || sawCancelled {
+		t.Fatalf("snapshot coordinator scopes=%d maximum=%d saw-cancelled-context=%v", scopes, maximum, sawCancelled)
+	}
+	if snapshots != 2 {
+		t.Fatalf("coordinated transition snapshots = %d, want state reconstruction plus cancellation proof", snapshots)
+	}
+}
+
+func TestRunnerReservesSnapshotBeforeRunTransitionLease(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	events, err := ledger.NewJSONLLedger(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	runner := &Runner{governed: fixture.authority, provenance: DerivedTransitionProvenance(fixture.authority), events: events}
+	coordinator := &recordingSnapshotCoordinator{entered: make(chan struct{})}
+	if err := runner.SetSnapshotCoordinator(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	coordinatorEntered := coordinator.entered
+	seedRunnerState(t, events, runner, domain.StateImplementing)
+	held, err := events.AcquireRunTransition(fixture.authority.RunID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- runner.transition(context.Background(), domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter", nil, nil)
+	}()
+	select {
+	case <-coordinatorEntered:
+	case <-time.After(2 * time.Second):
+		_ = held.Close()
+		t.Fatal("runner waited for the transition lease before reserving snapshot capacity")
+	}
+	select {
+	case err := <-result:
+		_ = held.Close()
+		t.Fatalf("runner passed a held transition lease: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner did not finish after transition lease release")
+	}
+}
+
+func TestRunnerSnapshotWaitCancellationGetsBoundedTerminalAttempt(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	events, err := ledger.NewJSONLLedger(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	runner := &Runner{governed: fixture.authority, provenance: DerivedTransitionProvenance(fixture.authority), events: events}
+	coordinator := &cancelThenAcquireSnapshotCoordinator{waiting: make(chan struct{})}
+	if err := runner.SetSnapshotCoordinator(coordinator); err != nil {
+		t.Fatal(err)
+	}
+	admitted := seedRunnerState(t, events, runner, domain.StateImplementing)
+	operationID := "cancel-snapshot-wait"
+	ownerLeaseID := digestForRunTest("cancel-snapshot-wait-owner")
+	request := apiCancelRequestForRunner(t, runner, operationID, ownerLeaseID, admitted, domain.StateImplementing)
+	if err := events.Append(request); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- runner.transition(ctx, domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter", nil, nil)
+	}()
+	select {
+	case <-coordinator.waiting:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not begin its cancellable snapshot wait")
+	}
+	cancel(NewAPICancelCause(operationID, ownerLeaseID))
+	select {
+	case err := <-result:
+		var selected *apiCancellationSelected
+		if !errors.As(err, &selected) {
+			t.Fatalf("terminal attempt after cancelled snapshot wait = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner did not make its bounded terminal snapshot attempt")
+	}
+	coordinator.mu.Lock()
+	calls := coordinator.calls
+	coordinator.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("snapshot coordination attempts = %d, want cancelled wait plus terminal attempt", calls)
+	}
+}
+
+func TestEveryRunnerTransitionExitSelectsExactAPICancellation(t *testing.T) {
+	tests := []struct {
+		from   domain.State
+		to     domain.State
+		source string
+	}{
+		{domain.StateRunCreated, domain.StateAuthorityValidated, "authority-validator"},
+		{domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner"},
+		{domain.StateExecutionStarting, domain.StateImplementing, "ralphex-adapter"},
+		{domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter"},
+		{domain.StateImplementationCompleted, domain.StateBranchAcceptancePending, "acceptance-controller"},
+		{domain.StateBranchAcceptancePending, domain.StateBranchAccepted, "acceptance-controller"},
+	}
+	for _, test := range tests {
+		t.Run(string(test.from), func(t *testing.T) {
+			fixture := newRunFixture(t, 0, commandPath(t, "true"))
+			events, err := ledger.NewJSONLLedger(fixture.ledgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer events.Close()
+			runner := &Runner{governed: fixture.authority, provenance: DerivedTransitionProvenance(fixture.authority), events: events}
+			admitted := seedRunnerState(t, events, runner, test.from)
+			operationID := "cancel-" + strings.ToLower(string(test.from))
+			ownerLeaseID := digestForRunTest("owner-" + string(test.from))
+			request := apiCancelRequestForRunner(t, runner, operationID, ownerLeaseID, admitted, test.from)
+			if err := events.Append(request); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancelCause(context.Background())
+			cancel(NewAPICancelCause(operationID, ownerLeaseID))
+			err = runner.transition(ctx, test.from, test.to, test.source, map[string]any{"would": "compete"}, nil)
+			var selected *apiCancellationSelected
+			if !errors.As(err, &selected) {
+				t.Fatalf("API cancellation selection error = %v", err)
+			}
+			history := readEvents(t, fixture.ledgerPath)
+			last := history[len(history)-1]
+			if last.StateFrom != test.from || last.StateTo != domain.StateCancelled || last.Source != test.source ||
+				payloadText(last.Payload, "operation_id") != operationID || payloadText(last.Payload, "owner_lease_id") != ownerLeaseID ||
+				payloadText(last.Payload, "request_event_id") != request.EventID {
+				t.Fatalf("selected cancellation = %+v", last)
+			}
+			for _, event := range history {
+				if event.StateFrom == test.from && event.StateTo == test.to {
+					t.Fatalf("competing %s transition survived watcher selection", test.to)
+				}
+			}
+		})
+	}
+}
+
+func TestWatcherWinningLeasePreventsPreviouslySelectedRunnerTransition(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	events, err := ledger.NewJSONLLedger(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	runner := &Runner{governed: fixture.authority, provenance: DerivedTransitionProvenance(fixture.authority), events: events}
+	admitted := seedRunnerState(t, events, runner, domain.StateImplementing)
+	operationID, ownerLeaseID := "watcher-wins-operation", digestForRunTest("watcher-owner")
+	request := apiCancelRequestForRunner(t, runner, operationID, ownerLeaseID, admitted, domain.StateImplementing)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	lease, err := events.AcquireRunTransition(fixture.authority.RunID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	transitionResult := make(chan error, 1)
+	go func() {
+		close(started)
+		transitionResult <- runner.transition(ctx, domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter", map[string]any{"outcome": "SUCCEEDED"}, nil)
+	}()
+	<-started
+	if err := events.AppendOrVerifyLeased(request, lease); err != nil {
+		lease.Close()
+		t.Fatal(err)
+	}
+	cancel(NewAPICancelCause(operationID, ownerLeaseID))
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-transitionResult:
+		var selected *apiCancellationSelected
+		if !errors.As(err, &selected) {
+			t.Fatalf("runner transition result = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runner did not resume after watcher released transition lease")
+	}
+	history := readEvents(t, fixture.ledgerPath)
+	completed, cancelled := 0, 0
+	for _, event := range history {
+		if event.StateTo == domain.StateImplementationCompleted {
+			completed++
+		}
+		if event.StateTo == domain.StateCancelled {
+			cancelled++
+		}
+	}
+	if completed != 0 || cancelled != 1 {
+		t.Fatalf("watcher-wins terminal counts completed=%d cancelled=%d", completed, cancelled)
+	}
+}
+
+func TestFinalTransitionSkipsFreezeWhenAPICancelWins(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	events, err := ledger.NewJSONLLedger(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	hook := &testFinalizationHook{}
+	runner := &Runner{governed: fixture.authority, provenance: DerivedTransitionProvenance(fixture.authority), events: events, finalization: hook}
+	admitted := seedRunnerState(t, events, runner, domain.StateImplementing)
+	operationID, ownerLeaseID := "final-cancel-winner", digestForRunTest("final-cancel-owner")
+	request := apiCancelRequestForRunner(t, runner, operationID, ownerLeaseID, admitted, domain.StateImplementing)
+	if err := events.Append(request); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(NewAPICancelCause(operationID, ownerLeaseID))
+	err = runner.finalTransition(ctx, domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter", nil, nil)
+	var selected *apiCancellationSelected
+	if !errors.As(err, &selected) {
+		t.Fatalf("final transition cancellation result = %v", err)
+	}
+	if hook.calls != 0 {
+		t.Fatalf("finalization ran after cancellation won: %d", hook.calls)
+	}
+	history := readEvents(t, fixture.ledgerPath)
+	if history[len(history)-1].StateTo != domain.StateCancelled {
+		t.Fatalf("final cancellation history = %#v", eventStates(history))
+	}
+}
+
+func TestFinalTransitionHookFailurePreventsSuccessfulEdge(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	events, err := ledger.NewJSONLLedger(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	freezeErr := errors.New("freeze failed")
+	hook := &testFinalizationHook{begin: func(context.Context) error { return freezeErr }}
+	runner := &Runner{governed: fixture.authority, provenance: DerivedTransitionProvenance(fixture.authority), events: events, finalization: hook}
+	seedRunnerState(t, events, runner, domain.StateBranchAcceptancePending)
+	if err := runner.finalTransition(context.Background(), domain.StateBranchAcceptancePending, domain.StateBranchAccepted, "acceptance-controller", nil, nil); !errors.Is(err, freezeErr) {
+		t.Fatalf("finalization failure = %v", err)
+	}
+	if hook.calls != 1 {
+		t.Fatalf("failed finalization calls = %d, want 1", hook.calls)
+	}
+	history := readEvents(t, fixture.ledgerPath)
+	if history[len(history)-1].StateTo != domain.StateBranchAcceptancePending {
+		t.Fatalf("successful edge survived failed freeze: %#v", eventStates(history))
+	}
+}
+
+func seedRunnerState(t *testing.T, events *ledger.JSONLLedger, runner *Runner, target domain.State) string {
+	t.Helper()
+	at := time.Date(2026, 9, 14, 8, 0, 0, 0, time.UTC)
+	created, err := ledger.NewEvent(runner.governed.RunID(), string(domain.StateRunCreated), actorController, "governed-runner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Timestamp = at
+	created.Payload = map[string]any{"state": domain.StateRunCreated}
+	runner.applyTransitionProvenance(&created)
+	if err := events.Append(created); err != nil {
+		t.Fatal(err)
+	}
+	if target == domain.StateRunCreated {
+		return created.EventID
+	}
+	from := domain.StateRunCreated
+	states := []domain.State{domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateImplementing,
+		domain.StateImplementationCompleted, domain.StateBranchAcceptancePending}
+	for index, to := range states {
+		event, err := ledger.NewEvent(runner.governed.RunID(), eventStateTransition, actorController, "test-seed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		event.Timestamp = at.Add(time.Duration(index+1) * time.Second)
+		event.StateFrom, event.StateTo = from, to
+		runner.applyTransitionProvenance(&event)
+		if err := events.Append(event); err != nil {
+			t.Fatal(err)
+		}
+		if target == to {
+			return event.EventID
+		}
+		from = to
+	}
+	t.Fatalf("unsupported runner seed target %s", target)
+	return ""
+}
+
+func apiCancelRequestForRunner(t *testing.T, runner *Runner, operationID, ownerLeaseID, admitted string, state domain.State) ledger.Event {
+	t.Helper()
+	event, err := ledger.NewEvent(runner.governed.RunID(), "API_CANCEL_REQUESTED", "control-plane", "service-action-watcher")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event.EventID = DeterministicAPICancelEventID(operationID)
+	event.Timestamp = time.Date(2026, 9, 14, 8, 1, 0, 0, time.UTC)
+	runner.applyTransitionProvenance(&event)
+	event.Payload = map[string]any{
+		"record_schema_version": 1, "action": "cancel", "operation_id": operationID, "principal_id": "service-principal",
+		"principal_type": "service", "request_id": "request-" + operationID, "request_sha256": digestForRunTest("request-" + operationID),
+		"expected_state": string(state), "expected_revision": digestForRunTest("revision-" + operationID), "reason": "cancel",
+		"admitted_state_transition_event_id": admitted, "owner_lease_id": ownerLeaseID,
+	}
+	return event
+}
+
+func DeterministicAPICancelEventID(operationID string) string {
+	sum := sha256.Sum256([]byte(apiCancelEventDomain + "\x00" + operationID))
+	return hex.EncodeToString(sum[:])
+}
+
+func digestForRunTest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func TestEP002StateCapExcludesIntegrationAndCompletion(t *testing.T) {
@@ -959,6 +1405,95 @@ type runFixture struct {
 
 type recordingEventAppender struct {
 	events []ledger.Event
+}
+
+type countingTransitionAppender struct {
+	base      *ledger.JSONLLedger
+	mu        sync.Mutex
+	snapshots int
+}
+
+func (a *countingTransitionAppender) Append(event ledger.Event) error {
+	return a.base.Append(event)
+}
+
+func (a *countingTransitionAppender) Snapshot() ([]byte, string, error) {
+	a.mu.Lock()
+	a.snapshots++
+	a.mu.Unlock()
+	return a.base.Snapshot()
+}
+
+func (a *countingTransitionAppender) AcquireRunTransition(runID string) (*ledger.RunTransitionLease, error) {
+	return a.base.AcquireRunTransition(runID)
+}
+
+func (a *countingTransitionAppender) AppendOrVerifyLeased(event ledger.Event, lease *ledger.RunTransitionLease) error {
+	return a.base.AppendOrVerifyLeased(event, lease)
+}
+
+type recordingSnapshotCoordinator struct {
+	mu           sync.Mutex
+	scopes       int
+	active       int
+	maximum      int
+	sawCancelled bool
+	entered      chan struct{}
+}
+
+func (c *recordingSnapshotCoordinator) WithSnapshot(ctx context.Context, operation func() error) error {
+	c.mu.Lock()
+	c.scopes++
+	c.active++
+	if c.active > c.maximum {
+		c.maximum = c.active
+	}
+	c.sawCancelled = c.sawCancelled || ctx.Err() != nil
+	if c.entered != nil {
+		close(c.entered)
+		c.entered = nil
+	}
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.active--
+		c.mu.Unlock()
+	}()
+	return operation()
+}
+
+type cancelThenAcquireSnapshotCoordinator struct {
+	mu      sync.Mutex
+	calls   int
+	waiting chan struct{}
+}
+
+func (c *cancelThenAcquireSnapshotCoordinator) WithSnapshot(ctx context.Context, operation func() error) error {
+	c.mu.Lock()
+	c.calls++
+	call := c.calls
+	if call == 1 {
+		close(c.waiting)
+	}
+	c.mu.Unlock()
+	if call == 1 {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return operation()
+}
+
+type testFinalizationHook struct {
+	begin func(context.Context) error
+	calls int
+}
+
+func (h *testFinalizationHook) BeginClose(ctx context.Context) error {
+	h.calls++
+	if h.begin != nil {
+		return h.begin(ctx)
+	}
+	return nil
 }
 
 type testContainedRunner struct {

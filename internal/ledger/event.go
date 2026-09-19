@@ -2,11 +2,8 @@ package ledger
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
@@ -84,76 +81,4 @@ func randomID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil
-}
-
-// ValidateRetainedEventID accepts exactly the two historical producer widths:
-// NewEvent's 16 random bytes and the deterministic PR/merge/CI constructors'
-// full 32 SHA-256 bytes. It validates without rewriting either representation.
-func ValidateRetainedEventID(value string) error {
-	if value != strings.ToLower(value) || len(value) != 32 && len(value) != 64 {
-		return errors.New("retained ledger event ID must be 32 or 64 lowercase hexadecimal characters")
-	}
-	decoded, err := hex.DecodeString(value)
-	if err != nil || len(decoded) != 16 && len(decoded) != 32 {
-		return errors.New("retained ledger event ID must encode exactly 16 or 32 bytes")
-	}
-	if hex.EncodeToString(decoded) != value {
-		return errors.New("retained ledger event ID is not canonical lowercase hexadecimal")
-	}
-	return nil
-}
-
-// ValidateV4EventID accepts only the V4 effect-event subtype. A retained
-// deterministic 64-character ID is intentionally not a V4 ID.
-func ValidateV4EventID(value string) error {
-	if len(value) != 32 || value != strings.ToLower(value) {
-		return errors.New("V4 ledger event ID must be 32 lowercase hexadecimal characters")
-	}
-	decoded, err := hex.DecodeString(value)
-	if err != nil || len(decoded) != 16 || hex.EncodeToString(decoded) != value {
-		return errors.New("V4 ledger event ID must encode exactly 16 bytes")
-	}
-	return nil
-}
-
-// DeriveV4EffectEventID implements the frozen ABCP-V4-LEDGER-EVENT-ID-V1
-// preimage. Digest arguments remain their 64-character UTF-8 spellings; they
-// are not decoded before hashing.
-func DeriveV4EffectEventID(effectKind, intentDigest, winningOutcomeDigest, stateTo string) (string, error) {
-	if effectKind != "PR" && effectKind != "MERGE" {
-		return "", errors.New("V4 effect kind must be PR or MERGE")
-	}
-	if err := validateSHA256Text(intentDigest); err != nil {
-		return "", fmt.Errorf("intent digest: %w", err)
-	}
-	if err := validateSHA256Text(winningOutcomeDigest); err != nil {
-		return "", fmt.Errorf("winning outcome digest: %w", err)
-	}
-	if stateTo == "" || strings.ContainsRune(stateTo, 0) {
-		return "", errors.New("V4 destination state is required and cannot contain NUL")
-	}
-	preimage := strings.Join([]string{
-		"ABCP-V4-LEDGER-EVENT-ID-V1",
-		effectKind,
-		intentDigest,
-		winningOutcomeDigest,
-		stateTo,
-	}, "\x00")
-	digest := sha256.Sum256([]byte(preimage))
-	identifier := hex.EncodeToString(digest[:16])
-	if err := ValidateV4EventID(identifier); err != nil {
-		return "", err
-	}
-	return identifier, nil
-}
-
-func validateSHA256Text(value string) error {
-	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
-		return errors.New("must be 64 lowercase hexadecimal characters")
-	}
-	decoded, err := hex.DecodeString(value)
-	if err != nil || len(decoded) != sha256.Size || hex.EncodeToString(decoded) != value {
-		return errors.New("must encode exactly 32 bytes")
-	}
-	return nil
 }

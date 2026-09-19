@@ -12,10 +12,6 @@ import (
 	"reflect"
 	"sync"
 	"time"
-
-	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
-	postgresbackend "github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend/postgres"
-	"github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 )
 
 const (
@@ -25,27 +21,101 @@ const (
 	maxLedgerRecords   = 262144
 )
 
+// ErrRegisteredGenerationChanged identifies a service open whose immutable
+// catalog generation no longer names the same parent and ledger objects.
+var ErrRegisteredGenerationChanged = errors.New("registered ledger generation changed")
+
 type JSONLLedger struct {
-	path                  string
-	parentPath            string
-	file                  *os.File
-	parent                *os.File
-	fileInfo              os.FileInfo
-	parentInfo            os.FileInfo
-	physicalID            string
-	mu                    sync.Mutex
-	predecessorFence      authoritybackend.PredecessorWriterFenceV1
-	predecessorBindingIDs []string
-	productionFence       *postgresbackend.PostgresPredecessorDirectoryFenceV1
+	path       string
+	parentPath string
+	file       *os.File
+	parent     *os.File
+	runLocks   *runTransitionNamespace
+	fileInfo   os.FileInfo
+	parentInfo os.FileInfo
+	physicalID string
+	expected   *PhysicalGeneration
+	readOnly   bool
+	// snapshotCoordinator is immutable after construction. Service-owned
+	// writable ledgers use it to share the global authoritative-snapshot gate.
+	snapshotCoordinator func(func() error) error
+	closed              bool
+	mu                  sync.Mutex
+}
+
+// PhysicalGeneration identifies the exact parent directory and ledger file
+// objects pinned by a ledger. Registered service opens require this complete
+// generation; standalone ledger constructors remain path based.
+type PhysicalGeneration struct {
+	ParentDevice uint64
+	ParentInode  uint64
+	FileDevice   uint64
+	FileInode    uint64
+}
+
+// Valid reports whether the generation contains all four physical identity
+// components.
+func (g PhysicalGeneration) Valid() bool {
+	return g.ParentDevice != 0 && g.ParentInode != 0 && g.FileDevice != 0 && g.FileInode != 0
 }
 
 func NewJSONLLedger(path string) (*JSONLLedger, error) {
+	return openJSONLLedger(path, true, false, nil, nil)
+}
+
+// OpenExistingJSONLLedger opens an existing authoritative ledger for a
+// governed writer. Unlike NewJSONLLedger, it never creates the parent or the
+// ledger file and it pins both identities before returning.
+func OpenExistingJSONLLedger(path string) (*JSONLLedger, error) {
+	return openJSONLLedger(path, false, false, nil, nil)
+}
+
+// OpenRegisteredJSONLLedger opens an existing writable ledger only when its
+// named parent and file still match immutable catalog authority.
+func OpenRegisteredJSONLLedger(path string, generation PhysicalGeneration) (*JSONLLedger, error) {
+	value, err := openJSONLLedger(path, false, false, nil, &generation)
+	if err != nil {
+		return nil, errors.Join(ErrRegisteredGenerationChanged, err)
+	}
+	return value, nil
+}
+
+// OpenExistingJSONLLedgerWithSnapshotCoordinator opens an existing writable
+// ledger and routes each Snapshot call through coordinator. The coordinator
+// may reject a snapshot without invoking it; otherwise it must invoke and
+// return the supplied bounded snapshot operation exactly once.
+func OpenExistingJSONLLedgerWithSnapshotCoordinator(path string, coordinator func(func() error) error) (*JSONLLedger, error) {
+	if coordinator == nil {
+		return nil, errors.New("snapshot coordinator is required")
+	}
+	return openJSONLLedger(path, false, false, coordinator, nil)
+}
+
+// OpenRegisteredJSONLLedgerWithSnapshotCoordinator is the generation-bound
+// service writer. It cannot adopt a coherently replaced ledger namespace.
+func OpenRegisteredJSONLLedgerWithSnapshotCoordinator(path string, generation PhysicalGeneration, coordinator func(func() error) error) (*JSONLLedger, error) {
+	if coordinator == nil {
+		return nil, errors.New("snapshot coordinator is required")
+	}
+	value, err := openJSONLLedger(path, false, false, coordinator, &generation)
+	if err != nil {
+		return nil, errors.Join(ErrRegisteredGenerationChanged, err)
+	}
+	return value, nil
+}
+
+func openJSONLLedger(path string, createParent, readOnly bool, snapshotCoordinator func(func() error) error, expected *PhysicalGeneration) (*JSONLLedger, error) {
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, fmt.Errorf("canonical absolute ledger path is required")
 	}
+	if expected != nil && !expected.Valid() {
+		return nil, errors.New("complete registered ledger generation is required")
+	}
 	parentPath := filepath.Dir(path)
-	if err := os.MkdirAll(parentPath, 0o700); err != nil {
-		return nil, fmt.Errorf("create ledger directory: %w", err)
+	if createParent {
+		if err := os.MkdirAll(parentPath, 0o700); err != nil {
+			return nil, fmt.Errorf("create ledger directory: %w", err)
+		}
 	}
 	resolvedParent, err := filepath.EvalSymlinks(parentPath)
 	if err != nil || filepath.Clean(resolvedParent) != parentPath {
@@ -76,74 +146,37 @@ func NewJSONLLedger(path string) (*JSONLLedger, error) {
 		_ = parent.Close()
 		return nil, statErr
 	}
-	result := &JSONLLedger{path: path, parentPath: parentPath, parent: parent, parentInfo: parentInfo}
-	if exists {
+	result := &JSONLLedger{
+		path: path, parentPath: parentPath, parent: parent, parentInfo: parentInfo,
+		readOnly: readOnly, snapshotCoordinator: snapshotCoordinator,
+	}
+	if expected != nil {
+		copy := *expected
+		result.expected = &copy
+	}
+	if exists || !createParent {
 		result.mu.Lock()
 		err = result.pinLedgerFileLocked(false)
+		if err == nil {
+			err = result.verifyPhysicalIdentityLocked()
+		}
 		result.mu.Unlock()
 		if err != nil {
-			_ = parent.Close()
-			return nil, err
+			return nil, errors.Join(err, result.Close())
 		}
 	}
 	return result, nil
 }
 
-// NewFencedJSONLLedger binds every retained ledger transition and run-wide
-// operation to the shared predecessor cutover fence. NewJSONLLedger remains
-// available to read historical/unactivated stores without reinterpreting
-// their bytes.
-func NewFencedJSONLLedger(path string, fence authoritybackend.PredecessorWriterFenceV1, bindingIDs []string) (*JSONLLedger, error) {
-	if fence == nil || len(bindingIDs) == 0 {
-		return nil, errors.New("predecessor writer fence and ledger binding IDs are required")
-	}
-	value, err := NewJSONLLedger(path)
-	if err != nil {
-		return nil, err
-	}
-	value.predecessorFence = fence
-	value.predecessorBindingIDs = append([]string(nil), bindingIDs...)
-	return value, nil
-}
-
-// NewProductionFencedJSONLLedger admits only the durable PostgreSQL fence.
-// The generic fenced constructor remains for retained unit tests and
-// historical non-production compositions.
-func NewProductionFencedJSONLLedger(path string, fence authoritybackend.PredecessorWriterFenceV1, bindingIDs []string) (*JSONLLedger, error) {
-	postgresFence, ok := fence.(*postgresbackend.PostgresPredecessorDirectoryFenceV1)
-	if !ok || postgresFence == nil {
-		return nil, errors.New("production ledger requires the durable PostgreSQL predecessor fence")
-	}
-	directory, err := postgresFence.DirectoryV1()
-	if err != nil {
-		return nil, fmt.Errorf("verify production PostgreSQL predecessor fence: %w", err)
-	}
-	registered := make(map[string]governance.PredecessorBindingKind, len(directory.Bindings))
-	for _, binding := range directory.Bindings {
-		registered[binding.BindingID] = binding.BindingKind
-	}
-	for _, bindingID := range bindingIDs {
-		if registered[bindingID] != governance.PredecessorBindingLedger {
-			return nil, fmt.Errorf("production ledger binding %q is not the registered durable ledger", bindingID)
-		}
-	}
-	value, err := NewFencedJSONLLedger(path, postgresFence, bindingIDs)
-	if err != nil {
-		return nil, err
-	}
-	value.productionFence = postgresFence
-	return value, nil
-}
-
 func (l *JSONLLedger) Append(event Event) error {
-	return l.appendOrVerify(event, "", false)
+	return l.appendOrVerify(event, "", false, nil)
 }
 
 // AppendOrVerify durably appends event, or succeeds when the byte-identical
 // event is already present. A repeated EventID with different bytes is an
 // integrity error. State transitions remain subject to an unresolved barrier.
 func (l *JSONLLedger) AppendOrVerify(event Event) error {
-	return l.appendOrVerify(event, "", true)
+	return l.appendOrVerify(event, "", true, nil)
 }
 
 // AppendOrVerifyTransition is the only append path permitted through an
@@ -154,59 +187,56 @@ func (l *JSONLLedger) AppendOrVerifyTransition(event Event, barrierSHA256 string
 	if barrierSHA256 == "" {
 		return errors.New("transition barrier digest is required")
 	}
-	return l.appendOrVerify(event, barrierSHA256, true)
+	return l.appendOrVerify(event, barrierSHA256, true, nil)
 }
 
 // AppendOrVerifyLeased appends while the caller owns the exact run-transition
 // lease. It is used for pre-submission terminal selection; barriers use the
 // stricter AppendOrVerifyTransition path instead.
 func (l *JSONLLedger) AppendOrVerifyLeased(event Event, lease *RunTransitionLease) error {
-	if lease == nil || lease.closed || lease.ledger != l || lease.runID != event.RunID {
+	if lease == nil {
 		return errors.New("exact run-transition lease is required")
 	}
-	return l.appendOrVerify(event, leasedAppendSentinel, true)
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if lease.closed || lease.ledger != l || lease.runID != event.RunID {
+		return errors.New("exact run-transition lease is required")
+	}
+	return l.appendOrVerify(event, leasedAppendSentinel, true, lease)
 }
 
-func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyExisting bool) (resultErr error) {
+func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyExisting bool, suppliedLease *RunTransitionLease) (resultErr error) {
 	if l == nil {
 		return errors.New("ledger is required")
 	}
 	if err := event.Validate(); err != nil {
 		return fmt.Errorf("validate event: %w", err)
 	}
-	var predecessorLease authoritybackend.PredecessorWriterLeaseHandleV1
-	if barrierSHA256 != leasedAppendSentinel {
-		var err error
-		predecessorLease, err = l.acquirePredecessorWriterV1("maintenance")
-		if err != nil {
-			return err
-		}
-		if predecessorLease != nil {
-			defer func() { resultErr = errors.Join(resultErr, predecessorLease.Release()) }()
-		}
-	}
-	if err := l.ensurePhysicalIdentity(true); err != nil {
-		return err
-	}
 	line, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)
 	}
-	var transitionFile *os.File
+	var transitionLease *RunTransitionLease
 	if event.StateFrom != "" && barrierSHA256 == "" {
-		transitionFile, err = l.acquireRunTransitionFile(event.RunID)
+		transitionLease, err = l.AcquireRunTransition(event.RunID)
 		if err != nil {
 			return err
 		}
 		defer func() {
-			_ = unlockLedgerFile(transitionFile)
-			_ = transitionFile.Close()
+			resultErr = errors.Join(resultErr, transitionLease.Close())
 		}()
+		suppliedLease = transitionLease
 	}
 
-	f := l.file
-
-	return l.WithFileLock(f, func() error {
+	return l.withFileLock(nil, true, func(f *os.File) error {
+		if suppliedLease != nil {
+			if suppliedLease.closed || suppliedLease.ledger != l || suppliedLease.runID != event.RunID {
+				return errors.New("exact run-transition lease is required")
+			}
+			if err := l.verifyRunTransitionLeaseLocked(suppliedLease); err != nil {
+				return err
+			}
+		}
 		if err := l.authorizeTransition(event, barrierSHA256); err != nil {
 			return err
 		}
@@ -247,26 +277,86 @@ func (l *JSONLLedger) appendOrVerify(event Event, barrierSHA256 string, verifyEx
 	})
 }
 
-func (l *JSONLLedger) acquirePredecessorWriterV1(operation string) (authoritybackend.PredecessorWriterLeaseHandleV1, error) {
-	if l == nil || l.predecessorFence == nil {
-		return nil, nil
-	}
-	return l.predecessorFence.AcquirePredecessorWriterV1(l.predecessorBindingIDs, operation)
-}
-
 func (l *JSONLLedger) Path() string { return l.path }
 
-// PredecessorFencedV1 reports whether this ledger was opened through the
-// production predecessor-writer composition. It exposes no fence authority;
-// production constructors use it only to reject an unfenced ledger handle.
-func (l *JSONLLedger) PredecessorFencedV1() bool {
-	return l != nil && l.predecessorFence != nil && len(l.predecessorBindingIDs) != 0
+// PhysicalIdentity returns the pinned physical ledger identity after proving
+// that both the parent and ledger names still resolve to the opened objects.
+func (l *JSONLLedger) PhysicalIdentity() (string, error) {
+	if l == nil {
+		return "", errors.New("ledger is required")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return "", errors.New("authoritative ledger is closed")
+	}
+	if l.file == nil {
+		if err := l.pinLedgerFileLocked(false); err != nil {
+			return "", err
+		}
+	}
+	if err := l.verifyPhysicalIdentityLocked(); err != nil {
+		return "", err
+	}
+	return l.physicalID, nil
 }
 
-// UsesProductionPostgresFenceV1 proves pointer-identical production
-// composition without exposing a generic fence capability.
-func (l *JSONLLedger) UsesProductionPostgresFenceV1(fence *postgresbackend.PostgresPredecessorDirectoryFenceV1) bool {
-	return l != nil && fence != nil && l.productionFence == fence && l.predecessorFence == fence && len(l.predecessorBindingIDs) != 0
+// PhysicalGeneration returns the exact verified parent/file generation. For
+// a new writable standalone ledger it materializes the empty ledger file so
+// a service registration can bind that object before the first event.
+func (l *JSONLLedger) PhysicalGeneration() (PhysicalGeneration, error) {
+	if l == nil {
+		return PhysicalGeneration{}, errors.New("ledger is required")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return PhysicalGeneration{}, errors.New("authoritative ledger is closed")
+	}
+	if l.file == nil {
+		if err := l.pinLedgerFileLocked(!l.readOnly); err != nil {
+			return PhysicalGeneration{}, err
+		}
+	}
+	if !l.readOnly {
+		if err := l.file.Sync(); err != nil {
+			return PhysicalGeneration{}, fmt.Errorf("sync ledger before generation binding: %w", err)
+		}
+		if err := l.parent.Sync(); err != nil {
+			return PhysicalGeneration{}, fmt.Errorf("sync ledger parent before generation binding: %w", err)
+		}
+	}
+	if err := l.verifyPhysicalIdentityLocked(); err != nil {
+		return PhysicalGeneration{}, err
+	}
+	return physicalLedgerGeneration(l.parentInfo, l.fileInfo)
+}
+
+// Close releases the two persistent descriptors owned by the ledger. It is
+// idempotent; once called, every operation on the object fails closed.
+func (l *JSONLLedger) Close() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil
+	}
+	l.closed = true
+	file, parent, runLocks := l.file, l.parent, l.runLocks
+	l.file, l.parent, l.runLocks = nil, nil, nil
+	l.fileInfo, l.parentInfo = nil, nil
+	l.physicalID = ""
+	l.expected = nil
+	var fileErr, parentErr error
+	if file != nil {
+		fileErr = file.Close()
+	}
+	if parent != nil {
+		parentErr = parent.Close()
+	}
+	return errors.Join(closeRunTransitionNamespace(runLocks), fileErr, parentErr)
 }
 
 // Snapshot returns one bounded, complete ledger image while holding the same
@@ -275,17 +365,46 @@ func (l *JSONLLedger) Snapshot() ([]byte, string, error) {
 	if l == nil {
 		return nil, "", errors.New("ledger is required")
 	}
-	if err := l.ensurePhysicalIdentity(true); err != nil {
-		return nil, "", err
+	if l.snapshotCoordinator != nil {
+		var data []byte
+		var physicalID string
+		invocations := 0
+		var snapshotErr error
+		coordinatorErr := l.snapshotCoordinator(func() error {
+			invocations++
+			if invocations != 1 {
+				return errors.New("snapshot coordinator invoked the operation more than once")
+			}
+			data, physicalID, snapshotErr = l.snapshot()
+			return snapshotErr
+		})
+		if invocations == 0 && coordinatorErr != nil {
+			return nil, "", coordinatorErr
+		}
+		if invocations != 1 {
+			return nil, "", errors.Join(errors.New("snapshot coordinator must invoke the operation exactly once"), coordinatorErr)
+		}
+		if err := errors.Join(snapshotErr, coordinatorErr); err != nil {
+			return nil, "", err
+		}
+		return data, physicalID, nil
 	}
-	f := l.file
+	return l.snapshot()
+}
+
+func (l *JSONLLedger) snapshot() ([]byte, string, error) {
 	var data []byte
-	err := l.WithFileLock(f, func() error {
+	var physicalID string
+	err := l.withFileLock(nil, true, func(f *os.File) error {
 		var readErr error
 		data, readErr = readBoundedLedger(f)
+		physicalID = l.physicalID
 		return readErr
 	})
-	return data, l.physicalID, err
+	if err != nil {
+		return nil, "", err
+	}
+	return data, physicalID, nil
 }
 
 // WithFileLock serializes one complete authoritative-ledger transaction with
@@ -296,15 +415,31 @@ func (l *JSONLLedger) WithFileLock(file *os.File, operation func() error) (resul
 	if l == nil || file == nil || operation == nil {
 		return errors.New("authoritative ledger lock requires a ledger, file, and operation")
 	}
+	return l.withFileLock(file, false, func(*os.File) error { return operation() })
+}
+
+// withFileLock keeps every descriptor and physical-identity observation under
+// the same in-process mutex as Close. A nil file selects the pinned ledger
+// descriptor after it has been created or verified while holding that mutex.
+func (l *JSONLLedger) withFileLock(file *os.File, create bool, operation func(*os.File) error) (result error) {
+	if l == nil || operation == nil {
+		return errors.New("authoritative ledger lock requires a ledger and operation")
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return errors.New("authoritative ledger is closed")
+	}
 	if l.file == nil {
-		if err := l.pinLedgerFileLocked(false); err != nil {
+		if err := l.pinLedgerFileLocked(create); err != nil {
 			return err
 		}
 	}
 	if err := l.verifyPhysicalIdentityLocked(); err != nil {
 		return err
+	}
+	if file == nil {
+		file = l.file
 	}
 	info, err := file.Stat()
 	if err != nil || !os.SameFile(info, l.fileInfo) {
@@ -318,7 +453,9 @@ func (l *JSONLLedger) WithFileLock(file *os.File, operation func() error) (resul
 			result = errors.Join(result, err)
 		}
 	}()
-	return operation()
+	operationErr := operation(file)
+	identityErr := l.verifyPhysicalIdentityLocked()
+	return errors.Join(operationErr, identityErr)
 }
 
 func (l *JSONLLedger) verifyPhysicalIdentity() error {
@@ -336,6 +473,9 @@ func (l *JSONLLedger) ensurePhysicalIdentity(create bool) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return errors.New("authoritative ledger is closed")
+	}
 	if l.file == nil {
 		if err := l.pinLedgerFileLocked(create); err != nil {
 			return err
@@ -345,7 +485,13 @@ func (l *JSONLLedger) ensurePhysicalIdentity(create bool) error {
 }
 
 func (l *JSONLLedger) pinLedgerFileLocked(create bool) error {
-	flags := os.O_RDWR | os.O_APPEND
+	if l.closed {
+		return errors.New("authoritative ledger is closed")
+	}
+	flags := os.O_RDONLY
+	if !l.readOnly {
+		flags = os.O_RDWR | os.O_APPEND
+	}
 	if create {
 		flags |= os.O_CREATE
 	}
@@ -364,12 +510,21 @@ func (l *JSONLLedger) pinLedgerFileLocked(create bool) error {
 }
 
 func (l *JSONLLedger) verifyPhysicalIdentityLocked() error {
+	if l.closed {
+		return errors.New("authoritative ledger is closed")
+	}
 	if l.parent == nil {
 		return errors.New("authoritative ledger parent descriptor is not pinned")
 	}
 	pinnedParent, err := l.parent.Stat()
 	if err != nil || !os.SameFile(pinnedParent, l.parentInfo) {
 		return errors.Join(errors.New("pinned ledger parent identity changed"), err)
+	}
+	canonicalParent, resolveErr := filepath.EvalSymlinks(l.parentPath)
+	parentNameInfo, nameErr := os.Lstat(l.parentPath)
+	if resolveErr != nil || filepath.Clean(canonicalParent) != l.parentPath || nameErr != nil ||
+		parentNameInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(parentNameInfo, l.parentInfo) {
+		return errors.Join(errors.New("ledger parent path was replaced"), resolveErr, nameErr)
 	}
 	resolvedParent, err := os.Open(l.parentPath)
 	if err != nil {
@@ -400,6 +555,12 @@ func (l *JSONLLedger) verifyPhysicalIdentityLocked() error {
 	if statErr != nil || closeErr != nil || nameErr != nil || nameInfo.Mode()&os.ModeSymlink != 0 ||
 		!os.SameFile(resolvedInfo, l.fileInfo) || !os.SameFile(nameInfo, l.fileInfo) || verifyLedgerFileInfo(resolvedInfo) != nil {
 		return errors.Join(errors.New("ledger path was replaced or became unsafe"), statErr, closeErr, nameErr)
+	}
+	if l.expected != nil {
+		observed, generationErr := physicalLedgerGeneration(l.parentInfo, l.fileInfo)
+		if generationErr != nil || observed != *l.expected {
+			return errors.Join(ErrRegisteredGenerationChanged, generationErr)
+		}
 	}
 	return nil
 }
@@ -442,6 +603,26 @@ func physicalLedgerIdentity(info os.FileInfo) string {
 		}
 	}
 	return "ledger-physical-identity-unavailable"
+}
+
+func physicalLedgerGeneration(parent, file os.FileInfo) (PhysicalGeneration, error) {
+	parentValue, fileValue := reflect.Indirect(reflect.ValueOf(parent.Sys())), reflect.Indirect(reflect.ValueOf(file.Sys()))
+	if !parentValue.IsValid() || !fileValue.IsValid() {
+		return PhysicalGeneration{}, errors.New("ledger physical generation is unavailable")
+	}
+	parentDevice, parentInode := parentValue.FieldByName("Dev"), parentValue.FieldByName("Ino")
+	fileDevice, fileInode := fileValue.FieldByName("Dev"), fileValue.FieldByName("Ino")
+	if !parentDevice.IsValid() || !parentInode.IsValid() || !fileDevice.IsValid() || !fileInode.IsValid() {
+		return PhysicalGeneration{}, errors.New("ledger physical generation is unavailable")
+	}
+	generation := PhysicalGeneration{
+		ParentDevice: parentDevice.Uint(), ParentInode: parentInode.Uint(),
+		FileDevice: fileDevice.Uint(), FileInode: fileInode.Uint(),
+	}
+	if !generation.Valid() {
+		return PhysicalGeneration{}, errors.New("ledger physical generation is incomplete")
+	}
+	return generation, nil
 }
 
 func scanExactEvent(file *os.File, eventID string, expected []byte) (bool, error) {

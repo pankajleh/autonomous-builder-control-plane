@@ -13,6 +13,13 @@ import (
 )
 
 func readBoundedLocal(root, path string, maximumBytes int64) ([]byte, error) {
+	return readBoundedLocalAtStages(root, path, maximumBytes, nil, nil)
+}
+
+// readBoundedLocalAtStages keeps the production path free of mutable package
+// hooks while allowing the Linux tests to make replacement/link races land at
+// the two security-sensitive descriptor boundaries deterministically.
+func readBoundedLocalAtStages(root, path string, maximumBytes int64, afterRead, beforeReopen func() error) ([]byte, error) {
 	rootHandle, err := openNoSymlinks(root)
 	if err != nil {
 		return nil, fmt.Errorf("open controller evidence root: %w", err)
@@ -38,6 +45,9 @@ func readBoundedLocal(root, path string, maximumBytes int64) ([]byte, error) {
 	if !before.Mode().IsRegular() {
 		return nil, errors.New("evidence artifact must be a regular file, not a symlink or special file")
 	}
+	if err := requireSingleLink(before); err != nil {
+		return nil, err
+	}
 	if before.Size() < 0 || before.Size() > maximumBytes {
 		return nil, fmt.Errorf("evidence artifact is %d bytes; maximum is %d", before.Size(), maximumBytes)
 	}
@@ -52,9 +62,17 @@ func readBoundedLocal(root, path string, maximumBytes int64) ([]byte, error) {
 	if int64(len(data)) > maximumBytes {
 		return nil, fmt.Errorf("evidence artifact exceeds maximum %d bytes", maximumBytes)
 	}
+	if afterRead != nil {
+		if err := afterRead(); err != nil {
+			return nil, fmt.Errorf("exercise evidence artifact read boundary: %w", err)
+		}
+	}
 	after, err := file.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("reinspect evidence artifact: %w", err)
+	}
+	if err := requireSingleLink(after); err != nil {
+		return nil, err
 	}
 	afterIdentity, err := fileIdentity(after)
 	if err != nil {
@@ -62,6 +80,11 @@ func readBoundedLocal(root, path string, maximumBytes int64) ([]byte, error) {
 	}
 	if beforeIdentity != afterIdentity || int64(len(data)) != before.Size() {
 		return nil, errors.New("evidence artifact changed while being read")
+	}
+	if beforeReopen != nil {
+		if err := beforeReopen(); err != nil {
+			return nil, fmt.Errorf("exercise evidence artifact reopen boundary: %w", err)
+		}
 	}
 
 	current, err := openNoSymlinks(path)
@@ -73,6 +96,9 @@ func readBoundedLocal(root, path string, maximumBytes int64) ([]byte, error) {
 	if statErr != nil || closeErr != nil {
 		return nil, fmt.Errorf("reinspect evidence artifact path: %w", errors.Join(statErr, closeErr))
 	}
+	if err := requireSingleLink(currentInfo); err != nil {
+		return nil, err
+	}
 	currentIdentity, err := fileIdentity(currentInfo)
 	if err != nil {
 		return nil, err
@@ -81,6 +107,17 @@ func readBoundedLocal(root, path string, maximumBytes int64) ([]byte, error) {
 		return nil, errors.New("evidence artifact path was replaced while being read")
 	}
 	return data, nil
+}
+
+func requireSingleLink(info os.FileInfo) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("evidence artifact link count is unavailable")
+	}
+	if stat.Nlink != 1 {
+		return errors.New("evidence artifact must have exactly one hard link")
+	}
+	return nil
 }
 
 type localFileIdentity struct {

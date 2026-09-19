@@ -12,10 +12,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/pankajleh/autonomous-builder-control-plane/internal/authoritybackend"
-	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 )
 
 const TransitionBarrierSchemaV1 = "run-transition-barrier-v1"
@@ -23,6 +21,8 @@ const TransitionBarrierSchemaV1 = "run-transition-barrier-v1"
 const leasedAppendSentinel = "leased-run-transition"
 
 var safeBarrierRunID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$`)
+
+var errRunTransitionIntegrity = errors.New("run-transition authority integrity failure")
 
 // TransitionBarrier is an immutable durable exclusion protecting a READY run
 // while one exact target-ref submission is unresolved.
@@ -46,35 +46,70 @@ type barrierPayload struct {
 // RunTransitionLease holds the cross-process run lock across final READY
 // reconstruction, authorization sealing, submission, and terminal selection.
 type RunTransitionLease struct {
-	ledger           *JSONLLedger
-	runID            string
-	file             *os.File
-	predecessorLease authoritybackend.PredecessorWriterLeaseHandleV1
-	closed           bool
+	ledger *JSONLLedger
+	runID  string
+	file   *os.File
+	dev    uint64
+	ino    uint64
+	digest [sha256.Size]byte
+	mu     sync.Mutex
+	closed bool
+}
+
+// runTransitionNamespace pins the only directory and registry generation
+// authorized to issue run-transition lock identities for one ledger.
+type runTransitionNamespace struct {
+	directory     *os.File
+	registry      *os.File
+	directoryDev  uint64
+	directoryIno  uint64
+	registryDev   uint64
+	registryIno   uint64
+	authorityName string
+	authorityData []byte
 }
 
 func (l *JSONLLedger) AcquireRunTransition(runID string) (*RunTransitionLease, error) {
 	if l == nil || !safeBarrierRunID.MatchString(runID) {
 		return nil, errors.New("valid ledger and run ID are required")
 	}
-	predecessorLease, err := l.acquirePredecessorWriterV1("maintenance")
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil, errors.New("authoritative ledger is closed")
+	}
+	if l.file == nil {
+		if err := l.pinLedgerFileLocked(true); err != nil {
+			l.mu.Unlock()
+			return nil, err
+		}
+	}
+	if err := l.verifyPhysicalIdentityLocked(); err != nil {
+		l.mu.Unlock()
+		return nil, err
+	}
+	lease, err := l.acquireRunTransitionLeaseLocked(runID)
+	l.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	if err := l.verifyPhysicalIdentity(); err != nil {
-		if predecessorLease != nil {
-			_ = predecessorLease.Release()
-		}
-		return nil, err
+	// Do not hold the ledger mutex during bounded flock acquisition: the
+	// current owner must remain able to append and release this same run.
+	if err := lockLedgerFile(lease.file, ledgerFileLockWait); err != nil {
+		_ = lease.file.Close()
+		return nil, fmt.Errorf("lock run transition: %w", err)
 	}
-	file, err := l.acquireRunTransitionFile(runID)
+	l.mu.Lock()
+	if l.closed {
+		err = errors.New("authoritative ledger is closed")
+	} else {
+		err = l.verifyRunTransitionLeaseLocked(lease)
+	}
+	l.mu.Unlock()
 	if err != nil {
-		if predecessorLease != nil {
-			_ = predecessorLease.Release()
-		}
-		return nil, err
+		return nil, errors.Join(err, unlockLedgerFile(lease.file), lease.file.Close())
 	}
-	return &RunTransitionLease{ledger: l, runID: runID, file: file, predecessorLease: predecessorLease}, nil
+	return lease, nil
 }
 
 func (l *RunTransitionLease) RunID() string {
@@ -85,47 +120,29 @@ func (l *RunTransitionLease) RunID() string {
 }
 
 func (l *RunTransitionLease) Close() error {
-	if l == nil || l.closed {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
 		return nil
 	}
 	l.closed = true
-	err := unlockLedgerFile(l.file)
-	closeErr := l.file.Close()
-	var predecessorErr error
-	if l.predecessorLease != nil {
-		predecessorErr = l.predecessorLease.Release()
+	var identityErr error
+	if l.ledger == nil {
+		identityErr = errors.New("run-transition lease lost its ledger authority")
+	} else {
+		l.ledger.mu.Lock()
+		if l.ledger.closed {
+			identityErr = errors.New("run-transition lease ledger is closed")
+		} else {
+			identityErr = l.ledger.verifyRunTransitionLeaseLocked(l)
+		}
+		l.ledger.mu.Unlock()
 	}
-	return errors.Join(err, closeErr, predecessorErr)
-}
-
-func (l *JSONLLedger) acquireRunTransitionFile(runID string) (*os.File, error) {
-	if err := l.verifyPhysicalIdentity(); err != nil {
-		return nil, err
-	}
-	directory := l.path + ".run-locks"
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return nil, err
-	}
-	if err := verifyLedgerControlDirectory(directory); err != nil {
-		return nil, err
-	}
-	sum := sha256.Sum256([]byte(runID))
-	path := filepath.Join(directory, hex.EncodeToString(sum[:])+".lock")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	info, statErr := file.Stat()
-	nameInfo, nameErr := os.Lstat(path)
-	if statErr != nil || nameErr != nil || nameInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, nameInfo) || verifyLedgerFileInfo(info) != nil {
-		_ = file.Close()
-		return nil, errors.Join(errors.New("run-transition lock is unsafe"), statErr, nameErr)
-	}
-	if err := lockLedgerFile(file, ledgerFileLockWait); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("lock run transition: %w", err)
-	}
-	return file, nil
+	unlockErr := unlockLedgerFile(l.file)
+	return errors.Join(identityErr, unlockErr, l.file.Close())
 }
 
 func NewTransitionBarrier(runID, attemptID, commitmentSHA256 string, created time.Time) (TransitionBarrier, error) {
@@ -176,19 +193,12 @@ func ParseTransitionBarrier(data []byte) (TransitionBarrier, error) {
 
 // InstallTransitionBarrier immutable-creates the exact barrier. A byte-identical
 // replay is accepted; a different barrier for the same run is rejected.
-func (l *JSONLLedger) InstallTransitionBarrier(barrier TransitionBarrier) (resultErr error) {
+func (l *JSONLLedger) InstallTransitionBarrier(barrier TransitionBarrier) error {
 	if l == nil || barrier.Validate() != nil {
 		return errors.New("valid transition barrier and ledger are required")
 	}
 	if err := l.verifyPhysicalIdentity(); err != nil {
 		return err
-	}
-	predecessorLease, err := l.acquirePredecessorWriterV1("maintenance")
-	if err != nil {
-		return err
-	}
-	if predecessorLease != nil {
-		defer func() { resultErr = errors.Join(resultErr, predecessorLease.Release()) }()
 	}
 	file, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -265,91 +275,14 @@ func (l *JSONLLedger) ActiveTransitionBarrier(runID string) (TransitionBarrier, 
 	return barrier, found, err
 }
 
-// PredecessorDrainSnapshotV1 takes the retained run-transition lock without
-// opening a predecessor writer lease (the caller already owns the exclusive
-// cutover fence), rejects any active barrier, and returns a deterministic
-// digest of the exact terminal run history. Unknown/malformed ledger bytes
-// fail closed.
-func (l *JSONLLedger) PredecessorDrainSnapshotV1(runID string) (string, error) {
-	if l == nil || !safeBarrierRunID.MatchString(runID) {
-		return "", errors.New("valid ledger and run ID are required")
-	}
-	transitionFile, err := l.acquireRunTransitionFile(runID)
-	if err != nil {
-		return "", fmt.Errorf("V3_DRAIN_REQUIRED: admitted run operation is active or unavailable: %w", err)
-	}
-	defer func() {
-		_ = unlockLedgerFile(transitionFile)
-		_ = transitionFile.Close()
-	}()
-	if _, active, err := l.ActiveTransitionBarrier(runID); err != nil {
-		return "", err
-	} else if active {
-		return "", errors.New("V3_DRAIN_REQUIRED: ledger transition barrier is active")
-	}
-	snapshot, _, err := l.Snapshot()
-	if err != nil {
-		return "", err
-	}
-	if len(snapshot) == 0 || snapshot[len(snapshot)-1] != '\n' {
-		return "", errors.New("V3_DRAIN_REQUIRED: ledger has no durable framed run history")
-	}
-	lines := bytes.Split(snapshot[:len(snapshot)-1], []byte{'\n'})
-	runLines := make([]json.RawMessage, 0)
-	var tip Event
-	for _, line := range lines {
-		if len(line) == 0 || len(line) > maxLedgerLineBytes {
-			return "", errors.New("V3_DRAIN_REQUIRED: ledger contains an invalid line bound")
-		}
-		var event Event
-		decoder := json.NewDecoder(bytes.NewReader(line))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&event); err != nil || event.Validate() != nil {
-			return "", errors.New("V3_DRAIN_REQUIRED: ledger contains a malformed event")
-		}
-		canonical, err := json.Marshal(event)
-		if err != nil || !bytes.Equal(canonical, line) {
-			return "", errors.New("V3_DRAIN_REQUIRED: ledger contains a non-canonical event")
-		}
-		if event.RunID == runID {
-			tip = event
-			runLines = append(runLines, append(json.RawMessage(nil), line...))
-		}
-	}
-	if len(runLines) == 0 || tip.StateTo != domain.StateCompleted && tip.StateTo != domain.StateFailed && tip.StateTo != domain.StateCancelled {
-		return "", errors.New("V3_DRAIN_REQUIRED: ledger run tip has an outgoing transition")
-	}
-	record := struct {
-		Kind          string            `json:"kind"`
-		SchemaVersion string            `json:"schema_version"`
-		RunID         string            `json:"run_id"`
-		Events        []json.RawMessage `json:"events"`
-		TerminalState domain.State      `json:"terminal_state"`
-		BarrierState  string            `json:"barrier_state"`
-	}{"PredecessorLedgerDrainSnapshotV1", "predecessor-ledger-drain-snapshot-v1", runID, runLines, tip.StateTo, "DRAINED"}
-	data, err := json.Marshal(record)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(data)
-	return hex.EncodeToString(digest[:]), nil
-}
-
 // ResolveTransitionBarrier removes the exact barrier only after the authorized
 // terminal event has been durably append-or-verified by the caller.
-func (l *JSONLLedger) ResolveTransitionBarrier(barrier TransitionBarrier) (resultErr error) {
+func (l *JSONLLedger) ResolveTransitionBarrier(barrier TransitionBarrier) error {
 	if l == nil || barrier.Validate() != nil {
 		return errors.New("valid transition barrier and ledger are required")
 	}
 	if err := l.verifyPhysicalIdentity(); err != nil {
 		return err
-	}
-	predecessorLease, err := l.acquirePredecessorWriterV1("maintenance")
-	if err != nil {
-		return err
-	}
-	if predecessorLease != nil {
-		defer func() { resultErr = errors.Join(resultErr, predecessorLease.Release()) }()
 	}
 	file, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {

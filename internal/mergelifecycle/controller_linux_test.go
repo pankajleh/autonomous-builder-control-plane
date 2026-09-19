@@ -25,21 +25,6 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
-func TestProductionControllerRequiresDurablePredecessorComposition(t *testing.T) {
-	f := newControllerFixture(t)
-	source, err := NewStaticAuthoritySource(f.governed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	controller, err := NewProduction(Config{StateRoot: f.stateRoot, Ledger: f.ledger, AuthoritySource: source, Provider: &fakeProvider{t: t}})
-	if controller != nil {
-		_ = controller.Close()
-	}
-	if err == nil || !strings.Contains(err.Error(), "same durable PostgreSQL fence") {
-		t.Fatalf("production merge controller accepted an unfenced composition: %v", err)
-	}
-}
-
 func TestControllerAppliedPersistsMergedBeforeCleanup(t *testing.T) {
 	f := newControllerFixture(t)
 	provider := &fakeProvider{t: t, disposition: githublifecycle.ReconciliationApplied}
@@ -113,11 +98,29 @@ func TestConcurrentControllersSubmitExactAttemptOnce(t *testing.T) {
 		}(controller)
 	}
 	close(start)
+	var outcomes []struct {
+		result Result
+		err    error
+	}
 	for range 2 {
-		outcome := <-results
-		if outcome.err != nil || outcome.result.State != domain.StateMerged {
-			t.Fatalf("concurrent controller = %+v, %v", outcome.result, outcome.err)
+		outcomes = append(outcomes, <-results)
+	}
+	const runTransitionBusy = "lock run transition: authoritative ledger file lock is busy"
+	merged := 0
+	for _, outcome := range outcomes {
+		if outcome.err == nil {
+			if outcome.result.State != domain.StateMerged {
+				t.Fatalf("concurrent controller returned unexpected successful result: %+v", outcome.result)
+			}
+			merged++
+			continue
 		}
+		if outcome.err.Error() != runTransitionBusy {
+			t.Fatalf("concurrent controller returned unexpected error: %+v, %v", outcome.result, outcome.err)
+		}
+	}
+	if merged == 0 {
+		t.Fatalf("concurrent controllers did not reach MERGED: %+v", outcomes)
 	}
 	if provider.submitCalls != 1 || provider.prepareCalls != 1 || provider.postMergeCalls != 1 {
 		t.Fatalf("duplicate side effects: prepare=%d submit=%d post=%d", provider.prepareCalls, provider.submitCalls, provider.postMergeCalls)
