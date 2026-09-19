@@ -1,6 +1,6 @@
 # ABCP-RC-P01 Delivery Evidence
 
-Status: **COMPLETE — HUMAN MERGE GATE**
+Status: **BOUNDED PRG CORRECTIONS COMPLETE — HUMAN MERGE GATE**
 
 ## Authority identities
 
@@ -20,15 +20,19 @@ All Repo C hashes above were recomputed from exact commit `b5de18b79765be089317d
 
 - Exact implementation base SHA: `4d45202f5b411d9c91caf5fef906d1eff9b26e4b`
 - Feature branch: `feature/abcp-rc-p01-run-admission-20260919`
-- Executable tested SHA: `3cdda8adc92756fa14e87af7d4e83cda2d95b943`
+- Executable tested SHA: `8a4ef3cd0a4a450cd924666682c850278fe9ace5`
 - Review-1 correction executable SHA: `3cdda8adc92756fa14e87af7d4e83cda2d95b943`
-- Evidence-only successor SHA: `e895e8b7010176c8aa45d6f836912344b1be1865`
+- Bounded PRG correction executable SHA: `8a4ef3cd0a4a450cd924666682c850278fe9ace5`
+- Prior evidence-only successor SHA: `e895e8b7010176c8aa45d6f836912344b1be1865`
+- Bounded PRG evidence-only successor SHA: `<bound by the follow-up evidence-only identity commit>`
 - Draft PR: `#22`, `https://github.com/pankajleh/autonomous-builder-control-plane/pull/22`
 - PR base: `main`
 - PR state at evidence preparation: open Draft, merge state `CLEAN`
 - Merge: **NOT DONE — HUMAN GATE**
 
 Commit `e895e8b7010176c8aa45d6f836912344b1be1865` is the first evidence-only successor to the executable. The follow-up evidence-only binding commit records that now-known identity and changes no executable behavior.
+
+Commit `8a4ef3cd0a4a450cd924666682c850278fe9ace5` is the exact executable correction tested for the later user-authorized bounded PRG review. The evidence commit carrying this update is an evidence-only successor and changes no executable behavior; its exact identity is recorded by the follow-up evidence-only identity commit.
 
 ## Implementation summary
 
@@ -45,13 +49,14 @@ Changed production paths:
 
 Changed test paths:
 
+- `cmd/abcp/main_test.go`
 - `internal/governance/governance_test.go`
 - `internal/runadmission/controller_linux_test.go`
 - `internal/serviceapi/server_test.go`
 - `internal/strictjson/strictjson_test.go`
 - `internal/workflowauthoritypg/backend_test.go`
 
-No product-facing DTO field or schema was added or removed. The correction enforces exact case-sensitive and valid-UTF-8 JSON, machine-service delegated-actor grants, repository-derived workflow initialization, owner/mode-safe private roots, exact registered-run binding, and non-success reconciliation for ambiguous launch state. Exact registered replay remains stable after repository HEAD advances.
+No product-facing DTO field or schema was added or removed. The original correction enforces exact case-sensitive and valid-UTF-8 JSON, machine-service delegated-actor grants, repository-derived workflow initialization, owner/mode-safe private roots, exact registered-run binding, and non-success reconciliation for ambiguous launch state. The bounded PRG correction additionally freezes the resolved private profile authority in the durable receipt, persists the exact private material/launch/catalog binding before launch, reconciles exact replay independently of later profile changes or removal while still verifying frozen material, rejects unbound receipt rebinding, and rejects configured repository identities that differ from the governance controller's canonical origin. Exact registered replay remains stable after repository HEAD advances.
 
 Repo C adapter/UI, human-decision continuation, retry/resume/recovery, provider selection, merge/publication authority, live infrastructure and all later-pack work remain excluded.
 
@@ -75,20 +80,28 @@ ALREADY_SATISFIED at the exact base:
 
 Final regressions additionally cover durable catalog failure, corrupt receipt state, launch failure with one preserved durable identity, exact and conflicting registered-run bindings, post-startup private-root mode widening, strict manifest/profile/workflow/public JSON, and denial of a granted non-service principal.
 
-## Focused gates at executable SHA
+Bounded PRG review regression evidence:
 
-- `go test -count=1 ./internal/runadmission`: PASS (`1.613s`)
-- `go test -count=1 ./internal/serviceapi`: PASS (`0.033s`)
-- `go test -count=1 ./internal/workflowauthoritypg`: PASS (`0.011s`)
-- `go test -count=1 ./internal/governance`: PASS (`3.928s`)
-- `go test -count=1 ./cmd/abcp`: PASS (`0.619s`)
-- `go test -count=1 -race ./internal/runadmission ./internal/serviceapi ./internal/workflowauthoritypg`: PASS (`2.741s`, `1.102s`, `1.030s` respectively)
+- `go test -count=1 ./internal/runadmission -run TestAdmissionRegisteredExactReplaySurvivesPrivateProfileChange -v`: RED before correction; exact replay returned `unsafe admission materialization` after a valid private profile change.
+- An isolated focused reproduction with the original profile ID removed returned `unknown admission profile` for the exact registered replay; the kept regressions cover both changed and removed profiles.
+- An isolated focused reproduction configured a non-origin repository identity that matched an alternate remote/template; `NewController` incorrectly accepted the profile before correction. `TestAdmissionProfileRejectsRepositoryIdentityThatIsNotCanonicalOrigin` now covers it.
+- Command coverage showed the repository-derived `EnsureInitialized` wiring was unexecuted and reverting it left the prior getter-only regression green. `TestRunCommandInitializesWorkflowAuthorityWithControllerDerivedRepositoryIdentity` now exercises the composition path with a recording backend.
+- Additional kept regressions cover changed-profile unbound receipts, bound relaunch after profile change, and registered replay rejection when frozen admission material drifts.
+
+## Focused gates at corrected executable SHA
+
+- `go test -count=1 ./internal/runadmission`: PASS (`3.197s`)
+- `go test -count=1 ./internal/serviceapi`: PASS (`0.028s`)
+- `go test -count=1 ./internal/workflowauthoritypg`: PASS (`0.013s`)
+- `go test -count=1 ./internal/governance`: PASS (`4.404s`)
+- `go test -count=1 ./cmd/abcp`: PASS (`0.647s`)
+- `go test -count=1 -race ./internal/runadmission ./internal/serviceapi ./internal/workflowauthoritypg`: PASS (`4.693s`, `1.137s`, `1.069s` respectively)
 - PostgreSQL integration test: SKIPPED exactly as coded because `ABCP_WORKFLOW_AUTHORITY_PG_TEST_DSN` was unavailable. No live infrastructure was provisioned.
 
-## Broad gates at executable SHA
+## Broad gates at corrected executable SHA
 
-- `go test -count=1 ./...`: PASS across all 33 listed packages (`internal/runtimecatalog` slowest at `92.953s`)
-- `go test -count=1 -race ./...`: PASS across all 33 listed packages (`internal/runtimecatalog` slowest at `335.666s`)
+- `go test -count=1 ./...`: PASS across all listed packages (`internal/runtimecatalog` slowest at `61.277s`)
+- `go test -count=1 -race ./...`: PASS across all listed packages (`internal/runtimecatalog` slowest at `314.232s`)
 - `go vet ./...`: PASS
 - `GOOS=darwin GOARCH=amd64 go build ./cmd/abcp`: PASS
 - `GOOS=windows GOARCH=amd64 go build ./cmd/abcp`: PASS
@@ -123,16 +136,30 @@ Review 2 final result: `<<<RALPHEX:REVIEW_DONE>>>`.
 
 Remaining accepted findings: none. No third review was performed.
 
+## User-authorized bounded PRG review
+
+This later bounded PRG review was explicitly requested by the user and is recorded separately from the already completed pack Review 1 / Review 2 sequence above; it is not represented as a third pack review.
+
+Accepted findings and corrections:
+
+- Exact replay incorrectly depended on the mutable current private profile. The corrected receipt freezes the selected private profile authority, a protected binding freezes the exact material/launch/catalog inputs before launch, registered replay uses that original binding, and unbound receipts cannot adopt changed private authority.
+- Profile loading accepted a non-origin repository identity that the actual governance run path necessarily rejected. Profile loading now requires the same canonical-origin identity derived by `ControllerV1`.
+- The repository-derived workflow-authority initialization correction lacked command-composition regression coverage. A recording backend now proves the run command passes the controller-derived repository identity rather than the manifest identity.
+
+Correction executable SHA: `8a4ef3cd0a4a450cd924666682c850278fe9ace5`.
+
+Required focused, focused-race, broad, broad-race, vet, cross-platform build, and diff-check gates all passed against that exact executable SHA. `ABCP_WORKFLOW_AUTHORITY_PG_TEST_DSN` was unavailable, so the PostgreSQL integration test skipped exactly as coded; no infrastructure was provisioned.
+
 ## Final scope and delivery checks
 
 - Allowed-path check: PASS; every executable and evidence path matches the exact pack regex.
-- Executable changed files: 13; PASS against the active bounded wrapper.
-- Executable diff: 752 insertions and 274 deletions; PASS against the active bounded wrapper.
+- Executable changed files: 14; PASS against the active bounded wrapper.
+- Executable diff: 1,299 insertions and 321 deletions; PASS against the active bounded wrapper.
 - Executable worktree before evidence: clean.
-- Executable branch push: PASS; remote head was `3cdda8adc92756fa14e87af7d4e83cda2d95b943` before the evidence successor.
+- Prior executable branch push: PASS; remote head was `3cdda8adc92756fa14e87af7d4e83cda2d95b943` before the earlier evidence successor. The bounded PRG correction and evidence successors are pushed together after the evidence identity is bound.
 - Draft PR targets `main`: PASS (`#22`, exact required title, Draft).
-- Executable SHA named by evidence: PASS.
-- Evidence-only successor explicitly distinguished: PASS (`e895e8b7010176c8aa45d6f836912344b1be1865`); it changes no executable behavior.
+- Executable SHA named by evidence: PASS (`8a4ef3cd0a4a450cd924666682c850278fe9ace5`).
+- Evidence-only successor explicitly distinguished: PASS; the bounded PRG evidence commit changes no executable behavior and its identity is bound by the follow-up evidence-only identity commit.
 - Unresolved scope-crossing finding: none.
 - Merge: **NOT DONE — HUMAN GATE**.
 
