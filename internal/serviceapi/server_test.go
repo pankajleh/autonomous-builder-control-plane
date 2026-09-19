@@ -25,6 +25,24 @@ type testFutureDependencies struct {
 	actionKinds  []ActionKind
 }
 
+type testRunAdmissionController struct {
+	mu        sync.Mutex
+	principal Principal
+	request   RunAdmissionRequestV1
+	response  RunAdmissionResponseV1
+	err       error
+	calls     int
+}
+
+func (c *testRunAdmissionController) AdmitRun(_ context.Context, principal Principal, request RunAdmissionRequestV1) (RunAdmissionResponseV1, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	c.principal = principal
+	c.request = request
+	return c.response, c.err
+}
+
 type heldResponseWriter struct {
 	header  http.Header
 	entered chan<- struct{}
@@ -226,6 +244,82 @@ func TestEveryV1RouteAuthenticatesAndCapabilitiesAreDeterministic(t *testing.T) 
 	if unsupported.Code != http.StatusNotImplemented || !strings.Contains(unsupported.Body.String(), "unsupported_capability") {
 		t.Fatalf("unsupported route = %d %q", unsupported.Code, unsupported.Body.String())
 	}
+}
+
+func TestRunAdmissionCapabilityAuthenticationAndAcceptedResponse(t *testing.T) {
+	controller := &testRunAdmissionController{response: RunAdmissionResponseV1{RunID: "admission-run-1", RunURL: "/v1/runs/admission-run-1"}}
+	server := newTestServer(t, &testCatalog{}, time.Now().UTC())
+	server.reserved.RunAdmission = controller
+
+	capabilities := httptest.NewRecorder()
+	server.Handler().ServeHTTP(capabilities, authenticatedRequest(http.MethodGet, "/v1/capabilities", nil))
+	if capabilities.Code != http.StatusOK || !strings.Contains(capabilities.Body.String(), `"run_admission":true`) {
+		t.Fatalf("admission capability = %d %q", capabilities.Code, capabilities.Body.String())
+	}
+	body := validRunAdmissionJSON("request-1", "task")
+	unauthenticated := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodPost, "/v1/runs", strings.NewReader(body)))
+	if unauthenticated.Code != http.StatusUnauthorized || controller.calls != 0 {
+		t.Fatalf("unauthenticated admission = %d, calls=%d", unauthenticated.Code, controller.calls)
+	}
+	accepted := httptest.NewRecorder()
+	server.Handler().ServeHTTP(accepted, authenticatedRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(body))))
+	if accepted.Code != http.StatusAccepted || accepted.Body.String() != `{"run_id":"admission-run-1","run_url":"/v1/runs/admission-run-1"}`+"\n" {
+		t.Fatalf("accepted admission = %d %q", accepted.Code, accepted.Body.String())
+	}
+	if controller.calls != 1 || controller.principal.PrincipalID != "test" || controller.request.DelegatedActor.SubjectType != PrincipalUser {
+		t.Fatalf("admission dispatch = calls=%d principal=%+v request=%+v", controller.calls, controller.principal, controller.request)
+	}
+}
+
+func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
+	controller := &testRunAdmissionController{response: RunAdmissionResponseV1{RunID: "admission-run-1", RunURL: "/v1/runs/admission-run-1"}}
+	server := newTestServer(t, &testCatalog{}, time.Now().UTC())
+	server.reserved.RunAdmission = controller
+	valid := validRunAdmissionJSON("request-1", "task")
+	for name, body := range map[string]string{
+		"unknown field":   strings.TrimSuffix(valid, "}") + `,"manifest_path":"/private"}`,
+		"duplicate field": strings.Replace(valid, `"profile_id":"default"`, `"profile_id":"default","profile_id":"other"`, 1),
+		"partial SHA":     strings.Replace(valid, strings.Repeat("b", 40), strings.Repeat("b", 12), 1),
+		"missing actor":   strings.Replace(valid, `,"delegated_actor":{"subject_id":"human-1","subject_type":"user"}`, "", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, authenticatedRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(body))))
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"code":"invalid_request"`) {
+				t.Fatalf("strict admission = %d %q", response.Code, response.Body.String())
+			}
+		})
+	}
+	for _, test := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{ErrRequestIDConflict, http.StatusConflict, "request_id_conflict"},
+		{ErrUnknownAdmissionProfile, http.StatusNotFound, "unknown_profile"},
+		{ErrRepositoryBaseMismatch, http.StatusConflict, "repository_base_mismatch"},
+		{ErrAdmissionUnavailable, http.StatusServiceUnavailable, "admission_unavailable"},
+		{ErrUnsafeAdmissionMaterialization, http.StatusInternalServerError, "unsafe_admission_materialization"},
+	} {
+		controller.err = test.err
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, authenticatedRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(valid))))
+		if response.Code != test.status || !strings.Contains(response.Body.String(), `"code":"`+test.code+`"`) || strings.Contains(response.Body.String(), "/private") {
+			t.Fatalf("mapped admission error %v = %d %q", test.err, response.Code, response.Body.String())
+		}
+	}
+}
+
+func validRunAdmissionJSON(requestID, task string) string {
+	request := RunAdmissionRequestV1{
+		SchemaVersion: 1, RequestID: requestID, ProfileID: "default",
+		ProductAuthorizationID: "authorization-1", ProductTaskID: "task-1", ProductVersionID: "version-1",
+		ProductManifestSHA256: strings.Repeat("a", 64), RepositoryBaseSHA: strings.Repeat("b", 40),
+		TaskMarkdown: task, DelegatedActor: DelegatedActorV1{SubjectID: "human-1", SubjectType: PrincipalUser},
+	}
+	data, _ := json.Marshal(request)
+	return string(data)
 }
 
 func TestFutureRoutesDispatchTypedInputsAndDeriveCapabilities(t *testing.T) {

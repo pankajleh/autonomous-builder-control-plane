@@ -267,13 +267,13 @@ The future deferred resume/recovery seam MUST consume the exact recorded decisio
 
 ## 13. Deferred action semantics
 
-There is no `/actions/retry`, `/actions/resume`, `/actions/recover`, or `POST /v1/runs` in EP-006 v1.
+There is no `/actions/retry`, `/actions/resume`, or `/actions/recover` in EP-006 v1. The later bounded `PRODUCT_RUN_ADMISSION.md` extension conditionally adds `POST /v1/runs` when a concrete controller-owned admission profile is configured; without it, admission remains unsupported and `run_admission=false`.
 
-- `FAILED` remains terminal unless a new run/attempt is created under explicit recovery authority; that creation/execution seam is deferred.
+- `FAILED` remains terminal unless a new run/attempt is created through an explicitly implemented admission/recovery path; general retry/recovery remains deferred.
 - `RETRYING`, `CAPACITY_WAIT`, and `RECOVERY_REQUIRED` remain observable through projections but not remotely actuated by EP-006.
-- capability discovery reports these action capabilities false.
+- capability discovery continues to report retry, resume, and recovery false.
 
-This removes any false implication that the service can materialize or launch authority it does not own.
+The admission extension reuses the existing `abcp run` execution path and does not imply retry/resume/recovery capability.
 
 ## 14. Error model
 
@@ -353,10 +353,10 @@ The concrete EP-006 server freezes these implementation values rather than leavi
 - evidence downloads: <=4 concurrent, <=16 MiB each;
 - active registered runs/watchers: <=256.
 
-Any implementation need to widen one of these ceilings returns to A design authority.
+Any implementation need to widen one of these ceilings requires a separately bounded design change.
 
 ## 18. UI and admission deferral
 
 ABCP ships no dashboard in EP-006. Repo C may combine ABCP projections with its own product/workspace/PDLC data.
 
-EP-006 also does not expose new-run admission because current `authority.Manifest` deliberately contains controller-local repository/plan/capsule/Ralphex/worktree/acceptance details. A later bounded Repo-C↔ABCP admission/provider design must define a safe higher-level submission contract rather than freezing those internals into `/v1`.
+The EP-006 core deliberately does not expose controller-local `authority.Manifest` fields. The bounded `PRODUCT_RUN_ADMISSION.md` extension supplies the safe higher-level Repo-C↔ABCP submission contract: callers provide only product identities/digests, task text, profile selection, repository base SHA, and delegated actor attribution; private manifest, paths, Ralphex/worktree settings, and workflow-authority storage remain controller-owned.

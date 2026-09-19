@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -101,6 +102,16 @@ func TestRunCLIRejectsAutonomousWorkflowWithoutAuthorityBackend(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(evidenceRoot, "cli-run", "authority.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("backendless admission created authority evidence: %v", err)
 	}
+
+	stderr.Reset()
+	missingWorkflowConfig := filepath.Join(t.TempDir(), "private-workflow-authority.json")
+	code = runCLI([]string{
+		"run", "--manifest", manifestPath, "--ledger", ledgerPath, "--evidence-root", evidenceRoot,
+		"--workflow-authority-config-file", missingWorkflowConfig,
+	}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "open workflow authority backend") || strings.Contains(stderr.String(), missingWorkflowConfig) {
+		t.Fatalf("workflow authority config failure = %d %q", code, stderr.String())
+	}
 }
 
 func TestRunCommandRequiresEveryExplicitPath(t *testing.T) {
@@ -144,6 +155,30 @@ func TestServeCommandRejectsNonLoopbackAndMissingProtectedConfiguration(t *testi
 	}, io.Discard, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), "load bearer authentication configuration") || strings.Contains(stderr.String(), secretPath) {
 		t.Fatalf("missing protected config = %d %q", code, stderr.String())
+	}
+}
+
+func TestServeCommandAdmissionProfileIsOptionalAndFailsClosedWhenConfigured(t *testing.T) {
+	root := t.TempDir()
+	tokenPath := filepath.Join(root, "token")
+	writeCLIFile(t, tokenPath, []byte(strings.Repeat("t", 32)), 0o600)
+	cursorPath := filepath.Join(root, "cursor")
+	cursor, err := json.Marshal(map[string]string{"key_id": "key-1", "key_base64": base64.StdEncoding.EncodeToString(make([]byte, 32))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCLIFile(t, cursorPath, cursor, 0o600)
+	grantsPath := filepath.Join(root, "grants")
+	writeCLIFile(t, grantsPath, []byte(`{"principals":[]}`), 0o600)
+	missingProfile := filepath.Join(root, "private-admission-profile")
+	var stderr bytes.Buffer
+	code := runCLI([]string{
+		"serve", "--service-root", filepath.Join(root, "service"), "--listen", "127.0.0.1:0",
+		"--token-file", tokenPath, "--principal-id", "service", "--cursor-key-file", cursorPath,
+		"--authority-grants-file", grantsPath, "--admission-profile-file", missingProfile,
+	}, io.Discard, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "load run admission configuration") || strings.Contains(stderr.String(), missingProfile) {
+		t.Fatalf("configured admission failure = %d %q", code, stderr.String())
 	}
 }
 

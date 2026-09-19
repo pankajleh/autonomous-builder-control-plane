@@ -55,6 +55,10 @@ var (
 	ErrDecisionAlreadyResolved         = errors.New("decision already resolved")
 	ErrDecisionAlreadyRecorded         = errors.New("decision already recorded")
 	ErrReconciliationRequired          = errors.New("reconciliation required")
+	ErrUnknownAdmissionProfile         = errors.New("unknown admission profile")
+	ErrRepositoryBaseMismatch          = errors.New("repository base mismatch")
+	ErrAdmissionUnavailable            = errors.New("run admission unavailable")
+	ErrUnsafeAdmissionMaterialization  = errors.New("unsafe admission materialization")
 	ErrInternalDurableSubstrateFailure = errors.New("internal durable substrate failure")
 	ErrInternalDurableSubstrate        = ErrInternalDurableSubstrateFailure
 	errRequestBodyTooLarge             = errors.New("request body exceeds limit")
@@ -103,6 +107,10 @@ type ActionController interface {
 	ReadAction(context.Context, Principal, string, string) (ActionStatusV1, error)
 }
 
+type RunAdmissionController interface {
+	AdmitRun(context.Context, Principal, RunAdmissionRequestV1) (RunAdmissionResponseV1, error)
+}
+
 type ServerConfig struct {
 	Authenticator  Authenticator
 	Authority      *AuthorityMatcher
@@ -114,6 +122,7 @@ type ServerConfig struct {
 	Timeline       TimelineReader
 	Evidence       EvidenceReader
 	Actions        ActionController
+	RunAdmission   RunAdmissionController
 }
 
 type Server struct {
@@ -287,7 +296,7 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	case "/v1/capabilities":
 		s.capabilities(writer, request, requestID)
 	case "/v1/runs":
-		s.runs(writer, request, requestID)
+		s.runs(writer, request, principal, requestID)
 	default:
 		s.runRoute(writer, request, principal, requestID)
 	}
@@ -299,7 +308,8 @@ func (s *Server) capabilities(writer http.ResponseWriter, request *http.Request,
 		return
 	}
 	s.writeJSON(writer, http.StatusOK, CapabilitiesV1{
-		Cancel: s.reserved.Actions != nil, Decision: s.reserved.Actions != nil,
+		RunAdmission: s.reserved.RunAdmission != nil,
+		Cancel:       s.reserved.Actions != nil, Decision: s.reserved.Actions != nil,
 		EvidenceDownload: s.reserved.Evidence != nil,
 	})
 }
@@ -537,9 +547,9 @@ func (s *Server) runActionStatus(writer http.ResponseWriter, request *http.Reque
 	s.writeJSON(writer, http.StatusOK, status)
 }
 
-func (s *Server) runs(writer http.ResponseWriter, request *http.Request, requestID string) {
+func (s *Server) runs(writer http.ResponseWriter, request *http.Request, principal Principal, requestID string) {
 	if request.Method == http.MethodPost {
-		s.writeError(writer, http.StatusNotImplemented, ErrorV1{Code: "unsupported_capability", Message: "run admission is not available", RequestID: requestID})
+		s.runAdmission(writer, request, principal, requestID)
 		return
 	}
 	if request.Method != http.MethodGet || !requestBodyEmpty(request) {
@@ -590,6 +600,42 @@ func (s *Server) runs(writer http.ResponseWriter, request *http.Request, request
 		}
 	}
 	s.writeJSON(writer, http.StatusOK, response)
+}
+
+func (s *Server) runAdmission(writer http.ResponseWriter, request *http.Request, principal Principal, requestID string) {
+	if s.reserved.RunAdmission == nil {
+		s.writeError(writer, http.StatusNotImplemented, ErrorV1{Code: "unsupported_capability", Message: "run admission is not available", RequestID: requestID})
+		return
+	}
+	if request.URL.RawQuery != "" {
+		s.writeError(writer, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid run admission request", RequestID: requestID})
+		return
+	}
+	data, err := io.ReadAll(request.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.writeError(writer, http.StatusRequestEntityTooLarge, ErrorV1{Code: "invalid_request", Message: "request body exceeds limit", RequestID: requestID})
+			return
+		}
+		s.writeError(writer, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid run admission request", RequestID: requestID})
+		return
+	}
+	var admission RunAdmissionRequestV1
+	if len(data) == 0 || decodeStrictJSON(data, &admission) != nil || ValidateRunAdmissionRequestV1(admission) != nil {
+		s.writeError(writer, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid run admission request", RequestID: requestID})
+		return
+	}
+	response, err := s.reserved.RunAdmission.AdmitRun(request.Context(), principal, admission)
+	if err != nil {
+		s.writeDependencyError(writer, requestID, err)
+		return
+	}
+	if runtimecatalog.ValidateIdentifier(response.RunID) != nil || response.RunURL != "/v1/runs/"+response.RunID {
+		s.writeDependencyError(writer, requestID, ErrInternalDurableSubstrate)
+		return
+	}
+	s.writeJSON(writer, http.StatusAccepted, response)
 }
 
 func validEmptyReadRequest(request *http.Request) error {
@@ -707,7 +753,15 @@ func (s *Server) writeDependencyError(writer http.ResponseWriter, requestID stri
 	case errors.Is(err, ErrStaleExpectedRevision):
 		status, apiError.Code, apiError.Message = http.StatusConflict, "stale_expected_revision", "expected revision is stale"
 	case errors.Is(err, ErrRequestIDConflict):
-		status, apiError.Code, apiError.Message = http.StatusConflict, "request_id_conflict", "request identifier conflicts with an existing action"
+		status, apiError.Code, apiError.Message = http.StatusConflict, "request_id_conflict", "request identifier conflicts with an existing operation"
+	case errors.Is(err, ErrUnknownAdmissionProfile):
+		status, apiError.Code, apiError.Message = http.StatusNotFound, "unknown_profile", "admission profile is not available"
+	case errors.Is(err, ErrRepositoryBaseMismatch):
+		status, apiError.Code, apiError.Message = http.StatusConflict, "repository_base_mismatch", "repository base does not match"
+	case errors.Is(err, ErrAdmissionUnavailable):
+		status, apiError.Code, apiError.Message, apiError.Retryable = http.StatusServiceUnavailable, "admission_unavailable", "run admission is temporarily unavailable", true
+	case errors.Is(err, ErrUnsafeAdmissionMaterialization):
+		status, apiError.Code, apiError.Message = http.StatusInternalServerError, "unsafe_admission_materialization", "run admission materialization is unsafe"
 	case errors.Is(err, ErrActionJournalExhausted):
 		status, apiError.Code, apiError.Message = http.StatusInsufficientStorage, "action_journal_exhausted", "action journal is exhausted"
 	case errors.Is(err, ErrActionTargetNotActive):
