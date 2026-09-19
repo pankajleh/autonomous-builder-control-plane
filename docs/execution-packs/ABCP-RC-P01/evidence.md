@@ -24,7 +24,7 @@ All Repo C hashes above were recomputed from exact commit `b5de18b79765be089317d
 - Review-1 correction executable SHA: `3cdda8adc92756fa14e87af7d4e83cda2d95b943`
 - Bounded PRG correction executable SHA: `8a4ef3cd0a4a450cd924666682c850278fe9ace5`
 - Prior evidence-only successor SHA: `e895e8b7010176c8aa45d6f836912344b1be1865`
-- Bounded PRG evidence-only successor SHA: `<bound by the follow-up evidence-only identity commit>`
+- Bounded PRG evidence-only successor SHA: `6b08ac4eb09947421ddbba5884086cf28e25681a`
 - Draft PR: `#22`, `https://github.com/pankajleh/autonomous-builder-control-plane/pull/22`
 - PR base: `main`
 - PR state at evidence preparation: open Draft, merge state `CLEAN`
@@ -32,7 +32,7 @@ All Repo C hashes above were recomputed from exact commit `b5de18b79765be089317d
 
 Commit `e895e8b7010176c8aa45d6f836912344b1be1865` is the first evidence-only successor to the executable. The follow-up evidence-only binding commit records that now-known identity and changes no executable behavior.
 
-Commit `8a4ef3cd0a4a450cd924666682c850278fe9ace5` is the exact executable correction tested for the later user-authorized bounded PRG review. The evidence commit carrying this update is an evidence-only successor and changes no executable behavior; its exact identity is recorded by the follow-up evidence-only identity commit.
+Commit `8a4ef3cd0a4a450cd924666682c850278fe9ace5` is the exact executable correction tested for the later user-authorized bounded PRG review. Evidence-only successor `6b08ac4eb09947421ddbba5884086cf28e25681a` records those results and changes no executable behavior. The follow-up identity-only commit binds that now-known evidence SHA and likewise changes no executable behavior.
 
 ## Implementation summary
 
@@ -156,10 +156,10 @@ Required focused, focused-race, broad, broad-race, vet, cross-platform build, an
 - Executable changed files: 14; PASS against the active bounded wrapper.
 - Executable diff: 1,299 insertions and 321 deletions; PASS against the active bounded wrapper.
 - Executable worktree before evidence: clean.
-- Prior executable branch push: PASS; remote head was `3cdda8adc92756fa14e87af7d4e83cda2d95b943` before the earlier evidence successor. The bounded PRG correction and evidence successors are pushed together after the evidence identity is bound.
+- Bounded correction delivery push: PASS; the remote branch includes executable correction `8a4ef3cd0a4a450cd924666682c850278fe9ace5`, evidence successor `6b08ac4eb09947421ddbba5884086cf28e25681a`, and the identity-only successor.
 - Draft PR targets `main`: PASS (`#22`, exact required title, Draft).
 - Executable SHA named by evidence: PASS (`8a4ef3cd0a4a450cd924666682c850278fe9ace5`).
-- Evidence-only successor explicitly distinguished: PASS; the bounded PRG evidence commit changes no executable behavior and its identity is bound by the follow-up evidence-only identity commit.
+- Evidence-only successor explicitly distinguished: PASS (`6b08ac4eb09947421ddbba5884086cf28e25681a`); it changes no executable behavior, and the follow-up identity-only commit only binds that SHA.
 - Unresolved scope-crossing finding: none.
 - Merge: **NOT DONE — HUMAN GATE**.
 
