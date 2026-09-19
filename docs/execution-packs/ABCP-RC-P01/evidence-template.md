@@ -5,9 +5,9 @@ Status: **EVIDENCE TEMPLATE — FILL DURING BOUNDED RUN**
 ## Authority identities
 
 - Pack: `ABCP-RC-P01`
-- Governing architecture SHA-256: `<fill after authority commit>`
-- Execution-pack SHA-256: `<fill after authority commit>`
-- Review-contract SHA-256: `<fill after authority commit>`
+- Governing architecture SHA-256: `883be23eb566c7c11ed675bdfdadb39eb12e0bce5ec00f7f6e65b824171713ad`
+- Execution-pack SHA-256: `5b1a7a4361c41b89eb6f6960fea202b891bdde9f46310c2715cbaab2b4f2d14d`
+- Review-contract SHA-256: `ac47543fdb96483e285730fa227c0c5a5968c1ef11e16ede78cef065d4dc950d`
 - Repo C authority commit: `b5de18b79765be089317d86786bf64956452ae10`
 - Repo C product contract SHA-256: `ffc01430674db7fd342647f2f0697691f9f58a9510558f3d199cb3da43d10d9e`
 - Repo C ABCP boundary SHA-256: `1560ce20c6b4066b342978daefde8fcf00752a11e0761781a508f88873320268`
