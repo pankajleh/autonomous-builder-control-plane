@@ -514,6 +514,17 @@ func TestControllerActivationCannotBeBypassedByOmittedCallerState(t *testing.T) 
 	}
 }
 
+func TestControllerExposesRepositoryDerivedIdentityForBackendInitialization(t *testing.T) {
+	repository, _, identity := governanceRepository(t)
+	controller, err := OpenControllerWithAuthorityBackendV1(repository, newTestWorkflowAuthorityStoreV1().client("host-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if controller.RepositoryIdentity() != identity {
+		t.Fatalf("repository identity = %q, want %q", controller.RepositoryIdentity(), identity)
+	}
+}
+
 func TestControllerCountersAndInFlightReservationAreDurable(t *testing.T) {
 	repository, base, identity := governanceRepository(t)
 	capsule := fixtureCapsule(contextcapsule.StageBImplementation, hashChar("a"))

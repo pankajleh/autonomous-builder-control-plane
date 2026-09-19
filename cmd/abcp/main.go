@@ -27,14 +27,26 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/readmodel"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/recovery"
 	runctl "github.com/pankajleh/autonomous-builder-control-plane/internal/run"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/runadmission"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi/platformbridge"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/timeline"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/workflowauthoritypg"
 )
 
 const version = "0.1.0-dev"
+
+type workflowAuthorityBackend interface {
+	governancev3.WorkflowAuthorityBackendV1
+	EnsureInitialized(context.Context, string, string) error
+	Close()
+}
+
+var openWorkflowAuthorityBackend = func(ctx context.Context, path string) (workflowAuthorityBackend, error) {
+	return workflowauthoritypg.Open(ctx, path)
+}
 
 func main() {
 	if platformbridge.IsContainmentChildV1(os.Args[1:]) {
@@ -499,11 +511,12 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	evidenceRoot := flags.String("evidence-root", "", "root directory for immutable run evidence")
 	cgroupRoot := flags.String("cgroup-root", "/sys/fs/cgroup", "controller cgroup v2 root")
 	serviceRoot := flags.String("service-root", "", "optional EP-006 service root for runtime registration")
+	workflowAuthorityConfigFile := flags.String("workflow-authority-config-file", "", "optional protected PostgreSQL workflow-authority config file")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 	if flags.NArg() != 0 || *manifestPath == "" || *ledgerPath == "" || *evidenceRoot == "" {
-		fmt.Fprintln(stderr, "usage: abcp run --manifest <path> --ledger <path> --evidence-root <path>")
+		fmt.Fprintln(stderr, "usage: abcp run --manifest <path> --ledger <path> --evidence-root <path> [--workflow-authority-config-file <protected-file>]")
 		return 2
 	}
 
@@ -512,7 +525,22 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	controller, err := governancev3.OpenControllerV1(manifest.Repository.Path)
+	var controller *governancev3.ControllerV1
+	var workflowBackend workflowAuthorityBackend
+	if *workflowAuthorityConfigFile != "" {
+		workflowBackend, err = openWorkflowAuthorityBackend(context.Background(), *workflowAuthorityConfigFile)
+		if err != nil {
+			fmt.Fprintln(stderr, "open workflow authority backend")
+			return 1
+		}
+		defer workflowBackend.Close()
+		controller, err = governancev3.OpenControllerWithAuthorityBackendV1(manifest.Repository.Path, workflowBackend)
+		if err == nil {
+			err = workflowBackend.EnsureInitialized(context.Background(), controller.ControllerIdentity(), controller.RepositoryIdentity())
+		}
+	} else {
+		controller, err = governancev3.OpenControllerV1(manifest.Repository.Path)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -739,11 +767,12 @@ func serveCommand(args []string, stderr io.Writer) int {
 	principalID := flags.String("principal-id", "", "stable service principal identifier")
 	cursorKeyFile := flags.String("cursor-key-file", "", "protected cursor key file")
 	grantsFile := flags.String("authority-grants-file", "", "protected exact authority grant file")
+	admissionProfileFile := flags.String("admission-profile-file", "", "optional protected run admission profile file")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path>")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>]")
 		return 2
 	}
 	if err := serviceapi.ValidateLoopbackAddress(*listen); err != nil {
@@ -771,6 +800,17 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer catalog.Close()
+	var admissions *runadmission.Controller
+	if *admissionProfileFile != "" {
+		admissions, err = runadmission.NewController(runadmission.Config{
+			ProfileFile: *admissionProfileFile, ServiceRoot: *serviceRoot, Catalog: catalog,
+		})
+		if err != nil {
+			fmt.Fprintln(stderr, "load run admission configuration")
+			return 1
+		}
+		defer admissions.Close()
+	}
 	localReadService, err := readmodel.New(catalog, cursors)
 	if err != nil {
 		fmt.Fprintln(stderr, "construct authoritative read service")
@@ -802,6 +842,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	server, err := serviceapi.NewServer(serviceapi.ServerConfig{
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
+		RunAdmission: admissions,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "construct service API")
