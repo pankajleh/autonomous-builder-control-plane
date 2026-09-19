@@ -22,13 +22,13 @@ All Repo C hashes above were recomputed from exact commit `b5de18b79765be089317d
 - Feature branch: `feature/abcp-rc-p01-run-admission-20260919`
 - Executable tested SHA: `3cdda8adc92756fa14e87af7d4e83cda2d95b943`
 - Review-1 correction executable SHA: `3cdda8adc92756fa14e87af7d4e83cda2d95b943`
-- Evidence-only successor identity: `SELF` — the unique evidence-only commit containing this document; its exact 40-character commit SHA is the pushed Draft PR head recorded in the PR body and delivery result.
+- Evidence-only successor SHA: `e895e8b7010176c8aa45d6f836912344b1be1865`
 - Draft PR: `#22`, `https://github.com/pankajleh/autonomous-builder-control-plane/pull/22`
 - PR base: `main`
 - PR state at evidence preparation: open Draft, merge state `CLEAN`
 - Merge: **NOT DONE — HUMAN GATE**
 
-The evidence-only successor changes no executable behavior.
+Commit `e895e8b7010176c8aa45d6f836912344b1be1865` is the first evidence-only successor to the executable. The follow-up evidence-only binding commit records that now-known identity and changes no executable behavior.
 
 ## Implementation summary
 
@@ -132,7 +132,7 @@ Remaining accepted findings: none. No third review was performed.
 - Executable branch push: PASS; remote head was `3cdda8adc92756fa14e87af7d4e83cda2d95b943` before the evidence successor.
 - Draft PR targets `main`: PASS (`#22`, exact required title, Draft).
 - Executable SHA named by evidence: PASS.
-- Evidence-only successor explicitly distinguished: PASS; it changes no executable behavior.
+- Evidence-only successor explicitly distinguished: PASS (`e895e8b7010176c8aa45d6f836912344b1be1865`); it changes no executable behavior.
 - Unresolved scope-crossing finding: none.
 - Merge: **NOT DONE — HUMAN GATE**.
 
