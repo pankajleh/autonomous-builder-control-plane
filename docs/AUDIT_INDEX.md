@@ -17,6 +17,8 @@ Operational role: this file indexes accepted, reviewed, merged, and durable evid
 | EP-005 CI Task 4 | #15 | `9ea0c67a0ab5fdcc1c26ed6eeae4e09732b5aaa2` | `66da45760c7923bd244f3ac6dd3aa699d89bc2e8` | 15/15 acceptance PASS; `CLEAN_CRITICAL_MAJOR`, 0C/0M; review SHA-256 `0b2a56c940d035e860ae21cfdb6cfd73fbd52f35294177257fe1b08429c357f5` |
 | Three-capsule governance hardening | #16 | `aa888f26652f88040ca8faa3499251ba6281a995` | `d145b9f69418fd579650e5b1afca267f6ee59e72` | `RETURN_TO_B_CLOSURE_CLEAN`, 0C/0M; review artifact SHA-256 `200c755f6591e7d1a7fe99f922973bfa46eb35c5e1aea44e20b2b26392f9a779` |
 | EP-005 merge lifecycle convergence | #17 | `8dd860286590044888052f2f53e856c3c8c1f1cb` | `ed74fad66b9dd564ac09dcedc1274b8fefffb983` | deterministic acceptance PASS; independent convergence `CLOSURE_CLEAN`, 0C/0M; post-merge acceptance/reconciliation PASS |
+| EP-006 rebaseline after assurance removal | #21 | `4040744d9db924ce4e174f7281fdc9f58db7818f` | `821e0476600c9299652b88a016c24ba471bf8a6b` | retained EP-006 tree restored as current platform baseline; post-EP-006 assurance expansion removed |
+| Repo C product run admission (ABCP-RC-P01) | #22 | `f1ae22fc3132513bbe5c411058e506676d9fb069` | `3d6a841e722c9c67c83d835a52178b09ca16776d` | final tested executable `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7`; required focused/broad/race/vet/cross-platform gates PASS; exactly two Ralphex review passes; bounded product admission integrated |
 
 EP-005 foundation merged earlier in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 
@@ -57,6 +59,26 @@ Durable evidence identities:
 - durability-seal SHA-256 `ca35273ae946fa3cbc91fe5bf099302e1bc33a4e42b9fcdfc25adcb3a987a57b`;
 - final manifest recheck failures: zero.
 
-## Phase-4 cutoff and remaining non-claims
+## Historical Phase-4 cutoff
 
-The legally recordable cutoff is Phase 4 complete through PR #17 and its fsync-sealed durable post-merge acceptance/reconciliation evidence. This projection records that cutoff. Production execution remains merge-only and same-repository-head; squash/rebase and fork-head merge execution are unsupported. Phase 5 and Phase 6 are not started. No runtime governance activation is inferred from PR #16 without its own activation evidence.
+The former Phase-4 cutoff through PR #17 and its fsync-sealed post-merge evidence remains historical audit evidence. It no longer describes the current product-integration boundary after the 2026-09-19 EP-006 rebaseline.
+
+## EP-006 rebaseline and P01 admission evidence
+
+PR #21 re-established the retained EP-006 service/runtime tree on `main` at merge `821e0476600c9299652b88a016c24ba471bf8a6b`. This intentionally removed the later post-EP-006 assurance expansion from current authority while preserving historical Git evidence.
+
+ABCP-RC-P01 then froze the product-facing Repo C→ABCP admission boundary. Exact implementation base was `4d45202f5b411d9c91caf5fef906d1eff9b26e4b`. The final tested executable was `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7`.
+
+P01 validation included focused package tests, full Go tests, focused/full race, `go vet ./...`, Darwin/Windows builds and `git diff --check`; all passed. The PostgreSQL integration test skipped exactly as authorized because `ABCP_WORKFLOW_AUTHORITY_PG_TEST_DSN` was unavailable and no live infrastructure was provisioned.
+
+The actual Ralphex review loop had exactly two passes. Review 1 corrected frozen-profile/replay and repository-identity issues; Review 2 corrected duplicate-launch risk after an ambiguous successful process start. No third Ralphex review was performed or authorized.
+
+PR #22 published exact head `f1ae22fc3132513bbe5c411058e506676d9fb069` and merged as `3d6a841e722c9c67c83d835a52178b09ca16776d`. Git/GitHub therefore supersede the pre-merge evidence document's historical "merge not done" statement.
+
+## Current cutoff and non-claims
+
+The current legally recordable source cutoff is Repo B `main@3d6a841e722c9c67c83d835a52178b09ca16776d`: retained EP-006 plus bounded product run admission.
+
+This cutoff does not claim Repo C UI completion, general retry/resume/recovery, human-decision continuation, provider redesign, live deployment/AWS mutation, or restoration of the discarded post-EP-006 assurance framework.
+
+Further Repo B work requires fresh bounded authority from a concrete product integration need; review/discovery alone is not authority to expand scope.
