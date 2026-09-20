@@ -1,59 +1,58 @@
 # Current Project State
 
-Date: 2026-09-13
+Date: 2026-09-20
 
-Operational role: this file is the present checkpoint and authority projection for governed work. It summarizes accepted controller, review, Git, and post-merge evidence; immutable evidence remains authoritative if a projection ever conflicts with it.
+Operational role: current checkpoint and authority projection for Repo B / ABCP. Immutable execution-pack/evidence artifacts and Git/GitHub objects remain authoritative if this projection conflicts with them.
 
 ## Repository checkpoint
 
 - Repository: `pankajleh/autonomous-builder-control-plane`.
-- Projection baseline: remote `main` through PR #17 merge `ed74fad66b9dd564ac09dcedc1274b8fefffb983`.
-- Current roadmap boundary: **Phase 4 — GitHub lifecycle is complete through durable post-merge acceptance**. This reconciliation materializes that legally recordable cutoff.
-- Current execution pack: EP-005 — GitHub Lifecycle, complete through the Phase-4 cutoff recorded by this projection.
-- Canonical roadmap: `docs/roadmap/IMPLEMENTATION_ROADMAP.md`.
-- Next roadmap phase: **Phase 5 — Service/API and dashboard**. No Phase-5 implementation or authority is recorded here.
+- Remote `main`: `3d6a841e722c9c67c83d835a52178b09ca16776d` (PR #22 merge).
+- Current retained platform boundary: **EP-006 service/API baseline plus the bounded Repo C product run-admission extension**.
+- Post-EP-006 A/B/C assurance expansion remains discarded and is not part of current runtime authority.
+- Repo C is the product/UX authority; ABCP owns execution admission, authoritative run lifecycle/projections/evidence/actions, and provider coordination after admission.
+- Repo A / Dev-Agent and Ralphex remain execution/provider mechanisms beneath ABCP; Repo C does not call them directly.
 
-## Phase-4 terminal chain
+## Rebaseline and P01 chain
 
-| Checkpoint | Exact evidence |
-|---|---|
-| CI evidence ingestion final acceptance/review | Corrected Task-4 head `9ea0c67a0ab5fdcc1c26ed6eeae4e09732b5aaa2`; 15/15 deterministic acceptance commands passed; final review `CLEAN_CRITICAL_MAJOR`, 0 Critical / 0 Major |
-| CI Task-4 publication | PR #15 merged as `66da45760c7923bd244f3ac6dd3aa699d89bc2e8` |
-| Three-capsule governance hardening | Exact corrected head `aa888f26652f88040ca8faa3499251ba6281a995`; final return-to-B closure `RETURN_TO_B_CLOSURE_CLEAN`, 0 Critical / 0 Major; PR #16 merged as `d145b9f69418fd579650e5b1afca267f6ee59e72` |
-| Merge authorization Task 1 | Independently accepted/reviewed 0C/0M at `bf5c851e8bce19f61648eb499ad146f25a1ee86c` |
-| Merge authorization Task 2 | Independently accepted/reviewed `CLOSURE_CLEAN`, 0C/0M at `c6716a800f1b317eb1cae43c9e50fa5e81bf67c2` |
-| Merge authorization Task 3 | Final exact-head `15a7585ca25d4fee036afc6d19324c1b528b9381`; `CLOSURE_CLEAN`, 0 Critical / 0 Major |
-| Bounded base convergence | Reviewed candidate `8dd860286590044888052f2f53e856c3c8c1f1cb`, tree `c055f686f20634e0e69550cc08e019cf4be7a0e5`; deterministic acceptance PASS; independent `CLOSURE_CLEAN`, 0C/0M |
-| Publication / merge | PR #17 published exact head `8dd8602…` against exact base `d145b9f…`, then merged with expected-head binding as `ed74fad66b9dd564ac09dcedc1274b8fefffb983` |
-| Durable post-merge acceptance | `POST_MERGE_DETERMINISTIC_ACCEPTANCE_PASS`; remote/result reconciliation PASS; durable fsync-sealed evidence bundle |
+| Checkpoint | Exact identity | Result |
+|---|---|---|
+| EP-006 retained baseline | retained EP-006 commit `f1f4af3c8783d870dcab85a1f86756e6ed4efcee` | service/API projections/actions retained; later assurance expansion removed |
+| Repo B rebaseline publication | PR #21 head `4040744d9db924ce4e174f7281fdc9f58db7818f`; merge `821e0476600c9299652b88a016c24ba471bf8a6b` | `main` re-established on the retained EP-006 tree |
+| P01 authority base | `4d45202f5b411d9c91caf5fef906d1eff9b26e4b` | frozen Repo C↔ABCP admission architecture, execution pack, review contract and evidence discipline |
+| P01 final tested executable | `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` | product-facing admission + replay/reconciliation hardening; all required gates passed, PostgreSQL integration skipped only because the authorized DSN was unavailable |
+| P01 publication | PR #22 head `f1ae22fc3132513bbe5c411058e506676d9fb069`; merge `3d6a841e722c9c67c83d835a52178b09ca16776d` | product run admission is integrated on `main` |
 
-## Durable post-merge result
+## Current product-facing service boundary
 
-The PR #17 result is independently reconciled as follows:
+ABCP now provides the retained EP-006 read/action surfaces plus bounded product run admission:
 
-- merge commit `ed74fad66b9dd564ac09dcedc1274b8fefffb983` is current remote `main` at the Phase-4 cutoff;
-- ordered parents are pre-merge main `d145b9f69418fd579650e5b1afca267f6ee59e72` and exact reviewed convergence head `8dd860286590044888052f2f53e856c3c8c1f1cb`;
-- result tree is `c055f686f20634e0e69550cc08e019cf4be7a0e5`, identical to the reviewed convergence tree;
-- candidate-to-result content diff is empty and the reviewed candidate is an ancestor of the result;
-- merged-state focused packages, full tests, full race, vet, smoke, metadata-free smoke, Darwin compile validation, diff-check, and clean-worktree gate all passed.
+- authenticated capability discovery;
+- run list/detail, events, timeline and evidence;
+- evidence download;
+- cancel;
+- human-decision recording;
+- action status;
+- `POST /v1/runs` when admission is configured.
 
-Durable evidence identities:
+The admission contract accepts only the frozen schema-v1 product-safe request, resolves controller-owned private execution configuration, binds one stable request identity to one durable ABCP run identity, and fails closed on conflicting replay, repository-base mismatch or unresolved reconciliation.
 
-- post-merge manifest SHA-256: `ba742fb2ed92eeb03094b34e7f128bb0c46881abbe9300f97ababb52adce7533`;
-- acceptance-record SHA-256: `da1a94c11f6803dec15d44b6b79b3c16f88ac8dae6f3e8971666f11a69489609`;
-- durability-seal SHA-256: `ca35273ae946fa3cbc91fe5bf099302e1bc33a4e42b9fcdfc25adcb3a987a57b`;
-- manifest recheck failures: zero.
+`run_admission` is independent of `retry`, `resume` and `recovery`; those capabilities remain false unless separately designed and authorized.
 
-## Governance boundary now in force
+## Deliberate limits
 
-PR #16 merged the hardened three-capsule governance implementation and contracts. Its governed sequence is `A_DESIGN -> DESIGN_ACCEPTED -> B_IMPLEMENTATION -> IMPLEMENTATION_CONVERGED -> C_ACCEPTANCE_MERGE`; C owns deterministic acceptance, exact-head final review, publication/merge authorization, and post-merge proof and is content-read-only for the bound candidate. A content mutation after C binding invalidates that C lineage and must return through valid B authority or a new A lineage when design/scope changes.
+Current `main` does **not** claim:
 
-This projection **does not claim** that a production `GovernanceActivationV1` installation occurred merely because PR #16 merged. Runtime activation remains a separately evidenced governed act.
+- Repo C UI completion;
+- Repo C adapter/runtime deployment completion;
+- human-decision continuation/resume;
+- general retry/recovery;
+- provider-selection redesign;
+- live production/AWS deployment;
+- restored Assurance Capsule / post-EP-006 A-B-C methodology.
 
-## Explicit Phase-4 limits
+The pre-merge evidence document for P01 intentionally records the human merge gate as not yet done at evidence freeze time. Git/GitHub merge records above are the authoritative post-publication result.
 
-Production merge execution at this cutoff is intentionally **merge-only** and same-repository-head. Squash/rebase execution and fork-head merge execution remain unsupported/fail-closed. CI `STABLE` remains observational evidence, not merge approval. No Phase-5 service/API/dashboard deliverable and no Phase-6 production-hardening deliverable is claimed complete.
+## Next bounded integration boundary
 
-## Next authorized planning boundary
-
-Phase 4 has no remaining implementation task at this cutoff. The next roadmap work is Phase 5 design/authority for the Service/API and dashboard deliverables. Before any Phase-5 implementation begins, establish the required fresh design/operation authority under the current governance contracts; do not reuse EP-005 implementation authority.
+Repo C P02 consumes the merged P01 admission contract through its own adapter/correlation layer. Any further ABCP capability is added only when a concrete Repo C product workflow proves it is required and the corresponding design authority is explicitly frozen. Review/discovery alone does not create new scope.
