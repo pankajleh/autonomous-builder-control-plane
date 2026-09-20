@@ -7,7 +7,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 ## Repository checkpoint
 
 - Repository: `pankajleh/autonomous-builder-control-plane`.
-- Remote `main`: `3d6a841e722c9c67c83d835a52178b09ca16776d` (PR #22 merge).
+- Executable/product baseline: PR #22 merge `3d6a841e722c9c67c83d835a52178b09ca16776d`. Later documentation-only projection commits may advance `main`; Git/GitHub are authoritative for the latest repository head.
 - Current retained platform boundary: **EP-006 service/API baseline plus the bounded Repo C product run-admission extension**.
 - Post-EP-006 A/B/C assurance expansion remains discarded and is not part of current runtime authority.
 - Repo C is the product/UX authority; ABCP owns execution admission, authoritative run lifecycle/projections/evidence/actions, and provider coordination after admission.
