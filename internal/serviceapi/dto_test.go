@@ -42,3 +42,21 @@ func TestCommandEnvelopeFoundationBounds(t *testing.T) {
 		t.Fatal("duplicate payload field accepted")
 	}
 }
+
+func TestRunAdmissionTaskMarkdownLineBoundMatchesPinnedPlanParser(t *testing.T) {
+	valid := RunAdmissionRequestV1{
+		SchemaVersion: 1, RequestID: "request-1", ProfileID: "default",
+		ProductAuthorizationID: "authorization-1", ProductTaskID: "task-1", ProductVersionID: "version-1",
+		ProductManifestSHA256: strings.Repeat("a", 64), RepositoryBaseSHA: strings.Repeat("b", 40),
+		TaskMarkdown:   strings.Repeat("x", MaxRunTaskMarkdownLineBytes) + "\n",
+		DelegatedActor: DelegatedActorV1{SubjectID: "user-1", SubjectType: PrincipalUser},
+	}
+	if err := ValidateRunAdmissionRequestV1(valid); err != nil {
+		t.Fatalf("maximum parser-safe line rejected: %v", err)
+	}
+	invalid := valid
+	invalid.TaskMarkdown = strings.Repeat("x", MaxRunTaskMarkdownLineBytes+1)
+	if err := ValidateRunAdmissionRequestV1(invalid); err == nil {
+		t.Fatal("task markdown line exceeding the pinned parser limit was accepted")
+	}
+}

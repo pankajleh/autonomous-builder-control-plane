@@ -25,6 +25,12 @@ const (
 	ModeFull      Mode = "full"
 	ModeTasksOnly Mode = "tasks-only"
 	ModeReview    Mode = "review"
+
+	// ExecutionPlanHandoffPrefixV1 names the repository-local namespace used
+	// for controller-owned copies of Git-ignored authority plans. Admission
+	// profiles must leave this namespace visible to Git so Ralphex can copy the
+	// selected plan into its worktree.
+	ExecutionPlanHandoffPrefixV1 = "abcp-ralphex-plan-"
 )
 
 type Invocation struct {

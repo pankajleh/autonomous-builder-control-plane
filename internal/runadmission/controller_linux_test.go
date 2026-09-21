@@ -72,6 +72,26 @@ func TestDeterministicRunIdentityAndSemanticDigest(t *testing.T) {
 	}
 }
 
+func TestAdmissionPlanHasExactlyOneExecutableTaskAndPreservesAuthorizedMarkdown(t *testing.T) {
+	request := testAdmissionRequest(strings.Repeat("a", 40))
+	request.TaskMarkdown = "### Task 7: Repo C task\n\n- [ ] preserve this requirement\n\n````markdown\n### Task 8: nested example\n- [ ] preserve this too\n````"
+	principal := serviceapi.Principal{PrincipalID: "service-1", PrincipalType: serviceapi.PrincipalService, AuthnMethod: "bearer"}
+	plan := admissionPlan(principal, request)
+	if err := ralphex.ValidateSingleIncompleteTaskV1(plan); err != nil {
+		t.Fatalf("admission plan is not exactly one executable task: %v\n%s", err, plan)
+	}
+	if !bytes.Contains(plan, []byte(request.TaskMarkdown)) {
+		t.Fatalf("admission plan did not preserve authorized task markdown byte-for-byte:\n%s", plan)
+	}
+	if strings.Count(string(plan), "### Task 1: Implement the authorized product task") != 1 ||
+		strings.Count(string(plan), "- [ ] Implement every requirement in the complete authorized product task below.") != 1 {
+		t.Fatalf("admission plan does not expose one actionable Task 1 section:\n%s", plan)
+	}
+	if !bytes.Contains(plan, []byte("~~~markdown\n")) {
+		t.Fatalf("admission plan did not choose the shorter collision-safe fence:\n%s", plan)
+	}
+}
+
 func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
 	fixture := newAdmissionFixture(t, true)
 	defer fixture.closeLocks()
@@ -108,6 +128,10 @@ func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
 	if manifest.RunID != expectedRunID || manifest.Repository.StartSHA != fixture.request.RepositoryBaseSHA ||
 		manifest.Worktree.Branch != "abcp/"+expectedRunID || manifest.ContextCapsule == nil {
 		t.Fatalf("derived manifest bindings = %+v", manifest)
+	}
+	pinnedRalphex := fixture.controller.profiles[fixture.request.ProfileID].template.Ralphex
+	if !reflect.DeepEqual(manifest.Ralphex, pinnedRalphex) || manifest.Ralphex.BinaryPath == testExecutable(t) || manifest.Ralphex.SourceSHA == "" {
+		t.Fatalf("derived manifest did not preserve controller-owned Ralphex identity: got %+v, want %+v", manifest.Ralphex, pinnedRalphex)
 	}
 	receiptPath := filepath.Join(fixture.service, "admissions", receiptKey(fixture.principal.PrincipalID, fixture.request.RequestID)+".json")
 	receiptData, err := os.ReadFile(receiptPath)
@@ -276,6 +300,64 @@ func TestAdmissionProfileRequiresIgnoredSymlinkFreeInput(t *testing.T) {
 				t.Fatal("unsafe admission input was accepted")
 			}
 		})
+	}
+}
+
+func TestAdmissionProfileRequiresGitVisibleRalphexHandoffNamespace(t *testing.T) {
+	for _, gitignore := range []string{
+		"*\n",
+		".abcp-input/\n*.md\n",
+		".abcp-input/\nabcp-ralphex-plan-*\n",
+	} {
+		t.Run(strings.ReplaceAll(strings.TrimSpace(gitignore), "\n", "_"), func(t *testing.T) {
+			root, repository, _ := makeRepository(t, true)
+			if err := os.WriteFile(filepath.Join(repository, ".gitignore"), []byte(gitignore), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			git(t, repository, "add", ".gitignore")
+			git(t, repository, "commit", "-m", "ignore Ralphex handoff namespace")
+			head := git(t, repository, "rev-parse", "HEAD")
+			config, catalog := writeAdmissionConfiguration(t, root, repository, head)
+			service := filepath.Join(root, "service")
+			if err := os.Mkdir(service, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			controller, err := NewController(Config{ProfileFile: config, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog})
+			if err == nil {
+				controller.Close()
+				t.Fatal("profile with an ignored Ralphex handoff namespace was accepted")
+			}
+		})
+	}
+}
+
+func TestAdmissionRejectsRunSpecificIgnoredRalphexHandoffPath(t *testing.T) {
+	root, repository, _ := makeRepository(t, true)
+	principal := serviceapi.Principal{PrincipalID: "repo-c-service", PrincipalType: serviceapi.PrincipalService, AuthnMethod: "test-v1"}
+	requestID := "request-1"
+	runID := DeriveRunID(principal.PrincipalID, requestID)
+	runIDSum := sha256.Sum256([]byte(runID))
+	ignored := ".abcp-input/\n" + ralphex.ExecutionPlanHandoffPrefixV1 + hex.EncodeToString(runIDSum[:]) + "/\n"
+	if err := os.WriteFile(filepath.Join(repository, ".gitignore"), []byte(ignored), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repository, "add", ".gitignore")
+	git(t, repository, "commit", "-m", "ignore one run handoff")
+	head := git(t, repository, "rev-parse", "HEAD")
+	config, catalog := writeAdmissionConfiguration(t, root, repository, head)
+	service := filepath.Join(root, "service")
+	if err := os.Mkdir(service, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := NewController(Config{ProfileFile: config, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	request := testAdmissionRequest(head)
+	request.RequestID = requestID
+	if _, err := controller.AdmitRun(context.Background(), principal, request); !errors.Is(err, serviceapi.ErrUnsafeAdmissionMaterialization) {
+		t.Fatalf("run-specific ignored handoff path admission = %v", err)
 	}
 }
 
@@ -934,15 +1016,22 @@ func makeRepository(t *testing.T, ignored bool) (string, string, string) {
 func writeAdmissionConfiguration(t *testing.T, root, repository, _ string) (string, *admissionTestCatalog) {
 	t.Helper()
 	truePath := testExecutable(t)
-	binary, err := os.ReadFile(truePath)
+	runtimePath := filepath.Join(root, "approved-ralphex")
+	if err := os.WriteFile(runtimePath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(runtimePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	binaryDigest := sha256.Sum256(binary)
 	template := authority.Manifest{
 		Repository: authority.RepositoryManifest{Remotes: map[string]string{"origin": "https://example.test/example/product.git"}, DefaultBranch: "main"},
-		Ralphex:    authority.RalphexManifest{BinaryPath: truePath, BinarySHA256: hex.EncodeToString(binaryDigest[:]), Mode: ralphex.ModeFull, Timeout: "5m", WaitOnLimit: "0s"},
-		Executor:   authority.ExecutorPolicy{Executor: "codex"}, Worktree: authority.WorktreePolicy{Enabled: true},
+		Ralphex: authority.RalphexManifest{
+			BinaryPath: runtimePath, BinarySHA256: hex.EncodeToString(binaryDigest[:]), SourceSHA: strings.Repeat("c", 40),
+			Mode: ralphex.ModeFull, Timeout: "5m", WaitOnLimit: "0s",
+		},
+		Executor: authority.ExecutorPolicy{Executor: "codex"}, Worktree: authority.WorktreePolicy{Enabled: true},
 		Acceptance:    []authority.AcceptanceCommand{{Name: "test", Required: true, Timeout: "5m", Argv: []string{truePath}}},
 		PolicyVersion: "product-v1",
 	}

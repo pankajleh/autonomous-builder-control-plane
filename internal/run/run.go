@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,10 +34,15 @@ import (
 )
 
 const (
-	eventStateTransition     = "STATE_TRANSITION"
-	actorController          = "control-plane"
-	ralphexEnvironmentPolicy = "ralphex-env-v2"
-	runnerSnapshotCloseWait  = 2 * time.Second
+	eventStateTransition       = "STATE_TRANSITION"
+	actorController            = "control-plane"
+	ralphexEnvironmentPolicy   = "ralphex-env-v2"
+	runnerSnapshotCloseWait    = 2 * time.Second
+	executionPlanOwnerKind     = "ExecutionPlanHandoffOwnerV1"
+	executionPlanOwnerRoot     = "abcp-ralphex-plan-handoffs"
+	executionPlanLockName      = "abcp-ralphex-execution.lock"
+	maxExecutionPlanOwners     = 1024
+	maxExecutionPlanOwnerBytes = 4096
 )
 
 const apiCancelEventDomain = "ep006-api-cancel-request-v1"
@@ -444,18 +450,38 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		return result, err
 	}
 	result.State = domain.StateRunCreated
+	failAuthorityValidation := func(validationErr error) (Result, error) {
+		if ctx.Err() != nil {
+			return r.cancel(ctx, result, domain.StateRunCreated, "authority-validator", validationErr, []ledger.EvidenceRef{authorityRef})
+		}
+		result.State = domain.StateFailed
+		result.FailureReason = validationErr.Error()
+		if appendErr := r.transition(ctx, domain.StateRunCreated, domain.StateFailed, "authority-validator", map[string]any{"reason": validationErr.Error()}, []ledger.EvidenceRef{authorityRef}); appendErr != nil {
+			return result, errors.Join(validationErr, appendErr)
+		}
+		return result, fmt.Errorf("validate pinned authority: %w", validationErr)
+	}
+	var repositoryLease *repositoryExecutionLease
+	if repositoryExecutionLeasingSupported() {
+		repositoryLease, err = acquireRepositoryExecutionLease(ctx, r.governed.Repository().Path)
+		if err != nil {
+			return failAuthorityValidation(fmt.Errorf("acquire repository execution lease: %w", err))
+		}
+	}
+	defer func() {
+		if repositoryLease != nil {
+			runErr = errors.Join(runErr, repositoryLease.Close())
+		}
+	}()
+	if repositoryLease != nil {
+		if err := recoverExecutionPlanHandoffs(repositoryLease); err != nil {
+			return failAuthorityValidation(fmt.Errorf("recover Ralphex execution plan handoffs: %w", err))
+		}
+	}
 
 	validation, err := validatePinnedIdentity(ctx, r.governed)
 	if err != nil {
-		if ctx.Err() != nil {
-			return r.cancel(ctx, result, domain.StateRunCreated, "authority-validator", err, []ledger.EvidenceRef{authorityRef})
-		}
-		result.State = domain.StateFailed
-		result.FailureReason = err.Error()
-		if appendErr := r.transition(ctx, domain.StateRunCreated, domain.StateFailed, "authority-validator", map[string]any{"reason": err.Error()}, []ledger.EvidenceRef{authorityRef}); appendErr != nil {
-			return result, errors.Join(err, appendErr)
-		}
-		return result, fmt.Errorf("validate pinned authority: %w", err)
+		return failAuthorityValidation(err)
 	}
 	validationRef, err := r.writeJSON("authority-validation.json", "authority-validation", validation)
 	if err != nil {
@@ -474,7 +500,16 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("create isolated Ralphex config directory: %w", err), nil)
 	}
 	defer os.RemoveAll(configDir)
-	invocation, err := r.invocation(configDir)
+	executionPlanPath, cleanupExecutionPlan, err := r.prepareExecutionPlan(ctx, repositoryLease)
+	if err != nil {
+		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
+	}
+	defer func() {
+		if cleanupExecutionPlan != nil {
+			runErr = errors.Join(runErr, cleanupExecutionPlan())
+		}
+	}()
+	invocation, err := r.invocation(configDir, executionPlanPath)
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
@@ -532,6 +567,14 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		}
 	} else {
 		process, processErr = r.processes.Run(ctx, command)
+	}
+	if cleanupExecutionPlan != nil {
+		processErr = errors.Join(processErr, cleanupExecutionPlan())
+		cleanupExecutionPlan = nil
+	}
+	if repositoryLease != nil {
+		processErr = errors.Join(processErr, repositoryLease.Close())
+		repositoryLease = nil
 	}
 	if invocation.Bounds != nil {
 		if finishErr := r.controller.FinishRalphexInvocationV1(reservation); finishErr != nil {
@@ -697,7 +740,7 @@ func validateReadOnlyReviewRepositoryV1(ctx context.Context, repository, expecte
 	return nil
 }
 
-func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
+func (r *Runner) invocation(configDir, executionPlanPath string) (ralphex.Invocation, error) {
 	policy := r.governed.Executor()
 	executor := strings.ToLower(strings.TrimSpace(policy.Executor))
 	if executor != "" && executor != "claude" && executor != "codex" {
@@ -705,7 +748,7 @@ func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
 	}
 	invocation := ralphex.Invocation{
 		BinaryPath:   r.governed.Ralphex().BinaryPath,
-		PlanPath:     r.governed.Plan().Path,
+		PlanPath:     executionPlanPath,
 		ConfigDir:    configDir,
 		Mode:         r.governed.Ralphex().Mode,
 		Codex:        executor == "codex",
@@ -737,6 +780,303 @@ func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
 		invocation.SourceSHA = runtime.SourceSHA
 	}
 	return invocation, nil
+}
+
+// prepareExecutionPlan keeps the immutable authority plan separate from the
+// mutable plan Ralphex ticks and archives. A tracked authority plan is already
+// present in a worktree. Product-admission plans are deliberately Git-ignored,
+// however, so Ralphex cannot detect and copy them when it creates its worktree.
+// For that case the controller creates a bounded untracked copy only after the
+// clean-tree and authority-hash checks have passed.
+func (r *Runner) prepareExecutionPlan(ctx context.Context, lease *repositoryExecutionLease) (string, func() error, error) {
+	plan := r.governed.Plan()
+	if !r.governed.Worktree().Enabled {
+		return plan.Path, nil, nil
+	}
+	repository := r.governed.Repository()
+	relative, err := filepath.Rel(repository.Path, plan.Path)
+	if err != nil || relative == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return "", nil, errors.New("prepare Ralphex execution plan: governed plan is outside the repository")
+	}
+	tracked := exec.CommandContext(ctx, "git", "cat-file", "blob", repository.StartSHA+":"+filepath.ToSlash(relative))
+	tracked.Dir = repository.Path
+	tracked.Env = gitexec.Environment()
+	trackedContents, err := tracked.Output()
+	if err == nil {
+		trackedSum := sha256.Sum256(trackedContents)
+		if hex.EncodeToString(trackedSum[:]) != plan.SHA256 {
+			return "", nil, errors.New("governed plan blob in start commit differs from governed plan")
+		}
+		return plan.Path, nil, nil
+	} else {
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) || exitError.ExitCode() != 128 {
+			return "", nil, fmt.Errorf("inspect governed plan in start commit: %w", err)
+		}
+	}
+
+	contents, err := os.ReadFile(plan.Path)
+	if err != nil {
+		return "", nil, fmt.Errorf("read governed plan for Ralphex execution copy: %w", err)
+	}
+	sum := sha256.Sum256([]byte(r.governed.RunID()))
+	runDigest := hex.EncodeToString(sum[:])
+	relativePath := filepath.ToSlash(filepath.Join(ralphex.ExecutionPlanHandoffPrefixV1+runDigest, "plan.md"))
+	directory := filepath.Join(repository.Path, filepath.Dir(filepath.FromSlash(relativePath)))
+	owner := executionPlanHandoffOwnerV1{
+		Kind: executionPlanOwnerKind, SchemaVersion: 1, RunID: r.governed.RunID(),
+		RelativePath: relativePath, SHA256: plan.SHA256,
+	}
+	ownerPath, err := writeExecutionPlanHandoffOwner(lease, owner)
+	if err != nil {
+		return "", nil, fmt.Errorf("record Ralphex execution plan ownership: %w", err)
+	}
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		_ = removeExecutionPlanHandoff(lease, ownerPath)
+		return "", nil, fmt.Errorf("create Ralphex execution plan directory: %w", err)
+	}
+	path := filepath.Join(directory, "plan.md")
+	cleanup := func() error {
+		return removeExecutionPlanHandoff(lease, ownerPath)
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		_ = cleanup()
+		return "", nil, fmt.Errorf("create Ralphex execution plan copy: %w", err)
+	}
+	written, writeErr := file.Write(contents)
+	if writeErr == nil && written != len(contents) {
+		writeErr = io.ErrShortWrite
+	}
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		_ = cleanup()
+		return "", nil, fmt.Errorf("write Ralphex execution plan copy: %w", errors.Join(writeErr, syncErr, closeErr))
+	}
+	copySHA, err := hashFile(path)
+	if err != nil || copySHA != plan.SHA256 {
+		_ = cleanup()
+		return "", nil, errors.Join(errors.New("Ralphex execution plan copy differs from governed plan"), err)
+	}
+	copyRelative, err := filepath.Rel(repository.Path, path)
+	if err != nil {
+		_ = cleanup()
+		return "", nil, fmt.Errorf("resolve Ralphex execution plan copy: %w", err)
+	}
+	status, err := gitOutput(ctx, repository.Path, "status", "--porcelain=v1", "--untracked-files=all", "--", filepath.ToSlash(copyRelative))
+	if err != nil || status != "?? "+filepath.ToSlash(copyRelative) {
+		_ = cleanup()
+		return "", nil, errors.Join(errors.New("Ralphex execution plan copy is not visible to Git for worktree handoff"), err)
+	}
+	return path, cleanup, nil
+}
+
+type repositoryExecutionLease struct {
+	file       *os.File
+	repository string
+	ownersDir  string
+}
+
+type executionPlanHandoffOwnerV1 struct {
+	Kind          string `json:"kind"`
+	SchemaVersion int    `json:"schema_version"`
+	RunID         string `json:"run_id"`
+	RelativePath  string `json:"relative_path"`
+	SHA256        string `json:"sha256"`
+}
+
+func recoverExecutionPlanHandoffs(lease *repositoryExecutionLease) error {
+	if lease == nil || lease.file == nil {
+		return errors.New("repository execution lease is required")
+	}
+	if err := ensureProtectedRunDirectory(filepath.Dir(lease.ownersDir)); err != nil {
+		return err
+	}
+	if err := ensureProtectedRunDirectory(lease.ownersDir); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(lease.ownersDir)
+	if err != nil {
+		return err
+	}
+	if len(entries) > maxExecutionPlanOwners {
+		return errors.New("too many Ralphex execution plan ownership records")
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasSuffix(name, ".json.tmp") && validLowerDigest(strings.TrimSuffix(name, ".json.tmp")) {
+			info, infoErr := entry.Info()
+			if infoErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+				return errors.Join(errors.New("invalid temporary Ralphex execution plan ownership record"), infoErr)
+			}
+			if err := os.Remove(filepath.Join(lease.ownersDir, name)); err != nil {
+				return err
+			}
+			continue
+		}
+		if !strings.HasSuffix(name, ".json") || !validLowerDigest(strings.TrimSuffix(name, ".json")) {
+			return errors.New("invalid Ralphex execution plan ownership record name")
+		}
+		if err := removeExecutionPlanHandoff(lease, filepath.Join(lease.ownersDir, name)); err != nil {
+			return err
+		}
+	}
+	return syncRunDirectory(lease.ownersDir)
+}
+
+func writeExecutionPlanHandoffOwner(lease *repositoryExecutionLease, owner executionPlanHandoffOwnerV1) (string, error) {
+	if lease == nil || lease.file == nil {
+		return "", errors.New("repository execution lease is required")
+	}
+	if err := ensureProtectedRunDirectory(filepath.Dir(lease.ownersDir)); err != nil {
+		return "", err
+	}
+	if err := ensureProtectedRunDirectory(lease.ownersDir); err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte(owner.RunID))
+	name := hex.EncodeToString(digest[:]) + ".json"
+	if err := validateExecutionPlanHandoffOwner(owner, name); err != nil {
+		return "", err
+	}
+	data, err := json.Marshal(owner)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(lease.ownersDir, name)
+	temporary := path + ".tmp"
+	file, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	written, writeErr := file.Write(data)
+	if writeErr == nil && written != len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	closeErr := errors.Join(file.Sync(), file.Close())
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(temporary)
+		return "", errors.Join(writeErr, closeErr)
+	}
+	if err := os.Link(temporary, path); err != nil {
+		_ = os.Remove(temporary)
+		return "", err
+	}
+	if err := os.Remove(temporary); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := syncRunDirectory(lease.ownersDir); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
+func removeExecutionPlanHandoff(lease *repositoryExecutionLease, ownerPath string) error {
+	owner, err := readExecutionPlanHandoffOwner(ownerPath)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256([]byte(owner.RunID))
+	if filepath.Base(ownerPath) != hex.EncodeToString(digest[:])+".json" {
+		return errors.New("Ralphex execution plan ownership filename does not match run")
+	}
+	path := filepath.Join(lease.repository, filepath.FromSlash(owner.RelativePath))
+	directory := filepath.Dir(path)
+	if info, statErr := os.Lstat(path); statErr == nil {
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return errors.New("owned Ralphex execution plan is not a protected regular file")
+		}
+		observed, hashErr := hashFile(path)
+		if hashErr != nil || observed != owner.SHA256 {
+			return errors.Join(errors.New("owned Ralphex execution plan hash changed"), hashErr)
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	if info, statErr := os.Lstat(directory); statErr == nil {
+		if !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+			return errors.New("owned Ralphex execution plan directory is not protected")
+		}
+		if err := os.Remove(directory); err != nil {
+			return err
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	if err := os.Remove(ownerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncRunDirectory(lease.ownersDir)
+}
+
+func readExecutionPlanHandoffOwner(path string) (executionPlanHandoffOwnerV1, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return executionPlanHandoffOwnerV1{}, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > maxExecutionPlanOwnerBytes {
+		return executionPlanHandoffOwnerV1{}, errors.New("invalid Ralphex execution plan ownership record")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return executionPlanHandoffOwnerV1{}, err
+	}
+	var owner executionPlanHandoffOwnerV1
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&owner); err != nil {
+		return executionPlanHandoffOwnerV1{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return executionPlanHandoffOwnerV1{}, errors.New("Ralphex execution plan ownership record has trailing data")
+	}
+	if err := validateExecutionPlanHandoffOwner(owner, filepath.Base(path)); err != nil {
+		return executionPlanHandoffOwnerV1{}, err
+	}
+	return owner, nil
+}
+
+func validateExecutionPlanHandoffOwner(owner executionPlanHandoffOwnerV1, name string) error {
+	if owner.Kind != executionPlanOwnerKind || owner.SchemaVersion != 1 || owner.RunID == "" || !validLowerDigest(owner.SHA256) {
+		return errors.New("invalid Ralphex execution plan ownership record")
+	}
+	digest := sha256.Sum256([]byte(owner.RunID))
+	runDigest := hex.EncodeToString(digest[:])
+	wantRelative := ralphex.ExecutionPlanHandoffPrefixV1 + runDigest + "/plan.md"
+	if owner.RelativePath != wantRelative || name != runDigest+".json" {
+		return errors.New("Ralphex execution plan ownership binding is invalid")
+	}
+	return nil
+}
+
+func ensureProtectedRunDirectory(path string) error {
+	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return errors.Join(errors.New("Ralphex execution plan ownership directory is not protected"), err)
+	}
+	return nil
+}
+
+func executionPlanOwnersDirectory(common, repository string) string {
+	sum := sha256.Sum256([]byte(repository))
+	return filepath.Join(common, executionPlanOwnerRoot, hex.EncodeToString(sum[:]))
+}
+
+func syncRunDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }
 
 func (r *Runner) appendCreated(authorityRef ledger.EvidenceRef) error {
