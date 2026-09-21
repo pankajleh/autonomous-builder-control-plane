@@ -786,7 +786,7 @@ func (r *Runner) prepareExecutionPlan(ctx context.Context) (string, func() error
 		return "", nil, fmt.Errorf("read governed plan for Ralphex execution copy: %w", err)
 	}
 	sum := sha256.Sum256([]byte(r.governed.RunID()))
-	directory := filepath.Join(repository.Path, "abcp-ralphex-plan-"+hex.EncodeToString(sum[:]))
+	directory := filepath.Join(repository.Path, ralphex.ExecutionPlanHandoffPrefixV1+hex.EncodeToString(sum[:]))
 	if err := os.Mkdir(directory, 0o700); err != nil {
 		return "", nil, fmt.Errorf("create Ralphex execution plan directory: %w", err)
 	}

@@ -21,6 +21,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/workflowauthoritypg"
@@ -154,8 +155,14 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 		return loadedProfile{}, errors.New("input directory must be repository-relative")
 	}
 	probe := configuration.InputDirectory + "/.abcp-admission-ignore-probe"
-	if _, err := gitOutput(configuration.RepositoryPath, "check-ignore", "-q", "--no-index", "--", probe); err != nil {
+	ignored, err := gitPathIgnored(configuration.RepositoryPath, probe)
+	if err != nil || !ignored {
 		return loadedProfile{}, errors.New("admission input directory is not Git-ignored")
+	}
+	handoffProbe := ralphex.ExecutionPlanHandoffPrefixV1 + strings.Repeat("0", sha256.Size*2) + "/plan.md"
+	ignored, err = gitPathIgnored(configuration.RepositoryPath, handoffProbe)
+	if err != nil || ignored {
+		return loadedProfile{}, errors.New("Ralphex execution-plan handoff namespace must not be Git-ignored")
 	}
 	inputFD, err := openRelativeDirectory(repositoryFD, configuration.InputDirectory, true)
 	if err != nil {
@@ -738,6 +745,12 @@ func validateReceipt(receipt AdmissionReceiptV1, name string) error {
 }
 
 func materialize(profile loadedProfile, principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1, runID string) (string, runBinding, error) {
+	runIDSum := sha256.Sum256([]byte(runID))
+	handoffPath := ralphex.ExecutionPlanHandoffPrefixV1 + hex.EncodeToString(runIDSum[:]) + "/plan.md"
+	ignored, err := gitPathIgnored(profile.configuration.RepositoryPath, handoffPath)
+	if err != nil || ignored {
+		return "", runBinding{}, errors.New("Ralphex execution-plan handoff path is Git-ignored")
+	}
 	for _, root := range []string{profile.ledgerRoot, profile.evidenceRoot} {
 		fd, err := openAbsoluteDirectory(root, false)
 		if err != nil {
@@ -794,10 +807,7 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, request 
 }
 
 func admissionPlan(principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1) []byte {
-	fence := strings.Repeat("`", longestBacktickRun(request.TaskMarkdown)+1)
-	if len(fence) < 3 {
-		fence = "```"
-	}
+	fence := markdownFence(request.TaskMarkdown)
 	taskMarkdown := request.TaskMarkdown
 	if !strings.HasSuffix(taskMarkdown, "\n") {
 		taskMarkdown += "\n"
@@ -808,10 +818,25 @@ func admissionPlan(principal serviceapi.Principal, request serviceapi.RunAdmissi
 		request.DelegatedActor.SubjectID, request.DelegatedActor.SubjectType, fence, taskMarkdown, fence))
 }
 
-func longestBacktickRun(value string) int {
+func markdownFence(value string) string {
+	backticks := longestRun(value, '`') + 1
+	tildes := longestRun(value, '~') + 1
+	if backticks < 3 {
+		backticks = 3
+	}
+	if tildes < 3 {
+		tildes = 3
+	}
+	if tildes < backticks {
+		return strings.Repeat("~", tildes)
+	}
+	return strings.Repeat("`", backticks)
+}
+
+func longestRun(value string, marker byte) int {
 	longest, current := 0, 0
 	for index := 0; index < len(value); index++ {
-		if value[index] == '`' {
+		if value[index] == marker {
 			current++
 			if current > longest {
 				longest = current
@@ -899,6 +924,18 @@ func gitOutput(repository string, args ...string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+func gitPathIgnored(repository, path string) (bool, error) {
+	_, err := gitOutput(repository, "check-ignore", "-q", "--no-index", "--", path)
+	if err == nil {
+		return true, nil
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) && exitError.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 func startProcess(executable string, args []string, lock *os.File) error {

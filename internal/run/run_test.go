@@ -122,22 +122,10 @@ git add candidate.txt || exit 33
 git commit -qm 'candidate implementation' || exit 34
 `
 	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{Enabled: true, Branch: "abcp/worktree-plan-copy"}, commandPath(t, "true"))
+	planBytes := []byte("### Task 1: product work\n\n- [ ] implement the product task\n")
+	ignoredPlan := configureIgnoredAuthorityPlan(t, &fixture, planBytes)
 	manifest := fixture.authority.Manifest()
 	repository := manifest.Repository.Path
-	ignoredPlan := filepath.Join(repository, ".abcp-input", "run", "plan.md")
-	planBytes := []byte("### Task 1: product work\n\n- [ ] implement the product task\n")
-	if err := os.MkdirAll(filepath.Dir(ignoredPlan), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	writeTestFile(t, ignoredPlan, planBytes, 0o600)
-	writeTestFile(t, filepath.Join(repository, ".gitignore"), []byte(".abcp-input/\n"), 0o600)
-	runGit(t, repository, "rm", "plan.md")
-	runGit(t, repository, "add", ".gitignore")
-	runGit(t, repository, "commit", "-m", "move authority plan to controller input")
-	manifest.Repository.StartSHA = runGit(t, repository, "rev-parse", "HEAD")
-	manifest.Plan = authority.PlanManifest{Path: ignoredPlan, SHA256: testHash(t, ignoredPlan)}
-	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
-	fixture.authority = fixture.admit(t, manifest)
 
 	result := fixture.execute(t)
 	if !result.Accepted() {
@@ -167,6 +155,132 @@ git commit -qm 'candidate implementation' || exit 34
 	if status := runGit(t, repository, "status", "--porcelain=v1", "--untracked-files=all"); status != "" {
 		t.Fatalf("execution plan handoff left source checkout dirty: %q", status)
 	}
+}
+
+func TestRunnerPinnedRalphexCopiesGitIgnoredAuthorityPlanIntoWorktree(t *testing.T) {
+	binaryPath := os.Getenv("ABCP_TEST_PINNED_RALPHEX")
+	if binaryPath == "" {
+		t.Skip("set ABCP_TEST_PINNED_RALPHEX to run the pinned-runtime contract test")
+	}
+	fakeBin := t.TempDir()
+	fakeCodex := filepath.Join(fakeBin, "codex")
+	writeTestFile(t, fakeCodex, []byte(`#!/bin/sh
+root=$(git rev-parse --show-toplevel) || exit 70
+plan=$(find "$root" -path '*/abcp-ralphex-plan-*/plan.md' -print -quit) || exit 71
+[ -r "$plan" ] || exit 72
+sed -i 's/- \[ \]/- [x]/' "$plan" || exit 73
+printf 'candidate from pinned runtime\n' > "$root/candidate.txt" || exit 74
+git add "$plan" "$root/candidate.txt" || exit 75
+git commit -qm 'pinned runtime candidate' || exit 76
+printf 'completed authorized task\n<<<RALPHEX:ALL_TASKS_DONE>>>\n'
+`), 0o700)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	fixture := newRunFixtureWithScript(t, "#!/bin/sh\nexit 99\n", authority.WorktreePolicy{Enabled: true, Branch: "abcp/pinned-runtime-plan-copy"}, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	manifest.Ralphex.BinaryPath = binaryPath
+	manifest.Ralphex.BinarySHA256 = testHash(t, binaryPath)
+	manifest.Ralphex.SourceSHA = "319e30618352a1b43e4be1b8a894c6c05e6d5fa8"
+	manifest.Ralphex.Timeout = "30s"
+	fixture.authority = fixture.admit(t, manifest)
+	planBytes := []byte("### Task 1: pinned runtime\n\n- [ ] implement through real Ralphex\n")
+	ignoredPlan := configureIgnoredAuthorityPlan(t, &fixture, planBytes)
+
+	result := fixture.execute(t)
+	if !result.Accepted() {
+		stdout, _ := os.ReadFile(result.Ralphex.StdoutRef.URI)
+		stderr, _ := os.ReadFile(result.Ralphex.StderrRef.URI)
+		t.Fatalf("pinned Ralphex worktree handoff result = %#v\nstdout:\n%s\nstderr:\n%s", result, stdout, stderr)
+	}
+	observed, err := os.ReadFile(ignoredPlan)
+	if err != nil || !bytes.Equal(observed, planBytes) {
+		t.Fatalf("pinned Ralphex changed authority plan: %q, %v", observed, err)
+	}
+	if status := runGit(t, fixture.authority.Repository().Path, "status", "--porcelain=v1", "--untracked-files=all"); status != "" {
+		t.Fatalf("pinned Ralphex left source checkout dirty: %q", status)
+	}
+	candidate := runGit(t, fixture.authority.Repository().Path, "show", "refs/heads/"+manifest.Worktree.Branch+":candidate.txt")
+	if candidate != "candidate from pinned runtime" {
+		t.Fatalf("pinned Ralphex did not execute the worktree plan: %q", candidate)
+	}
+}
+
+func TestRunnerCleansGitIgnoredExecutionPlanAfterFailureAndCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		script func(*testing.T) string
+		cancel bool
+	}{
+		{name: "nonzero exit", script: func(*testing.T) string { return "#!/bin/sh\nexit 17\n" }},
+		{name: "cancellation", cancel: true, script: func(t *testing.T) string {
+			ready := filepath.Join(t.TempDir(), "ready")
+			return fmt.Sprintf("#!/bin/sh\nprintf ready > %s\nwhile :; do sleep 60; done\n", ready)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			script := test.script(t)
+			fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{Enabled: true, Branch: "abcp/cleanup-" + strings.ReplaceAll(test.name, " ", "-")}, commandPath(t, "true"))
+			planBytes := []byte("### Task 1: cleanup\n\n- [ ] exercise cleanup\n")
+			ignoredPlan := configureIgnoredAuthorityPlan(t, &fixture, planBytes)
+
+			if test.cancel {
+				ctx, cancel := context.WithCancel(context.Background())
+				done := make(chan struct{}, 1)
+				runner := fixture.runner(t)
+				go func() {
+					_, _ = runner.Run(ctx)
+					done <- struct{}{}
+				}()
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					matches, _ := filepath.Glob(filepath.Join(fixture.authority.Repository().Path, ralphex.ExecutionPlanHandoffPrefixV1+"*", "plan.md"))
+					if len(matches) == 1 {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("timed out waiting for execution plan copy")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				cancel()
+				<-done
+			} else {
+				_ = fixture.execute(t)
+			}
+			runIDSum := sha256.Sum256([]byte(fixture.authority.RunID()))
+			executionPlan := filepath.Join(fixture.authority.Repository().Path, ralphex.ExecutionPlanHandoffPrefixV1+hex.EncodeToString(runIDSum[:]), "plan.md")
+			if _, err := os.Stat(executionPlan); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("execution plan copy remained after %s: %v", test.name, err)
+			}
+			observed, err := os.ReadFile(ignoredPlan)
+			if err != nil || !bytes.Equal(observed, planBytes) {
+				t.Fatalf("authority plan changed after %s: %q, %v", test.name, observed, err)
+			}
+			if status := runGit(t, fixture.authority.Repository().Path, "status", "--porcelain=v1", "--untracked-files=all"); status != "" {
+				t.Fatalf("cleanup after %s left repository dirty: %q", test.name, status)
+			}
+		})
+	}
+}
+
+func configureIgnoredAuthorityPlan(t *testing.T, fixture *runFixture, planBytes []byte) string {
+	t.Helper()
+	manifest := fixture.authority.Manifest()
+	repository := manifest.Repository.Path
+	ignoredPlan := filepath.Join(repository, ".abcp-input", "run", "plan.md")
+	if err := os.MkdirAll(filepath.Dir(ignoredPlan), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, ignoredPlan, planBytes, 0o600)
+	writeTestFile(t, filepath.Join(repository, ".gitignore"), []byte(".abcp-input/\n"), 0o600)
+	runGit(t, repository, "rm", "plan.md")
+	runGit(t, repository, "add", ".gitignore")
+	runGit(t, repository, "commit", "-m", "move authority plan to controller input")
+	manifest.Repository.StartSHA = runGit(t, repository, "rev-parse", "HEAD")
+	manifest.Plan = authority.PlanManifest{Path: ignoredPlan, SHA256: testHash(t, ignoredPlan)}
+	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
+	fixture.authority = fixture.admit(t, manifest)
+	return ignoredPlan
 }
 
 func TestRunnerSuccessfulReturnInvokesFinalizationBeforeBranchAccepted(t *testing.T) {

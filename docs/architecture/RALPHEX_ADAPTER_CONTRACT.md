@@ -17,6 +17,10 @@ A governed invocation binds the exact binary hash and source identity, repositor
 
 An asserted feature, repository-local `.ralphex` override, or success string is not capability evidence. Any missing proof returns `EXECUTION_BOUNDS_INVALID` before spawn.
 
+### Execution-plan handoff
+
+The governed authority plan and its admitted SHA-256 remain immutable controller evidence. When worktree execution uses a product-admission plan that is Git-ignored, the controller writes the same bytes to a restricted, hash-verified `abcp-ralphex-plan-<run-id-digest>/plan.md` copy, passes that copy to Ralphex, and removes it after the process returns or setup fails. The reserved `abcp-ralphex-plan-*` namespace must remain visible to Git; admission profiles whose repository ignore rules hide it are rejected. Tracked authority plans continue to use their governed path directly. Failure to create, verify, expose, or remove a required copy fails the run.
+
 ## Structured invocation and bounds
 
 Arguments are emitted as a structured string array; no shell concatenation is permitted. A B invocation includes all native per-process controls and always emits `--skip-finalize`. Codex task and review effort are exactly `xhigh`.

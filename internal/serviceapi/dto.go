@@ -18,6 +18,9 @@ const (
 	MaxActionPayloadBytes   = 16 << 10
 	MaxActionPayloadDepth   = 8
 	MaxRunTaskMarkdownBytes = 64 << 10
+	// MaxRunTaskMarkdownLineBytes stays below the pinned Ralphex plan parser's
+	// bufio.Scanner token ceiling. The total task bound remains unchanged.
+	MaxRunTaskMarkdownLineBytes = (64 << 10) - 1
 )
 
 var stateNamePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,127}$`)
@@ -80,7 +83,8 @@ func ValidateRunAdmissionRequestV1(request RunAdmissionRequestV1) error {
 		return errors.New("invalid run admission digest")
 	}
 	if request.TaskMarkdown == "" || len(request.TaskMarkdown) > MaxRunTaskMarkdownBytes ||
-		!utf8.ValidString(request.TaskMarkdown) || strings.ContainsRune(request.TaskMarkdown, 0) {
+		!utf8.ValidString(request.TaskMarkdown) || strings.ContainsRune(request.TaskMarkdown, 0) ||
+		maxLineBytes(request.TaskMarkdown) > MaxRunTaskMarkdownLineBytes {
 		return errors.New("invalid run task markdown")
 	}
 	if ValidatePrincipalID(request.DelegatedActor.SubjectID) != nil ||
@@ -88,6 +92,24 @@ func ValidateRunAdmissionRequestV1(request RunAdmissionRequestV1) error {
 		return errors.New("invalid delegated actor")
 	}
 	return nil
+}
+
+func maxLineBytes(value string) int {
+	maximum, current := 0, 0
+	for index := 0; index < len(value); index++ {
+		if value[index] == '\n' {
+			if current > maximum {
+				maximum = current
+			}
+			current = 0
+			continue
+		}
+		current++
+	}
+	if current > maximum {
+		maximum = current
+	}
+	return maximum
 }
 
 func ValidateCommandEnvelopeV1(command CommandEnvelopeV1, delegatedActorRequired bool) error {

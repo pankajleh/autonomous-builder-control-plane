@@ -87,6 +87,9 @@ func TestAdmissionPlanHasExactlyOneExecutableTaskAndPreservesAuthorizedMarkdown(
 		strings.Count(string(plan), "- [ ] Implement every requirement in the complete authorized product task below.") != 1 {
 		t.Fatalf("admission plan does not expose one actionable Task 1 section:\n%s", plan)
 	}
+	if !bytes.Contains(plan, []byte("~~~markdown\n")) {
+		t.Fatalf("admission plan did not choose the shorter collision-safe fence:\n%s", plan)
+	}
 }
 
 func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
@@ -297,6 +300,64 @@ func TestAdmissionProfileRequiresIgnoredSymlinkFreeInput(t *testing.T) {
 				t.Fatal("unsafe admission input was accepted")
 			}
 		})
+	}
+}
+
+func TestAdmissionProfileRequiresGitVisibleRalphexHandoffNamespace(t *testing.T) {
+	for _, gitignore := range []string{
+		"*\n",
+		".abcp-input/\n*.md\n",
+		".abcp-input/\nabcp-ralphex-plan-*\n",
+	} {
+		t.Run(strings.ReplaceAll(strings.TrimSpace(gitignore), "\n", "_"), func(t *testing.T) {
+			root, repository, _ := makeRepository(t, true)
+			if err := os.WriteFile(filepath.Join(repository, ".gitignore"), []byte(gitignore), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			git(t, repository, "add", ".gitignore")
+			git(t, repository, "commit", "-m", "ignore Ralphex handoff namespace")
+			head := git(t, repository, "rev-parse", "HEAD")
+			config, catalog := writeAdmissionConfiguration(t, root, repository, head)
+			service := filepath.Join(root, "service")
+			if err := os.Mkdir(service, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			controller, err := NewController(Config{ProfileFile: config, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog})
+			if err == nil {
+				controller.Close()
+				t.Fatal("profile with an ignored Ralphex handoff namespace was accepted")
+			}
+		})
+	}
+}
+
+func TestAdmissionRejectsRunSpecificIgnoredRalphexHandoffPath(t *testing.T) {
+	root, repository, _ := makeRepository(t, true)
+	principal := serviceapi.Principal{PrincipalID: "repo-c-service", PrincipalType: serviceapi.PrincipalService, AuthnMethod: "test-v1"}
+	requestID := "request-1"
+	runID := DeriveRunID(principal.PrincipalID, requestID)
+	runIDSum := sha256.Sum256([]byte(runID))
+	ignored := ".abcp-input/\n" + ralphex.ExecutionPlanHandoffPrefixV1 + hex.EncodeToString(runIDSum[:]) + "/\n"
+	if err := os.WriteFile(filepath.Join(repository, ".gitignore"), []byte(ignored), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repository, "add", ".gitignore")
+	git(t, repository, "commit", "-m", "ignore one run handoff")
+	head := git(t, repository, "rev-parse", "HEAD")
+	config, catalog := writeAdmissionConfiguration(t, root, repository, head)
+	service := filepath.Join(root, "service")
+	if err := os.Mkdir(service, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := NewController(Config{ProfileFile: config, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	request := testAdmissionRequest(head)
+	request.RequestID = requestID
+	if _, err := controller.AdmitRun(context.Background(), principal, request); !errors.Is(err, serviceapi.ErrUnsafeAdmissionMaterialization) {
+		t.Fatalf("run-specific ignored handoff path admission = %v", err)
 	}
 }
 
