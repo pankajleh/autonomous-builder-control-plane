@@ -2,6 +2,7 @@ package run
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -83,6 +84,88 @@ func TestRunnerSuccessReachesBranchAcceptedWithOrderedEvidence(t *testing.T) {
 	}
 	if len(events[len(events)-1].EvidenceRefs) < 8 {
 		t.Fatalf("BRANCH_ACCEPTED lacks complete acceptance evidence: %#v", events[len(events)-1].EvidenceRefs)
+	}
+}
+
+func TestRunnerCopiesGitIgnoredAuthorityPlanForRalphexWorktree(t *testing.T) {
+	script := `#!/bin/sh
+branch=
+plan=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--branch) branch=$2; shift 2 ;;
+		*) plan=$1; shift ;;
+	esac
+done
+[ -n "$branch" ] || exit 20
+[ -r "$plan" ] || exit 21
+status=$(git status --porcelain=v1 --untracked-files=all -- "$plan") || exit 22
+case "$status" in "?? "*) ;; *) exit 23 ;; esac
+root=$(git rev-parse --show-toplevel) || exit 24
+rel=${plan#"$root"/}
+[ "$rel" != "$plan" ] || exit 25
+worktree="$root/.test-ralphex-worktree"
+git worktree add -q -b "$branch" "$worktree" HEAD || exit 26
+cleanup() {
+	cd "$root" || return
+	git worktree remove --force "$worktree" >/dev/null 2>&1 || return
+}
+trap cleanup EXIT
+mkdir -p "$worktree/$(dirname "$rel")" || exit 27
+cp "$plan" "$worktree/$rel" || exit 28
+cd "$worktree" || exit 29
+[ -r "$rel" ] || exit 30
+git add "$rel" || exit 31
+git commit -qm 'add execution plan' || exit 32
+printf 'candidate\n' > candidate.txt
+git add candidate.txt || exit 33
+git commit -qm 'candidate implementation' || exit 34
+`
+	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{Enabled: true, Branch: "abcp/worktree-plan-copy"}, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	repository := manifest.Repository.Path
+	ignoredPlan := filepath.Join(repository, ".abcp-input", "run", "plan.md")
+	planBytes := []byte("### Task 1: product work\n\n- [ ] implement the product task\n")
+	if err := os.MkdirAll(filepath.Dir(ignoredPlan), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, ignoredPlan, planBytes, 0o600)
+	writeTestFile(t, filepath.Join(repository, ".gitignore"), []byte(".abcp-input/\n"), 0o600)
+	runGit(t, repository, "rm", "plan.md")
+	runGit(t, repository, "add", ".gitignore")
+	runGit(t, repository, "commit", "-m", "move authority plan to controller input")
+	manifest.Repository.StartSHA = runGit(t, repository, "rev-parse", "HEAD")
+	manifest.Plan = authority.PlanManifest{Path: ignoredPlan, SHA256: testHash(t, ignoredPlan)}
+	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
+	fixture.authority = fixture.admit(t, manifest)
+
+	result := fixture.execute(t)
+	if !result.Accepted() {
+		t.Fatalf("worktree plan handoff result = %#v", result)
+	}
+	executionPlan := result.Ralphex.Argv[len(result.Ralphex.Argv)-1]
+	if executionPlan == ignoredPlan || !strings.Contains(executionPlan, "abcp-ralphex-plan-") {
+		t.Fatalf("Ralphex execution plan = %q, authority plan = %q", executionPlan, ignoredPlan)
+	}
+	if _, err := os.Stat(executionPlan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source execution copy was not removed: %v", err)
+	}
+	observed, err := os.ReadFile(ignoredPlan)
+	if err != nil || !bytes.Equal(observed, planBytes) || testHash(t, ignoredPlan) != manifest.Plan.SHA256 {
+		t.Fatalf("immutable authority plan changed: %q, err=%v", observed, err)
+	}
+	relative, err := filepath.Rel(repository, executionPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	show := exec.Command("git", "show", "refs/heads/"+manifest.Worktree.Branch+":"+filepath.ToSlash(relative))
+	show.Dir = repository
+	branchPlan, err := show.Output()
+	if err != nil || !bytes.Equal(branchPlan, planBytes) {
+		t.Fatalf("worktree-readable plan = %q, err=%v", branchPlan, err)
+	}
+	if status := runGit(t, repository, "status", "--porcelain=v1", "--untracked-files=all"); status != "" {
+		t.Fatalf("execution plan handoff left source checkout dirty: %q", status)
 	}
 }
 

@@ -72,6 +72,23 @@ func TestDeterministicRunIdentityAndSemanticDigest(t *testing.T) {
 	}
 }
 
+func TestAdmissionPlanHasExactlyOneExecutableTaskAndPreservesAuthorizedMarkdown(t *testing.T) {
+	request := testAdmissionRequest(strings.Repeat("a", 40))
+	request.TaskMarkdown = "### Task 7: Repo C task\n\n- [ ] preserve this requirement\n\n````markdown\n### Task 8: nested example\n- [ ] preserve this too\n````"
+	principal := serviceapi.Principal{PrincipalID: "service-1", PrincipalType: serviceapi.PrincipalService, AuthnMethod: "bearer"}
+	plan := admissionPlan(principal, request)
+	if err := ralphex.ValidateSingleIncompleteTaskV1(plan); err != nil {
+		t.Fatalf("admission plan is not exactly one executable task: %v\n%s", err, plan)
+	}
+	if !bytes.Contains(plan, []byte(request.TaskMarkdown)) {
+		t.Fatalf("admission plan did not preserve authorized task markdown byte-for-byte:\n%s", plan)
+	}
+	if strings.Count(string(plan), "### Task 1: Implement the authorized product task") != 1 ||
+		strings.Count(string(plan), "- [ ] Implement every requirement in the complete authorized product task below.") != 1 {
+		t.Fatalf("admission plan does not expose one actionable Task 1 section:\n%s", plan)
+	}
+}
+
 func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
 	fixture := newAdmissionFixture(t, true)
 	defer fixture.closeLocks()

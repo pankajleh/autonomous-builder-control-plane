@@ -794,10 +794,33 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, request 
 }
 
 func admissionPlan(principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1) []byte {
-	return []byte(fmt.Sprintf("# Product run admission\n\n- Request ID: `%s`\n- Product authorization ID: `%s`\n- Product task ID: `%s`\n- Product version ID: `%s`\n- Product manifest SHA-256: `%s`\n- Repository base SHA: `%s`\n- Authenticated principal: `%s` (`%s`)\n- Delegated actor: `%s` (`%s`)\n\n## Task\n\n%s\n",
+	fence := strings.Repeat("`", longestBacktickRun(request.TaskMarkdown)+1)
+	if len(fence) < 3 {
+		fence = "```"
+	}
+	taskMarkdown := request.TaskMarkdown
+	if !strings.HasSuffix(taskMarkdown, "\n") {
+		taskMarkdown += "\n"
+	}
+	return []byte(fmt.Sprintf("# Product run admission\n\n- Request ID: `%s`\n- Product authorization ID: `%s`\n- Product task ID: `%s`\n- Product version ID: `%s`\n- Product manifest SHA-256: `%s`\n- Repository base SHA: `%s`\n- Authenticated principal: `%s` (`%s`)\n- Delegated actor: `%s` (`%s`)\n\n### Task 1: Implement the authorized product task\n\n- [ ] Implement every requirement in the complete authorized product task below.\n\n#### Complete authorized product task\n\n%smarkdown\n%s%s\n",
 		request.RequestID, request.ProductAuthorizationID, request.ProductTaskID, request.ProductVersionID,
 		request.ProductManifestSHA256, request.RepositoryBaseSHA, principal.PrincipalID, principal.PrincipalType,
-		request.DelegatedActor.SubjectID, request.DelegatedActor.SubjectType, request.TaskMarkdown))
+		request.DelegatedActor.SubjectID, request.DelegatedActor.SubjectType, fence, taskMarkdown, fence))
+}
+
+func longestBacktickRun(value string) int {
+	longest, current := 0, 0
+	for index := 0; index < len(value); index++ {
+		if value[index] == '`' {
+			current++
+			if current > longest {
+				longest = current
+			}
+			continue
+		}
+		current = 0
+	}
+	return longest
 }
 
 func admissionCapsuleSpec(profile loadedProfile, request serviceapi.RunAdmissionRequestV1, planRelative string) contextcapsule.Spec {

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -474,7 +475,16 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("create isolated Ralphex config directory: %w", err), nil)
 	}
 	defer os.RemoveAll(configDir)
-	invocation, err := r.invocation(configDir)
+	executionPlanPath, cleanupExecutionPlan, err := r.prepareExecutionPlan(ctx)
+	if err != nil {
+		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
+	}
+	defer func() {
+		if cleanupExecutionPlan != nil {
+			runErr = errors.Join(runErr, cleanupExecutionPlan())
+		}
+	}()
+	invocation, err := r.invocation(configDir, executionPlanPath)
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
@@ -532,6 +542,10 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		}
 	} else {
 		process, processErr = r.processes.Run(ctx, command)
+	}
+	if cleanupExecutionPlan != nil {
+		processErr = errors.Join(processErr, cleanupExecutionPlan())
+		cleanupExecutionPlan = nil
 	}
 	if invocation.Bounds != nil {
 		if finishErr := r.controller.FinishRalphexInvocationV1(reservation); finishErr != nil {
@@ -697,7 +711,7 @@ func validateReadOnlyReviewRepositoryV1(ctx context.Context, repository, expecte
 	return nil
 }
 
-func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
+func (r *Runner) invocation(configDir, executionPlanPath string) (ralphex.Invocation, error) {
 	policy := r.governed.Executor()
 	executor := strings.ToLower(strings.TrimSpace(policy.Executor))
 	if executor != "" && executor != "claude" && executor != "codex" {
@@ -705,7 +719,7 @@ func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
 	}
 	invocation := ralphex.Invocation{
 		BinaryPath:   r.governed.Ralphex().BinaryPath,
-		PlanPath:     r.governed.Plan().Path,
+		PlanPath:     executionPlanPath,
 		ConfigDir:    configDir,
 		Mode:         r.governed.Ralphex().Mode,
 		Codex:        executor == "codex",
@@ -737,6 +751,92 @@ func (r *Runner) invocation(configDir string) (ralphex.Invocation, error) {
 		invocation.SourceSHA = runtime.SourceSHA
 	}
 	return invocation, nil
+}
+
+// prepareExecutionPlan keeps the immutable authority plan separate from the
+// mutable plan Ralphex ticks and archives. A tracked authority plan is already
+// present in a worktree. Product-admission plans are deliberately Git-ignored,
+// however, so Ralphex cannot detect and copy them when it creates its worktree.
+// For that case the controller creates a bounded untracked copy only after the
+// clean-tree and authority-hash checks have passed.
+func (r *Runner) prepareExecutionPlan(ctx context.Context) (string, func() error, error) {
+	plan := r.governed.Plan()
+	if !r.governed.Worktree().Enabled {
+		return plan.Path, nil, nil
+	}
+	repository := r.governed.Repository()
+	relative, err := filepath.Rel(repository.Path, plan.Path)
+	if err != nil || relative == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return "", nil, errors.New("prepare Ralphex execution plan: governed plan is outside the repository")
+	}
+	tracked := exec.CommandContext(ctx, "git", "cat-file", "-e", repository.StartSHA+":"+filepath.ToSlash(relative))
+	tracked.Dir = repository.Path
+	tracked.Env = gitexec.Environment()
+	if err := tracked.Run(); err == nil {
+		return plan.Path, nil, nil
+	} else {
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) || exitError.ExitCode() != 128 {
+			return "", nil, fmt.Errorf("inspect governed plan in start commit: %w", err)
+		}
+	}
+
+	contents, err := os.ReadFile(plan.Path)
+	if err != nil {
+		return "", nil, fmt.Errorf("read governed plan for Ralphex execution copy: %w", err)
+	}
+	sum := sha256.Sum256([]byte(r.governed.RunID()))
+	directory := filepath.Join(repository.Path, "abcp-ralphex-plan-"+hex.EncodeToString(sum[:]))
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		return "", nil, fmt.Errorf("create Ralphex execution plan directory: %w", err)
+	}
+	path := filepath.Join(directory, "plan.md")
+	cleanup := func() error {
+		removeErr := os.Remove(path)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+		directoryErr := os.Remove(directory)
+		if errors.Is(directoryErr, os.ErrNotExist) {
+			directoryErr = nil
+		}
+		removeErr = errors.Join(removeErr, directoryErr)
+		if removeErr != nil {
+			return fmt.Errorf("remove Ralphex execution plan copy: %w", removeErr)
+		}
+		return nil
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		_ = os.Remove(directory)
+		return "", nil, fmt.Errorf("create Ralphex execution plan copy: %w", err)
+	}
+	written, writeErr := file.Write(contents)
+	if writeErr == nil && written != len(contents) {
+		writeErr = io.ErrShortWrite
+	}
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		_ = cleanup()
+		return "", nil, fmt.Errorf("write Ralphex execution plan copy: %w", errors.Join(writeErr, syncErr, closeErr))
+	}
+	copySHA, err := hashFile(path)
+	if err != nil || copySHA != plan.SHA256 {
+		_ = cleanup()
+		return "", nil, errors.Join(errors.New("Ralphex execution plan copy differs from governed plan"), err)
+	}
+	copyRelative, err := filepath.Rel(repository.Path, path)
+	if err != nil {
+		_ = cleanup()
+		return "", nil, fmt.Errorf("resolve Ralphex execution plan copy: %w", err)
+	}
+	status, err := gitOutput(ctx, repository.Path, "status", "--porcelain=v1", "--untracked-files=all", "--", filepath.ToSlash(copyRelative))
+	if err != nil || status != "?? "+filepath.ToSlash(copyRelative) {
+		_ = cleanup()
+		return "", nil, errors.Join(errors.New("Ralphex execution plan copy is not visible to Git for worktree handoff"), err)
+	}
+	return path, cleanup, nil
 }
 
 func (r *Runner) appendCreated(authorityRef ledger.EvidenceRef) error {
