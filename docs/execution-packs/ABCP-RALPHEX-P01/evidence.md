@@ -33,3 +33,22 @@ The private Repo B admission manifest template now pins the approved Ralphex exe
 - `go vet ./...`: PASS.
 
 The bounded correction leaves Repo C source and public DTO shape unchanged. Repo B now enforces the parser-safe admission contract, rejects profiles whose ignore rules hide the handoff namespace, generates one executable Task 1 wrapper, and supplies real Ralphex a verified temporary plan copy without mutating the admitted authority plan.
+
+## Final live C → B → Ralphex proof
+
+- Final executable Repo B HEAD before this evidence successor: `ad736b1`.
+- Fresh Repo C integration run: `admission-4c44adab5d686d0c2a5b6467dd8c92257d4eff86ca93ff625c7946d6f641ec54`.
+- Materialized Ralphex timeout: `10m0s`; real Ralphex process outcome: `succeeded`, exit code `0`.
+- Candidate branch: `abcp/admission-4c44adab5d686d0c2a5b6467dd8c92257d4eff86ca93ff625c7946d6f641ec54`.
+- Candidate HEAD: `c4920e6f281dad32218b7e1df0705463f40e2016`.
+- Existing ABCP acceptance command: PASS.
+- Final candidate checkout: clean.
+- Ledger terminal acceptance transition: `BRANCH_ACCEPTED`.
+- Existing C → B replay and ambiguous-outcome reconciliation harness: `LOCAL_INTEGRATION_EXERCISE_PASS`.
+
+The live proof therefore exercised the required chain on the final executable tree:
+Repo C authorization → Repo B admission → `abcp run` → `internal/run` → `internal/ralphex` → approved real Ralphex/Codex → candidate branch/evidence → existing ABCP acceptance.
+
+## Review closure
+
+Review 1 produced accepted corrections. Review 2 corrections are included through `ad736b1` and were followed by focused, broad, race, vet, pinned-runtime, and final live integration verification. A subsequent automatic review iteration was stopped without applying changes in order to honor the frozen `No Review 3` contract. The branch is now at the human merge gate.
