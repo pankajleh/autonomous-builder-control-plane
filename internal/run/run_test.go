@@ -263,6 +263,121 @@ func TestRunnerCleansGitIgnoredExecutionPlanAfterFailureAndCancellation(t *testi
 	}
 }
 
+func TestRunnerRecoversOwnedExecutionPlanAfterInterruptedCleanup(t *testing.T) {
+	script := `#!/bin/sh
+branch=
+plan=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--branch) branch=$2; shift 2 ;;
+		*) plan=$1; shift ;;
+	esac
+done
+root=$(git rev-parse --show-toplevel) || exit 20
+rel=${plan#"$root"/}
+worktree="$root/.test-ralphex-recovery-worktree"
+git worktree add -q -b "$branch" "$worktree" HEAD || exit 21
+trap 'cd "$root" && git worktree remove --force "$worktree" >/dev/null 2>&1' EXIT
+mkdir -p "$worktree/$(dirname "$rel")" || exit 22
+cp "$plan" "$worktree/$rel" || exit 23
+cd "$worktree" || exit 24
+git add "$rel" && git commit -qm 'add recovered execution plan' || exit 25
+printf 'candidate\n' > candidate.txt
+git add candidate.txt && git commit -qm 'candidate after recovery' || exit 26
+`
+	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{Enabled: true, Branch: "abcp/recovered-plan-copy"}, commandPath(t, "true"))
+	configureIgnoredAuthorityPlan(t, &fixture, []byte("### Task 1: recover\n\n- [ ] recover interrupted handoff\n"))
+
+	lease, err := acquireRepositoryExecutionLease(context.Background(), fixture.authority.Repository().Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverExecutionPlanHandoffs(lease); err != nil {
+		t.Fatal(err)
+	}
+	stalePath, _, err := fixture.runner(t).prepareExecutionPlan(context.Background(), lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stalePath); err != nil {
+		t.Fatalf("simulated interrupted handoff is absent: %v", err)
+	}
+
+	result := fixture.execute(t)
+	if !result.Accepted() {
+		t.Fatalf("run did not recover the interrupted handoff: %#v", result)
+	}
+	if _, err := os.Stat(stalePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovered handoff remains: %v", err)
+	}
+	if status := runGit(t, fixture.authority.Repository().Path, "status", "--porcelain=v1", "--untracked-files=all"); status != "" {
+		t.Fatalf("recovered run left source checkout dirty: %q", status)
+	}
+}
+
+func TestRunnerRejectsTamperedInterruptedExecutionPlan(t *testing.T) {
+	fixture := newRunFixtureWithScript(t, "#!/bin/sh\nexit 0\n", authority.WorktreePolicy{Enabled: true, Branch: "abcp/tampered-stale-plan"}, commandPath(t, "true"))
+	configureIgnoredAuthorityPlan(t, &fixture, []byte("### Task 1: preserve\n\n- [ ] preserve stale handoff integrity\n"))
+	lease, err := acquireRepositoryExecutionLease(context.Background(), fixture.authority.Repository().Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverExecutionPlanHandoffs(lease); err != nil {
+		t.Fatal(err)
+	}
+	stalePath, _, err := fixture.runner(t).prepareExecutionPlan(context.Background(), lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stalePath, []byte("tampered\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "owned Ralphex execution plan hash changed") {
+		t.Fatalf("tampered stale handoff result = %#v, err = %v", result, err)
+	}
+	if result.State != domain.StateFailed {
+		t.Fatalf("tampered stale handoff state = %s, want FAILED", result.State)
+	}
+	if observed, readErr := os.ReadFile(stalePath); readErr != nil || string(observed) != "tampered\n" {
+		t.Fatalf("tampered stale handoff was removed or changed: %q, %v", observed, readErr)
+	}
+}
+
+func TestRepositoryExecutionLeaseSerializesOverlappingRuns(t *testing.T) {
+	fixture := newRunFixture(t, 0, commandPath(t, "true"))
+	repository := fixture.authority.Repository().Path
+	first, err := acquireRepositoryExecutionLease(context.Background(), repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if second, err := acquireRepositoryExecutionLease(ctx, repository); !errors.Is(err, context.DeadlineExceeded) {
+		if second != nil {
+			_ = second.Close()
+		}
+		t.Fatalf("overlapping repository lease = %v, want deadline exceeded", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := acquireRepositoryExecutionLease(context.Background(), repository)
+	if err != nil {
+		t.Fatalf("repository lease unavailable after owner release: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func configureIgnoredAuthorityPlan(t *testing.T, fixture *runFixture, planBytes []byte) string {
 	t.Helper()
 	manifest := fixture.authority.Manifest()
