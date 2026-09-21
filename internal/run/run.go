@@ -798,10 +798,15 @@ func (r *Runner) prepareExecutionPlan(ctx context.Context, lease *repositoryExec
 	if err != nil || relative == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 		return "", nil, errors.New("prepare Ralphex execution plan: governed plan is outside the repository")
 	}
-	tracked := exec.CommandContext(ctx, "git", "cat-file", "-e", repository.StartSHA+":"+filepath.ToSlash(relative))
+	tracked := exec.CommandContext(ctx, "git", "cat-file", "blob", repository.StartSHA+":"+filepath.ToSlash(relative))
 	tracked.Dir = repository.Path
 	tracked.Env = gitexec.Environment()
-	if err := tracked.Run(); err == nil {
+	trackedContents, err := tracked.Output()
+	if err == nil {
+		trackedSum := sha256.Sum256(trackedContents)
+		if hex.EncodeToString(trackedSum[:]) != plan.SHA256 {
+			return "", nil, errors.New("governed plan blob in start commit differs from governed plan")
+		}
 		return plan.Path, nil, nil
 	} else {
 		var exitError *exec.ExitError

@@ -157,6 +157,29 @@ git commit -qm 'candidate implementation' || exit 34
 	}
 }
 
+func TestRunnerRejectsTrackedPlanWhenStartCommitBlobDiffers(t *testing.T) {
+	fixture := newRunFixtureWithScript(t, "#!/bin/sh\nexit 0\n", authority.WorktreePolicy{
+		Enabled: true, Branch: "abcp/tracked-plan-mismatch",
+	}, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	repository := manifest.Repository.Path
+	runGit(t, repository, "update-index", "--skip-worktree", "plan.md")
+	writeTestFile(t, manifest.Plan.Path, []byte("# differently governed plan\n"), 0o600)
+	if status := runGit(t, repository, "status", "--porcelain=v1", "--untracked-files=all"); status != "" {
+		t.Fatalf("skip-worktree did not hide the tracked plan change: %q", status)
+	}
+	manifest.Plan.SHA256 = testHash(t, manifest.Plan.Path)
+	fixture.authority = fixture.admit(t, manifest)
+
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "plan blob in start commit differs") {
+		t.Fatalf("expected tracked plan blob mismatch rejection, got %v", err)
+	}
+	if result.State != domain.StateFailed {
+		t.Fatalf("tracked plan blob mismatch state = %s, want FAILED", result.State)
+	}
+}
+
 func TestRunnerPinnedRalphexCopiesGitIgnoredAuthorityPlanIntoWorktree(t *testing.T) {
 	binaryPath := os.Getenv("ABCP_TEST_PINNED_RALPHEX")
 	if binaryPath == "" {
