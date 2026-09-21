@@ -109,6 +109,10 @@ func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
 		manifest.Worktree.Branch != "abcp/"+expectedRunID || manifest.ContextCapsule == nil {
 		t.Fatalf("derived manifest bindings = %+v", manifest)
 	}
+	pinnedRalphex := fixture.controller.profiles[fixture.request.ProfileID].template.Ralphex
+	if !reflect.DeepEqual(manifest.Ralphex, pinnedRalphex) || manifest.Ralphex.BinaryPath == testExecutable(t) || manifest.Ralphex.SourceSHA == "" {
+		t.Fatalf("derived manifest did not preserve controller-owned Ralphex identity: got %+v, want %+v", manifest.Ralphex, pinnedRalphex)
+	}
 	receiptPath := filepath.Join(fixture.service, "admissions", receiptKey(fixture.principal.PrincipalID, fixture.request.RequestID)+".json")
 	receiptData, err := os.ReadFile(receiptPath)
 	if err != nil {
@@ -934,15 +938,22 @@ func makeRepository(t *testing.T, ignored bool) (string, string, string) {
 func writeAdmissionConfiguration(t *testing.T, root, repository, _ string) (string, *admissionTestCatalog) {
 	t.Helper()
 	truePath := testExecutable(t)
-	binary, err := os.ReadFile(truePath)
+	runtimePath := filepath.Join(root, "approved-ralphex")
+	if err := os.WriteFile(runtimePath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(runtimePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	binaryDigest := sha256.Sum256(binary)
 	template := authority.Manifest{
 		Repository: authority.RepositoryManifest{Remotes: map[string]string{"origin": "https://example.test/example/product.git"}, DefaultBranch: "main"},
-		Ralphex:    authority.RalphexManifest{BinaryPath: truePath, BinarySHA256: hex.EncodeToString(binaryDigest[:]), Mode: ralphex.ModeFull, Timeout: "5m", WaitOnLimit: "0s"},
-		Executor:   authority.ExecutorPolicy{Executor: "codex"}, Worktree: authority.WorktreePolicy{Enabled: true},
+		Ralphex: authority.RalphexManifest{
+			BinaryPath: runtimePath, BinarySHA256: hex.EncodeToString(binaryDigest[:]), SourceSHA: strings.Repeat("c", 40),
+			Mode: ralphex.ModeFull, Timeout: "5m", WaitOnLimit: "0s",
+		},
+		Executor: authority.ExecutorPolicy{Executor: "codex"}, Worktree: authority.WorktreePolicy{Enabled: true},
 		Acceptance:    []authority.AcceptanceCommand{{Name: "test", Required: true, Timeout: "5m", Argv: []string{truePath}}},
 		PolicyVersion: "product-v1",
 	}
