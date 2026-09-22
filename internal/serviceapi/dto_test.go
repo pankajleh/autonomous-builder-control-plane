@@ -1,6 +1,8 @@
 package serviceapi
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -58,5 +60,38 @@ func TestRunAdmissionTaskMarkdownLineBoundMatchesPinnedPlanParser(t *testing.T) 
 	invalid.TaskMarkdown = strings.Repeat("x", MaxRunTaskMarkdownLineBytes+1)
 	if err := ValidateRunAdmissionRequestV1(invalid); err == nil {
 		t.Fatal("task markdown line exceeding the pinned parser limit was accepted")
+	}
+}
+
+func TestDevelopmentRunAdmissionValidatesExactCapsuleDigestAndBounds(t *testing.T) {
+	markdown := strings.Repeat("x", MaxRunTaskMarkdownLineBytes) + "\n"
+	sum := sha256.Sum256([]byte(markdown))
+	valid := DevelopmentRunAdmissionRequestV1{
+		SchemaVersion: 1, RequestID: "request-1", ProfileID: "repo-c-development-v1",
+		DevelopmentCapsuleID: "capsule-004", DevelopmentSliceID: "slice-1",
+		DevelopmentCapsuleSHA256: hex.EncodeToString(sum[:]), RepositoryBaseSHA: strings.Repeat("b", 40),
+		TaskMarkdown: markdown, DelegatedActor: DelegatedActorV1{SubjectID: "user-1", SubjectType: PrincipalUser},
+	}
+	if err := ValidateDevelopmentRunAdmissionRequestV1(valid); err != nil {
+		t.Fatalf("valid development request rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*DevelopmentRunAdmissionRequestV1){
+		"capsule digest": func(request *DevelopmentRunAdmissionRequestV1) {
+			request.DevelopmentCapsuleSHA256 = strings.Repeat("a", 64)
+		},
+		"line bound": func(request *DevelopmentRunAdmissionRequestV1) {
+			request.TaskMarkdown = strings.Repeat("x", MaxRunTaskMarkdownLineBytes+1)
+			sum := sha256.Sum256([]byte(request.TaskMarkdown))
+			request.DevelopmentCapsuleSHA256 = hex.EncodeToString(sum[:])
+		},
+		"missing actor": func(request *DevelopmentRunAdmissionRequestV1) { request.DelegatedActor = DelegatedActorV1{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := valid
+			mutate(&request)
+			if err := ValidateDevelopmentRunAdmissionRequestV1(request); err == nil {
+				t.Fatal("invalid development admission accepted")
+			}
+		})
 	}
 }

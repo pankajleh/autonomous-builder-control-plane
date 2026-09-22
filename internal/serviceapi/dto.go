@@ -2,6 +2,7 @@ package serviceapi
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -67,6 +68,21 @@ type RunAdmissionRequestV1 struct {
 	DelegatedActor         DelegatedActorV1 `json:"delegated_actor"`
 }
 
+// DevelopmentRunAdmissionRequestV1 is the complete development-only run
+// admission shape. Private execution and filesystem policy deliberately have
+// no representation in this DTO.
+type DevelopmentRunAdmissionRequestV1 struct {
+	SchemaVersion            int              `json:"schema_version"`
+	RequestID                string           `json:"request_id"`
+	ProfileID                string           `json:"profile_id"`
+	DevelopmentCapsuleID     string           `json:"development_capsule_id"`
+	DevelopmentSliceID       string           `json:"development_slice_id"`
+	DevelopmentCapsuleSHA256 string           `json:"development_capsule_sha256"`
+	RepositoryBaseSHA        string           `json:"repository_base_sha"`
+	TaskMarkdown             string           `json:"task_markdown"`
+	DelegatedActor           DelegatedActorV1 `json:"delegated_actor"`
+}
+
 type RunAdmissionResponseV1 struct {
 	RunID  string `json:"run_id"`
 	RunURL string `json:"run_url"`
@@ -86,6 +102,31 @@ func ValidateRunAdmissionRequestV1(request RunAdmissionRequestV1) error {
 		!utf8.ValidString(request.TaskMarkdown) || strings.ContainsRune(request.TaskMarkdown, 0) ||
 		maxLineBytes(request.TaskMarkdown) > MaxRunTaskMarkdownLineBytes {
 		return errors.New("invalid run task markdown")
+	}
+	if ValidatePrincipalID(request.DelegatedActor.SubjectID) != nil ||
+		(request.DelegatedActor.SubjectType != PrincipalUser && request.DelegatedActor.SubjectType != PrincipalOperator) {
+		return errors.New("invalid delegated actor")
+	}
+	return nil
+}
+
+func ValidateDevelopmentRunAdmissionRequestV1(request DevelopmentRunAdmissionRequestV1) error {
+	if request.SchemaVersion != 1 || ValidatePrincipalID(request.RequestID) != nil ||
+		runtimecatalog.ValidateIdentifier(request.ProfileID) != nil || len(request.ProfileID) > 128 ||
+		ValidatePrincipalID(request.DevelopmentCapsuleID) != nil || ValidatePrincipalID(request.DevelopmentSliceID) != nil {
+		return errors.New("invalid development run admission identity")
+	}
+	if !isLowerSHA256(request.DevelopmentCapsuleSHA256) || !isLowerGitObjectID(request.RepositoryBaseSHA) {
+		return errors.New("invalid development run admission digest")
+	}
+	if request.TaskMarkdown == "" || len(request.TaskMarkdown) > MaxRunTaskMarkdownBytes ||
+		!utf8.ValidString(request.TaskMarkdown) || strings.ContainsRune(request.TaskMarkdown, 0) ||
+		maxLineBytes(request.TaskMarkdown) > MaxRunTaskMarkdownLineBytes {
+		return errors.New("invalid development task markdown")
+	}
+	capsuleDigest := sha256.Sum256([]byte(request.TaskMarkdown))
+	if hex.EncodeToString(capsuleDigest[:]) != request.DevelopmentCapsuleSHA256 {
+		return errors.New("development capsule digest mismatch")
 	}
 	if ValidatePrincipalID(request.DelegatedActor.SubjectID) != nil ||
 		(request.DelegatedActor.SubjectType != PrincipalUser && request.DelegatedActor.SubjectType != PrincipalOperator) {

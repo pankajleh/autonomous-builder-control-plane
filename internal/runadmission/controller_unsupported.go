@@ -14,4 +14,8 @@ func (c *Controller) admitRun(context.Context, serviceapi.Principal, serviceapi.
 	return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
 }
 
+func (c *Controller) admitDevelopmentRun(context.Context, serviceapi.Principal, serviceapi.DevelopmentRunAdmissionRequestV1) (serviceapi.RunAdmissionResponseV1, error) {
+	return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
+}
+
 func closeFD(int) error { return nil }
