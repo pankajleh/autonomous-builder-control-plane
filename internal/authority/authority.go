@@ -20,6 +20,11 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
+const (
+	PolicyVersionProductDefaultV1   = "abcp-product-default-v1"
+	PolicyVersionRepoCDevelopmentV2 = "repo-c-development-v2"
+)
+
 // Manifest is the mutable, serializable input used to construct an Authority.
 type Manifest struct {
 	RunID          string                  `json:"run_id"`
@@ -75,15 +80,31 @@ type ContextCapsuleManifest struct {
 }
 
 // RalphexManifest pins the executable, its source metadata, and invocation mode.
+type RalphexValidationCommand struct {
+	ID               string   `json:"id"`
+	Argv             []string `json:"argv"`
+	Cwd              string   `json:"cwd,omitempty"`
+	Timeout          string   `json:"timeout"`
+	ExpectedDuration string   `json:"expected_duration,omitempty"`
+	StallTimeout     string   `json:"stall_timeout,omitempty"`
+}
+
+// RalphexManifest pins the executable, source, budgets and deterministic validation policy.
 type RalphexManifest struct {
-	BinaryPath     string                    `json:"binary_path"`
-	BinarySHA256   string                    `json:"binary_sha256"`
-	SourceSHA      string                    `json:"source_sha,omitempty"`
-	Mode           ralphex.Mode              `json:"mode"`
-	Timeout        string                    `json:"timeout"`
-	WaitOnLimit    string                    `json:"wait_on_limit"`
-	Capability     *ralphex.CapabilityV1     `json:"capability,omitempty"`
-	ExecutionState *ralphex.ExecutionStateV1 `json:"execution_state,omitempty"`
+	BinaryPath                string                     `json:"binary_path"`
+	BinarySHA256              string                     `json:"binary_sha256"`
+	SourceSHA                 string                     `json:"source_sha,omitempty"`
+	Mode                      ralphex.Mode               `json:"mode"`
+	Timeout                   string                     `json:"timeout"`
+	WaitOnLimit               string                     `json:"wait_on_limit"`
+	MaxIterations             int                        `json:"max_iterations,omitempty"`
+	SessionTimeout            string                     `json:"session_timeout,omitempty"`
+	IdleTimeout               string                     `json:"idle_timeout,omitempty"`
+	MaxInternalReviewPasses   int                        `json:"max_internal_review_passes,omitempty"`
+	LongRunningSubprocessMode string                     `json:"long_running_subprocess_mode,omitempty"`
+	Validation                []RalphexValidationCommand `json:"validation,omitempty"`
+	Capability                *ralphex.CapabilityV1      `json:"capability,omitempty"`
+	ExecutionState            *ralphex.ExecutionStateV1  `json:"execution_state,omitempty"`
 }
 
 // GovernanceManifest selects one V3 operation and binds activation evidence
@@ -154,6 +175,7 @@ func newAuthority(input Manifest, controller *governancev3.ControllerV1) (Author
 	if err := canonicalizeExecutorPolicy(&manifest.Executor); err != nil {
 		return Authority{}, err
 	}
+	applyExecutionDefaults(&manifest)
 	if err := validateRequired(manifest); err != nil {
 		return Authority{}, err
 	}
@@ -211,8 +233,28 @@ func newAuthority(input Manifest, controller *governancev3.ControllerV1) (Author
 	}
 	manifest.Ralphex.Timeout = canonicalDuration(manifest.Ralphex.Timeout)
 	manifest.Ralphex.WaitOnLimit = canonicalDuration(manifest.Ralphex.WaitOnLimit)
+	if manifest.Ralphex.SessionTimeout != "" {
+		manifest.Ralphex.SessionTimeout = canonicalDuration(manifest.Ralphex.SessionTimeout)
+	}
+	if manifest.Ralphex.IdleTimeout != "" {
+		manifest.Ralphex.IdleTimeout = canonicalDuration(manifest.Ralphex.IdleTimeout)
+	}
+	for index := range manifest.Ralphex.Validation {
+		manifest.Ralphex.Validation[index].Timeout = canonicalDuration(manifest.Ralphex.Validation[index].Timeout)
+		if manifest.Ralphex.Validation[index].ExpectedDuration != "" {
+			manifest.Ralphex.Validation[index].ExpectedDuration = canonicalDuration(manifest.Ralphex.Validation[index].ExpectedDuration)
+		}
+		if manifest.Ralphex.Validation[index].StallTimeout != "" {
+			manifest.Ralphex.Validation[index].StallTimeout = canonicalDuration(manifest.Ralphex.Validation[index].StallTimeout)
+		}
+	}
 	for index := range manifest.Acceptance {
 		manifest.Acceptance[index].Timeout = canonicalDuration(manifest.Acceptance[index].Timeout)
+	}
+	if governedExecutionPolicy(manifest.PolicyVersion) {
+		if err := ralphex.VerifyGovernedExecutionCapabilityV1(manifest.Ralphex.BinaryPath, manifest.Ralphex.BinarySHA256, manifest.Ralphex.SourceSHA); err != nil {
+			return Authority{}, err
+		}
 	}
 	if err := validateGovernanceAdmission(manifest, controller); err != nil {
 		return Authority{}, err
@@ -416,6 +458,52 @@ func validateGovernanceAdmission(manifest Manifest, controller *governancev3.Con
 	return nil
 }
 
+func applyExecutionDefaults(manifest *Manifest) {
+	if manifest == nil {
+		return
+	}
+	var outer, session, idle, acceptance string
+	var iterations int
+	switch manifest.PolicyVersion {
+	case PolicyVersionProductDefaultV1:
+		outer, session, idle, acceptance, iterations = "6h", "90m", "30m", "90m", 12
+	case PolicyVersionRepoCDevelopmentV2:
+		outer, session, idle, acceptance, iterations = "90m", "45m", "15m", "45m", 8
+	default:
+		return
+	}
+	if manifest.Ralphex.Timeout == "" {
+		manifest.Ralphex.Timeout = outer
+	}
+	if manifest.Ralphex.WaitOnLimit == "" {
+		manifest.Ralphex.WaitOnLimit = "0s"
+	}
+	if manifest.Ralphex.SessionTimeout == "" {
+		manifest.Ralphex.SessionTimeout = session
+	}
+	if manifest.Ralphex.IdleTimeout == "" {
+		manifest.Ralphex.IdleTimeout = idle
+	}
+	if manifest.Ralphex.MaxIterations == 0 {
+		manifest.Ralphex.MaxIterations = iterations
+	}
+	if manifest.Ralphex.MaxInternalReviewPasses == 0 {
+		manifest.Ralphex.MaxInternalReviewPasses = 2
+	}
+	if manifest.Ralphex.LongRunningSubprocessMode == "" {
+		manifest.Ralphex.LongRunningSubprocessMode = "orchestrator"
+	}
+	for i := range manifest.Acceptance {
+		if manifest.Acceptance[i].Timeout == "" {
+			manifest.Acceptance[i].Timeout = acceptance
+		}
+	}
+}
+
+func governedExecutionPolicy(policy string) bool {
+	return policy == PolicyVersionProductDefaultV1 || policy == PolicyVersionRepoCDevelopmentV2
+}
+
 func autonomousWorkflowPolicy(manifest Manifest) (bool, string, error) {
 	if manifest.ContextCapsule == nil {
 		return false, "", nil
@@ -511,6 +599,43 @@ func validateRequired(manifest Manifest) error {
 	}
 	if err := validateDuration("ralphex.wait_on_limit", manifest.Ralphex.WaitOnLimit, true); err != nil {
 		return err
+	}
+	if manifest.Ralphex.SessionTimeout != "" {
+		if err := validateDuration("ralphex.session_timeout", manifest.Ralphex.SessionTimeout, false); err != nil {
+			return err
+		}
+	}
+	if manifest.Ralphex.IdleTimeout != "" {
+		if err := validateDuration("ralphex.idle_timeout", manifest.Ralphex.IdleTimeout, false); err != nil {
+			return err
+		}
+	}
+	if manifest.Ralphex.MaxIterations < 0 || manifest.Ralphex.MaxInternalReviewPasses < 0 || manifest.Ralphex.MaxInternalReviewPasses > 2 {
+		return errors.New("invalid Ralphex iteration/review budget")
+	}
+	if manifest.Ralphex.LongRunningSubprocessMode != "" && manifest.Ralphex.LongRunningSubprocessMode != "legacy-agent" && manifest.Ralphex.LongRunningSubprocessMode != "orchestrator" {
+		return errors.New("invalid Ralphex long-running subprocess mode")
+	}
+	if manifest.Ralphex.LongRunningSubprocessMode == "orchestrator" && len(manifest.Ralphex.Validation) == 0 {
+		return errors.New("orchestrator subprocess mode requires deterministic validation commands")
+	}
+	if manifest.Ralphex.LongRunningSubprocessMode != "orchestrator" && len(manifest.Ralphex.Validation) > 0 {
+		return errors.New("deterministic validation commands require orchestrator subprocess mode")
+	}
+	for index, command := range manifest.Ralphex.Validation {
+		if command.ID == "" || len(command.Argv) == 0 || command.Timeout == "" {
+			return fmt.Errorf("invalid Ralphex validation command %d", index)
+		}
+		if err := validateDuration(fmt.Sprintf("ralphex validation command %d timeout", index), command.Timeout, false); err != nil {
+			return err
+		}
+		for _, extra := range []string{command.ExpectedDuration, command.StallTimeout} {
+			if extra != "" {
+				if err := validateDuration("ralphex validation duration", extra, false); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	if manifest.Worktree.Enabled && manifest.Worktree.Branch == "" {
 		return errors.New("worktree.branch is required when worktree is enabled")

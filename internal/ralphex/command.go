@@ -34,23 +34,29 @@ const (
 )
 
 type Invocation struct {
-	BinaryPath   string
-	PlanPath     string
-	ConfigDir    string
-	Mode         Mode
-	Codex        bool
-	Worktree     bool
-	Branch       string
-	TaskModel    string
-	TaskEffort   string
-	ReviewModel  string
-	ReviewEffort string
-	WaitOnLimit  string
-	BaseRef      string
-	Bounds       *contextcapsule.ExecutionBoundsV1
-	Capability   *CapabilityV1
-	BinarySHA256 string
-	SourceSHA    string
+	BinaryPath                string
+	PlanPath                  string
+	ConfigDir                 string
+	Mode                      Mode
+	Codex                     bool
+	Worktree                  bool
+	Branch                    string
+	TaskModel                 string
+	TaskEffort                string
+	ReviewModel               string
+	ReviewEffort              string
+	WaitOnLimit               string
+	MaxIterations             int
+	SessionTimeout            string
+	IdleTimeout               string
+	MaxInternalReviewPasses   int
+	LongRunningSubprocessMode string
+	ValidationSpecPath        string
+	BaseRef                   string
+	Bounds                    *contextcapsule.ExecutionBoundsV1
+	Capability                *CapabilityV1
+	BinarySHA256              string
+	SourceSHA                 string
 }
 
 // HandoffMode identifies the controller-visible review->lease->fix boundary.
@@ -83,17 +89,20 @@ type CapabilityV1 struct {
 // --abcp-governance-capability-v1. The controller supplies the binary digest,
 // so probe output cannot redirect attestation to a different executable.
 type CapabilityProbeV1 struct {
-	Kind                     string      `json:"kind"`
-	SourceSHA                string      `json:"source_sha"`
-	MaxIterationsFlag        bool        `json:"max_iterations_flag"`
-	SessionTimeoutFlag       bool        `json:"session_timeout_flag"`
-	IdleTimeoutFlag          bool        `json:"idle_timeout_flag"`
-	SkipFinalizeFlag         bool        `json:"skip_finalize_flag"`
-	BaseRefFlag              bool        `json:"base_ref_flag"`
-	ExecutorModelEffortFlags bool        `json:"executor_model_effort_flags"`
-	IsolatedConfig           bool        `json:"isolated_config"`
-	GovernedHandoff          HandoffMode `json:"governed_handoff"`
-	LinuxContainment         bool        `json:"linux_containment"`
+	Kind                         string      `json:"kind"`
+	SourceSHA                    string      `json:"source_sha"`
+	MaxIterationsFlag            bool        `json:"max_iterations_flag"`
+	SessionTimeoutFlag           bool        `json:"session_timeout_flag"`
+	IdleTimeoutFlag              bool        `json:"idle_timeout_flag"`
+	SkipFinalizeFlag             bool        `json:"skip_finalize_flag"`
+	BaseRefFlag                  bool        `json:"base_ref_flag"`
+	ExecutorModelEffortFlags     bool        `json:"executor_model_effort_flags"`
+	IsolatedConfig               bool        `json:"isolated_config"`
+	GovernedHandoff              HandoffMode `json:"governed_handoff"`
+	LinuxContainment             bool        `json:"linux_containment"`
+	InternalReviewBudgetV1       bool        `json:"internal_review_budget_v1,omitempty"`
+	OrchestratorSubprocessWaitV1 bool        `json:"orchestrator_subprocess_wait_v1,omitempty"`
+	HumanSessionIdentityV1       bool        `json:"human_session_identity_v1,omitempty"`
 }
 
 // ExecutionStateV1 contains durable B-wide counters which process restarts do
@@ -155,6 +164,27 @@ func (i Invocation) Argv() ([]string, error) {
 	}
 	if i.WaitOnLimit != "" {
 		argv = append(argv, "--wait", i.WaitOnLimit)
+	}
+	if i.MaxIterations > 0 {
+		argv = append(argv, "--max-iterations", strconv.Itoa(i.MaxIterations))
+	}
+	if i.SessionTimeout != "" {
+		argv = append(argv, "--session-timeout", i.SessionTimeout)
+	}
+	if i.IdleTimeout != "" {
+		argv = append(argv, "--idle-timeout", i.IdleTimeout)
+	}
+	if i.MaxInternalReviewPasses > 0 {
+		argv = append(argv, "--max-internal-review-passes", strconv.Itoa(i.MaxInternalReviewPasses))
+	}
+	if i.LongRunningSubprocessMode != "" {
+		argv = append(argv, "--long-running-subprocess-mode", i.LongRunningSubprocessMode)
+	}
+	if i.ValidationSpecPath != "" {
+		argv = append(argv, "--validation-spec", i.ValidationSpecPath)
+	}
+	if i.BaseRef != "" && i.Bounds == nil {
+		argv = append(argv, "--base-ref", i.BaseRef)
 	}
 	if i.Bounds != nil {
 		argv = append(argv,
@@ -275,6 +305,48 @@ func VerifyBinaryCapabilityV1(binaryPath string, expected CapabilityV1, binarySH
 		return fmt.Errorf("EXECUTION_BOUNDS_INVALID: manifest capability differs from the pinned binary probe")
 	}
 	return ValidateCapabilityV1(actual, binarySHA256, sourceSHA, mode)
+}
+
+// VerifyGovernedExecutionCapabilityV1 attests the bounded review/wait/identity
+// features required by ABCP product-default and Repo-C development-v2 profiles.
+func VerifyGovernedExecutionCapabilityV1(binaryPath, binarySHA256, sourceSHA string) error {
+	file, err := os.Open(binaryPath)
+	if err != nil {
+		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: open pinned Ralphex binary: %w", err)
+	}
+	hasher := sha256.New()
+	_, copyErr := io.Copy(hasher, io.LimitReader(file, 1<<30))
+	closeErr := file.Close()
+	if copyErr != nil || closeErr != nil || hex.EncodeToString(hasher.Sum(nil)) != binarySHA256 {
+		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: selected Ralphex binary does not match its pinned digest")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, binaryPath, "--abcp-governance-capability-v1").Output()
+	if err != nil {
+		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe failed: %w", err)
+	}
+	if len(output) == 0 || len(output) > 64<<10 {
+		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe output is empty or oversized")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	probe := CapabilityProbeV1{}
+	if err := decoder.Decode(&probe); err != nil {
+		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: decode capability probe: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe contains trailing JSON")
+	}
+	canonical, err := json.Marshal(probe)
+	if err != nil || !bytes.Equal(bytes.TrimSpace(output), canonical) {
+		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe is not strict canonical JSON")
+	}
+	if probe.Kind != "RalphexCapabilityProbeV1" || probe.SourceSHA != sourceSHA || !probe.MaxIterationsFlag || !probe.SessionTimeoutFlag || !probe.IdleTimeoutFlag || !probe.IsolatedConfig || !probe.InternalReviewBudgetV1 || !probe.OrchestratorSubprocessWaitV1 || !probe.HumanSessionIdentityV1 {
+		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: pinned Ralphex lacks required governed execution capability")
+	}
+	return nil
 }
 
 // ValidateExecutionStateV1 enforces B-wide cumulative ceilings without reset.
