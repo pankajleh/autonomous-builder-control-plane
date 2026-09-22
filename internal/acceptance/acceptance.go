@@ -195,6 +195,7 @@ func (e *Executor) Run(ctx context.Context, governed authority.Authority, target
 		return result, err
 	}
 	defer cleanupEnvironment()
+	environment = append(environment, "ABCP_REPOSITORY_BASE_SHA="+governed.Repository().StartSHA)
 
 	for index, configured := range commands {
 		process, err := e.runCommand(ctx, repository, environment, index, configured)

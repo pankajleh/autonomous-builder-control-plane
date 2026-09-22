@@ -27,6 +27,7 @@ const (
 	MaxLaunchIntentBytes     = 4 << 10
 	ReceiptLockTimeout       = 2 * time.Second
 	DevelopmentProfileID     = "repo-c-development-v1"
+	DevelopmentProfileIDV2   = "repo-c-development-v2"
 	admissionKindDevelopment = "development"
 	developmentDigestDomain  = "abcp-development-authority-v1"
 )

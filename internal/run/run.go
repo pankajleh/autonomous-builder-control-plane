@@ -500,6 +500,10 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("create isolated Ralphex config directory: %w", err), nil)
 	}
 	defer os.RemoveAll(configDir)
+	validationSpecPath, err := r.prepareValidationSpec(configDir)
+	if err != nil {
+		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
+	}
 	executionPlanPath, cleanupExecutionPlan, err := r.prepareExecutionPlan(ctx, repositoryLease)
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
@@ -510,6 +514,9 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		}
 	}()
 	invocation, err := r.invocation(configDir, executionPlanPath)
+	if err == nil {
+		invocation.ValidationSpecPath = validationSpecPath
+	}
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
@@ -747,18 +754,23 @@ func (r *Runner) invocation(configDir, executionPlanPath string) (ralphex.Invoca
 		return ralphex.Invocation{}, fmt.Errorf("unsupported executor %q", executor)
 	}
 	invocation := ralphex.Invocation{
-		BinaryPath:   r.governed.Ralphex().BinaryPath,
-		PlanPath:     executionPlanPath,
-		ConfigDir:    configDir,
-		Mode:         r.governed.Ralphex().Mode,
-		Codex:        executor == "codex",
-		Worktree:     r.governed.Worktree().Enabled,
-		Branch:       r.governed.Worktree().Branch,
-		TaskModel:    policy.TaskModel,
-		TaskEffort:   policy.TaskEffort,
-		ReviewModel:  policy.ReviewModel,
-		ReviewEffort: policy.ReviewEffort,
-		WaitOnLimit:  r.governed.Ralphex().WaitOnLimit,
+		BinaryPath:                r.governed.Ralphex().BinaryPath,
+		PlanPath:                  executionPlanPath,
+		ConfigDir:                 configDir,
+		Mode:                      r.governed.Ralphex().Mode,
+		Codex:                     executor == "codex",
+		Worktree:                  r.governed.Worktree().Enabled,
+		Branch:                    r.governed.Worktree().Branch,
+		TaskModel:                 policy.TaskModel,
+		TaskEffort:                policy.TaskEffort,
+		ReviewModel:               policy.ReviewModel,
+		ReviewEffort:              policy.ReviewEffort,
+		WaitOnLimit:               r.governed.Ralphex().WaitOnLimit,
+		MaxIterations:             r.governed.Ralphex().MaxIterations,
+		SessionTimeout:            r.governed.Ralphex().SessionTimeout,
+		IdleTimeout:               r.governed.Ralphex().IdleTimeout,
+		MaxInternalReviewPasses:   r.governed.Ralphex().MaxInternalReviewPasses,
+		LongRunningSubprocessMode: r.governed.Ralphex().LongRunningSubprocessMode,
 	}
 	data, err := os.ReadFile(r.capsule.Path)
 	if err != nil {
@@ -780,6 +792,46 @@ func (r *Runner) invocation(configDir, executionPlanPath string) (ralphex.Invoca
 		invocation.SourceSHA = runtime.SourceSHA
 	}
 	return invocation, nil
+}
+
+func (r *Runner) prepareValidationSpec(configDir string) (string, error) {
+	runtime := r.governed.Ralphex()
+	if runtime.LongRunningSubprocessMode != "orchestrator" {
+		return "", nil
+	}
+	if len(runtime.Validation) == 0 {
+		return "", errors.New("governed orchestrator validation commands are absent")
+	}
+	type command struct {
+		ID               string   `json:"id"`
+		Argv             []string `json:"argv"`
+		Cwd              string   `json:"cwd,omitempty"`
+		Timeout          string   `json:"timeout"`
+		ExpectedDuration string   `json:"expected_duration,omitempty"`
+		StallTimeout     string   `json:"stall_timeout,omitempty"`
+	}
+	spec := struct {
+		SchemaVersion int       `json:"schema_version"`
+		Commands      []command `json:"commands"`
+	}{SchemaVersion: 1}
+	for _, configured := range runtime.Validation {
+		argv := append([]string(nil), configured.Argv...)
+		for i, arg := range argv {
+			if arg == "{{repository_base_sha}}" {
+				argv[i] = r.governed.Repository().StartSHA
+			}
+		}
+		spec.Commands = append(spec.Commands, command{ID: configured.ID, Argv: argv, Cwd: configured.Cwd, Timeout: configured.Timeout, ExpectedDuration: configured.ExpectedDuration, StallTimeout: configured.StallTimeout})
+	}
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return "", fmt.Errorf("marshal governed validation spec: %w", err)
+	}
+	path := filepath.Join(configDir, "abcp-validation-v1.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", fmt.Errorf("write governed validation spec: %w", err)
+	}
+	return path, nil
 }
 
 // prepareExecutionPlan keeps the immutable authority plan separate from the

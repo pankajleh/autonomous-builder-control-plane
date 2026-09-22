@@ -43,7 +43,7 @@ type admissionAuthority struct {
 	profileID              string
 	repositoryBaseSHA      string
 	canonicalRequestSHA256 string
-	plan                   func(serviceapi.Principal) []byte
+	plan                   func(serviceapi.Principal, string, string) []byte
 	capsuleSpec            func(string, string) contextcapsule.Spec
 }
 
@@ -51,7 +51,9 @@ func productAdmissionAuthority(request serviceapi.RunAdmissionRequestV1) admissi
 	return admissionAuthority{
 		requestID: request.RequestID, profileID: request.ProfileID, repositoryBaseSHA: request.RepositoryBaseSHA,
 		canonicalRequestSHA256: RequestDigest(request),
-		plan:                   func(principal serviceapi.Principal) []byte { return admissionPlan(principal, request) },
+		plan: func(principal serviceapi.Principal, repositoryIdentity, runID string) []byte {
+			return decorateAdmissionPlan(admissionPlan(principal, request), repositoryIdentity, runID)
+		},
 		capsuleSpec: func(repositoryIdentity, planRelative string) contextcapsule.Spec {
 			return admissionCapsuleSpecForIdentity(repositoryIdentity, request, planRelative)
 		},
@@ -62,7 +64,9 @@ func developmentAdmissionAuthority(request serviceapi.DevelopmentRunAdmissionReq
 	return admissionAuthority{
 		kind: admissionKindDevelopment, requestID: request.RequestID, profileID: request.ProfileID,
 		repositoryBaseSHA: request.RepositoryBaseSHA, canonicalRequestSHA256: DevelopmentRequestDigest(request),
-		plan: func(principal serviceapi.Principal) []byte { return developmentAdmissionPlan(principal, request) },
+		plan: func(principal serviceapi.Principal, repositoryIdentity, runID string) []byte {
+			return decorateAdmissionPlan(developmentAdmissionPlan(principal, request), repositoryIdentity, runID)
+		},
 		capsuleSpec: func(repositoryIdentity, planRelative string) contextcapsule.Spec {
 			return developmentAdmissionCapsuleSpecForIdentity(repositoryIdentity, request, planRelative)
 		},
@@ -312,7 +316,7 @@ func (c *Controller) admitDevelopmentRun(ctx context.Context, principal servicea
 		serviceapi.ValidateDevelopmentRunAdmissionRequestV1(request) != nil || serviceapi.ValidatePrincipalID(principal.PrincipalID) != nil {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
 	}
-	if request.ProfileID != DevelopmentProfileID {
+	if request.ProfileID != DevelopmentProfileID && request.ProfileID != DevelopmentProfileIDV2 {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrUnknownAdmissionProfile
 	}
 	return c.admitAuthority(ctx, principal, developmentAdmissionAuthority(request))
@@ -680,7 +684,7 @@ func validateAdmissionBindingMaterial(binding AdmissionBindingV1, principal serv
 		return err
 	}
 	plan, found, err := readRegularAt(runFD, "plan.md", MaxManifestTemplateBytes)
-	if err != nil || !found || !bytes.Equal(plan, admission.plan(principal)) {
+	if err != nil || !found || !bytes.Equal(plan, admission.plan(principal, binding.RepositoryIdentity, binding.RunID)) {
 		return errors.New("admission plan binding is invalid")
 	}
 	capsuleData, found, err := readRegularAt(runFD, "context-capsule.json", MaxManifestTemplateBytes)
@@ -851,7 +855,7 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, admissio
 	runDirectory := filepath.Join(profile.inputPath, runID)
 	planPath := filepath.Join(runDirectory, "plan.md")
 	planRelative := profile.configuration.InputDirectory + "/" + runID + "/plan.md"
-	plan := admission.plan(principal)
+	plan := admission.plan(principal, profile.configuration.RepositoryIdentity, runID)
 	if err := createOrVerifyAt(runFD, "plan.md", plan); err != nil {
 		return "", runBinding{}, err
 	}
@@ -896,6 +900,73 @@ func developmentAdmissionPlan(principal serviceapi.Principal, request serviceapi
 		request.RequestID, request.DevelopmentCapsuleID, request.DevelopmentSliceID,
 		request.DevelopmentCapsuleSHA256, request.RepositoryBaseSHA, principal.PrincipalID, principal.PrincipalType,
 		request.DelegatedActor.SubjectID, request.DelegatedActor.SubjectType, fence, taskMarkdown, fence))
+}
+
+func decorateAdmissionPlan(plan []byte, repositoryIdentity, runID string) []byte {
+	text := string(plan)
+	title, project := admissionDisplayMetadata(text)
+	if title == "" {
+		title = "Governed task " + shortRunID(runID)
+	}
+	var lines []string
+	lines = append(lines, "Display-Title: "+title)
+	if project != "" {
+		lines = append(lines, "Project: "+project)
+	}
+	if repositoryIdentity != "" {
+		lines = append(lines, "Repository: "+repositoryIdentity)
+	}
+	if id := strings.TrimPrefix(runID, "admission-"); id != "" {
+		lines = append(lines, "Admission-ID: "+id)
+	}
+	insert := strings.Join(lines, "\n") + "\n"
+	if newline := strings.IndexByte(text, '\n'); newline >= 0 {
+		return []byte(text[:newline+1] + insert + text[newline+1:])
+	}
+	return []byte(text + "\n" + insert)
+}
+
+func admissionDisplayMetadata(text string) (string, string) {
+	var title, project string
+	lines := strings.Split(text, "\n")
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if project == "" && strings.HasPrefix(line, "project_id:") {
+			project = quotedScalar(line)
+		}
+		if title == "" && (strings.HasPrefix(line, "display_title:") || strings.HasPrefix(line, "task_title:") || strings.HasPrefix(line, "objective:")) {
+			title = quotedScalar(line)
+		}
+		if title == "" && line == "## Objective" {
+			for j := i + 1; j < len(lines); j++ {
+				if v := strings.TrimSpace(lines[j]); v != "" {
+					title = v
+					break
+				}
+			}
+		}
+	}
+	if project == "" && strings.HasPrefix(text, "# Development run admission") {
+		project = "repo-c-development"
+	}
+	return strings.TrimSpace(title), strings.TrimSpace(project)
+}
+
+func quotedScalar(line string) string {
+	_, value, ok := strings.Cut(line, ":")
+	if !ok {
+		return ""
+	}
+	value = strings.TrimSpace(value)
+	return strings.Trim(value, "\"'")
+}
+
+func shortRunID(runID string) string {
+	id := strings.TrimPrefix(runID, "admission-")
+	if len(id) > 8 {
+		id = id[:8] + "…"
+	}
+	return id
 }
 
 func markdownFence(value string) string {
