@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
@@ -92,6 +93,165 @@ func TestAdmissionPlanHasExactlyOneExecutableTaskAndPreservesAuthorizedMarkdown(
 	}
 }
 
+func TestDevelopmentIdentityIsNamespacedAndPlanCarriesOnlyDevelopmentAuthority(t *testing.T) {
+	request := testDevelopmentAdmissionRequest(strings.Repeat("a", 40), "### Task 7: capsule task\n\n- [ ] inert requirement\n\n````markdown\n### Task 8: nested\n- [ ] inert too\n````")
+	principal := serviceapi.Principal{PrincipalID: "service-1", PrincipalType: serviceapi.PrincipalService, AuthnMethod: "bearer"}
+	product := testAdmissionRequest(request.RepositoryBaseSHA)
+	product.RequestID = request.RequestID
+
+	developmentID := DeriveDevelopmentRunID(principal.PrincipalID, request.RequestID)
+	if developmentID == DeriveRunID(principal.PrincipalID, request.RequestID) ||
+		receiptKeyFor(admissionKindDevelopment, principal.PrincipalID, request.RequestID) == receiptKey(principal.PrincipalID, request.RequestID) ||
+		DevelopmentRequestDigest(request) == RequestDigest(product) || runtimecatalog.ValidateIdentifier(developmentID) != nil {
+		t.Fatal("development authority did not receive a distinct deterministic namespace")
+	}
+
+	plan := developmentAdmissionPlan(principal, request)
+	if err := ralphex.ValidateSingleIncompleteTaskV1(plan); err != nil {
+		t.Fatalf("development plan is not exactly one executable task: %v\n%s", err, plan)
+	}
+	if !bytes.Contains(plan, []byte(request.TaskMarkdown)) ||
+		strings.Count(string(plan), "### Task 1: Implement the frozen development slice") != 1 ||
+		strings.Count(string(plan), "- [ ] Implement every requirement in the complete frozen development capsule below.") != 1 ||
+		!bytes.Contains(plan, []byte("~~~markdown\n")) {
+		t.Fatalf("development plan does not preserve one collision-safe inert capsule:\n%s", plan)
+	}
+	metadata := string(plan[:bytes.Index(plan, []byte("~~~markdown\n"))])
+	if strings.Contains(metadata, "Product") || strings.Contains(metadata, "product") {
+		t.Fatalf("development plan emitted product authority labels:\n%s", metadata)
+	}
+
+	spec := developmentAdmissionCapsuleSpecForIdentity("example/product", request, ".abcp-input/run/plan.md")
+	if spec.Project != "repo-c-development" || spec.RoadmapPhase != "repo-c-development" ||
+		spec.ExecutionPack != request.DevelopmentCapsuleID || spec.Plan != request.DevelopmentSliceID || spec.Task != request.RequestID ||
+		spec.OperationContext == nil || !reflect.DeepEqual(spec.OperationContext.OwnedScope, []string{"Development slice " + request.DevelopmentSliceID}) {
+		t.Fatalf("development context labels = %+v", spec)
+	}
+}
+
+func TestDevelopmentAdmissionMaterializesReplaysConflictsAndDoesNotAliasProduct(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	defer fixture.closeLocks()
+	request := testDevelopmentAdmissionRequest(fixture.request.RepositoryBaseSHA, "# Frozen capsule\n\nImplement the development slice.\n")
+
+	response, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedRunID := DeriveDevelopmentRunID(fixture.principal.PrincipalID, request.RequestID)
+	if response.RunID != expectedRunID || response.RunURL != "/v1/runs/"+expectedRunID {
+		t.Fatalf("development admission response = %+v", response)
+	}
+	plan, err := os.ReadFile(filepath.Join(fixture.input, expectedRunID, "plan.md"))
+	if err != nil || !bytes.Contains(plan, []byte(request.TaskMarkdown)) || !bytes.Contains(plan, []byte(request.DevelopmentCapsuleSHA256)) {
+		t.Fatalf("materialized development plan = %q, err=%v", plan, err)
+	}
+	capsuleData, err := os.ReadFile(filepath.Join(fixture.input, expectedRunID, "context-capsule.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	capsule, err := contextcapsule.Parse(capsuleData)
+	if err != nil || capsule.RoadmapPhase != "repo-c-development" || capsule.ExecutionPack != request.DevelopmentCapsuleID ||
+		capsule.Plan != request.DevelopmentSliceID || capsule.OperationContext == nil ||
+		!reflect.DeepEqual(capsule.OperationContext.OwnedScope, []string{"Development slice " + request.DevelopmentSliceID}) {
+		t.Fatalf("materialized development context = %+v, err=%v", capsule, err)
+	}
+	receiptPath := filepath.Join(fixture.service, "admissions", receiptKeyFor(admissionKindDevelopment, fixture.principal.PrincipalID, request.RequestID)+".json")
+	receiptData, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt AdmissionReceiptV1
+	if strictJSON(receiptData, &receipt) != nil || receipt.AdmissionKind != admissionKindDevelopment ||
+		receipt.CanonicalRequestSHA256 != DevelopmentRequestDigest(request) || receipt.ProfileID != DevelopmentProfileID {
+		t.Fatalf("development admission receipt = %s", receiptData)
+	}
+
+	registerFixtureRun(t, fixture, expectedRunID)
+	replayed, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, request)
+	if err != nil || replayed != response {
+		t.Fatalf("development replay = %+v, %v", replayed, err)
+	}
+	conflict := request
+	setDevelopmentMarkdown(&conflict, "conflicting capsule")
+	if _, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, conflict); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
+		t.Fatalf("development conflict = %v", err)
+	}
+
+	productResponse, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if productResponse.RunID == response.RunID {
+		t.Fatal("product and development admissions aliased the same public request identity")
+	}
+	if _, err := os.Stat(filepath.Join(fixture.service, "admissions", receiptKey(fixture.principal.PrincipalID, fixture.request.RequestID)+".json")); err != nil {
+		t.Fatalf("product receipt namespace unavailable after development admission: %v", err)
+	}
+}
+
+func TestDevelopmentAdmissionRejectsProfileAndBaseMismatchBeforeMaterialization(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	request := testDevelopmentAdmissionRequest(fixture.request.RepositoryBaseSHA, "frozen capsule")
+	for _, profileID := range []string{"default", "local-p02"} {
+		wrongProfile := request
+		wrongProfile.ProfileID = profileID
+		if _, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, wrongProfile); !errors.Is(err, serviceapi.ErrUnknownAdmissionProfile) {
+			t.Fatalf("development profile %q = %v", profileID, err)
+		}
+	}
+	wrongBase := request
+	wrongBase.RepositoryBaseSHA = strings.Repeat("b", 40)
+	if wrongBase.RepositoryBaseSHA == request.RepositoryBaseSHA {
+		wrongBase.RepositoryBaseSHA = strings.Repeat("c", 40)
+	}
+	if _, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, wrongBase); !errors.Is(err, serviceapi.ErrRepositoryBaseMismatch) {
+		t.Fatalf("development base mismatch = %v", err)
+	}
+	runID := DeriveDevelopmentRunID(fixture.principal.PrincipalID, request.RequestID)
+	if _, err := os.Stat(filepath.Join(fixture.input, runID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("development base mismatch materialized inputs: %v", err)
+	}
+}
+
+func TestDevelopmentAdmissionFailsClosedOnBindingCorruptionAndAmbiguousLaunch(t *testing.T) {
+	t.Run("binding corruption", func(t *testing.T) {
+		fixture := newAdmissionFixture(t, true)
+		request := testDevelopmentAdmissionRequest(fixture.request.RepositoryBaseSHA, "frozen capsule")
+		if _, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, request); err != nil {
+			t.Fatal(err)
+		}
+		bindingPath := filepath.Join(fixture.service, "admissions", bindingName(admissionKindDevelopment, fixture.principal.PrincipalID, request.RequestID))
+		if err := os.WriteFile(bindingPath, []byte(`{"kind":"tampered"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, request); !errors.Is(err, serviceapi.ErrUnsafeAdmissionMaterialization) {
+			t.Fatalf("development binding corruption = %v", err)
+		}
+	})
+	t.Run("ambiguous launch", func(t *testing.T) {
+		fixture := newAdmissionFixture(t, true)
+		request := testDevelopmentAdmissionRequest(fixture.request.RepositoryBaseSHA, "frozen capsule")
+		if _, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, request); err != nil {
+			t.Fatal(err)
+		}
+		fixture.mu.Lock()
+		lock := fixture.locks[0]
+		fixture.mu.Unlock()
+		if err := lock.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, request); !errors.Is(err, serviceapi.ErrReconciliationRequired) {
+			t.Fatalf("development ambiguous replay = %v", err)
+		}
+		fixture.mu.Lock()
+		defer fixture.mu.Unlock()
+		if len(fixture.starts) != 1 {
+			t.Fatalf("development ambiguous replay relaunched %d processes", len(fixture.starts))
+		}
+	})
+}
+
 func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
 	fixture := newAdmissionFixture(t, true)
 	defer fixture.closeLocks()
@@ -141,6 +301,9 @@ func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
 	var receipt AdmissionReceiptV1
 	if strictJSON(receiptData, &receipt) != nil || receipt.CanonicalRequestSHA256 != RequestDigest(fixture.request) || receipt.RunID != expectedRunID {
 		t.Fatalf("admission receipt = %s", receiptData)
+	}
+	if bytes.Contains(receiptData, []byte("admission_kind")) {
+		t.Fatalf("product admission receipt shape changed: %s", receiptData)
 	}
 	canonical, _ := json.Marshal(receipt)
 	if !reflect.DeepEqual(receiptData, canonical) {
@@ -1048,12 +1211,15 @@ func writeAdmissionConfiguration(t *testing.T, root, repository, _ string) (stri
 			t.Fatal(err)
 		}
 	}
-	profile := ProfileFileV1{SchemaVersion: 1, Profiles: []ProfileV1{{
+	productProfile := ProfileV1{
 		ProfileID: "default", RepositoryPath: repository, RepositoryIdentity: "example/product",
 		ManifestTemplatePath: templatePath, InputDirectory: ".abcp-input",
 		LedgerRoot: filepath.Join(root, "ledger"), EvidenceRoot: filepath.Join(root, "evidence"), CgroupRoot: filepath.Join(root, "cgroup"),
 		WorkflowAuthorityConfigPath: workflowAuthorityPath,
-	}}}
+	}
+	developmentProfile := productProfile
+	developmentProfile.ProfileID = DevelopmentProfileID
+	profile := ProfileFileV1{SchemaVersion: 1, Profiles: []ProfileV1{productProfile, developmentProfile}}
 	profilePath := filepath.Join(root, "admission-profiles.json")
 	writeProtectedJSON(t, profilePath, profile)
 	return profilePath, &admissionTestCatalog{records: make(map[string]runtimecatalog.RunRegistrationV1)}
@@ -1086,6 +1252,22 @@ func testAdmissionRequest(baseSHA string) serviceapi.RunAdmissionRequestV1 {
 		TaskMarkdown:   "Implement the bounded product task.",
 		DelegatedActor: serviceapi.DelegatedActorV1{SubjectID: "operator-1", SubjectType: serviceapi.PrincipalOperator},
 	}
+}
+
+func testDevelopmentAdmissionRequest(baseSHA, markdown string) serviceapi.DevelopmentRunAdmissionRequestV1 {
+	request := serviceapi.DevelopmentRunAdmissionRequestV1{
+		SchemaVersion: 1, RequestID: "request-1", ProfileID: DevelopmentProfileID,
+		DevelopmentCapsuleID: "capsule-004", DevelopmentSliceID: "slice-1", RepositoryBaseSHA: baseSHA,
+		DelegatedActor: serviceapi.DelegatedActorV1{SubjectID: "operator-1", SubjectType: serviceapi.PrincipalOperator},
+	}
+	setDevelopmentMarkdown(&request, markdown)
+	return request
+}
+
+func setDevelopmentMarkdown(request *serviceapi.DevelopmentRunAdmissionRequestV1, markdown string) {
+	request.TaskMarkdown = markdown
+	sum := sha256.Sum256([]byte(markdown))
+	request.DevelopmentCapsuleSHA256 = hex.EncodeToString(sum[:])
 }
 
 func writeProtectedJSON(t *testing.T, path string, value any) {

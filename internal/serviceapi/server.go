@@ -111,18 +111,23 @@ type RunAdmissionController interface {
 	AdmitRun(context.Context, Principal, RunAdmissionRequestV1) (RunAdmissionResponseV1, error)
 }
 
+type DevelopmentRunAdmissionController interface {
+	AdmitDevelopmentRun(context.Context, Principal, DevelopmentRunAdmissionRequestV1) (RunAdmissionResponseV1, error)
+}
+
 type ServerConfig struct {
-	Authenticator  Authenticator
-	Authority      *AuthorityMatcher
-	Catalog        CatalogReader
-	CursorSigner   *CursorSigner
-	Clock          func() time.Time
-	RunProjections RunProjectionReader
-	Events         EventProjectionReader
-	Timeline       TimelineReader
-	Evidence       EvidenceReader
-	Actions        ActionController
-	RunAdmission   RunAdmissionController
+	Authenticator           Authenticator
+	Authority               *AuthorityMatcher
+	Catalog                 CatalogReader
+	CursorSigner            *CursorSigner
+	Clock                   func() time.Time
+	RunProjections          RunProjectionReader
+	Events                  EventProjectionReader
+	Timeline                TimelineReader
+	Evidence                EvidenceReader
+	Actions                 ActionController
+	RunAdmission            RunAdmissionController
+	DevelopmentRunAdmission DevelopmentRunAdmissionController
 }
 
 type Server struct {
@@ -297,6 +302,8 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.capabilities(writer, request, requestID)
 	case "/v1/runs":
 		s.runs(writer, request, principal, requestID)
+	case "/v1/development-runs":
+		s.developmentRunAdmission(writer, request, principal, requestID)
 	default:
 		s.runRoute(writer, request, principal, requestID)
 	}
@@ -631,6 +638,46 @@ func (s *Server) runAdmission(writer http.ResponseWriter, request *http.Request,
 		return
 	}
 	response, err := s.reserved.RunAdmission.AdmitRun(request.Context(), principal, admission)
+	if err != nil {
+		s.writeDependencyError(writer, requestID, err)
+		return
+	}
+	if runtimecatalog.ValidateIdentifier(response.RunID) != nil || response.RunURL != "/v1/runs/"+response.RunID {
+		s.writeDependencyError(writer, requestID, ErrInternalDurableSubstrate)
+		return
+	}
+	s.writeJSON(writer, http.StatusAccepted, response)
+}
+
+func (s *Server) developmentRunAdmission(writer http.ResponseWriter, request *http.Request, principal Principal, requestID string) {
+	if s.reserved.DevelopmentRunAdmission == nil {
+		s.writeError(writer, http.StatusNotImplemented, ErrorV1{Code: "unsupported_capability", Message: "development run admission is not available", RequestID: requestID})
+		return
+	}
+	if principal.PrincipalType != PrincipalService || !s.authority.MayAssertDelegatedActor(principal) {
+		s.writeDependencyError(writer, requestID, ErrAuthorityDenied)
+		return
+	}
+	if request.Method != http.MethodPost || request.URL.RawQuery != "" {
+		s.writeError(writer, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid development run admission request", RequestID: requestID})
+		return
+	}
+	data, err := io.ReadAll(request.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.writeError(writer, http.StatusRequestEntityTooLarge, ErrorV1{Code: "invalid_request", Message: "request body exceeds limit", RequestID: requestID})
+			return
+		}
+		s.writeError(writer, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid development run admission request", RequestID: requestID})
+		return
+	}
+	var admission DevelopmentRunAdmissionRequestV1
+	if len(data) == 0 || decodeStrictJSON(data, &admission) != nil || ValidateDevelopmentRunAdmissionRequestV1(admission) != nil {
+		s.writeError(writer, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid development run admission request", RequestID: requestID})
+		return
+	}
+	response, err := s.reserved.DevelopmentRunAdmission.AdmitDevelopmentRun(request.Context(), principal, admission)
 	if err != nil {
 		s.writeDependencyError(writer, requestID, err)
 		return

@@ -3,6 +3,8 @@ package serviceapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -34,7 +36,25 @@ type testRunAdmissionController struct {
 	calls     int
 }
 
+type testDevelopmentRunAdmissionController struct {
+	mu        sync.Mutex
+	principal Principal
+	request   DevelopmentRunAdmissionRequestV1
+	response  RunAdmissionResponseV1
+	err       error
+	calls     int
+}
+
 func (c *testRunAdmissionController) AdmitRun(_ context.Context, principal Principal, request RunAdmissionRequestV1) (RunAdmissionResponseV1, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	c.principal = principal
+	c.request = request
+	return c.response, c.err
+}
+
+func (c *testDevelopmentRunAdmissionController) AdmitDevelopmentRun(_ context.Context, principal Principal, request DevelopmentRunAdmissionRequestV1) (RunAdmissionResponseV1, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls++
@@ -230,7 +250,7 @@ func TestEveryV1RouteAuthenticatesAndCapabilitiesAreDeterministic(t *testing.T) 
 	now := time.Now().UTC()
 	server := newTestServer(t, &testCatalog{}, now)
 	for _, path := range []string{
-		"/v1", "/v1/capabilities", "/v1/runs", "/v1/runs/run", "/v1/runs/run/events",
+		"/v1", "/v1/capabilities", "/v1/runs", "/v1/development-runs", "/v1/runs/run", "/v1/runs/run/events",
 		"/v1/runs/run/timeline", "/v1/runs/run/evidence", "/v1/runs/run/evidence/item",
 		"/v1/runs/run/actions/cancel", "/v1/runs/run/actions/operation", "/v1/unknown",
 	} {
@@ -288,10 +308,11 @@ func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
 	grantRunAdmission(server)
 	valid := validRunAdmissionJSON("request-1", "task")
 	for name, body := range map[string]string{
-		"unknown field":   strings.TrimSuffix(valid, "}") + `,"manifest_path":"/private"}`,
-		"duplicate field": strings.Replace(valid, `"profile_id":"default"`, `"profile_id":"default","profile_id":"other"`, 1),
-		"partial SHA":     strings.Replace(valid, strings.Repeat("b", 40), strings.Repeat("b", 12), 1),
-		"missing actor":   strings.Replace(valid, `,"delegated_actor":{"subject_id":"human-1","subject_type":"user"}`, "", 1),
+		"unknown field":     strings.TrimSuffix(valid, "}") + `,"manifest_path":"/private"}`,
+		"development field": strings.TrimSuffix(valid, "}") + `,"development_capsule_id":"capsule-004"}`,
+		"duplicate field":   strings.Replace(valid, `"profile_id":"default"`, `"profile_id":"default","profile_id":"other"`, 1),
+		"partial SHA":       strings.Replace(valid, strings.Repeat("b", 40), strings.Repeat("b", 12), 1),
+		"missing actor":     strings.Replace(valid, `,"delegated_actor":{"subject_id":"human-1","subject_type":"user"}`, "", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			response := httptest.NewRecorder()
@@ -358,11 +379,101 @@ func TestRunAdmissionRejectsGrantedNonServicePrincipal(t *testing.T) {
 	}
 }
 
+func TestDevelopmentRunAdmissionAcceptedWithoutChangingCapabilities(t *testing.T) {
+	controller := &testDevelopmentRunAdmissionController{response: RunAdmissionResponseV1{RunID: "admission-development-1", RunURL: "/v1/runs/admission-development-1"}}
+	server := newTestServer(t, &testCatalog{}, time.Now().UTC())
+	server.reserved.DevelopmentRunAdmission = controller
+	grantRunAdmission(server)
+
+	capabilities := httptest.NewRecorder()
+	server.Handler().ServeHTTP(capabilities, authenticatedRequest(http.MethodGet, "/v1/capabilities", nil))
+	if capabilities.Code != http.StatusOK || capabilities.Body.String() != "{\"run_admission\":false,\"retry\":false,\"resume\":false,\"recovery\":false,\"cancel\":false,\"decision\":false,\"evidence_download\":false}\n" {
+		t.Fatalf("development admission changed frozen capabilities = %d %q", capabilities.Code, capabilities.Body.String())
+	}
+
+	body := validDevelopmentRunAdmissionJSON("request-1", "# Immutable development capsule\n")
+	accepted := httptest.NewRecorder()
+	server.Handler().ServeHTTP(accepted, authenticatedRequest(http.MethodPost, "/v1/development-runs", bytes.NewReader([]byte(body))))
+	if accepted.Code != http.StatusAccepted || accepted.Body.String() != `{"run_id":"admission-development-1","run_url":"/v1/runs/admission-development-1"}`+"\n" {
+		t.Fatalf("accepted development admission = %d %q", accepted.Code, accepted.Body.String())
+	}
+	if controller.calls != 1 || controller.principal.PrincipalID != "test" || controller.request.DevelopmentCapsuleID != "capsule-004" {
+		t.Fatalf("development dispatch = calls=%d principal=%+v request=%+v", controller.calls, controller.principal, controller.request)
+	}
+}
+
+func TestDevelopmentRunAdmissionStrictShapeDigestAuthorizationAndErrors(t *testing.T) {
+	controller := &testDevelopmentRunAdmissionController{response: RunAdmissionResponseV1{RunID: "admission-development-1", RunURL: "/v1/runs/admission-development-1"}}
+	server := newTestServer(t, &testCatalog{}, time.Now().UTC())
+	server.reserved.DevelopmentRunAdmission = controller
+	valid := validDevelopmentRunAdmissionJSON("request-1", "development capsule")
+
+	unauthorized := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthorized, authenticatedRequest(http.MethodPost, "/v1/development-runs", bytes.NewReader([]byte(valid))))
+	if unauthorized.Code != http.StatusForbidden || controller.calls != 0 {
+		t.Fatalf("ungranted development admission = %d %q, calls=%d", unauthorized.Code, unauthorized.Body.String(), controller.calls)
+	}
+	grantRunAdmission(server)
+
+	for name, body := range map[string][]byte{
+		"unknown private policy": []byte(strings.TrimSuffix(valid, "}") + `,"manifest_path":"/private"}`),
+		"product field":          []byte(strings.TrimSuffix(valid, "}") + `,"product_task_id":"task-1"}`),
+		"duplicate field":        []byte(strings.Replace(valid, `"profile_id":"repo-c-development-v1"`, `"profile_id":"repo-c-development-v1","profile_id":"local-p02"`, 1)),
+		"case alias":             bytes.Replace([]byte(valid), []byte(`"schema_version"`), []byte(`"Schema_Version"`), 1),
+		"digest mismatch":        bytes.Replace([]byte(valid), []byte(`"task_markdown":"development capsule"`), []byte(`"task_markdown":"changed capsule"`), 1),
+		"missing actor":          []byte(strings.Replace(valid, `,"delegated_actor":{"subject_id":"human-1","subject_type":"user"}`, "", 1)),
+		"invalid UTF-8":          bytes.Replace([]byte(valid), []byte("development capsule"), []byte{'d', 'e', 'v', 0xff}, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, authenticatedRequest(http.MethodPost, "/v1/development-runs", bytes.NewReader(body)))
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"code":"invalid_request"`) {
+				t.Fatalf("strict development admission = %d %q", response.Code, response.Body.String())
+			}
+		})
+	}
+	if controller.calls != 0 {
+		t.Fatalf("invalid development requests dispatched %d calls", controller.calls)
+	}
+
+	for _, test := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{ErrRequestIDConflict, http.StatusConflict, "request_id_conflict"},
+		{ErrUnknownAdmissionProfile, http.StatusNotFound, "unknown_profile"},
+		{ErrRepositoryBaseMismatch, http.StatusConflict, "repository_base_mismatch"},
+		{ErrReconciliationRequired, http.StatusConflict, "reconciliation_required"},
+		{ErrAdmissionUnavailable, http.StatusServiceUnavailable, "admission_unavailable"},
+		{ErrUnsafeAdmissionMaterialization, http.StatusInternalServerError, "unsafe_admission_materialization"},
+	} {
+		controller.err = test.err
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, authenticatedRequest(http.MethodPost, "/v1/development-runs", bytes.NewReader([]byte(valid))))
+		if response.Code != test.status || !strings.Contains(response.Body.String(), `"code":"`+test.code+`"`) {
+			t.Fatalf("mapped development admission error %v = %d %q", test.err, response.Code, response.Body.String())
+		}
+	}
+}
+
 func validRunAdmissionJSON(requestID, task string) string {
 	request := RunAdmissionRequestV1{
 		SchemaVersion: 1, RequestID: requestID, ProfileID: "default",
 		ProductAuthorizationID: "authorization-1", ProductTaskID: "task-1", ProductVersionID: "version-1",
 		ProductManifestSHA256: strings.Repeat("a", 64), RepositoryBaseSHA: strings.Repeat("b", 40),
+		TaskMarkdown: task, DelegatedActor: DelegatedActorV1{SubjectID: "human-1", SubjectType: PrincipalUser},
+	}
+	data, _ := json.Marshal(request)
+	return string(data)
+}
+
+func validDevelopmentRunAdmissionJSON(requestID, task string) string {
+	digest := sha256.Sum256([]byte(task))
+	request := DevelopmentRunAdmissionRequestV1{
+		SchemaVersion: 1, RequestID: requestID, ProfileID: "repo-c-development-v1",
+		DevelopmentCapsuleID: "capsule-004", DevelopmentSliceID: "slice-1",
+		DevelopmentCapsuleSHA256: hex.EncodeToString(digest[:]), RepositoryBaseSHA: strings.Repeat("b", 40),
 		TaskMarkdown: task, DelegatedActor: DelegatedActorV1{SubjectID: "human-1", SubjectType: PrincipalUser},
 	}
 	data, _ := json.Marshal(request)

@@ -842,7 +842,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	server, err := serviceapi.NewServer(serviceapi.ServerConfig{
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
-		RunAdmission: admissions,
+		RunAdmission: admissions, DevelopmentRunAdmission: admissions,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "construct service API")

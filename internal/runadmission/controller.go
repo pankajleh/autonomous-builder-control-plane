@@ -26,6 +26,9 @@ const (
 	MaxBindingBytes          = 32 << 10
 	MaxLaunchIntentBytes     = 4 << 10
 	ReceiptLockTimeout       = 2 * time.Second
+	DevelopmentProfileID     = "repo-c-development-v1"
+	admissionKindDevelopment = "development"
+	developmentDigestDomain  = "abcp-development-authority-v1"
 )
 
 type CatalogReader interface {
@@ -60,6 +63,7 @@ type ProfileV1 struct {
 type AdmissionReceiptV1 struct {
 	Kind                   string               `json:"kind"`
 	SchemaVersion          int                  `json:"schema_version"`
+	AdmissionKind          string               `json:"admission_kind,omitempty"`
 	Principal              serviceapi.Principal `json:"principal"`
 	RequestID              string               `json:"request_id"`
 	CanonicalRequestSHA256 string               `json:"canonical_request_sha256"`
@@ -74,6 +78,7 @@ type AdmissionReceiptV1 struct {
 type AdmissionBindingV1 struct {
 	Kind                          string `json:"kind"`
 	SchemaVersion                 int    `json:"schema_version"`
+	AdmissionKind                 string `json:"admission_kind,omitempty"`
 	PrincipalID                   string `json:"principal_id"`
 	RequestID                     string `json:"request_id"`
 	CanonicalRequestSHA256        string `json:"canonical_request_sha256"`
@@ -103,6 +108,7 @@ type AdmissionBindingV1 struct {
 type AdmissionLaunchIntentV1 struct {
 	Kind                   string `json:"kind"`
 	SchemaVersion          int    `json:"schema_version"`
+	AdmissionKind          string `json:"admission_kind,omitempty"`
 	PrincipalID            string `json:"principal_id"`
 	RequestID              string `json:"request_id"`
 	RunID                  string `json:"run_id"`
@@ -138,13 +144,32 @@ func RequestDigest(request serviceapi.RunAdmissionRequestV1) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func DevelopmentRequestDigest(request serviceapi.DevelopmentRunAdmissionRequestV1) string {
+	data, _ := json.Marshal(request)
+	digest := sha256.Sum256(append([]byte(developmentDigestDomain+"\x00"), data...))
+	return hex.EncodeToString(digest[:])
+}
+
 func DeriveRunID(principalID, requestID string) string {
 	digest := sha256.Sum256([]byte(principalID + "\x00" + requestID))
 	return "admission-" + hex.EncodeToString(digest[:])
 }
 
+func DeriveDevelopmentRunID(principalID, requestID string) string {
+	digest := sha256.Sum256([]byte(developmentDigestDomain + "\x00" + principalID + "\x00" + requestID))
+	return "admission-" + hex.EncodeToString(digest[:])
+}
+
 func receiptKey(principalID, requestID string) string {
 	digest := sha256.Sum256([]byte(principalID + "\x00" + requestID))
+	return hex.EncodeToString(digest[:])
+}
+
+func receiptKeyFor(admissionKind, principalID, requestID string) string {
+	if admissionKind == "" {
+		return receiptKey(principalID, requestID)
+	}
+	digest := sha256.Sum256([]byte(developmentDigestDomain + "\x00receipt\x00" + principalID + "\x00" + requestID))
 	return hex.EncodeToString(digest[:])
 }
 
@@ -172,4 +197,8 @@ func (c *Controller) Close() error {
 // outlives the HTTP request that admitted it.
 func (c *Controller) AdmitRun(ctx context.Context, principal serviceapi.Principal, request serviceapi.RunAdmissionRequestV1) (serviceapi.RunAdmissionResponseV1, error) {
 	return c.admitRun(ctx, principal, request)
+}
+
+func (c *Controller) AdmitDevelopmentRun(ctx context.Context, principal serviceapi.Principal, request serviceapi.DevelopmentRunAdmissionRequestV1) (serviceapi.RunAdmissionResponseV1, error) {
+	return c.admitDevelopmentRun(ctx, principal, request)
 }
