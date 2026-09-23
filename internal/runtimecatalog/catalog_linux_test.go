@@ -245,10 +245,14 @@ func TestCatalogRootGenerationAuthorityIsCompactAndDurable(t *testing.T) {
 		_ = catalog.Close()
 		t.Fatalf("catalog root authority: bytes=%d found=%v err=%v", len(authority), found, err)
 	}
-	runAuthority, found, err := getCatalogRunAuthority(catalog.rootFD)
+	runAuthority, found, err := getCatalogRunAuthority(catalog.runs.fd)
 	if err != nil || !found || len(runAuthority) > maxCatalogRunAuthority {
 		_ = catalog.Close()
 		t.Fatalf("catalog run authority: bytes=%d found=%v err=%v", len(runAuthority), found, err)
+	}
+	if _, legacyFound, legacyErr := getCatalogRunAuthority(catalog.rootFD); legacyErr != nil || legacyFound {
+		_ = catalog.Close()
+		t.Fatalf("catalog run authority remained on shared service root: found=%v err=%v", legacyFound, legacyErr)
 	}
 	if err := catalog.Close(); err != nil {
 		t.Fatal(err)
@@ -261,6 +265,280 @@ func TestCatalogRootGenerationAuthorityIsCompactAndDurable(t *testing.T) {
 	observed, found, err := getCatalogRootXattr(reopened.rootFD)
 	if err != nil || !found || !bytes.Equal(observed, authority) {
 		t.Fatalf("catalog root authority changed across reopen: found=%v err=%v", found, err)
+	}
+}
+
+func TestCatalogRunAuthorityMigratesFromLegacyServiceRootXattr(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "service")
+	catalog, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := testRunRegistration(t, "migrated-run", time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC))
+	if err := catalog.RegisterRun(registration); err != nil {
+		_ = catalog.Close()
+		t.Fatal(err)
+	}
+	authority, found, err := getCatalogRunAuthority(catalog.runs.fd)
+	if err != nil || !found {
+		_ = catalog.Close()
+		t.Fatalf("read current run authority: found=%v err=%v", found, err)
+	}
+	if err := catalog.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rootFD, err := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runsFD, err := syscall.Open(filepath.Join(root, "catalog", "runs"), syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		_ = syscall.Close(rootFD)
+		t.Fatal(err)
+	}
+	if err := setCatalogRunAuthority(rootFD, authority, catalogXattrCreate); err != nil {
+		_ = syscall.Close(runsFD)
+		_ = syscall.Close(rootFD)
+		t.Fatal(err)
+	}
+	if err := removeCatalogRunAuthorityForTest(runsFD); err != nil {
+		_ = syscall.Close(runsFD)
+		_ = syscall.Close(rootFD)
+		t.Fatal(err)
+	}
+	if err := errors.Join(syscall.Fsync(rootFD), syscall.Fsync(runsFD), syscall.Close(runsFD), syscall.Close(rootFD)); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(root)
+	if err != nil {
+		t.Fatalf("migrate legacy run-authority storage: %v", err)
+	}
+	defer reopened.Close()
+	migrated, found, err := getCatalogRunAuthority(reopened.runs.fd)
+	if err != nil || !found || !bytes.Equal(migrated, authority) {
+		t.Fatalf("migrated run authority: found=%v equal=%v err=%v", found, bytes.Equal(migrated, authority), err)
+	}
+	if _, legacyFound, legacyErr := getCatalogRunAuthority(reopened.rootFD); legacyErr != nil || legacyFound {
+		t.Fatalf("legacy service-root authority after migration: found=%v err=%v", legacyFound, legacyErr)
+	}
+	if observed, err := reopened.ReadRun(registration.RunID); err != nil || observed != registration {
+		t.Fatalf("migrated registration = %#v, err=%v", observed, err)
+	}
+}
+
+func TestCatalogRunAuthorityMigrationAcceptsEqualDualCopy(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "service")
+	catalog, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := testRunRegistration(t, "dual-copy-run", time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC))
+	if err := catalog.RegisterRun(registration); err != nil {
+		_ = catalog.Close()
+		t.Fatal(err)
+	}
+	if err := catalog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	moveCatalogRunAuthorityToLegacyRoot(t, root, true)
+
+	reopened, err := Open(root)
+	if err != nil {
+		t.Fatalf("recover equal dual-copy migration: %v", err)
+	}
+	defer reopened.Close()
+	if _, found, err := getCatalogRunAuthority(reopened.rootFD); err != nil || found {
+		t.Fatalf("legacy copy after equal dual-copy recovery: found=%v err=%v", found, err)
+	}
+	if _, found, err := getCatalogRunAuthority(reopened.runs.fd); err != nil || !found {
+		t.Fatalf("destination copy after equal dual-copy recovery: found=%v err=%v", found, err)
+	}
+}
+
+func TestCatalogRunAuthorityMigrationRejectsConflictingDualCopy(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "service")
+	catalog, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := testRunRegistration(t, "conflict-run", time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC))
+	if err := catalog.RegisterRun(registration); err != nil {
+		_ = catalog.Close()
+		t.Fatal(err)
+	}
+	_, conflicting, err := makeCatalogRunAuthority(catalog, catalogRunStateEstablished, 0, "", nil)
+	if err != nil {
+		_ = catalog.Close()
+		t.Fatal(err)
+	}
+	if err := catalog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rootFD, err := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := setCatalogRunAuthority(rootFD, conflicting, catalogXattrCreate); err != nil {
+		_ = syscall.Close(rootFD)
+		t.Fatal(err)
+	}
+	if err := errors.Join(syscall.Fsync(rootFD), syscall.Close(rootFD)); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(root)
+	if reopened != nil {
+		_ = reopened.Close()
+	}
+	if !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("conflicting dual-copy migration accepted: %v", err)
+	}
+}
+
+func TestCatalogRunAuthorityMigrationReconcilesPreparedStates(t *testing.T) {
+	for _, boundary := range []string{"prepared-run", "prepared-full"} {
+		t.Run(boundary, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "service")
+			_, target, _ := prepareCatalogRunIssuanceCrashFixture(t, root)
+			runCatalogIssuanceCrashHelper(t, root, target, boundary)
+			moveCatalogRunAuthorityToLegacyRoot(t, root, false)
+
+			catalog, err := Open(root)
+			if err != nil {
+				t.Fatalf("migrate/reconcile %s: %v", boundary, err)
+			}
+			defer catalog.Close()
+			if _, found, err := getCatalogRunAuthority(catalog.rootFD); err != nil || found {
+				t.Fatalf("%s legacy copy after migration: found=%v err=%v", boundary, found, err)
+			}
+			if _, found, err := getCatalogRunAuthority(catalog.runs.fd); err != nil || !found {
+				t.Fatalf("%s destination after migration: found=%v err=%v", boundary, found, err)
+			}
+			if err := catalog.RegisterRun(target); err != nil {
+				t.Fatalf("complete target after %s migration: %v", boundary, err)
+			}
+		})
+	}
+}
+
+func TestCatalogRunAuthorityMigrationJoinsIssuanceLock(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "service")
+	catalog, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	moveCatalogRunAuthorityToLegacyRoot(t, root, false)
+
+	lockFD, err := syscall.Open(filepath.Join(root, "catalog", ".lock"), syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(lockFD, syscall.LOCK_EX); err != nil {
+		_ = syscall.Close(lockFD)
+		t.Fatal(err)
+	}
+	type openResult struct {
+		catalog *Catalog
+		err     error
+	}
+	result := make(chan openResult, 1)
+	go func() {
+		opened, openErr := Open(root)
+		result <- openResult{catalog: opened, err: openErr}
+	}()
+
+	select {
+	case early := <-result:
+		if early.catalog != nil {
+			_ = early.catalog.Close()
+		}
+		_ = syscall.Flock(lockFD, syscall.LOCK_UN)
+		_ = syscall.Close(lockFD)
+		t.Fatalf("migration bypassed issuance lock: %v", early.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := errors.Join(syscall.Flock(lockFD, syscall.LOCK_UN), syscall.Close(lockFD)); err != nil {
+		t.Fatal(err)
+	}
+	opened := <-result
+	if opened.err != nil {
+		t.Fatalf("migration after issuance lock release: %v", opened.err)
+	}
+	if opened.catalog == nil {
+		t.Fatal("migration returned nil catalog")
+	}
+	defer opened.catalog.Close()
+}
+
+func TestCatalogRunAuthorityMigrationRevalidatesSourceBeforeRemoval(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "service")
+	catalog, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := testRunRegistration(t, "source-revalidation-run", time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC))
+	if err := catalog.RegisterRun(registration); err != nil {
+		_ = catalog.Close()
+		t.Fatal(err)
+	}
+	_, conflicting, err := makeCatalogRunAuthority(catalog, catalogRunStateEstablished, 0, "", nil)
+	if err != nil {
+		_ = catalog.Close()
+		t.Fatal(err)
+	}
+	if err := catalog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	original := moveCatalogRunAuthorityToLegacyRoot(t, root, false)
+
+	catalogRunAuthorityMigrationBoundaryHook = func(boundary string) {
+		if boundary != "destination-durable" {
+			return
+		}
+		rootFD, openErr := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+		if openErr != nil {
+			t.Errorf("open source for mutation: %v", openErr)
+			return
+		}
+		if setErr := setCatalogRunAuthority(rootFD, conflicting, catalogXattrReplace); setErr != nil {
+			t.Errorf("mutate migration source: %v", setErr)
+		}
+		if syncErr := syscall.Fsync(rootFD); syncErr != nil {
+			t.Errorf("sync mutated source: %v", syncErr)
+		}
+		_ = syscall.Close(rootFD)
+	}
+	defer func() { catalogRunAuthorityMigrationBoundaryHook = func(string) {} }()
+
+	reopened, err := Open(root)
+	if reopened != nil {
+		_ = reopened.Close()
+	}
+	if !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("mutated migration source accepted: %v", err)
+	}
+	rootFD, err := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(rootFD)
+	observed, found, err := getCatalogRunAuthority(rootFD)
+	if err != nil || !found || !bytes.Equal(observed, conflicting) {
+		t.Fatalf("newer/conflicting source was removed: found=%v err=%v", found, err)
+	}
+	runsFD, err := syscall.Open(filepath.Join(root, "catalog", "runs"), syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(runsFD)
+	destination, found, err := getCatalogRunAuthority(runsFD)
+	if err != nil || !found || !bytes.Equal(destination, original) {
+		t.Fatalf("durable destination changed unexpectedly: found=%v err=%v", found, err)
 	}
 }
 
@@ -297,11 +575,19 @@ func TestCatalogLegacyRunAuthorityUpgradeAndRequiredCheckpoint(t *testing.T) {
 	rootAuthority.state = catalogGenerationReady
 	legacyData := encodeCatalogRootGeneration(rootAuthority)
 	setErr := setCatalogRootXattr(rootFD, legacyData, catalogXattrReplace)
-	removeErr := removeCatalogRunAuthorityForTest(rootFD)
-	syncErr := syscall.Fsync(rootFD)
-	if setErr != nil || removeErr != nil || syncErr != nil {
+	runsFD, openRunsErr := syscall.Open(filepath.Join(root, "catalog", "runs"), syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if openRunsErr != nil {
 		_ = syscall.Close(rootFD)
-		t.Fatalf("construct legacy catalog: set=%v remove=%v sync=%v", setErr, removeErr, syncErr)
+		t.Fatal(openRunsErr)
+	}
+	removeErr := removeCatalogRunAuthorityForTest(runsFD)
+	syncRunsErr := syscall.Fsync(runsFD)
+	syncErr := syscall.Fsync(rootFD)
+	closeRunsErr := syscall.Close(runsFD)
+	if setErr != nil || removeErr != nil || syncRunsErr != nil || syncErr != nil || closeRunsErr != nil {
+		_ = syscall.Close(rootFD)
+		t.Fatalf("construct legacy catalog: set=%v remove=%v sync-runs=%v sync-root=%v close-runs=%v",
+			setErr, removeErr, syncRunsErr, syncErr, closeRunsErr)
 	}
 	if err := syscall.Close(rootFD); err != nil {
 		t.Fatal(err)
@@ -316,7 +602,7 @@ func TestCatalogLegacyRunAuthorityUpgradeAndRequiredCheckpoint(t *testing.T) {
 		_ = reopened.Close()
 		t.Fatalf("upgraded root authority = %+v, err=%v", observedRoot, err)
 	}
-	runAuthorityData, found, err := getCatalogRunAuthority(reopened.rootFD)
+	runAuthorityData, found, err := getCatalogRunAuthority(reopened.runs.fd)
 	runAuthority, decodeErr := decodeCatalogRunAuthority(runAuthorityData, reopened)
 	if err != nil || !found || decodeErr != nil || runAuthority.State != catalogRunStateEstablished || runAuthority.IssuanceCount != 1 {
 		_ = reopened.Close()
@@ -330,17 +616,17 @@ func TestCatalogLegacyRunAuthorityUpgradeAndRequiredCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rootFD, err = syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	runsFD, err = syscall.Open(filepath.Join(root, "catalog", "runs"), syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	removeErr = removeCatalogRunAuthorityForTest(rootFD)
-	syncErr = syscall.Fsync(rootFD)
+	removeErr = removeCatalogRunAuthorityForTest(runsFD)
+	syncErr = syscall.Fsync(runsFD)
 	if removeErr != nil || syncErr != nil {
-		_ = syscall.Close(rootFD)
+		_ = syscall.Close(runsFD)
 		t.Fatalf("remove required run authority: remove=%v sync=%v", removeErr, syncErr)
 	}
-	_ = syscall.Close(rootFD)
+	_ = syscall.Close(runsFD)
 	failed, err := Open(root)
 	if failed != nil {
 		_ = failed.Close()
@@ -348,6 +634,36 @@ func TestCatalogLegacyRunAuthorityUpgradeAndRequiredCheckpoint(t *testing.T) {
 	if !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("upgraded catalog recreated removed run authority: %v", err)
 	}
+}
+
+func moveCatalogRunAuthorityToLegacyRoot(t *testing.T, root string, keepDestination bool) []byte {
+	t.Helper()
+	rootFD, err := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(rootFD)
+	runsFD, err := syscall.Open(filepath.Join(root, "catalog", "runs"), syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(runsFD)
+	authority, found, err := getCatalogRunAuthority(runsFD)
+	if err != nil || !found {
+		t.Fatalf("read destination run authority: found=%v err=%v", found, err)
+	}
+	if err := setCatalogRunAuthority(rootFD, authority, catalogXattrCreate); err != nil {
+		t.Fatal(err)
+	}
+	if !keepDestination {
+		if err := removeCatalogRunAuthorityForTest(runsFD); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := errors.Join(syscall.Fsync(runsFD), syscall.Fsync(rootFD)); err != nil {
+		t.Fatal(err)
+	}
+	return append([]byte(nil), authority...)
 }
 
 func removeCatalogRunAuthorityForTest(fd int) error {
