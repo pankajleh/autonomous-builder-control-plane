@@ -161,6 +161,7 @@ const (
 )
 
 var catalogRunIssuanceBoundaryHook = func(string) {}
+var catalogRunAuthorityMigrationBoundaryHook = func(string) {}
 
 // Open creates a missing canonical service root, validates controller
 // ownership/mode, pins it, and creates the bounded internal namespaces.
@@ -247,6 +248,9 @@ func Open(root string) (*Catalog, error) {
 	}
 	if !allowCreate && legacy && authority != legacyAuthority {
 		return fail(ErrIntegrity)
+	}
+	if err := catalog.migrateCatalogRunAuthorityStorage(); err != nil {
+		return fail(fmt.Errorf("migrate runtime catalog run authority storage: %w", err))
 	}
 	if err := catalog.verifyNamespaceAuthority(); err != nil {
 		return fail(err)
@@ -980,11 +984,11 @@ func (c *Catalog) createRunNamespace(component string) (*runNamespace, error) {
 	}
 	nextDigest := catalogRunRecordDigest(state.lastDigest, line[:len(line)-1])
 	_, establishedData, err := makeCatalogRunAuthority(c, catalogRunStateEstablished, prepared.Sequence, nextDigest, nil)
-	if err != nil || setCatalogRunAuthority(c.rootFD, establishedData, catalogXattrReplace) != nil {
+	if err != nil || setCatalogRunAuthority(c.runs.fd, establishedData, catalogXattrReplace) != nil {
 		return nil, ErrIntegrity
 	}
 	catalogRunIssuanceBoundaryHook("checkpoint-visible")
-	if syscall.Fsync(c.rootFD) != nil || verifyCatalogRunAuthorityData(c.rootFD, establishedData) != nil {
+	if syscall.Fsync(c.runs.fd) != nil || verifyCatalogRunAuthorityData(c.runs.fd, establishedData) != nil {
 		return nil, ErrIntegrity
 	}
 	catalogRunIssuanceBoundaryHook("checkpoint-durable")
@@ -1160,7 +1164,7 @@ func (c *Catalog) reconcileRunNamespaceIssuance(allowBootstrap bool) error {
 	if err := c.verifyNamespaceAuthority(); err != nil {
 		return err
 	}
-	_, found, err := getCatalogRunAuthority(c.rootFD)
+	_, found, err := getCatalogRunAuthority(c.runs.fd)
 	if err != nil {
 		return err
 	}
@@ -1205,7 +1209,7 @@ func (c *Catalog) reconcileRunNamespaceIssuance(allowBootstrap bool) error {
 }
 
 func (c *Catalog) bootstrapCatalogRunAuthority() error {
-	if _, found, err := getCatalogRunAuthority(c.rootFD); err != nil || found {
+	if _, found, err := getCatalogRunAuthority(c.runs.fd); err != nil || found {
 		if err != nil {
 			return err
 		}
@@ -1240,17 +1244,17 @@ func (c *Catalog) bootstrapCatalogRunAuthority() error {
 		return ErrIntegrity
 	}
 	_, authorityData, err := makeCatalogRunAuthority(c, catalogRunStateEstablished, len(records), prior, nil)
-	if err != nil || setCatalogRunAuthority(c.rootFD, authorityData, catalogXattrCreate) != nil || syscall.Fsync(c.rootFD) != nil {
+	if err != nil || setCatalogRunAuthority(c.runs.fd, authorityData, catalogXattrCreate) != nil || syscall.Fsync(c.runs.fd) != nil {
 		return ErrIntegrity
 	}
-	return verifyCatalogRunAuthorityData(c.rootFD, authorityData)
+	return verifyCatalogRunAuthorityData(c.runs.fd, authorityData)
 }
 
 func (c *Catalog) loadRunNamespaceGenerationState() (catalogRunGenerationState, *os.File, syscall.Stat_t, error) {
 	if c == nil || c.verifyNamespaceAuthority() != nil {
 		return catalogRunGenerationState{}, nil, syscall.Stat_t{}, ErrIntegrity
 	}
-	authorityData, found, err := getCatalogRunAuthority(c.rootFD)
+	authorityData, found, err := getCatalogRunAuthority(c.runs.fd)
 	if err != nil || !found {
 		return catalogRunGenerationState{}, nil, syscall.Stat_t{}, ErrIntegrity
 	}
@@ -1791,20 +1795,146 @@ func decodeCatalogRunAuthority(data []byte, c *Catalog) (catalogRunAuthorityV1, 
 	return authority, nil
 }
 
-func (c *Catalog) replaceCatalogRunAuthority(expected, next []byte, boundary string) error {
-	if err := c.verifyNamespaceAuthority(); err != nil || verifyCatalogRunAuthorityData(c.rootFD, expected) != nil {
+// migrateCatalogRunAuthorityStorage moves the run-issuance authority off the
+// service-root inode and onto the already-pinned catalog/runs inode. Older
+// deployments stored this bounded but temporarily expanding record on the
+// shared service-root xattr block, where unrelated action-journal authorities
+// can exhaust ext4's per-inode xattr budget.
+//
+// The migration joins the same catalog .lock domain used by run issuance.
+// That prevents an already-open legacy process from advancing the root copy
+// while a new binary copies/removes it. Destination publication is fsynced and
+// byte-verified first, the legacy source is re-read under the lock immediately
+// before removal, and the root removal is then fsynced. A crash can therefore
+// leave either one valid copy or two byte-identical copies; conflicting dual
+// copies fail closed.
+func (c *Catalog) migrateCatalogRunAuthorityStorage() (resultErr error) {
+	if c == nil || c.rootFD < 0 || c.runs.fd < 0 {
 		return ErrIntegrity
 	}
-	if setCatalogRunAuthority(c.rootFD, next, catalogXattrReplace) != nil {
+	lockFD, err := c.acquireRunAuthorityMigrationLock()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, c.releaseRunAuthorityMigrationLock(lockFD))
+	}()
+
+	legacy, legacyFound, legacyErr := getCatalogRunAuthority(c.rootFD)
+	current, currentFound, currentErr := getCatalogRunAuthority(c.runs.fd)
+	if legacyErr != nil || currentErr != nil {
+		return ErrIntegrity
+	}
+	if legacyFound {
+		if _, err := decodeCatalogRunAuthority(legacy, c); err != nil {
+			return err
+		}
+	}
+	if currentFound {
+		if _, err := decodeCatalogRunAuthority(current, c); err != nil {
+			return err
+		}
+	}
+	if legacyFound && currentFound && !bytes.Equal(legacy, current) {
+		return ErrIntegrity
+	}
+	if !legacyFound {
+		return nil
+	}
+
+	if !currentFound {
+		if err := setCatalogRunAuthority(c.runs.fd, legacy, catalogXattrCreate); err != nil {
+			return err
+		}
+	}
+	if syscall.Fsync(c.runs.fd) != nil || verifyCatalogRunAuthorityData(c.runs.fd, legacy) != nil {
+		return ErrIntegrity
+	}
+	catalogRunAuthorityMigrationBoundaryHook("destination-durable")
+
+	// Revalidate the source after destination durability while still holding
+	// the issuance lock. This catches non-cooperating mutation/tampering and
+	// prevents deleting an authority newer than the copied generation.
+	observedLegacy, found, err := getCatalogRunAuthority(c.rootFD)
+	if err != nil || !found || !bytes.Equal(observedLegacy, legacy) {
+		return ErrIntegrity
+	}
+	if err := removeCatalogRunAuthority(c.rootFD); err != nil {
+		return err
+	}
+	catalogRunAuthorityMigrationBoundaryHook("source-removed")
+	if syscall.Fsync(c.rootFD) != nil {
+		return ErrIntegrity
+	}
+	if _, found, err := getCatalogRunAuthority(c.rootFD); err != nil || found {
+		return ErrIntegrity
+	}
+	return verifyCatalogRunAuthorityData(c.runs.fd, legacy)
+}
+
+func (c *Catalog) acquireRunAuthorityMigrationLock() (int, error) {
+	if err := c.verifyNamespacePins(); err != nil {
+		return -1, err
+	}
+	fd, err := syscall.Openat(c.catalog.fd, ".lock", syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, ErrIntegrity
+	}
+	if err := c.verifyLockFD(fd); err != nil {
+		_ = syscall.Close(fd)
+		return -1, err
+	}
+	deadline := time.Now().Add(LockTimeout)
+	for {
+		err = syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			if err := errors.Join(c.verifyLockFD(fd), c.verifyNamespacePins()); err != nil {
+				_ = syscall.Flock(fd, syscall.LOCK_UN)
+				_ = syscall.Close(fd)
+				return -1, err
+			}
+			return fd, nil
+		}
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			_ = syscall.Close(fd)
+			return -1, ErrIntegrity
+		}
+		if !time.Now().Before(deadline) {
+			_ = syscall.Close(fd)
+			return -1, ErrBusy
+		}
+		remaining := time.Until(deadline)
+		if remaining > 10*time.Millisecond {
+			remaining = 10 * time.Millisecond
+		}
+		if remaining > 0 {
+			time.Sleep(remaining)
+		}
+	}
+}
+
+func (c *Catalog) releaseRunAuthorityMigrationLock(fd int) error {
+	if fd < 0 {
+		return ErrIntegrity
+	}
+	verifyErr := errors.Join(c.verifyLockFD(fd), c.verifyNamespacePins())
+	return errors.Join(verifyErr, syscall.Flock(fd, syscall.LOCK_UN), syscall.Close(fd))
+}
+
+func (c *Catalog) replaceCatalogRunAuthority(expected, next []byte, boundary string) error {
+	if err := c.verifyNamespaceAuthority(); err != nil || verifyCatalogRunAuthorityData(c.runs.fd, expected) != nil {
+		return ErrIntegrity
+	}
+	if setCatalogRunAuthority(c.runs.fd, next, catalogXattrReplace) != nil {
 		return ErrIntegrity
 	}
 	if boundary != "" {
 		catalogRunIssuanceBoundaryHook(boundary + "-visible")
 	}
-	if syscall.Fsync(c.rootFD) != nil {
+	if syscall.Fsync(c.runs.fd) != nil {
 		return ErrIntegrity
 	}
-	return verifyCatalogRunAuthorityData(c.rootFD, next)
+	return verifyCatalogRunAuthorityData(c.runs.fd, next)
 }
 
 func getCatalogRunAuthority(fd int) ([]byte, bool, error) {
@@ -1834,6 +1964,18 @@ func setCatalogRunAuthority(fd int, data []byte, flags int) error {
 	}
 	_, _, errno := syscall.Syscall6(syscall.SYS_FSETXATTR, uintptr(fd), uintptr(unsafe.Pointer(name)),
 		uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)), uintptr(flags), 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func removeCatalogRunAuthority(fd int) error {
+	name, err := syscall.BytePtrFromString(catalogRunAuthorityXattr)
+	if err != nil {
+		return ErrIntegrity
+	}
+	_, _, errno := syscall.Syscall(syscall.SYS_FREMOVEXATTR, uintptr(fd), uintptr(unsafe.Pointer(name)), 0)
 	if errno != 0 {
 		return errno
 	}
@@ -1876,15 +2018,14 @@ func (c *Catalog) verifyRootPath() error {
 	return validateDirectoryFD(fd, true)
 }
 
-func (c *Catalog) verifyNamespaceAuthority() error {
+func (c *Catalog) verifyNamespacePins() error {
 	if err := c.verifyRootPath(); err != nil {
 		return err
 	}
 	if len(c.rootAuthorityData) == 0 || verifyCatalogRootGenerationData(c.rootFD, c.rootAuthorityData) != nil {
 		return fmt.Errorf("%w: runtime catalog generation authority changed", ErrIntegrity)
 	}
-	rootAuthority, err := decodeCatalogRootGeneration(c.rootAuthorityData)
-	if err != nil {
+	if _, err := decodeCatalogRootGeneration(c.rootAuthorityData); err != nil {
 		return ErrIntegrity
 	}
 	for _, check := range []struct {
@@ -1898,7 +2039,18 @@ func (c *Catalog) verifyNamespaceAuthority() error {
 			return err
 		}
 	}
-	runAuthorityData, found, err := getCatalogRunAuthority(c.rootFD)
+	return nil
+}
+
+func (c *Catalog) verifyNamespaceAuthority() error {
+	if err := c.verifyNamespacePins(); err != nil {
+		return err
+	}
+	rootAuthority, err := decodeCatalogRootGeneration(c.rootAuthorityData)
+	if err != nil {
+		return ErrIntegrity
+	}
+	runAuthorityData, found, err := getCatalogRunAuthority(c.runs.fd)
 	if err != nil || (rootAuthority.state == catalogGenerationReadyV2 && !found) {
 		return fmt.Errorf("%w: runtime catalog run authority is unavailable", ErrIntegrity)
 	}
