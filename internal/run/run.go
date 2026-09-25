@@ -598,6 +598,9 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		if _, api := APICancelProvenance(ctx); api {
 			return r.cancel(ctx, result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
 		}
+		if isHumanDecisionFailure(process, processErr) {
+			return r.blockHumanDecision(ctx, result, process, processErr, processRefs(process))
+		}
 		return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
 	}
 	metadataRef, err := r.writeJSON("ralphex-process.json", "ralphex-process-metadata", struct {
@@ -617,6 +620,10 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		terminal := domain.StateFailed
 		if process.Outcome == supervisor.OutcomeCanceled || apiCancelActive {
 			terminal = domain.StateCancelled
+		}
+		if !apiCancelActive && process.Outcome != supervisor.OutcomeCanceled &&
+			isHumanDecisionFailure(process, nil) {
+			return r.blockHumanDecision(ctx, result, process, nil, implementationRefs)
 		}
 		reason := fmt.Sprintf("Ralphex ended with outcome %s", process.Outcome)
 		result.State = terminal
@@ -1330,7 +1337,7 @@ func ep002State(state domain.State) bool {
 	switch state {
 	case domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateImplementing,
 		domain.StateImplementationCompleted, domain.StateBranchAcceptancePending, domain.StateBranchAccepted,
-		domain.StateValidationUnavailable, domain.StateFailed, domain.StateCancelled:
+		domain.StateValidationUnavailable, domain.StateHumanDecisionRequired, domain.StateFailed, domain.StateCancelled:
 		return true
 	default:
 		return false
