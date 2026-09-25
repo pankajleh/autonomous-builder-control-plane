@@ -452,12 +452,15 @@ func (c *Controller) applyDecision(ctx context.Context, authority *actioncontrol
 		if outcomeErr != nil {
 			return mapJournalError(outcomeErr)
 		}
-		// The decision is durably applied. If the human answered "proceed",
-		// re-launch the paused run so the recorded resume transition takes
-		// effect. A nil resume hook records only.
-		answerPayload, _, decodeErr := DecodeDecisionPayload(receipt.Payload)
-		if decodeErr == nil && answerPayload.Answer == "proceed" && c.resume != nil {
-			_ = c.resume(ctx, receipt.RunID, answerPayload.DecisionRequestID)
+		// The decision is durably applied. Re-launch the paused run so the
+		// recorded answer takes effect: the re-launched run subprocess reads the
+		// decision and either aborts (FAILED) or restarts the attempt. A nil
+		// resume hook records only. This fires for every applied decision, so an
+		// "abort" still terminates the run.
+		if c.resume != nil {
+			if answerPayload, _, decodeErr := DecodeDecisionPayload(receipt.Payload); decodeErr == nil {
+				_ = c.resume(ctx, receipt.RunID, answerPayload.DecisionRequestID)
+			}
 		}
 		return nil
 	}

@@ -20,16 +20,23 @@ import (
 // an evidence file from being read whole into memory.
 const maxFailureDiagnosticBytes = 16 << 10
 
+// Human-decision answers the controller-authored requirement accepts. The
+// producer, the resume reader, and (through the re-launch hook) the service all
+// agree on these two values: "proceed" restarts the attempt, "abort" fails it.
+const (
+	HumanDecisionProceed = "proceed"
+	HumanDecisionAbort   = "abort"
+)
+
 // humanDecisionRequirement is the controller-authored default requirement for a
 // failure the classifier escalates to HUMAN_DECISION_REQUIRED. The operator is
 // presented an explicit bounded question and must answer with one of the two
-// accepted answers: "proceed" restarts the attempt, "abort" fails it. This is a
-// conservative default and may be replaced by profile-specific policy under
-// separate authority.
+// accepted answers. This is a conservative default and may be replaced by
+// profile-specific policy under separate authority.
 func humanDecisionRequirement() recovery.BlockerRequirement {
 	return recovery.BlockerRequirement{HumanDecision: &recovery.HumanDecisionRequirement{
 		Question:          "Proceed with the next attempt?",
-		AcceptedAnswers:   []string{"proceed", "abort"},
+		AcceptedAnswers:   []string{HumanDecisionProceed, HumanDecisionAbort},
 		RequiredAuthority: "operator",
 	}}
 }

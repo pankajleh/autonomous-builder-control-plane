@@ -127,9 +127,9 @@ func pendingResumeAnswer(events []ledger.Event) (resumeAnswer, error) {
 			if requestID != "" && requestID == blockerID {
 				value, _ := event.Payload["answer"].(string)
 				switch value {
-				case "proceed":
+				case HumanDecisionProceed:
 					answer = &resumeAnswer{proceed: true, decisionID: requestID}
-				case "abort":
+				case HumanDecisionAbort:
 					answer = &resumeAnswer{proceed: false, decisionID: requestID}
 				default:
 					return resumeAnswer{}, fmt.Errorf("human decision answer %q is not accepted", value)

@@ -2,10 +2,7 @@ package runadmission
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"strings"
-	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
@@ -52,11 +49,13 @@ func (c *Controller) bindingForRunID(runID string) (AdmissionBindingV1, error) {
 		return AdmissionBindingV1{}, serviceapi.ErrActionStatusNotFound
 	}
 	if err := validateAdmissionBinding(found, AdmissionReceiptV1{
-		AdmissionKind: found.AdmissionKind,
-		Principal:     serviceapi.Principal{PrincipalID: found.PrincipalID},
-		RequestID:     found.RequestID,
-		RunID:         found.RunID,
-		ProfileID:     found.ProfileID,
+		AdmissionKind:          found.AdmissionKind,
+		Principal:              serviceapi.Principal{PrincipalID: found.PrincipalID},
+		RequestID:              found.RequestID,
+		CanonicalRequestSHA256: found.CanonicalRequestSHA256,
+		RunID:                  found.RunID,
+		ProfileID:              found.ProfileID,
+		ProfileBindingSHA256:   found.ProfileBindingSHA256,
 	}); err != nil {
 		return AdmissionBindingV1{}, serviceapi.ErrUnsafeAdmissionMaterialization
 	}
@@ -64,9 +63,15 @@ func (c *Controller) bindingForRunID(runID string) (AdmissionBindingV1, error) {
 }
 
 // ResumeRun re-launches the exact run subprocess with --resume after a human
-// decision recorded "proceed". It re-derives the launch from the durable
-// admission binding, so it never synthesizes authority that the original
-// admission did not already carry.
+// decision was durably recorded. It re-derives the launch from the durable
+// admission binding, so it never synthesizes authority the original admission
+// did not already carry.
+//
+// Resume is intentionally separate from first admission: the first-admission
+// launch intent stays as durable evidence of the original launch, and resume is
+// guarded only by the non-blocking launch lock plus the resume subprocess's own
+// idempotency (it fails closed if the run is no longer paused). This allows the
+// legitimate sequence pause -> resume -> re-implement -> pause -> resume.
 func (c *Controller) ResumeRun(ctx context.Context, runID string) error {
 	if c == nil || c.start == nil {
 		return serviceapi.ErrAdmissionUnavailable
@@ -80,23 +85,9 @@ func (c *Controller) ResumeRun(ctx context.Context, runID string) error {
 		return serviceapi.ErrAdmissionUnavailable
 	}
 	if !acquired {
-		// A resume launch is already in flight or the original run still holds
-		// the lock. Do not double-launch.
+		// A resume launch is already in flight for this run.
 		lock.Close()
 		return nil
-	}
-	launchAttempted, err := c.readAdmissionLaunchIntent(binding)
-	if err != nil {
-		lock.Close()
-		return serviceapi.ErrUnsafeAdmissionMaterialization
-	}
-	if launchAttempted {
-		lock.Close()
-		return serviceapi.ErrReconciliationRequired
-	}
-	if err := c.createAdmissionLaunchIntent(binding); err != nil {
-		lock.Close()
-		return serviceapi.ErrAdmissionUnavailable
 	}
 	args := []string{
 		"run", "--resume", "--manifest", binding.ManifestPath, "--ledger", binding.CanonicalLedgerPath,
@@ -105,16 +96,11 @@ func (c *Controller) ResumeRun(ctx context.Context, runID string) error {
 		"--workflow-authority-config-file", binding.WorkflowAuthorityConfigPath,
 	}
 	if err := c.start(c.executable, args, lock); err != nil {
-		_ = c.clearAdmissionLaunchIntent(binding)
 		lock.Close()
 		return serviceapi.ErrAdmissionUnavailable
 	}
 	if err := lock.Close(); err != nil {
 		return serviceapi.ErrAdmissionUnavailable
 	}
-	_ = time.Now // keep time import if unused elsewhere; resume launch is immediate
 	return nil
 }
-
-var _ = fmt.Errorf
-var _ = errors.New

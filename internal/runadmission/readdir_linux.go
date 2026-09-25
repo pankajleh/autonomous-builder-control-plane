@@ -1,10 +1,7 @@
 package runadmission
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
-	"os"
 	"sort"
 	"syscall"
 	"unsafe"
@@ -14,15 +11,24 @@ import (
 // descriptor. The result is sorted so iteration order is deterministic. It is
 // used only to enumerate the durable admission-binding records, never to resolve
 // untrusted caller-supplied paths.
+//
+// A fresh directory descriptor is opened for every call: getdents advances the
+// descriptor's read offset, so reading the shared descriptor directly would make
+// a second enumeration return nothing.
 func readDirAt(parent int) ([]string, error) {
 	if parent < 0 {
 		return nil, errors.New("invalid directory descriptor")
 	}
+	fd, err := syscall.Openat(parent, ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.Close(fd)
 	const bufferBytes = 64 << 10
 	buffer := make([]byte, bufferBytes)
 	var names []string
 	for {
-		n, err := syscall.ReadDirent(parent, buffer)
+		n, err := syscall.ReadDirent(fd, buffer)
 		if err != nil {
 			return nil, err
 		}
@@ -84,7 +90,3 @@ func direntName(entry []byte) (string, bool) {
 	}
 	return name, true
 }
-
-var _ = json.Marshal
-var _ = io.EOF
-var _ = os.ErrNotExist
