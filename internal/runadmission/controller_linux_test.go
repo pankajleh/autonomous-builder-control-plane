@@ -1178,9 +1178,14 @@ func makeRepository(t *testing.T, ignored bool) (string, string, string) {
 
 func writeAdmissionConfiguration(t *testing.T, root, repository, _ string) (string, *admissionTestCatalog) {
 	t.Helper()
-	truePath := testExecutable(t)
 	runtimePath := filepath.Join(root, "approved-ralphex")
 	if err := os.WriteFile(runtimePath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Acceptance must be a command that could fail; manifest validation rejects
+	// no-op commands such as /usr/bin/true.
+	acceptancePath := filepath.Join(root, "acceptance-validator")
+	if err := os.WriteFile(acceptancePath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	binary, err := os.ReadFile(runtimePath)
@@ -1195,7 +1200,7 @@ func writeAdmissionConfiguration(t *testing.T, root, repository, _ string) (stri
 			Mode: ralphex.ModeFull, Timeout: "5m", WaitOnLimit: "0s",
 		},
 		Executor: authority.ExecutorPolicy{Executor: "codex"}, Worktree: authority.WorktreePolicy{Enabled: true},
-		Acceptance:    []authority.AcceptanceCommand{{Name: "test", Required: true, Timeout: "5m", Argv: []string{truePath}}},
+		Acceptance:    []authority.AcceptanceCommand{{Name: "test", Required: true, Timeout: "5m", Argv: []string{acceptancePath}}},
 		PolicyVersion: "product-v1",
 	}
 	templatePath := filepath.Join(root, "manifest-template.json")

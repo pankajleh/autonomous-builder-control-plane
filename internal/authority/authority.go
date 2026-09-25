@@ -669,6 +669,9 @@ func validateRequired(manifest Manifest) error {
 				return fmt.Errorf("acceptance command %d argv[%d] must not be empty", index, argIndex)
 			}
 		}
+		if reason := acceptanceCommandCannotVerify(command.Argv); reason != "" {
+			return fmt.Errorf("acceptance command %d: %s", index, reason)
+		}
 	}
 	if !hasRequiredAcceptance {
 		return errors.New("at least one required acceptance command is required")
@@ -952,4 +955,91 @@ func cloneAcceptance(input []AcceptanceCommand) []AcceptanceCommand {
 		clone[index].Argv = append([]string(nil), command.Argv...)
 	}
 	return clone
+}
+
+// noOpAcceptanceShellBodies are shell statements that succeed without inspecting
+// anything. A candidate cannot fail them.
+var noOpAcceptanceNoOps = map[string]struct{}{
+	"true": {}, ":": {},
+}
+
+var acceptanceShellExecutables = map[string]struct{}{
+	"bash": {}, "sh": {}, "dash": {}, "zsh": {}, "ksh": {},
+}
+
+// acceptanceCommandCannotVerify reports why an acceptance command can never
+// reject a candidate, or "" when the command is a plausible check.
+//
+// Acceptance is the controller's independent verification that the exact
+// candidate works. A command that always succeeds regardless of the candidate
+// silently converts every run into BRANCH_ACCEPTED and makes that terminal state
+// meaningless, so it is rejected at manifest validation rather than recorded as
+// a gate. This guards against placeholder acceptance commands being carried into
+// a governed profile; it does not attempt to prove that a genuine-looking
+// command is a *meaningful* check, which remains per-consumer authoring
+// responsibility.
+func acceptanceCommandCannotVerify(argv []string) string {
+	executable := filepath.Base(argv[0])
+	if _, isNoOp := noOpAcceptanceNoOps[executable]; isNoOp {
+		return fmt.Sprintf("%q always succeeds and cannot verify a candidate", argv[0])
+	}
+	if _, isShell := acceptanceShellExecutables[executable]; !isShell {
+		return ""
+	}
+	script, present := acceptanceShellScript(argv)
+	if !present {
+		return ""
+	}
+	if scriptIsNoOp(script) {
+		return fmt.Sprintf("shell body %q always succeeds and cannot verify a candidate", strings.TrimSpace(script))
+	}
+	return ""
+}
+
+// acceptanceShellScript returns the script operand of a command flag such as
+// -c, -lc or -eu -c. Long options (for example --norc) are skipped so they are
+// never mistaken for a command flag.
+func acceptanceShellScript(argv []string) (string, bool) {
+	for index := 1; index < len(argv); index++ {
+		arg := argv[index]
+		if arg == "--" {
+			return "", false
+		}
+		if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") {
+			continue
+		}
+		if strings.Contains(strings.TrimPrefix(arg, "-"), "c") {
+			if index+1 < len(argv) {
+				return argv[index+1], true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// scriptIsNoOp reports whether every statement in a shell body is a no-op.
+// Shell option setup (set ...) and empty statements are ignored, because they
+// configure the shell rather than check anything.
+func scriptIsNoOp(script string) bool {
+	sawCheck := false
+	for _, statement := range strings.FieldsFunc(strings.ReplaceAll(script, "&&", ";"), func(r rune) bool {
+		return r == ';' || r == '\n'
+	}) {
+		fields := strings.Fields(strings.ToLower(strings.TrimSpace(statement)))
+		if len(fields) == 0 {
+			continue
+		}
+		switch {
+		case fields[0] == "set":
+			continue
+		case len(fields) == 1 && (fields[0] == "true" || fields[0] == ":"):
+			continue
+		case len(fields) == 2 && fields[0] == "exit" && fields[1] == "0":
+			continue
+		default:
+			sawCheck = true
+		}
+	}
+	return !sawCheck
 }
