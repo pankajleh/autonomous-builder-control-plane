@@ -31,6 +31,11 @@ type ControllerConfig struct {
 	ReadModel projectionService
 	Journal   *actioncontrol.Journal
 	Authority *serviceapi.AuthorityMatcher
+	// ResumeHook is invoked, best-effort, after a "proceed" decision has been
+	// durably applied, so the admission controller can re-launch the paused run.
+	// It receives the run id and the recorded decision request id. A nil hook
+	// leaves the run paused after a proceed decision (recording only).
+	ResumeHook func(ctx context.Context, runID, decisionRequestID string) error
 }
 
 type Controller struct {
@@ -38,6 +43,7 @@ type Controller struct {
 	model     projectionService
 	journal   *actioncontrol.Journal
 	authority *serviceapi.AuthorityMatcher
+	resume    func(ctx context.Context, runID, decisionRequestID string) error
 	ctx       context.Context
 	cancel    context.CancelFunc
 	queue     chan actionWork
@@ -54,7 +60,8 @@ func NewController(config ControllerConfig) (*Controller, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	controller := &Controller{catalog: config.Catalog, model: config.ReadModel, journal: config.Journal, authority: config.Authority,
-		ctx: ctx, cancel: cancel, queue: make(chan actionWork, 256), queued: map[string]struct{}{}}
+		resume: config.ResumeHook,
+		ctx:    ctx, cancel: cancel, queue: make(chan actionWork, 256), queued: map[string]struct{}{}}
 	for index := 0; index < 2; index++ {
 		controller.wg.Add(1)
 		go controller.worker()
@@ -442,7 +449,17 @@ func (c *Controller) applyDecision(ctx context.Context, authority *actioncontrol
 			return mapJournalError(err)
 		}
 		_, outcomeErr := c.journal.AppendOutcome(ctx, receipt.RunID, receipt.OperationID, actioncontrol.StatusApplied, []string{claim.ControllerEventID}, "")
-		return mapJournalError(outcomeErr)
+		if outcomeErr != nil {
+			return mapJournalError(outcomeErr)
+		}
+		// The decision is durably applied. If the human answered "proceed",
+		// re-launch the paused run so the recorded resume transition takes
+		// effect. A nil resume hook records only.
+		answerPayload, _, decodeErr := DecodeDecisionPayload(receipt.Payload)
+		if decodeErr == nil && answerPayload.Answer == "proceed" && c.resume != nil {
+			_ = c.resume(ctx, receipt.RunID, answerPayload.DecisionRequestID)
+		}
+		return nil
 	}
 	_, markerErr := c.journal.AppendOutcome(ctx, receipt.RunID, receipt.OperationID, actioncontrol.StatusReconciliationRequired, nil, "decision_effect_ambiguous")
 	if markerErr != nil {

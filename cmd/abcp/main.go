@@ -840,7 +840,17 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer journal.Close()
-	actions, err := actionapi.NewController(actionapi.ControllerConfig{Catalog: catalog, ReadModel: readService, Journal: journal, Authority: authorityMatcher})
+	actions, err := actionapi.NewController(actionapi.ControllerConfig{
+		Catalog: catalog, ReadModel: readService, Journal: journal, Authority: authorityMatcher,
+		// A "proceed" human decision re-launches the paused run from its durable
+		// admission binding. A nil admissions controller simply records.
+		ResumeHook: func(ctx context.Context, runID, decisionRequestID string) error {
+			if admissions == nil {
+				return nil
+			}
+			return admissions.ResumeRun(ctx, runID)
+		},
+	})
 	if err != nil {
 		fmt.Fprintln(stderr, "construct governed action controller")
 		return 1
