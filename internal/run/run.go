@@ -292,6 +292,8 @@ type Runner struct {
 	parsedCapsule contextcapsule.Capsule
 	lifecycleMu   sync.Mutex
 	started       bool
+	resume        bool
+	resumeOrdinal int
 	finalization  FinalizationHook
 	snapshots     SnapshotCoordinator
 }
@@ -418,6 +420,15 @@ func autonomousDevelopmentCapsule(capsule contextcapsule.Capsule) bool {
 	}
 }
 
+// RunResume re-enters a run that paused at HUMAN_DECISION_REQUIRED after a
+// human decision was recorded. It reads the decision from the authoritative
+// ledger and either aborts (FAILED) or restarts the implementation attempt
+// (AUTHORITY_VALIDATED), then continues through branch acceptance.
+func (r *Runner) RunResume(ctx context.Context) (Result, error) {
+	r.resume = true
+	return r.Run(ctx)
+}
+
 // Run executes exactly one governed implementation and branch-acceptance
 // lifecycle. Process and acceptance failures are represented in Result;
 // errors indicate that the controller itself could not preserve governance.
@@ -441,59 +452,81 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		}
 	}()
 
-	authorityRef, err := r.artifacts.WriteBytes("authority.json", "validated-authority", r.governed.CanonicalJSON())
-	if err != nil {
-		return result, fmt.Errorf("publish authority evidence: %w", err)
-	}
-	result.AuthorityEvidenceRef = authorityRef
-	if err := r.appendCreated(authorityRef); err != nil {
-		return result, err
-	}
-	result.State = domain.StateRunCreated
-	failAuthorityValidation := func(validationErr error) (Result, error) {
-		if ctx.Err() != nil {
-			return r.cancel(ctx, result, domain.StateRunCreated, "authority-validator", validationErr, []ledger.EvidenceRef{authorityRef})
-		}
-		result.State = domain.StateFailed
-		result.FailureReason = validationErr.Error()
-		if appendErr := r.transition(ctx, domain.StateRunCreated, domain.StateFailed, "authority-validator", map[string]any{"reason": validationErr.Error()}, []ledger.EvidenceRef{authorityRef}); appendErr != nil {
-			return result, errors.Join(validationErr, appendErr)
-		}
-		return result, fmt.Errorf("validate pinned authority: %w", validationErr)
-	}
 	var repositoryLease *repositoryExecutionLease
-	if repositoryExecutionLeasingSupported() {
-		repositoryLease, err = acquireRepositoryExecutionLease(ctx, r.governed.Repository().Path)
-		if err != nil {
-			return failAuthorityValidation(fmt.Errorf("acquire repository execution lease: %w", err))
+	acquireLease := func() error {
+		if !repositoryExecutionLeasingSupported() {
+			return nil
 		}
+		lease, err := acquireRepositoryExecutionLease(ctx, r.governed.Repository().Path)
+		if err != nil {
+			return fmt.Errorf("acquire repository execution lease: %w", err)
+		}
+		repositoryLease = lease
+		if err := recoverExecutionPlanHandoffs(repositoryLease); err != nil {
+			return fmt.Errorf("recover Ralphex execution plan handoffs: %w", err)
+		}
+		return nil
 	}
 	defer func() {
 		if repositoryLease != nil {
 			runErr = errors.Join(runErr, repositoryLease.Close())
 		}
 	}()
-	if repositoryLease != nil {
-		if err := recoverExecutionPlanHandoffs(repositoryLease); err != nil {
-			return failAuthorityValidation(fmt.Errorf("recover Ralphex execution plan handoffs: %w", err))
-		}
-	}
 
-	validation, err := validatePinnedIdentity(ctx, r.governed)
-	if err != nil {
-		return failAuthorityValidation(err)
+	if r.resume {
+		// Re-entry: the attempt already passed authority validation in its first
+		// lifecycle. Perform the HUMAN_DECISION_REQUIRED -> next transition from
+		// the recorded human decision, then continue implementation.
+		result, err := r.resumeFromHumanDecision(ctx, result)
+		if err != nil {
+			return result, err
+		}
+		if result.State != domain.StateAuthorityValidated {
+			return result, nil
+		}
+		if err := acquireLease(); err != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "resume-controller", err, nil)
+		}
+	} else {
+		authorityRef, err := r.artifacts.WriteBytes("authority.json", "validated-authority", r.governed.CanonicalJSON())
+		if err != nil {
+			return result, fmt.Errorf("publish authority evidence: %w", err)
+		}
+		result.AuthorityEvidenceRef = authorityRef
+		if err := r.appendCreated(authorityRef); err != nil {
+			return result, err
+		}
+		result.State = domain.StateRunCreated
+		failAuthorityValidation := func(validationErr error) (Result, error) {
+			if ctx.Err() != nil {
+				return r.cancel(ctx, result, domain.StateRunCreated, "authority-validator", validationErr, []ledger.EvidenceRef{authorityRef})
+			}
+			result.State = domain.StateFailed
+			result.FailureReason = validationErr.Error()
+			if appendErr := r.transition(ctx, domain.StateRunCreated, domain.StateFailed, "authority-validator", map[string]any{"reason": validationErr.Error()}, []ledger.EvidenceRef{authorityRef}); appendErr != nil {
+				return result, errors.Join(validationErr, appendErr)
+			}
+			return result, fmt.Errorf("validate pinned authority: %w", validationErr)
+		}
+		if err := acquireLease(); err != nil {
+			return failAuthorityValidation(err)
+		}
+		validation, err := validatePinnedIdentity(ctx, r.governed)
+		if err != nil {
+			return failAuthorityValidation(err)
+		}
+		validationRef, err := r.writeJSON("authority-validation.json", "authority-validation", validation)
+		if err != nil {
+			return result, fmt.Errorf("publish authority validation evidence: %w", err)
+		}
+		result.ValidationEvidenceRef = validationRef
+		if err := r.transition(ctx, domain.StateRunCreated, domain.StateAuthorityValidated, "authority-validator", map[string]any{
+			"authority_sha256": r.governed.SHA256(),
+		}, []ledger.EvidenceRef{authorityRef, validationRef}); err != nil {
+			return result, err
+		}
+		result.State = domain.StateAuthorityValidated
 	}
-	validationRef, err := r.writeJSON("authority-validation.json", "authority-validation", validation)
-	if err != nil {
-		return result, fmt.Errorf("publish authority validation evidence: %w", err)
-	}
-	result.ValidationEvidenceRef = validationRef
-	if err := r.transition(ctx, domain.StateRunCreated, domain.StateAuthorityValidated, "authority-validator", map[string]any{
-		"authority_sha256": r.governed.SHA256(),
-	}, []ledger.EvidenceRef{authorityRef, validationRef}); err != nil {
-		return result, err
-	}
-	result.State = domain.StateAuthorityValidated
 
 	configDir, err := os.MkdirTemp("", "abcp-ralphex-config-")
 	if err != nil {
@@ -544,8 +577,8 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		Cwd:     r.governed.Repository().Path,
 		Env:     ralphexEnvironment(r.governed.Executor().Executor, r.capsule),
 		Timeout: ralphexTimeout,
-		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stdout.log", Kind: "ralphex-stdout"},
-		Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: "ralphex-stderr.log", Kind: "ralphex-stderr"},
+		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: r.ralphexArtifactName("ralphex-stdout.log"), Kind: "ralphex-stdout"},
+		Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: r.ralphexArtifactName("ralphex-stderr.log"), Kind: "ralphex-stderr"},
 	}
 	var reservation governancev3.InvocationReservationV1
 	if invocation.Bounds != nil {
@@ -598,9 +631,12 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		if _, api := APICancelProvenance(ctx); api {
 			return r.cancel(ctx, result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
 		}
+		if isHumanDecisionFailure(process, processErr) {
+			return r.blockHumanDecision(ctx, result, process, processErr, processRefs(process))
+		}
 		return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
 	}
-	metadataRef, err := r.writeJSON("ralphex-process.json", "ralphex-process-metadata", struct {
+	metadataRef, err := r.writeJSON(r.ralphexArtifactName("ralphex-process.json"), "ralphex-process-metadata", struct {
 		Process           supervisor.Result      `json:"process"`
 		EnvironmentPolicy string                 `json:"environment_policy"`
 		EvidenceRefs      []ledger.EvidenceRef   `json:"evidence_refs"`
@@ -617,6 +653,10 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		terminal := domain.StateFailed
 		if process.Outcome == supervisor.OutcomeCanceled || apiCancelActive {
 			terminal = domain.StateCancelled
+		}
+		if !apiCancelActive && process.Outcome != supervisor.OutcomeCanceled &&
+			isHumanDecisionFailure(process, nil) {
+			return r.blockHumanDecision(ctx, result, process, nil, implementationRefs)
 		}
 		reason := fmt.Sprintf("Ralphex ended with outcome %s", process.Outcome)
 		result.State = terminal
@@ -1330,7 +1370,7 @@ func ep002State(state domain.State) bool {
 	switch state {
 	case domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateImplementing,
 		domain.StateImplementationCompleted, domain.StateBranchAcceptancePending, domain.StateBranchAccepted,
-		domain.StateValidationUnavailable, domain.StateFailed, domain.StateCancelled:
+		domain.StateValidationUnavailable, domain.StateHumanDecisionRequired, domain.StateFailed, domain.StateCancelled:
 		return true
 	default:
 		return false
