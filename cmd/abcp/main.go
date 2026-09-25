@@ -512,6 +512,7 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	cgroupRoot := flags.String("cgroup-root", "/sys/fs/cgroup", "controller cgroup v2 root")
 	serviceRoot := flags.String("service-root", "", "optional EP-006 service root for runtime registration")
 	workflowAuthorityConfigFile := flags.String("workflow-authority-config-file", "", "optional protected PostgreSQL workflow-authority config file")
+	resume := flags.Bool("resume", false, "re-enter a run paused at HUMAN_DECISION_REQUIRED from its recorded human decision")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -642,7 +643,13 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		watcher.Start()
 	}
-	result, err := runner.Run(ctx)
+	var runResult runctl.Result
+	if *resume {
+		runResult, err = runner.RunResume(ctx)
+	} else {
+		runResult, err = runner.Run(ctx)
+	}
+	result := runResult
 	if watcher != nil {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		retireErr := watcher.Close(closeCtx)
