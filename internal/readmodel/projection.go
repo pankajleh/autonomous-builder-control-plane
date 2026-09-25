@@ -172,8 +172,30 @@ func payloadInitialState(payload map[string]any) bool {
 	return ok && state == string(domain.StateRunCreated)
 }
 
+// terminalState reports whether a run has reached the end of the lifecycle this
+// controller actually implements.
+//
+// The governed run lifecycle is "exactly one governed implementation and
+// branch-acceptance lifecycle" (internal/run). A run that reached
+// BRANCH_ACCEPTED has completed every automated step available to the
+// controller and the controller will take no further action for it. Integration,
+// merge and production acceptance are separate, human-authorized concerns
+// outside the run lifecycle; they are not run states this controller produces,
+// so their absence must not make a finished run report as non-terminal.
+//
+// Reporting a branch-accepted run as terminal does not claim integration or
+// merge occurred: TerminalStatus.State carries the exact state reached
+// (BRANCH_ACCEPTED), and COMPLETED remains reserved for a ledger that genuinely
+// reaches it. If a future controller advances a run past BRANCH_ACCEPTED the
+// projection is recomputed from the ledger, so the run correctly reports
+// non-terminal again while it is in an integration state.
 func terminalState(state domain.State) bool {
-	return state == domain.StateCompleted || state == domain.StateFailed || state == domain.StateCancelled
+	switch state {
+	case domain.StateCompleted, domain.StateBranchAccepted, domain.StateFailed, domain.StateCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 func updateIdentityHistory(values *[]IdentitySummaryV1, positions map[string]int, id string, event ledger.Event, ordinal uint64, registration runtimecatalog.RunRegistrationV1) {
