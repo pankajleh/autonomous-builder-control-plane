@@ -163,11 +163,14 @@ func newRunnerAPIIntegrationFixture(t *testing.T, options runnerAPIFixtureOption
 		options.ralphexScript = "#!/bin/sh\nprintf candidate > candidate.txt\ngit add candidate.txt || exit 90\ngit commit -qm candidate || exit 91\n"
 	}
 	if len(options.acceptanceArgv) == 0 {
-		truePath, err := exec.LookPath("true")
-		if err != nil {
+		// Acceptance must be a command that could fail. Manifest validation
+		// rejects no-op commands such as /usr/bin/true, so the fixture uses a
+		// real executable instead.
+		validator := filepath.Join(t.TempDir(), "acceptance-validator")
+		if err := os.WriteFile(validator, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		options.acceptanceArgv = []string{truePath}
+		options.acceptanceArgv = []string{validator}
 	}
 
 	repository := filepath.Join(t.TempDir(), "repository")

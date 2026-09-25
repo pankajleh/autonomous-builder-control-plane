@@ -67,10 +67,10 @@ func TestRunCLIRejectsAutonomousWorkflowWithoutAuthorityBackend(t *testing.T) {
 
 	binaryPath := filepath.Join(t.TempDir(), "fake-ralphex")
 	writeCLIFile(t, binaryPath, []byte("#!/bin/sh\nprintf 'cli fake ralphex\\n'\nprintf 'candidate\\n' > candidate.txt\ngit add candidate.txt || exit 20\ngit commit -qm 'candidate implementation' || exit 21\n"), 0o700)
-	truePath, err := exec.LookPath("true")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Acceptance must be a command that could fail; manifest validation rejects
+	// no-op commands such as /usr/bin/true.
+	acceptancePath := filepath.Join(t.TempDir(), "acceptance-validator")
+	writeCLIFile(t, acceptancePath, []byte("#!/bin/sh\nexit 0\n"), 0o700)
 	manifest := authority.Manifest{
 		RunID: "cli-run",
 		Repository: authority.RepositoryManifest{
@@ -78,7 +78,7 @@ func TestRunCLIRejectsAutonomousWorkflowWithoutAuthorityBackend(t *testing.T) {
 		},
 		Plan:          authority.PlanManifest{Path: planPath, SHA256: cliFileHash(t, planPath)},
 		Ralphex:       authority.RalphexManifest{BinaryPath: binaryPath, BinarySHA256: cliFileHash(t, binaryPath), Mode: ralphex.ModeFull, Timeout: "5s", WaitOnLimit: "0s"},
-		Acceptance:    []authority.AcceptanceCommand{{Required: true, Timeout: "5s", Argv: []string{truePath}}},
+		Acceptance:    []authority.AcceptanceCommand{{Required: true, Timeout: "5s", Argv: []string{acceptancePath}}},
 		PolicyVersion: "cli-v1",
 	}
 	capsuleSpec := contextcapsule.Spec{
@@ -270,12 +270,17 @@ func TestServiceRootRuntimeRegistrationInstallsAndRetiresExactOwner(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Acceptance must be a command that could fail; manifest validation rejects
+	// no-op commands such as /usr/bin/true. The fake Ralphex binary may still be
+	// a no-op because it is the implementation engine, not the acceptance gate.
+	acceptancePath := filepath.Join(t.TempDir(), "acceptance-validator")
+	writeCLIFile(t, acceptancePath, []byte("#!/bin/sh\nexit 0\n"), 0o700)
 	manifest := authority.Manifest{
 		RunID:         "registered-run",
 		Repository:    authority.RepositoryManifest{Path: repository, Identity: "example/service-registration", Remotes: map[string]string{"origin": remoteURL}, DefaultBranch: "main", StartSHA: startSHA},
 		Plan:          authority.PlanManifest{Path: planPath, SHA256: cliFileHash(t, planPath)},
 		Ralphex:       authority.RalphexManifest{BinaryPath: truePath, BinarySHA256: cliFileHash(t, truePath), Mode: ralphex.ModeFull, Timeout: "5s", WaitOnLimit: "0s"},
-		Acceptance:    []authority.AcceptanceCommand{{Required: true, Timeout: "5s", Argv: []string{truePath}}},
+		Acceptance:    []authority.AcceptanceCommand{{Required: true, Timeout: "5s", Argv: []string{acceptancePath}}},
 		PolicyVersion: "service-registration-v1",
 	}
 	governed, err := authority.New(manifest)

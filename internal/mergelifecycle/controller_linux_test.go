@@ -476,12 +476,19 @@ func newControllerFixture(t *testing.T) controllerFixture {
 	headTree := runGitTest(t, repositoryPath, "rev-parse", "HEAD^{tree}")
 
 	binary, _ := exec.LookPath("true")
+	// Acceptance must be a command that could fail; manifest validation rejects
+	// no-op commands such as /usr/bin/true. The Ralphex binary may still be a
+	// no-op because it is the implementation engine, not the acceptance gate.
+	acceptanceValidator := filepath.Join(t.TempDir(), "acceptance-validator")
+	if err := os.WriteFile(acceptanceValidator, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	manifest := authority.Manifest{
 		RunID: "run-merge-1", Repository: authority.RepositoryManifest{Path: repositoryPath, Identity: "octo-org/control-plane", Remotes: map[string]string{"origin": "https://github.com/octo-org/control-plane"}, DefaultBranch: "main", StartSHA: baseSHA},
 		Plan:       authority.PlanManifest{Path: planPath, SHA256: hashFileTest(t, planPath)},
 		Ralphex:    authority.RalphexManifest{BinaryPath: binary, BinarySHA256: hashFileTest(t, binary), SourceSHA: "source", Mode: ralphex.ModeTasksOnly, Timeout: "5s", WaitOnLimit: "0s"},
 		Executor:   authority.ExecutorPolicy{Executor: "codex", TaskModel: "test", TaskEffort: "xhigh", ReviewModel: "test", ReviewEffort: "xhigh"},
-		Acceptance: []authority.AcceptanceCommand{{Name: "test", Class: "unit", Required: true, Timeout: "5s", Argv: []string{binary}}}, PolicyVersion: "phase3-v1",
+		Acceptance: []authority.AcceptanceCommand{{Name: "test", Class: "unit", Required: true, Timeout: "5s", Argv: []string{acceptanceValidator}}}, PolicyVersion: "phase3-v1",
 	}
 	phase3, err := authority.New(manifest)
 	if err != nil {

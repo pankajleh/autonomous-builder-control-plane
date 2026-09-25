@@ -1989,6 +1989,15 @@ git commit -qm 'candidate implementation' || exit 91
 
 func newRunFixtureWithScript(t *testing.T, script string, worktree authority.WorktreePolicy, acceptanceArgv ...string) runFixture {
 	t.Helper()
+	// Callers that pass the `true` binary use it only as a placeholder for "the
+	// default acceptance command". Acceptance must be a command that could fail,
+	// because manifest validation rejects no-op commands such as /usr/bin/true:
+	// a command that cannot fail would turn every candidate into BRANCH_ACCEPTED.
+	// Deliberate acceptance commands (for example `false`, or `test -f x`) are
+	// passed through unchanged.
+	if len(acceptanceArgv) == 1 && filepath.Base(acceptanceArgv[0]) == "true" {
+		acceptanceArgv = []string{acceptanceValidator(t)}
+	}
 	repository := filepath.Join(t.TempDir(), "repository")
 	runGit(t, "", "init", "-b", "main", repository)
 	runGit(t, repository, "config", "user.email", "controller@example.test")
@@ -2267,4 +2276,16 @@ func testHash(t *testing.T, path string) string {
 	}
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
+}
+
+// acceptanceValidator writes a real executable acceptance command. Manifest
+// validation rejects no-op commands such as /usr/bin/true because they cannot
+// reject a candidate, so fixtures use a genuine executable instead.
+func acceptanceValidator(t *testing.T) string {
+	t.Helper()
+	validator := filepath.Join(t.TempDir(), "acceptance-validator")
+	if err := os.WriteFile(validator, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return validator
 }
