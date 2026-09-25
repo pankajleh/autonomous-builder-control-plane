@@ -44,6 +44,7 @@ type admissionAuthority struct {
 	repositoryBaseSHA      string
 	canonicalRequestSHA256 string
 	plan                   func(serviceapi.Principal, string, string) []byte
+	legacyPlan             func(serviceapi.Principal, string, string) []byte
 	capsuleSpec            func(string, string) contextcapsule.Spec
 }
 
@@ -53,6 +54,9 @@ func productAdmissionAuthority(request serviceapi.RunAdmissionRequestV1) admissi
 		canonicalRequestSHA256: RequestDigest(request),
 		plan: func(principal serviceapi.Principal, repositoryIdentity, runID string) []byte {
 			return decorateAdmissionPlan(admissionPlan(principal, request), repositoryIdentity, runID)
+		},
+		legacyPlan: func(principal serviceapi.Principal, repositoryIdentity, runID string) []byte {
+			return legacyDecorateAdmissionPlan(admissionPlan(principal, request), repositoryIdentity, runID)
 		},
 		capsuleSpec: func(repositoryIdentity, planRelative string) contextcapsule.Spec {
 			return admissionCapsuleSpecForIdentity(repositoryIdentity, request, planRelative)
@@ -66,6 +70,9 @@ func developmentAdmissionAuthority(request serviceapi.DevelopmentRunAdmissionReq
 		repositoryBaseSHA: request.RepositoryBaseSHA, canonicalRequestSHA256: DevelopmentRequestDigest(request),
 		plan: func(principal serviceapi.Principal, repositoryIdentity, runID string) []byte {
 			return decorateAdmissionPlan(developmentAdmissionPlan(principal, request), repositoryIdentity, runID)
+		},
+		legacyPlan: func(principal serviceapi.Principal, repositoryIdentity, runID string) []byte {
+			return legacyDecorateAdmissionPlan(developmentAdmissionPlan(principal, request), repositoryIdentity, runID)
 		},
 		capsuleSpec: func(repositoryIdentity, planRelative string) contextcapsule.Spec {
 			return developmentAdmissionCapsuleSpecForIdentity(repositoryIdentity, request, planRelative)
@@ -684,7 +691,9 @@ func validateAdmissionBindingMaterial(binding AdmissionBindingV1, principal serv
 		return err
 	}
 	plan, found, err := readRegularAt(runFD, "plan.md", MaxManifestTemplateBytes)
-	if err != nil || !found || !bytes.Equal(plan, admission.plan(principal, binding.RepositoryIdentity, binding.RunID)) {
+	currentPlan := admission.plan(principal, binding.RepositoryIdentity, binding.RunID)
+	legacyPlan := admission.legacyPlan(principal, binding.RepositoryIdentity, binding.RunID)
+	if err != nil || !found || (!bytes.Equal(plan, currentPlan) && !bytes.Equal(plan, legacyPlan)) {
 		return errors.New("admission plan binding is invalid")
 	}
 	capsuleData, found, err := readRegularAt(runFD, "context-capsule.json", MaxManifestTemplateBytes)
@@ -787,7 +796,7 @@ func validateReceipt(receipt AdmissionReceiptV1, name string) error {
 	expectedRunID := DeriveRunID(receipt.Principal.PrincipalID, receipt.RequestID)
 	if receipt.AdmissionKind == admissionKindDevelopment {
 		expectedRunID = DeriveDevelopmentRunID(receipt.Principal.PrincipalID, receipt.RequestID)
-		if receipt.ProfileID != DevelopmentProfileID {
+		if receipt.ProfileID != DevelopmentProfileID && receipt.ProfileID != DevelopmentProfileIDV2 {
 			return errors.New("invalid development admission profile")
 		}
 	} else if receipt.AdmissionKind != "" {
@@ -855,8 +864,10 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, admissio
 	runDirectory := filepath.Join(profile.inputPath, runID)
 	planPath := filepath.Join(runDirectory, "plan.md")
 	planRelative := profile.configuration.InputDirectory + "/" + runID + "/plan.md"
-	plan := admission.plan(principal, profile.configuration.RepositoryIdentity, runID)
-	if err := createOrVerifyAt(runFD, "plan.md", plan); err != nil {
+	currentPlan := admission.plan(principal, profile.configuration.RepositoryIdentity, runID)
+	legacyPlan := admission.legacyPlan(principal, profile.configuration.RepositoryIdentity, runID)
+	plan, err := createOrVerifyAdmissionPlanAt(runFD, currentPlan, legacyPlan)
+	if err != nil {
 		return "", runBinding{}, err
 	}
 	spec := admission.capsuleSpec(profile.configuration.RepositoryIdentity, planRelative)
@@ -903,6 +914,14 @@ func developmentAdmissionPlan(principal serviceapi.Principal, request serviceapi
 }
 
 func decorateAdmissionPlan(plan []byte, repositoryIdentity, runID string) []byte {
+	return decorateAdmissionPlanWithID(plan, repositoryIdentity, runID, runID)
+}
+
+func legacyDecorateAdmissionPlan(plan []byte, repositoryIdentity, runID string) []byte {
+	return decorateAdmissionPlanWithID(plan, repositoryIdentity, runID, strings.TrimPrefix(runID, "admission-"))
+}
+
+func decorateAdmissionPlanWithID(plan []byte, repositoryIdentity, runID, admissionID string) []byte {
 	text := string(plan)
 	title, project := admissionDisplayMetadata(text)
 	if title == "" {
@@ -916,14 +935,35 @@ func decorateAdmissionPlan(plan []byte, repositoryIdentity, runID string) []byte
 	if repositoryIdentity != "" {
 		lines = append(lines, "Repository: "+repositoryIdentity)
 	}
-	if id := strings.TrimPrefix(runID, "admission-"); id != "" {
-		lines = append(lines, "Admission-ID: "+id)
+	if admissionID != "" {
+		lines = append(lines, "Admission-ID: "+admissionID)
 	}
 	insert := strings.Join(lines, "\n") + "\n"
 	if newline := strings.IndexByte(text, '\n'); newline >= 0 {
 		return []byte(text[:newline+1] + insert + text[newline+1:])
 	}
 	return []byte(text + "\n" + insert)
+}
+
+func createOrVerifyAdmissionPlanAt(runFD int, current, legacy []byte) ([]byte, error) {
+	data, found, err := readRegularAt(runFD, "plan.md", MaxManifestTemplateBytes)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		if bytes.Equal(data, current) || bytes.Equal(data, legacy) {
+			return data, nil
+		}
+		return nil, errors.New("existing admission material differs")
+	}
+	if err := writeNewAtomicAt(runFD, "plan.md", current); err != nil {
+		return nil, err
+	}
+	data, found, err = readRegularAt(runFD, "plan.md", MaxManifestTemplateBytes)
+	if err != nil || !found || !bytes.Equal(data, current) {
+		return nil, errors.New("admission material verification failed")
+	}
+	return data, nil
 }
 
 func admissionDisplayMetadata(text string) (string, string) {

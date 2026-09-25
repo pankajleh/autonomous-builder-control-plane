@@ -129,6 +129,116 @@ func TestDevelopmentIdentityIsNamespacedAndPlanCarriesOnlyDevelopmentAuthority(t
 	}
 }
 
+func TestAdmissionMetadataUsesFullRunIDAndKeepsLegacyFormDeterministic(t *testing.T) {
+	runID := "admission-" + strings.Repeat("a", 64)
+	raw := []byte("# Development run admission\n\n## Objective\nShip the slice.\n")
+	current := decorateAdmissionPlan(raw, "example/product", runID)
+	legacy := legacyDecorateAdmissionPlan(raw, "example/product", runID)
+
+	header := func(plan []byte, prefix string) string {
+		t.Helper()
+		for _, line := range strings.Split(string(plan), "\n") {
+			if strings.HasPrefix(line, prefix) {
+				return strings.TrimPrefix(line, prefix)
+			}
+		}
+		return ""
+	}
+	if got := header(current, "Admission-ID: "); got != runID {
+		t.Fatalf("current Admission-ID = %q, want %q", got, runID)
+	}
+	if got, want := header(legacy, "Admission-ID: "), strings.TrimPrefix(runID, "admission-"); got != want {
+		t.Fatalf("legacy Admission-ID = %q, want %q", got, want)
+	}
+	for _, prefix := range []string{"Display-Title: ", "Project: ", "Repository: "} {
+		if header(current, prefix) != header(legacy, prefix) {
+			t.Fatalf("%s changed between current and legacy decoration", prefix)
+		}
+	}
+	if got := header(decorateAdmissionPlan(raw, "example/product", ""), "Admission-ID: "); got != "" {
+		t.Fatalf("empty run ID emitted Admission-ID %q", got)
+	}
+}
+
+func TestLegacyAdmissionPlanRecoveryAndRegisteredReplay(t *testing.T) {
+	t.Run("product", func(t *testing.T) {
+		fixture := newAdmissionFixture(t, true)
+		runID := DeriveRunID(fixture.principal.PrincipalID, fixture.request.RequestID)
+		legacy := legacyDecorateAdmissionPlan(admissionPlan(fixture.principal, fixture.request), "example/product", runID)
+		seedAdmissionPlan(t, fixture.input, runID, legacy)
+
+		response, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertAdmissionPlanBytes(t, fixture.input, runID, legacy)
+		before := readAdmissionMaterial(t, fixture.input, runID)
+		registerFixtureRun(t, fixture, runID)
+		replayed, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)
+		if err != nil || replayed != response {
+			t.Fatalf("legacy product registered replay = %+v, %v", replayed, err)
+		}
+		assertAdmissionPlanBytes(t, fixture.input, runID, legacy)
+		assertAdmissionMaterialUnchanged(t, fixture.input, runID, before)
+	})
+
+	t.Run("development", func(t *testing.T) {
+		fixture := newAdmissionFixture(t, true)
+		request := testDevelopmentAdmissionRequest(fixture.request.RepositoryBaseSHA, "# Frozen capsule\n\nImplement it.\n")
+		runID := DeriveDevelopmentRunID(fixture.principal.PrincipalID, request.RequestID)
+		legacy := legacyDecorateAdmissionPlan(developmentAdmissionPlan(fixture.principal, request), "example/product", runID)
+		seedAdmissionPlan(t, fixture.input, runID, legacy)
+
+		response, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertAdmissionPlanBytes(t, fixture.input, runID, legacy)
+		before := readAdmissionMaterial(t, fixture.input, runID)
+		registerFixtureRun(t, fixture, runID)
+		replayed, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, request)
+		if err != nil || replayed != response {
+			t.Fatalf("legacy development registered replay = %+v, %v", replayed, err)
+		}
+		assertAdmissionPlanBytes(t, fixture.input, runID, legacy)
+		assertAdmissionMaterialUnchanged(t, fixture.input, runID, before)
+	})
+
+	t.Run("third form rejected", func(t *testing.T) {
+		fixture := newAdmissionFixture(t, true)
+		runID := DeriveRunID(fixture.principal.PrincipalID, fixture.request.RequestID)
+		invalid := decorateAdmissionPlanWithID(admissionPlan(fixture.principal, fixture.request), "example/product", runID, "third-form")
+		seedAdmissionPlan(t, fixture.input, runID, invalid)
+		if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); !errors.Is(err, serviceapi.ErrUnsafeAdmissionMaterialization) {
+			t.Fatalf("third-form admission material = %v", err)
+		}
+	})
+}
+
+func TestDevelopmentV2AdmissionReplaysWithPersistedReceipt(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	request := testDevelopmentAdmissionRequest(fixture.request.RepositoryBaseSHA, "# Frozen v2 capsule\n\nImplement it.\n")
+	request.ProfileID = DevelopmentProfileIDV2
+
+	response, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID := DeriveDevelopmentRunID(fixture.principal.PrincipalID, request.RequestID)
+	registerFixtureRun(t, fixture, runID)
+
+	replayed, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, request)
+	if err != nil || replayed != response {
+		t.Fatalf("v2 development replay = %+v, %v", replayed, err)
+	}
+
+	conflict := request
+	setDevelopmentMarkdown(&conflict, "changed v2 capsule")
+	if _, err := fixture.controller.AdmitDevelopmentRun(context.Background(), fixture.principal, conflict); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
+		t.Fatalf("v2 conflicting replay = %v", err)
+	}
+}
+
 func TestDevelopmentAdmissionMaterializesReplaysConflictsAndDoesNotAliasProduct(t *testing.T) {
 	fixture := newAdmissionFixture(t, true)
 	defer fixture.closeLocks()
@@ -143,7 +253,8 @@ func TestDevelopmentAdmissionMaterializesReplaysConflictsAndDoesNotAliasProduct(
 		t.Fatalf("development admission response = %+v", response)
 	}
 	plan, err := os.ReadFile(filepath.Join(fixture.input, expectedRunID, "plan.md"))
-	if err != nil || !bytes.Contains(plan, []byte(request.TaskMarkdown)) || !bytes.Contains(plan, []byte(request.DevelopmentCapsuleSHA256)) {
+	if err != nil || !bytes.Contains(plan, []byte(request.TaskMarkdown)) || !bytes.Contains(plan, []byte(request.DevelopmentCapsuleSHA256)) ||
+		!bytes.Contains(plan, []byte("Admission-ID: "+expectedRunID+"\n")) {
 		t.Fatalf("materialized development plan = %q, err=%v", plan, err)
 	}
 	capsuleData, err := os.ReadFile(filepath.Join(fixture.input, expectedRunID, "context-capsule.json"))
@@ -277,7 +388,8 @@ func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
 		t.Fatalf("launch argv = %#v", starts)
 	}
 	plan, err := os.ReadFile(filepath.Join(fixture.input, expectedRunID, "plan.md"))
-	if err != nil || !strings.Contains(string(plan), fixture.request.ProductManifestSHA256) || !strings.Contains(string(plan), fixture.request.TaskMarkdown) || strings.Contains(string(plan), "--manifest") {
+	if err != nil || !strings.Contains(string(plan), fixture.request.ProductManifestSHA256) || !strings.Contains(string(plan), fixture.request.TaskMarkdown) ||
+		strings.Contains(string(plan), "--manifest") || !strings.Contains(string(plan), "Admission-ID: "+expectedRunID+"\n") {
 		t.Fatalf("materialized product plan = %q, err=%v", plan, err)
 	}
 	var manifest authority.Manifest
@@ -1224,10 +1336,63 @@ func writeAdmissionConfiguration(t *testing.T, root, repository, _ string) (stri
 	}
 	developmentProfile := productProfile
 	developmentProfile.ProfileID = DevelopmentProfileID
-	profile := ProfileFileV1{SchemaVersion: 1, Profiles: []ProfileV1{productProfile, developmentProfile}}
+	developmentProfileV2 := productProfile
+	developmentProfileV2.ProfileID = DevelopmentProfileIDV2
+	profile := ProfileFileV1{SchemaVersion: 1, Profiles: []ProfileV1{productProfile, developmentProfile, developmentProfileV2}}
 	profilePath := filepath.Join(root, "admission-profiles.json")
 	writeProtectedJSON(t, profilePath, profile)
 	return profilePath, &admissionTestCatalog{records: make(map[string]runtimecatalog.RunRegistrationV1)}
+}
+
+func seedAdmissionPlan(t *testing.T, input, runID string, plan []byte) {
+	t.Helper()
+	runDirectory := filepath.Join(input, runID)
+	if err := os.MkdirAll(runDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(runDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDirectory, "plan.md"), plan, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertAdmissionPlanBytes(t *testing.T, input, runID string, expected []byte) {
+	t.Helper()
+	observed, err := os.ReadFile(filepath.Join(input, runID, "plan.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(observed, expected) {
+		t.Fatalf("admission plan bytes changed\nobserved: %q\nexpected: %q", observed, expected)
+	}
+}
+
+func readAdmissionMaterial(t *testing.T, input, runID string) map[string][]byte {
+	t.Helper()
+	result := make(map[string][]byte)
+	for _, name := range []string{"plan.md", "context-capsule.json", "manifest.json"} {
+		data, err := os.ReadFile(filepath.Join(input, runID, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		result[name] = data
+	}
+	return result
+}
+
+func assertAdmissionMaterialUnchanged(t *testing.T, input, runID string, expected map[string][]byte) {
+	t.Helper()
+	for name, want := range expected {
+		got, err := os.ReadFile(filepath.Join(input, runID, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s changed across legacy registered replay", name)
+		}
+	}
 }
 
 func registerFixtureRun(t *testing.T, fixture *admissionFixture, runID string) {
