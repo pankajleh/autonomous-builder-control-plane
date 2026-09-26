@@ -26,6 +26,9 @@ type Store struct {
 	dir, lock    *os.File
 	next         uint64
 	sequenceInfo os.FileInfo
+	registryInfo os.FileInfo
+	registry     initializationRegistry
+	registryHash string
 	cache        map[string]*runLog
 	closed       bool
 }
@@ -51,6 +54,7 @@ type logAnchor struct {
 
 type sequenceState struct {
 	Next     uint64 `json:"next"`
+	Registry string `json:"registry"`
 	Checksum string `json:"checksum"`
 }
 
@@ -91,11 +95,11 @@ func OpenStore(root string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{root: root, dir: dir, lock: lock, cache: map[string]*runLog{}}
-	data, err := readFile(filepath.Join(root, "sequence"), 128, true)
+	data, err := readFile(filepath.Join(root, "sequence"), 256, true)
 	var sequence sequenceState
 	if errors.Is(err, os.ErrNotExist) {
-		entries, e := dir.ReadDir(-1)
-		if e != nil {
+		entries, e := dir.ReadDir(2*runtimecatalog.MaxRuns + 11)
+		if e != nil && e != io.EOF || len(entries) > 2*runtimecatalog.MaxRuns+10 {
 			s.Close()
 			return nil, ErrIntegrity
 		}
@@ -105,16 +109,27 @@ func OpenStore(root string) (*Store, error) {
 				return nil, ErrIntegrity
 			}
 		}
-		if err = s.saveSequence(0); err != nil {
+		info, e := dir.Stat()
+		if e != nil {
+			s.Close()
+			return nil, ErrIntegrity
+		}
+		s.registry = initializationRegistry{Namespace: identity(root, physicalID(info)), Runs: map[string]initializedRun{}}
+		if err = s.saveRegistry(); err != nil {
 			s.Close()
 			return nil, err
 		}
-	} else if err != nil || strictjson.Decode(data, &sequence) != nil || sequence.Next > 1<<53-1 || sequence.Checksum != jsonDigest(sequence.Next) {
+	} else if err != nil || strictjson.Decode(data, &sequence) != nil || sequence.Next > 1<<53-1 || len(sequence.Registry) != 64 || sequence.Checksum != sequenceChecksum(sequence) {
 		s.Close()
 		return nil, ErrIntegrity
 	}
 	if data != nil {
 		s.next = sequence.Next
+		s.registryHash = sequence.Registry
+		if err = s.loadRegistry(); err != nil {
+			s.Close()
+			return nil, err
+		}
 	}
 	seq, err := openRegular(filepath.Join(root, "sequence"), os.O_RDONLY, true)
 	if err != nil {
@@ -129,8 +144,14 @@ func OpenStore(root string) (*Store, error) {
 	}
 	// Check the committed high water marks before allocating any new run's
 	// ordinal, so a rolled-back sequence cannot alias another run on restart.
-	entries, scanErr := os.ReadDir(root)
-	if scanErr != nil || len(entries) > 2*runtimecatalog.MaxRuns+10 {
+	scan, scanErr := openDirectory(root)
+	if scanErr != nil {
+		s.Close()
+		return nil, ErrIntegrity
+	}
+	entries, scanErr := scan.ReadDir(2*runtimecatalog.MaxRuns + 11)
+	scan.Close()
+	if scanErr != nil && scanErr != io.EOF || len(entries) > 2*runtimecatalog.MaxRuns+10 {
 		s.Close()
 		return nil, ErrIntegrity
 	}
@@ -173,7 +194,9 @@ func (s *Store) saveSequence(next uint64) error {
 	if err != nil {
 		return ErrIntegrity
 	}
-	data, _ := json.Marshal(sequenceState{Next: next, Checksum: jsonDigest(next)})
+	state := sequenceState{Next: next, Registry: s.registryHash}
+	state.Checksum = sequenceChecksum(state)
+	data, _ := json.Marshal(state)
 	_, err = f.Write(data)
 	err = errors.Join(err, f.Sync(), f.Close())
 	if err != nil {
@@ -210,11 +233,18 @@ func (s *Store) load(run, registration string) (*runLog, error) {
 	if err != nil || e != nil || !os.SameFile(info, original) {
 		return nil, ErrIntegrity
 	}
+	if err = s.checkRegistry(); err != nil {
+		return nil, err
+	}
+	initialized, known := s.registry.Runs[run]
+	if known && initialized.Registration != digest([]byte(registration)) {
+		return nil, ErrIntegrity
+	}
 	path := s.path(run)
 	anchor, anchorErr := s.readAnchor(path + ".anchor.json")
 	f, err := openRegular(path, os.O_RDONLY, true)
 	if errors.Is(err, os.ErrNotExist) {
-		if _, exists := s.cache[run]; exists || !errors.Is(anchorErr, os.ErrNotExist) {
+		if _, exists := s.cache[run]; exists || known || !errors.Is(anchorErr, os.ErrNotExist) {
 			return nil, ErrIntegrity
 		}
 		var seed [32]byte
@@ -222,6 +252,17 @@ func (s *Store) load(run, registration string) (*runLog, error) {
 			return nil, err
 		}
 		h := logHeader{run, hex.EncodeToString(seed[:]), registration}
+		if len(s.registry.Runs) >= runtimecatalog.MaxRuns {
+			return nil, ErrExhausted
+		}
+		initialized = initializedRun{Generation: h.Generation, Registration: digest([]byte(registration))}
+		s.registry.Runs[run] = initialized
+		// Persist the independent initialization witness BEFORE creating a log.
+		// An interrupted initialization fails closed; it cannot erase a generation.
+		if err = s.saveRegistry(); err != nil {
+			return nil, err
+		}
+		known = true
 		data, _ := json.Marshal(h)
 		data = append(data, '\n')
 		f, err = openRegular(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, true)
@@ -247,6 +288,9 @@ func (s *Store) load(run, registration string) (*runLog, error) {
 		return nil, ErrIntegrity
 	}
 	defer f.Close()
+	if !known || anchor.Generation != initialized.Generation {
+		return nil, ErrIntegrity
+	}
 	info, err = f.Stat()
 	if err != nil || info.Size() > MaxBytes || anchorErr != nil || anchor.Bytes > info.Size() || anchor.Bytes <= 0 || anchor.Physical == "" || anchor.Physical != generationFileID(f) {
 		return nil, ErrIntegrity

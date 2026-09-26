@@ -47,12 +47,13 @@ type session struct {
 }
 
 type sidecar struct {
-	url        string
-	client     *http.Client
-	command    *exec.Cmd
-	runtimeDir string
-	done       chan struct{}
-	cancel     context.CancelFunc
+	url          string
+	client       *http.Client
+	command      *exec.Cmd
+	runtimeDir   string
+	runtimeLease *os.File
+	done         chan struct{}
+	cancel       context.CancelFunc
 }
 
 func providerClient() *http.Client {
@@ -119,12 +120,7 @@ func startSidecar(ctx context.Context, scope Scope, root string) (*sidecar, erro
 	// The provider installs configuration before entering watch-only mode.
 	// Give it a private home and cwd outside the admitted repository so neither
 	// default installation nor local project configuration can affect the run.
-	parent, err := privateDirectory(root, false)
-	if err != nil {
-		return nil, ErrUnavailable
-	}
-	parent.Close()
-	runtimeDir, err := os.MkdirTemp(root, "activity-sidecar-")
+	runtimeDir, lease, err := newSidecarRuntime(startup, root)
 	if err != nil {
 		return nil, ErrUnavailable
 	}
@@ -132,6 +128,7 @@ func startSidecar(ctx context.Context, scope Scope, root string) (*sidecar, erro
 	defer func() {
 		if !keepRuntime {
 			os.RemoveAll(runtimeDir)
+			lease.Close()
 		}
 	}()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -145,12 +142,15 @@ func startSidecar(ctx context.Context, scope Scope, root string) (*sidecar, erro
 	command.Env = append(gitexec.Environment(), "HOME="+runtimeDir)
 	command.Dir = runtimeDir
 	pinExecutable(command, binary)
-	if err = command.Start(); err != nil {
+	// Both controller and child retain the runtime lease. Reconciliation must
+	// not remove runtime state while either process is still alive.
+	command.ExtraFiles = append(command.ExtraFiles, lease)
+	done := make(chan struct{})
+	if err = startContained(command, done); err != nil {
 		cancel()
 		return nil, ErrUnavailable
 	}
-	sc := &sidecar{url: "http://127.0.0.1:" + strconv.Itoa(port), client: providerClient(), command: command, runtimeDir: runtimeDir, done: make(chan struct{}), cancel: cancel}
-	go func() { _ = command.Wait(); close(sc.done) }()
+	sc := &sidecar{url: "http://127.0.0.1:" + strconv.Itoa(port), client: providerClient(), command: command, runtimeDir: runtimeDir, runtimeLease: lease, done: done, cancel: cancel}
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -179,6 +179,7 @@ func (s *sidecar) close() {
 	<-s.done
 	s.client.CloseIdleConnections()
 	os.RemoveAll(s.runtimeDir)
+	s.runtimeLease.Close()
 }
 
 func (s *sidecar) sessions(ctx context.Context) ([]session, error) {

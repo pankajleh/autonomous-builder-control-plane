@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -130,10 +131,14 @@ func (r Resolver) Resolve(ctx context.Context, run string) (Scope, error) {
 // Git subprocesses are bounded and inherit the repository's existing sanitized
 // Git environment, including protection from GIT_DIR/worktree overrides.
 func git(ctx context.Context, path string, args ...string) (string, error) {
+	return gitEnvironment(ctx, path, nil, args...)
+}
+
+func gitEnvironment(ctx context.Context, path string, extra []string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", path}, args...)...)
-	cmd.Env = gitexec.Environment()
+	cmd.Env = append(gitexec.Environment(), extra...)
 	var out limitedBuffer
 	cmd.Stdout = &out
 	cmd.Stderr = io.Discard
@@ -141,6 +146,41 @@ func git(ctx context.Context, path string, args ...string) (string, error) {
 		return "", ErrUnavailable
 	}
 	return strings.TrimSpace(out.String()), nil
+}
+
+// Never let index stat caches or hidden-worktree flags certify source content.
+// A fresh private index starts at the immutable HEAD tree with no cached stat
+// data, so really-refresh must hash the tracked worktree content independently.
+// The governed index is only read, never refreshed or modified by this observer.
+func checkpointClean(ctx context.Context, path, head string) bool {
+	flags, err := git(ctx, path, "ls-files", "-v", "-z")
+	if err != nil {
+		return false
+	}
+	for _, entry := range strings.Split(flags, "\x00") {
+		if entry != "" && !strings.HasPrefix(entry, "H ") {
+			return false
+		}
+	}
+	status, err := git(ctx, path, "status", "--porcelain", "--untracked-files=all")
+	if err != nil || status != "" {
+		return false
+	}
+	dir, err := os.MkdirTemp("", "abcp-checkpoint-")
+	if err != nil {
+		return false
+	}
+	defer os.RemoveAll(dir)
+	env := []string{"GIT_INDEX_FILE=" + filepath.Join(dir, "index")}
+	config := []string{"-c", "core.ignorestat=false", "-c", "core.filemode=true", "-c", "core.sparseCheckout=false", "-c", "core.splitIndex=false"}
+	if _, err = gitEnvironment(ctx, path, env, append(config, "read-tree", "--no-sparse-checkout", head)...); err != nil {
+		return false
+	}
+	if _, err = gitEnvironment(ctx, path, env, append(config, "update-index", "--really-refresh")...); err != nil {
+		return false
+	}
+	_, err = gitEnvironment(ctx, path, env, append(config, "diff-files", "--quiet", "--no-ext-diff", "--ignore-submodules=none", "--")...)
+	return err == nil
 }
 
 type limitedBuffer struct {
@@ -207,12 +247,11 @@ func checkpoint(ctx context.Context, scope Scope, now time.Time) (Event, bool) {
 	if err != nil || path != scope.Worktree {
 		return Event{}, false
 	}
-	status, err := git(ctx, path, "status", "--porcelain", "--untracked-files=all")
-	if err != nil || status != "" {
-		return Event{}, false
-	}
 	head, err := git(ctx, path, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil || !gitSHA.MatchString(head) || head == scope.Base {
+		return Event{}, false
+	}
+	if !checkpointClean(ctx, path, head) {
 		return Event{}, false
 	}
 	if _, err = git(ctx, path, "merge-base", "--is-ancestor", scope.Base, head); err != nil {
@@ -231,8 +270,7 @@ func checkpoint(ctx context.Context, scope Scope, now time.Time) (Event, bool) {
 	if err != nil || next != head {
 		return Event{}, false
 	}
-	status, err = git(ctx, path, "status", "--porcelain", "--untracked-files=all")
-	if err != nil || status != "" {
+	if !checkpointClean(ctx, path, head) {
 		return Event{}, false
 	}
 	e := baseEvent(scope.RunID, now)

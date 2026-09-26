@@ -5,6 +5,7 @@ package activity
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,3 +221,70 @@ func TestCheckpointNeedsCleanExactDescendant(t *testing.T) {
 		t.Fatal("unrelated history emitted")
 	}
 }
+
+func TestCheckpointRejectsHiddenTrackedChanges(t *testing.T) {
+	for _, flag := range []string{"--skip-worktree", "--assume-unchanged"} {
+		for _, dirty := range []bool{false, true} {
+			t.Run(flag+fmt.Sprint(dirty), func(t *testing.T) {
+				f := newBindingFixture(t)
+				command(t, f.worktree, "commit", "--allow-empty", "-m", "descendant")
+				command(t, f.worktree, "update-index", flag, "source")
+				if dirty {
+					if err := os.WriteFile(filepath.Join(f.worktree, "source"), []byte("hidden change\n"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if status := command(t, f.worktree, "status", "--porcelain"); status != "" {
+					t.Fatalf("fixture did not hide tracked state: %q", status)
+				}
+				if _, ok := checkpoint(context.Background(), f.scope, testTime); ok {
+					t.Fatal("hidden index flag certified as clean")
+				}
+			})
+		}
+	}
+}
+
+func TestCheckpointIndependentlyVerifiesContentAndRevalidates(t *testing.T) {
+	for _, scenario := range []string{"initial-content", "final-content", "final-skip-worktree", "final-assume-unchanged"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newBindingFixture(t)
+			command(t, f.worktree, "commit", "--allow-empty", "-m", "descendant")
+			gitPath, err := exec.LookPath("git")
+			if err != nil {
+				t.Fatal(err)
+			}
+			wrapper := t.TempDir()
+			// Force status to return a false clean result. For final-boundary
+			// cases mutate only after the initial fresh-index verification, when
+			// checkpoint begins its ancestry proof. The content cases keep the
+			// real index flags normal so only independent content checks reject.
+			script := "#!/bin/sh\nreal=" + shellQuote(gitPath) + "\n"
+			if scenario == "initial-content" {
+				os.WriteFile(filepath.Join(f.worktree, "source"), []byte("hidden\n"), 0600)
+			} else {
+				script += "if [ \"$3\" = merge-base ]; then\n"
+				if scenario == "final-content" {
+					script += "  printf 'hidden\\n' > " + shellQuote(filepath.Join(f.worktree, "source")) + "\n"
+				} else {
+					flag := "--skip-worktree"
+					if scenario == "final-assume-unchanged" {
+						flag = "--assume-unchanged"
+					}
+					script += "  \"$real\" -C " + shellQuote(f.worktree) + " update-index " + flag + " source\n"
+				}
+				script += "fi\n"
+			}
+			script += "if [ \"$3\" = status ]; then exit 0; fi\nexec \"$real\" \"$@\"\n"
+			if err = os.WriteFile(filepath.Join(wrapper, "git"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", wrapper+string(os.PathListSeparator)+os.Getenv("PATH"))
+			if _, ok := checkpoint(context.Background(), f.scope, testTime); ok {
+				t.Fatal("unverified tracked content certified clean")
+			}
+		})
+	}
+}
+
+func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'" }

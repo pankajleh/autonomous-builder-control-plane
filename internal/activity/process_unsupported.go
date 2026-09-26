@@ -7,5 +7,6 @@ import (
 	"os/exec"
 )
 
-func pinExecutable(*exec.Cmd, *os.File) {}
-func ownsListener(int, int) bool        { return false }
+func pinExecutable(*exec.Cmd, *os.File)             {}
+func ownsListener(int, int) bool                    { return false }
+func startContained(*exec.Cmd, chan struct{}) error { return ErrUnavailable }

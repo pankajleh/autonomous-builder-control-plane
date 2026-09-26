@@ -52,6 +52,8 @@ func New(parent context.Context, root string, catalog Catalog, snapshots Snapsho
 		return nil, ErrUnavailable
 	}
 	ctx, cancel := context.WithCancel(parent)
+	// Runtime cleanup is provider-only: failure cannot disable ledger reads.
+	_ = reconcileSidecarRuntime(ctx, root)
 	store, _ := OpenStore(root + "/activity")
 	return &Service{store: store, resolver: Resolver{root, catalog}, snapshots: snapshots, cursors: cursors, ctx: ctx, cancel: cancel, workers: map[string]*worker{}, faults: map[string]error{}, sidecars: map[string]*sharedSidecar{}, now: time.Now}, nil
 }

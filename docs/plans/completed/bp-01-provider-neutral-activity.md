@@ -370,7 +370,7 @@ The pre-implementation plan review above is not an implementation review verdict
 
 ## Post-run external-review correction authority — 2026-09-26
 
-Status: **CORRECTION AUTHORIZED — SAME BP-01 SCOPE ONLY**
+Status: **CORRECTION IMPLEMENTED — LOCAL CANDIDATE; NEW EXACT-HEAD REVIEW REQUIRED**
 
 Exact reviewed candidate with blocked publication:
 `122c337a8d2981d8567d90488dbc7748a190b045`
@@ -407,13 +407,13 @@ The correction must resolve exactly these three confirmed Major findings:
 
 ### Task 2: Correct the three external-review Major findings
 
-- [ ] Preserve exact BP-01 HTTP/activity authority semantics and original path ceiling.
-- [ ] Harden checkpoint cleanliness against hidden index flags and hidden tracked-file changes, including final revalidation.
-- [ ] Add independent durable run-initialization/generation registry so paired log+anchor deletion after acknowledged history fails integrity across restart/cache eviction.
-- [ ] Add Linux parent-death containment and bounded stale sidecar-runtime reconciliation.
-- [ ] Add adversarial regression tests for all three findings.
-- [ ] Re-run focused tests, focused race, vet, full tests, full race, full vet, Darwin compile-only, diff/path checks.
-- [ ] Leave one clean correction candidate commit for a new independent exact-head publication review.
+- [x] Preserve exact BP-01 HTTP/activity authority semantics and original path ceiling.
+- [x] Harden checkpoint cleanliness against hidden index flags and hidden tracked-file changes, including final revalidation.
+- [x] Add independent durable run-initialization/generation registry so paired log+anchor deletion after acknowledged history fails integrity across restart/cache eviction.
+- [x] Add Linux parent-death containment and bounded stale sidecar-runtime reconciliation.
+- [x] Add adversarial regression tests for all three findings.
+- [x] Re-run focused tests, focused race, vet, full tests, full race, full vet, Darwin compile-only, diff/path checks.
+- [x] Leave one clean correction candidate commit for a new independent exact-head publication review.
 
 Publication remains blocked until this Task 2 correction completes, all operator-owned acceptance gates pass, and a **new** independent exact-head review returns 0 Critical / 0 Major. The prior 122c337 candidate remains review evidence only.
 
@@ -426,3 +426,58 @@ CORRECTION_READY: YES
 ```
 
 The review confirmed the three fixes are implementable inside `internal/activity/**`, add no shared contract or authority, constitute a fresh correction run rather than Review 3, and preserve all operator-owned validation/publication gates.
+
+
+## Correction implementation validation — 2026-09-26
+
+Task 2 resolves the three confirmed Major findings inside `internal/activity/**`.
+The BP-01 HTTP contracts, provider/ABCP authority separation, and original allowed
+source paths are preserved.
+
+Checkpoint observation rejects skip-worktree and assume-unchanged index flags,
+including flags on currently unchanged files. It builds a private temporary index
+from the sampled immutable commit, forces tracked-content refresh independently
+of the governed index's stat cache, and verifies the resulting worktree diff.
+Both hidden-index and tracked-content checks run again at final revalidation.
+Tests cover hidden modifications, falsely clean status output, and changes made
+between the initial observation and final revalidation.
+
+A bounded initialization registry records each run generation and registration
+digest before its log is created or any history is acknowledged. Its digest is
+committed in the durable ordinal allocator, and the registry is bound to the
+existing activity directory identity. Paired log/anchor deletion now fails
+integrity after both cache eviction and restart; genuinely new runs still
+initialize. Registry deletion, corruption, rollback, namespace/generation
+mismatch, resource ceilings, and interrupted initialization have regression
+coverage. Registry publication interrupted before allocator commitment fails the
+activity extension closed. An older activity namespace without the independent
+registry also fails closed; no unsafe legacy-history adoption is attempted.
+Existing authoritative run-ledger endpoints retain their behavior.
+
+Linux sidecars use SIGKILL parent-death containment on a dedicated spawning
+thread retained until child exit. Private runtime directories carry ownership
+markers and a lease inherited by the child. Subsequent service startup and
+sidecar startup reconcile only marked, unleased directories in the dedicated
+private namespace, with bounded directory counts, traversal size, depth, and
+startup time. Unmarked legacy directories, unrelated paths, symbolic-link
+targets, and live-owned directories are preserved. Regression tests kill an
+actual controller subprocess, verify its sidecar exits and listener closes,
+then verify startup removes stale owned runtime state and a new watcher starts.
+Non-Linux provider execution remains unavailable.
+
+Validation passed:
+- `go test ./internal/activity ./internal/serviceapi ./cmd/abcp`
+- `go test -race ./internal/activity ./internal/serviceapi ./cmd/abcp`
+- `go vet ./internal/activity ./internal/serviceapi ./cmd/abcp`
+- `go test ./...`
+- `go test -race ./...`
+- `go vet ./...`
+- `GOOS=darwin GOARCH=amd64 go test -c` for all three affected packages
+- `git diff --check` and staged whitespace checks
+- exact-base changed-path allowlist proof from
+  `935114d21cdd79cf444bdea89c6052e27309a5bf`
+
+This correction candidate still requires a new independent review of its exact
+commit with 0 Critical / 0 Major before publication. The prior blocked candidate
+and correction-authority review do not substitute for that implementation review.
+No PR publication, deployment, merge, or activation was performed.

@@ -21,6 +21,19 @@ import (
 // The test executable doubles as a hash-pinned machine-contract fixture. This
 // exercises real exec, attestation, listener ownership, and process cleanup.
 func TestMain(m *testing.M) {
+	if len(os.Args) == 3 && os.Args[1] == "--activity-controller" {
+		var scope Scope
+		if json.NewDecoder(os.Stdin).Decode(&scope) != nil {
+			os.Exit(10)
+		}
+		sc, err := startSidecar(context.Background(), scope, os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(11)
+		}
+		json.NewEncoder(os.Stdout).Encode(sidecarProcess{PID: sc.command.Process.Pid, URL: sc.url, Runtime: sc.runtimeDir})
+		select {} // Test parent sends SIGKILL: no deferred cleanup can run.
+	}
 	if len(os.Args) > 1 && os.Args[1] == "--abcp-governance-capability-v1" {
 		p := ralphex.CapabilityProbeV1{Kind: "RalphexCapabilityProbeV1", SourceSHA: strings.Repeat("b", 40), MaxIterationsFlag: true, SessionTimeoutFlag: true, IdleTimeoutFlag: true, IsolatedConfig: true, InternalReviewBudgetV1: true, OrchestratorSubprocessWaitV1: true, HumanSessionIdentityV1: true}
 		data, _ := json.Marshal(p)
