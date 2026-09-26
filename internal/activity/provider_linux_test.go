@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -19,6 +21,15 @@ import (
 	"testing"
 	"time"
 )
+
+func testSidecar(server *httptest.Server) *sidecar {
+	// The HTTP fixture's listener belongs to this test process. Exercise the
+	// real ownership checks rather than bypassing them for synthetic providers.
+	return &sidecar{
+		url: server.URL, port: server.Listener.Addr().(*net.TCPAddr).Port,
+		client: providerClient(), command: &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}, done: make(chan struct{}),
+	}
+}
 
 func providerSession(t *testing.T, f *bindingFixture) session {
 	t.Helper()
@@ -146,7 +157,7 @@ func TestProviderReplayGapDedupeAndLastEventID(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	sc := &sidecar{url: server.URL, client: providerClient()}
+	sc := testSidecar(server)
 	last := uint64(math.MaxUint64)
 	if err := s.collectBatch(f.scope, registration, sc, &last); err != nil {
 		t.Fatal(err)
@@ -238,7 +249,7 @@ func TestReplayPreservesEventsAcrossProviderAndStoreRestarts(t *testing.T) {
 			}
 		}))
 		s := &Service{store: store, resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return stampAt }}
-		sc := &sidecar{url: server.URL, client: providerClient()}
+		sc := testSidecar(server)
 		last := uint64(math.MaxUint64)
 		err = s.collectBatch(f.scope, registration, sc, &last)
 		server.Close()
@@ -303,7 +314,7 @@ func TestReplayRejectsChangedSourceOrdinalAssociation(t *testing.T) {
 				}))
 				s := &Service{store: store, resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return testTime }}
 				last := uint64(math.MaxUint64)
-				err := s.collectBatch(f.scope, registration, &sidecar{url: server.URL, client: providerClient()}, &last)
+				err := s.collectBatch(f.scope, registration, testSidecar(server), &last)
 				server.Close()
 				if lifetime == 0 && err != nil {
 					t.Fatal(err)
@@ -351,9 +362,8 @@ func TestProviderBatchTimeoutPreservesCompleteFramesAndResumes(t *testing.T) {
 		<-r.Context().Done()
 	}))
 	defer server.Close()
-	client := providerClient()
-	client.Timeout = 100 * time.Millisecond
-	sc := &sidecar{url: server.URL, client: client}
+	sc := testSidecar(server)
+	sc.client.Timeout = 100 * time.Millisecond
 	last := uint64(math.MaxUint64)
 	for i := uint64(0); i < 2; i++ {
 		if err := s.collectBatch(f.scope, registration, sc, &last); err != nil || last != i {
@@ -378,7 +388,7 @@ func TestProviderBatchCancellationClosesLiveRequest(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	sc := &sidecar{url: server.URL, client: providerClient()}
+	sc := testSidecar(server)
 	done := make(chan error, 1)
 	go func() { _, err := sc.batch(ctx, "session", math.MaxUint64); done <- err }()
 	select {
@@ -443,7 +453,7 @@ func TestProviderBatchRejectsTrustChangesDuringRequest(t *testing.T) {
 			}))
 			defer server.Close()
 			last := uint64(0)
-			sc := &sidecar{url: server.URL, client: providerClient()}
+			sc := testSidecar(server)
 			if err := s.collectBatch(f.scope, registration, sc, &last); !errors.Is(err, ErrIntegrity) {
 				t.Fatal("changed trust accepted", err)
 			}

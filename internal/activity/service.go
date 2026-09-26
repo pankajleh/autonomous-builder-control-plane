@@ -359,6 +359,9 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 	if err = s.store.checkProviderReplay(scope.RunID, registration, events); err != nil {
 		return err
 	}
+	if err = sc.verifyOwner(); err != nil {
+		return err
+	}
 	if err = s.store.saveProof(scope.RunID, registration, proof); err != nil {
 		return err
 	}

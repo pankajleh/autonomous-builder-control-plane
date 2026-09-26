@@ -48,6 +48,7 @@ type session struct {
 
 type sidecar struct {
 	url          string
+	port         int
 	client       *http.Client
 	command      *exec.Cmd
 	runtimeDir   string
@@ -150,7 +151,7 @@ func startSidecar(ctx context.Context, scope Scope, root string) (*sidecar, erro
 		cancel()
 		return nil, ErrUnavailable
 	}
-	sc := &sidecar{url: "http://127.0.0.1:" + strconv.Itoa(port), client: providerClient(), command: command, runtimeDir: runtimeDir, runtimeLease: lease, done: done, cancel: cancel}
+	sc := &sidecar{url: "http://127.0.0.1:" + strconv.Itoa(port), port: port, client: providerClient(), command: command, runtimeDir: runtimeDir, runtimeLease: lease, done: done, cancel: cancel}
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -162,11 +163,6 @@ func startSidecar(ctx context.Context, scope Scope, root string) (*sidecar, erro
 			cancel()
 			return nil, ErrUnavailable
 		case <-ticker.C:
-			// Prove the allocated loopback listener belongs to this exact child. A
-			// process that wins the bind race must not impersonate the pinned sidecar.
-			if !ownsListener(command.Process.Pid, port) {
-				continue
-			}
 			if _, err = sc.sessions(startup); err == nil {
 				keepRuntime = true
 				return sc, nil
@@ -182,7 +178,33 @@ func (s *sidecar) close() {
 	s.runtimeLease.Close()
 }
 
+// Each request opens a new connection. The port alone is not identity: another
+// process can bind it after the pinned child exits. Check both before and after
+// reading responses, and again at the batch's persistence boundary.
+func (s *sidecar) verifyOwner() error {
+	if s.command == nil || s.command.Process == nil || s.done == nil || s.port < 1 {
+		return ErrUnavailable
+	}
+	select {
+	case <-s.done:
+		return ErrUnavailable
+	default:
+	}
+	if !ownsListener(s.command.Process.Pid, s.port) {
+		return ErrUnavailable
+	}
+	select {
+	case <-s.done:
+		return ErrUnavailable
+	default:
+		return nil
+	}
+}
+
 func (s *sidecar) sessions(ctx context.Context) ([]session, error) {
+	if err := s.verifyOwner(); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url+"/api/sessions", nil)
 	if err != nil {
 		return nil, ErrIntegrity
@@ -202,6 +224,9 @@ func (s *sidecar) sessions(ctx context.Context) ([]session, error) {
 	var list []session
 	if strictjson.Decode(data, &list) != nil || list == nil || len(list) > 10000 {
 		return nil, ErrIntegrity
+	}
+	if err = s.verifyOwner(); err != nil {
+		return nil, err
 	}
 	return list, nil
 }
@@ -317,6 +342,9 @@ type providerMessage struct {
 // Bounded five-second reads allow metadata/generation revalidation between
 // batches and avoid trusting a long-lived provider connection after rotation.
 func (s *sidecar) batch(ctx context.Context, id string, last uint64) ([]providerMessage, error) {
+	if err := s.verifyOwner(); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url+"/events?session="+url.QueryEscape(id), nil)
 	if err != nil {
 		return nil, ErrIntegrity
@@ -332,7 +360,14 @@ func (s *sidecar) batch(ctx context.Context, id string, last uint64) ([]provider
 	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
 		return nil, ErrUnavailable
 	}
-	return parseSSE(response.Body)
+	messages, err := parseSSE(response.Body)
+	if err != nil {
+		return nil, err
+	}
+	if err = s.verifyOwner(); err != nil {
+		return nil, err
+	}
+	return messages, nil
 }
 
 func parseSSE(reader io.Reader) ([]providerMessage, error) {
