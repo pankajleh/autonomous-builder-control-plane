@@ -109,16 +109,6 @@ func (s *Service) Available() bool {
 	}
 	return false
 }
-func receiptIdentity(p serviceapi.Principal, id string) string {
-	return jsonDigest([]string{"preview-command-v1", p.PrincipalID, id})
-}
-func commandDigest(kind, run, id string, p serviceapi.Principal, c any) string {
-	return jsonDigest(struct {
-		Kind, Run, Preview string
-		Principal          serviceapi.Principal
-		Command            any
-	}{kind, run, id, p, c})
-}
 func (s *Service) replay(key, d string) (serviceapi.PreviewV1, bool, error) {
 	if r, ok := s.store.receipts[key]; ok {
 		if r.Digest != d {
@@ -128,12 +118,13 @@ func (s *Service) replay(key, d string) (serviceapi.PreviewV1, bool, error) {
 	}
 	return serviceapi.PreviewV1{}, false, nil
 }
-func (s *Service) CreatePreview(ctx context.Context, p serviceapi.Principal, run string, c serviceapi.PreviewRequestV1) (serviceapi.PreviewV1, error) {
+func (s *Service) CreatePreview(ctx context.Context, p serviceapi.Principal, authorityDigest, run string, c serviceapi.PreviewRequestV1) (serviceapi.PreviewV1, error) {
 	empty := serviceapi.PreviewV1{}
-	if serviceapi.ValidatePreviewRequestV1(c, run) != nil || p.PrincipalType != serviceapi.PrincipalService || serviceapi.ValidatePrincipalID(p.PrincipalID) != nil {
+	if serviceapi.ValidatePreviewRequestV1(c, run) != nil || !owner(p).valid() || !sha256Pattern.MatchString(authorityDigest) {
 		return empty, serviceapi.ErrPreviewIneligible
 	}
-	key, d := receiptIdentity(p, c.RequestID), commandDigest("create", run, "", p, c)
+	receipt := createReceipt(p, authorityDigest, run, c)
+	key, d := receipt.Key, receipt.Digest
 	s.mu.Lock()
 	if s.closed || s.store.broken {
 		s.mu.Unlock()
@@ -172,7 +163,8 @@ func (s *Service) CreatePreview(ctx context.Context, p serviceapi.Principal, run
 	now := s.now().UTC()
 	id := jsonDigest([]string{key, d})
 	v := serviceapi.PreviewV1{SchemaVersion: "PreviewV1", PreviewID: id, Revision: s.store.revisions[run] + 1, RunID: run, CheckpointActivityID: c.CheckpointActivityID, SourceSHA: source.SHA, ProductAuthorizationID: source.ProductAuthorizationID, ProductTaskID: source.ProductTaskID, ProductVersionID: source.ProductVersionID, ProfileID: c.ProfileID, ProfileDigest: profile.Digest(), Status: "REQUESTED", Health: "UNKNOWN", CreatedAt: stamp(now), ExpiresAt: stamp(now.Add(time.Duration(profile.TTLSeconds) * time.Second)), ValidationID: source.ValidationID, EvidenceID: jsonDigest([]string{id, "REQUESTED"}), RequestID: c.RequestID, RequestDigest: d}
-	if err = s.store.append(v, &receipt{key, d, v}); err != nil {
+	receipt.Result = v
+	if err = s.store.append(v, &receipt); err != nil {
 		return empty, serviceapi.ErrPreviewUnavailable
 	}
 	workerCtx, cancel := context.WithDeadline(s.ctx, parseTime(v.ExpiresAt))
@@ -325,7 +317,7 @@ func (s *Service) work(ctx context.Context, id string, source Source, p PreviewP
 		}
 	}
 }
-func (s *Service) ListPreviews(ctx context.Context, run string) (serviceapi.PreviewListV1, error) {
+func (s *Service) ListPreviews(ctx context.Context, p serviceapi.Principal, run string) (serviceapi.PreviewListV1, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := serviceapi.PreviewListV1{SchemaVersion: "PreviewListV1", RunID: run, Previews: []serviceapi.PreviewV1{}}
@@ -333,7 +325,7 @@ func (s *Service) ListPreviews(ctx context.Context, run string) (serviceapi.Prev
 		return out, serviceapi.ErrPreviewUnavailable
 	}
 	for _, v := range s.store.records {
-		if v.RunID == run {
+		if v.RunID == run && owner(p).valid() && s.store.owners[v.PreviewID] == owner(p) {
 			v = s.expire(v)
 			out.Previews = append(out.Previews, v)
 		}
@@ -344,14 +336,14 @@ func (s *Service) ListPreviews(ctx context.Context, run string) (serviceapi.Prev
 	sort.Slice(out.Previews, func(i, j int) bool { return out.Previews[i].Revision < out.Previews[j].Revision })
 	return out, nil
 }
-func (s *Service) ReadPreview(ctx context.Context, run, id string) (serviceapi.PreviewV1, error) {
+func (s *Service) ReadPreview(ctx context.Context, p serviceapi.Principal, run, id string) (serviceapi.PreviewV1, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.store.broken || ctx.Err() != nil {
 		return serviceapi.PreviewV1{}, serviceapi.ErrPreviewUnavailable
 	}
 	v, ok := s.store.records[id]
-	if !ok || v.RunID != run {
+	if !ok || v.RunID != run || !owner(p).valid() || s.store.owners[id] != owner(p) {
 		return serviceapi.PreviewV1{}, serviceapi.ErrDependencyNotFound
 	}
 	v = s.expire(v)
@@ -360,9 +352,9 @@ func (s *Service) ReadPreview(ctx context.Context, run, id string) (serviceapi.P
 	}
 	return v, nil
 }
-func (s *Service) StopPreview(ctx context.Context, p serviceapi.Principal, run, id string, c serviceapi.PreviewStopRequestV1) (serviceapi.PreviewV1, error) {
+func (s *Service) StopPreview(ctx context.Context, p serviceapi.Principal, authorityDigest, run, id string, c serviceapi.PreviewStopRequestV1) (serviceapi.PreviewV1, error) {
 	empty := serviceapi.PreviewV1{}
-	if serviceapi.ValidatePreviewStopRequestV1(c, run, id) != nil || p.PrincipalType != serviceapi.PrincipalService || serviceapi.ValidatePrincipalID(p.PrincipalID) != nil {
+	if serviceapi.ValidatePreviewStopRequestV1(c, run, id) != nil || !owner(p).valid() || !sha256Pattern.MatchString(authorityDigest) {
 		return empty, serviceapi.ErrPreviewIneligible
 	}
 	s.mu.Lock()
@@ -370,18 +362,19 @@ func (s *Service) StopPreview(ctx context.Context, p serviceapi.Principal, run, 
 	if s.closed || s.store.broken || ctx.Err() != nil {
 		return empty, serviceapi.ErrPreviewUnavailable
 	}
-	key, d := receiptIdentity(p, c.RequestID), commandDigest("stop", run, id, p, c)
-	if v, ok, err := s.replay(key, d); ok {
+	receipt := stopReceipt(p, authorityDigest, run, id, c)
+	if v, ok, err := s.replay(receipt.Key, receipt.Digest); ok {
 		return v, err
 	}
 	v, ok := s.store.records[id]
-	if !ok || v.RunID != run {
+	if !ok || v.RunID != run || s.store.owners[id] != owner(p) {
 		return empty, serviceapi.ErrDependencyNotFound
 	}
 	if !terminal(v.Status) {
 		v = ended(v, "STOPPED", s.now())
 	}
-	if s.store.append(v, &receipt{key, d, v}) != nil {
+	receipt.Result = v
+	if s.store.append(v, &receipt) != nil {
 		return empty, serviceapi.ErrPreviewUnavailable
 	}
 	if cancel := s.workers[id]; cancel != nil {

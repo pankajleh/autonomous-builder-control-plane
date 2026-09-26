@@ -78,6 +78,9 @@ func (r *memoryRuntime) Stop(_ context.Context, id string) error {
 	return r.stopErr
 }
 func (r *memoryRuntime) Reconcile(context.Context) error { r.reconciled = true; return r.reconcileErr }
+
+const testAuthorityDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func principal() serviceapi.Principal {
 	return serviceapi.Principal{PrincipalID: "gateway", PrincipalType: serviceapi.PrincipalService, AuthnMethod: "bearer-token-v1"}
 }
@@ -104,7 +107,7 @@ func awaitPreview(t *testing.T, s *Service, id, status, health string) serviceap
 	t.Helper()
 	deadline := time.Now().Add(4 * time.Second)
 	for {
-		v, err := s.ReadPreview(context.Background(), "run-1", id)
+		v, err := s.ReadPreview(context.Background(), principal(), "run-1", id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -137,7 +140,7 @@ func TestLifecycleReplayHealthStopAndTerminalRetry(t *testing.T) {
 	rt := &memoryRuntime{available: true, healthy: true}
 	s, m := fixtureService(t, rt)
 	c := createCommand("create-1")
-	first, err := s.CreatePreview(context.Background(), principal(), "run-1", c)
+	first, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,13 +148,13 @@ func TestLifecycleReplayHealthStopAndTerminalRetry(t *testing.T) {
 	if ready.RouteHandle == "" {
 		t.Fatal("ready has no opaque route")
 	}
-	replay, err := s.CreatePreview(context.Background(), principal(), "run-1", c)
+	replay, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", c)
 	if err != nil || replay != first {
 		t.Fatal("receipt changed", err)
 	}
 	changed := c
 	changed.ProfileID = "another"
-	if _, err = s.CreatePreview(context.Background(), principal(), "run-1", changed); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
+	if _, err = s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", changed); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
 		t.Fatal("body conflict", err)
 	}
 	rt.mu.Lock()
@@ -159,16 +162,16 @@ func TestLifecycleReplayHealthStopAndTerminalRetry(t *testing.T) {
 	rt.mu.Unlock()
 	awaitPreview(t, s, first.PreviewID, "READY", "DEGRADED")
 	stop := serviceapi.PreviewStopRequestV1{SchemaVersion: 1, RequestID: "stop-1", ExpectedRunID: "run-1", ExpectedPreviewID: first.PreviewID, DelegatedActor: c.DelegatedActor}
-	stopped, err := s.StopPreview(context.Background(), principal(), "run-1", first.PreviewID, stop)
+	stopped, err := s.StopPreview(context.Background(), principal(), testAuthorityDigest, "run-1", first.PreviewID, stop)
 	if err != nil || stopped.Status != "STOPPED" || stopped.RouteHandle != "" {
 		t.Fatal(stopped, err)
 	}
-	again, err := s.StopPreview(context.Background(), principal(), "run-1", first.PreviewID, stop)
+	again, err := s.StopPreview(context.Background(), principal(), testAuthorityDigest, "run-1", first.PreviewID, stop)
 	if err != nil || again != stopped {
 		t.Fatal("stop replay changed", err)
 	}
 	stop.RequestID = c.RequestID
-	if _, err = s.StopPreview(context.Background(), principal(), "run-1", first.PreviewID, stop); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
+	if _, err = s.StopPreview(context.Background(), principal(), testAuthorityDigest, "run-1", first.PreviewID, stop); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
 		t.Fatal("cross-command conflict", err)
 	}
 	awaitCleanup(t, s)
@@ -176,16 +179,16 @@ func TestLifecycleReplayHealthStopAndTerminalRetry(t *testing.T) {
 	rt.healthy = true
 	rt.mu.Unlock()
 	c.RequestID = "retry-2"
-	second, err := s.CreatePreview(context.Background(), principal(), "run-1", c)
+	second, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", c)
 	if err != nil || second.PreviewID == first.PreviewID || second.Revision != first.Revision+1 || second.SourceSHA != first.SourceSHA {
 		t.Fatal("terminal retry identity", second, err)
 	}
 	awaitPreview(t, s, second.PreviewID, "READY", "")
-	list, err := s.ListPreviews(context.Background(), "run-1")
+	list, err := s.ListPreviews(context.Background(), principal(), "run-1")
 	if err != nil || len(list.Previews) != 2 || list.Previews[0] != stopped {
 		t.Fatal("history changed", list, err)
 	}
-	if _, err = s.ReadPreview(context.Background(), "other", first.PreviewID); !errors.Is(err, serviceapi.ErrDependencyNotFound) {
+	if _, err = s.ReadPreview(context.Background(), principal(), "other", first.PreviewID); !errors.Is(err, serviceapi.ErrDependencyNotFound) {
 		t.Fatal("cross-run read", err)
 	}
 	s.Close()
@@ -220,7 +223,7 @@ func TestLifecycleFailureExpiryAndUnavailable(t *testing.T) {
 			if scenario == "unknown-profile" {
 				c.ProfileID = "unknown"
 			}
-			v, err := s.CreatePreview(context.Background(), principal(), "run-1", c)
+			v, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", c)
 			if scenario == "unavailable" || scenario == "wrong-repo" || scenario == "unknown-profile" {
 				if err == nil {
 					t.Fatal("unsafe create accepted")
@@ -255,7 +258,7 @@ func TestConcurrentRequestReceiptIsUnique(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			v, err := s.CreatePreview(context.Background(), principal(), "run-1", c)
+			v, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", c)
 			if err != nil {
 				t.Error(err)
 			}
@@ -283,7 +286,7 @@ func TestDurableRecoveryPreservesReceiptAndEndsInterruptedRuntime(t *testing.T) 
 	rt := &memoryRuntime{available: true, healthy: true}
 	s, _ := serviceAt(t, root, rt, time.Now)
 	c := createCommand("persisted")
-	v, err := s.CreatePreview(context.Background(), principal(), "run-1", c)
+	v, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,16 +300,16 @@ func TestDurableRecoveryPreservesReceiptAndEndsInterruptedRuntime(t *testing.T) 
 	s.wg.Wait()
 	s.store.close()
 	recovered, _ := serviceAt(t, root, &memoryRuntime{available: true, healthy: true}, time.Now)
-	got, err := recovered.ReadPreview(context.Background(), "run-1", v.PreviewID)
+	got, err := recovered.ReadPreview(context.Background(), principal(), "run-1", v.PreviewID)
 	if err != nil || got.Status != "FAILED" || got.RouteHandle != "" {
 		t.Fatal("restart resumed runtime", got, err)
 	}
-	replay, err := recovered.CreatePreview(context.Background(), principal(), "run-1", c)
+	replay, err := recovered.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", c)
 	if err != nil || replay != v {
 		t.Fatal("restart changed receipt", err)
 	}
 	c.RequestID = "after-restart"
-	next, err := recovered.CreatePreview(context.Background(), principal(), "run-1", c)
+	next, err := recovered.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", c)
 	if err != nil || next.Revision != v.Revision+1 {
 		t.Fatal("revision reused", err)
 	}
@@ -315,13 +318,13 @@ func TestReadsExpireBeforeReturningRoute(t *testing.T) {
 	var offset atomic.Int64
 	now := func() time.Time { return time.Now().Add(time.Duration(offset.Load()) * time.Second) }
 	s, _ := serviceAt(t, filepath.Join(t.TempDir(), "previews"), &memoryRuntime{available: true, healthy: true}, now)
-	v, err := s.CreatePreview(context.Background(), principal(), "run-1", createCommand("expire-read"))
+	v, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("expire-read"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	awaitPreview(t, s, v.PreviewID, "READY", "")
 	offset.Store(120)
-	got, err := s.ReadPreview(context.Background(), "run-1", v.PreviewID)
+	got, err := s.ReadPreview(context.Background(), principal(), "run-1", v.PreviewID)
 	if err != nil || got.Status != "EXPIRED" || got.RouteHandle != "" {
 		t.Fatal("expired route exposed", got, err)
 	}
@@ -367,7 +370,7 @@ func TestProtectedProfilesAndDurableStorageFailClosed(t *testing.T) {
 }
 func TestJournalRejectsTruncationAndTerminalRebinding(t *testing.T) {
 	s, _ := fixtureService(t, &memoryRuntime{available: true, healthy: true})
-	v, err := s.CreatePreview(context.Background(), principal(), "run-1", createCommand("journal"))
+	v, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("journal"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,14 +402,14 @@ func TestJournalRejectsTruncationAndTerminalRebinding(t *testing.T) {
 func TestNewCheckpointGetsNextRevisionAndRequestIDsBindTargets(t *testing.T) {
 	s, _ := fixtureService(t, &memoryRuntime{available: true, healthy: true})
 	c := createCommand("checkpoint-1")
-	first, err := s.CreatePreview(context.Background(), principal(), "run-1", c)
+	first, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", c)
 	if err != nil {
 		t.Fatal(err)
 	}
 	awaitPreview(t, s, first.PreviewID, "READY", "")
 	other := c
 	other.ExpectedRunID = "run-2"
-	if _, err = s.CreatePreview(context.Background(), principal(), "run-2", other); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
+	if _, err = s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-2", other); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
 		t.Fatal("request rebound to another run", err)
 	}
 	nextSource := s.resolver.(staticResolver).source
@@ -415,12 +418,12 @@ func TestNewCheckpointGetsNextRevisionAndRequestIDsBindTargets(t *testing.T) {
 	s.resolver = staticResolver{source: nextSource}
 	c.RequestID = "checkpoint-2"
 	c.CheckpointActivityID = nextSource.CheckpointActivityID
-	second, err := s.CreatePreview(context.Background(), principal(), "run-1", c)
+	second, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", c)
 	if err != nil || second.Revision != first.Revision+1 || second.PreviewID == first.PreviewID {
 		t.Fatal("revision not advanced", second, err)
 	}
 	awaitPreview(t, s, second.PreviewID, "READY", "")
-	historical, err := s.ReadPreview(context.Background(), "run-1", first.PreviewID)
+	historical, err := s.ReadPreview(context.Background(), principal(), "run-1", first.PreviewID)
 	if err != nil || historical.SourceSHA != first.SourceSHA {
 		t.Fatal("previous source identity rebound")
 	}
@@ -465,7 +468,7 @@ func TestStopAndExpiryDuringStartupCannotPublishLateRoute(t *testing.T) {
 				p.TTLSeconds = 1
 				s.profiles[p.ProfileID] = p
 			}
-			v, err := s.CreatePreview(context.Background(), principal(), "run-1", createCommand("startup-race"))
+			v, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("startup-race"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -479,7 +482,7 @@ func TestStopAndExpiryDuringStartupCannotPublishLateRoute(t *testing.T) {
 			if scenario == "stop" {
 				status = "STOPPED"
 				stop := serviceapi.PreviewStopRequestV1{SchemaVersion: 1, RequestID: "stop-race", ExpectedRunID: "run-1", ExpectedPreviewID: v.PreviewID, DelegatedActor: createCommand("").DelegatedActor}
-				if _, err = s.StopPreview(context.Background(), principal(), "run-1", v.PreviewID, stop); err != nil {
+				if _, err = s.StopPreview(context.Background(), principal(), testAuthorityDigest, "run-1", v.PreviewID, stop); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -491,7 +494,7 @@ func TestStopAndExpiryDuringStartupCannotPublishLateRoute(t *testing.T) {
 			release.Do(func() { close(delayed.release) })
 			terminal := awaitPreview(t, s, v.PreviewID, status, "")
 			awaitCleanup(t, s)
-			got, err := s.ReadPreview(context.Background(), "run-1", v.PreviewID)
+			got, err := s.ReadPreview(context.Background(), principal(), "run-1", v.PreviewID)
 			if err != nil || got != terminal || got.RouteHandle != "" || !s.Available() {
 				t.Fatal("late runtime result changed terminal identity", got, err)
 			}
@@ -523,7 +526,7 @@ func TestCleanupAndRecoveryFailuresDisableAdmission(t *testing.T) {
 				defer s.Close()
 			}
 			if !strings.HasSuffix(scenario, "reconcile") {
-				v, err := s.CreatePreview(context.Background(), principal(), "run-1", createCommand("cleanup"))
+				v, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("cleanup"))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -536,7 +539,7 @@ func TestCleanupAndRecoveryFailuresDisableAdmission(t *testing.T) {
 					awaitPreview(t, s, v.PreviewID, "FAILED", "")
 				} else {
 					stop := serviceapi.PreviewStopRequestV1{SchemaVersion: 1, RequestID: "stop-cleanup", ExpectedRunID: "run-1", ExpectedPreviewID: v.PreviewID, DelegatedActor: createCommand("").DelegatedActor}
-					if _, err = s.StopPreview(context.Background(), principal(), "run-1", v.PreviewID, stop); err != nil {
+					if _, err = s.StopPreview(context.Background(), principal(), testAuthorityDigest, "run-1", v.PreviewID, stop); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -545,7 +548,7 @@ func TestCleanupAndRecoveryFailuresDisableAdmission(t *testing.T) {
 			if s.Available() {
 				t.Fatal("failed cleanup remains available")
 			}
-			if _, err := s.CreatePreview(context.Background(), principal(), "run-1", createCommand("after-failure")); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
+			if _, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("after-failure")); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
 				t.Fatal("admitted after failure", err)
 			}
 			if scenario == "runtime-stop" && len(m.removed) != 0 {
@@ -561,7 +564,7 @@ func TestDamagedJournalStillReconcilesExclusivelyOwnedObjects(t *testing.T) {
 	for _, damage := range []string{"torn-frame", "wrong-anchor"} {
 		t.Run(damage, func(t *testing.T) {
 			s, _ := fixtureService(t, &memoryRuntime{available: true, healthy: true})
-			v, err := s.CreatePreview(context.Background(), principal(), "run-1", createCommand("before-crash"))
+			v, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("before-crash"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -605,10 +608,10 @@ func TestDamagedJournalStillReconcilesExclusivelyOwnedObjects(t *testing.T) {
 			if _, err = os.Stat(orphan); !os.IsNotExist(err) {
 				t.Fatal("orphan source remains", err)
 			}
-			if _, err = recovered.ReadPreview(context.Background(), "run-1", v.PreviewID); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
+			if _, err = recovered.ReadPreview(context.Background(), principal(), "run-1", v.PreviewID); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
 				t.Fatal("untrusted partial history readable", err)
 			}
-			if _, err = recovered.CreatePreview(context.Background(), principal(), "run-1", createCommand("before-crash")); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
+			if _, err = recovered.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("before-crash")); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
 				t.Fatal("damaged receipt replayed", err)
 			}
 			after, err := os.ReadFile(file)

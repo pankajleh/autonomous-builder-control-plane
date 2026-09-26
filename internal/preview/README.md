@@ -104,8 +104,11 @@ and targets only the presented service; siblings remain internal.
 Missing profile configuration or an unsupported host/profile leaves
 `preview_runtime=false` at `GET /v1/extensions/pdlc-experience`. At least one
 profile must pass the full isolation, blocked-egress, mount and loopback-access
-probe before capability becomes true. Unreadable/invalid protected configuration
-or inability to acquire namespace ownership fails service startup. A corrupt
+probe before capability becomes true. The authenticated principal must also be a
+service principal with the fixed `preview.control` grant and
+`may_assert_delegated_actor: true`; otherwise its capability remains false.
+Unreadable/invalid protected configuration or inability to acquire namespace
+ownership fails service startup. A corrupt
 preview journal keeps preview unavailable, preserves the damaged history, and
 still permits namespace-owned runtime cleanup and the legacy service to start.
 Source cleanup follows successful runtime cleanup so live containers never lose
@@ -128,8 +131,9 @@ images. Validation commands are `go test ./...`, `go test -race ./...` and
 
 ## HTTP API and receipts
 
-All preview routes require the service's bearer authentication. POST additionally
-requires a service principal whose protected authority grant has
+All preview routes require an authenticated service principal with the fixed
+`preview.control` authority in the protected authority-grants file. POST additionally
+requires that principal's grant to have
 `may_assert_delegated_actor: true`; the delegated subject must be `user` or
 `operator`. Requests cannot use query parameters. POST JSON must be at most
 8192 bytes and rejects unknown/duplicate fields. GET requests have no body.
@@ -154,7 +158,11 @@ controller-created admission capsule, not the caller.
 List: `GET /v1/runs/{runId}/previews` returns `PreviewListV1` with `run_id` and a
 `previews` array ordered by revision. Detail:
 `GET /v1/runs/{runId}/previews/{previewId}` returns the current `PreviewV1`.
-Both return HTTP 200.
+Both return HTTP 200 for visible previews. Lists include only previews created by
+the authenticated principal; another principal's detail returns 404. Stop also
+requires the exact creating principal and returns 404 across principals. There is
+no administrative ownership override. Owner identities and authority-grant digests
+are internal journal metadata and never appear in public preview DTOs.
 
 Stop: `POST /v1/runs/{runId}/previews/{previewId}/stop`
 
@@ -177,9 +185,14 @@ request identities, revision and timestamps. Only current READY state carries
 an opaque server-only `route_handle`; this is not a browser URL or access grant.
 
 Request IDs are scoped to the authenticated principal across both commands and
-all runs. The same ID with the same canonical body/target returns the original
-receipt, even if current state has changed. Reusing it with a different command,
-body or target conflicts. Read detail/list for current state. After ambiguous
+all runs. Receipts bind the principal ID/type, exact authority-file digest, fixed
+operation, run/target, request ID, delegated actor, canonical body digest and
+resulting preview. The same ID with the same binding returns the original receipt,
+even if current state has changed. Reusing it with a different operation, run,
+body, target, actor or authority-file digest conflicts without mutation. A different
+principal cannot inherit a receipt. An authority-file change, including formatting,
+requires reconciliation of old requests; reads remain scoped to the original owner.
+Read detail/list for current state. After ambiguous
 transport, read list/detail and match `request_id` before deciding to retry; an
 exact replay retrieves the same receipt. A deliberate retry after terminal state
 needs a new request ID and creates a new preview ID/revision, even for the same SHA.
@@ -188,7 +201,7 @@ needs a new request ID and creates a new preview ID/revision, even for the same 
 | --- | --- |
 | 400 | `invalid_request`: malformed or out-of-contract request |
 | 401 | Authentication required/invalid |
-| 403 | `authority_denied`: delegated actor authority missing |
+| 403 | `authority_denied`: service identity, `preview.control` or delegation authority missing |
 | 404 | `not_found` or `unknown_preview_profile` |
 | 409 | `preview_ineligible` or `request_id_conflict` |
 | 503 | `NOT_AVAILABLE`: runtime, history or capacity unavailable |
@@ -197,3 +210,8 @@ History and receipts remain after terminal cleanup. The foundation bounds each
 service store to 1000 preview identities, 100000 frames and 64 MiB of journal
 storage, and at most eight concurrent preview workers. Do not delete history to
 reset those limits or damaged receipts; preserve it for operator recovery.
+
+Journals created before ownership and authority-bound receipts were introduced
+remain preserved but disable preview on recovery. Ownership is never inferred
+from the current caller or retroactively assigned. Namespace cleanup and legacy
+service startup still proceed; preserve these journals for operator reconciliation.

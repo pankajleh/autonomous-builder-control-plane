@@ -467,17 +467,17 @@ If satisfying these findings requires changing any path outside the original BP-
 
 ### Task 2: Correct preview-control authorization and ownership
 
-- [ ] Require fixed `preview.control` grant on all preview routes; create/stop additionally require delegated-actor authority.
-- [ ] Make list/detail principal-scoped without exposing owner identity in public DTOs.
-- [ ] Persist immutable internal preview ownership and deny cross-principal stop.
-- [ ] Bind durable mutation receipts/replay to authenticated principal and exact authority-grant digest.
-- [ ] Correct/add adversarial tests for grant, delegation, cross-principal reads/stops, replay and capability truth.
-- [ ] Re-run focused preview/serviceapi/cmd tests.
-- [ ] Re-run `go test ./...`, `go test -race ./...`, `go vet ./...`.
-- [ ] Re-run Darwin/amd64 and Windows/amd64 compile-only checks for affected packages.
-- [ ] Re-run opt-in Docker smoke with the existing local digest-pinned image; `preview_runtime=false` remains an accepted fail-closed host outcome.
-- [ ] Run `git diff --check` and exact blocked-candidate-to-head allowed-path proof.
-- [ ] Leave one clean correction candidate for a **new** independent exact-head 0C/0M publication review.
+- [x] Require fixed `preview.control` grant on all preview routes; create/stop additionally require delegated-actor authority.
+- [x] Make list/detail principal-scoped without exposing owner identity in public DTOs.
+- [x] Persist immutable internal preview ownership and deny cross-principal stop.
+- [x] Bind durable mutation receipts/replay to authenticated principal and exact authority-grant digest.
+- [x] Correct/add adversarial tests for grant, delegation, cross-principal reads/stops, replay and capability truth.
+- [x] Re-run focused preview/serviceapi/cmd tests.
+- [x] Re-run `go test ./...`, `go test -race ./...`, `go vet ./...`.
+- [x] Re-run Darwin/amd64 and Windows/amd64 compile-only checks for affected packages.
+- [x] Re-run opt-in Docker smoke with the existing local digest-pinned image; `preview_runtime=false` remains an accepted fail-closed host outcome.
+- [x] Run `git diff --check` and exact blocked-candidate-to-head allowed-path proof.
+- [x] Leave one clean correction candidate for a **new** independent exact-head 0C/0M publication review.
 
 Publication, PR merge, runtime cutover, PX-06 and deployment remain blocked until this correction completes, independent acceptance is green, and a new exact-head publication review returns 0 Critical / 0 Major.
 
@@ -498,3 +498,42 @@ Confirmed invariants:
 - original BP-02 path/authority ceilings remain and publication still requires fresh acceptance/review.
 
 This review authorizes only Task 2 above. It grants no merge, publication, runtime cutover, PX-06 or deployment authority.
+
+
+## Task 2 correction completion — 2026-09-26
+
+Implemented the authorized preview-control correction within the original BP-02
+path ceiling. Every preview route now matches the fixed `preview.control` grant
+for an authenticated service principal. Create/stop additionally require delegated
+actor authority and a valid user/operator actor. Preview capability is true only
+for an authorized, delegating service principal when the runtime is available;
+the legacy capabilities response and action/admission handlers are unchanged.
+
+Preview journals preserve immutable internal principal ID/type ownership. Reads
+and stops are principal-scoped, and public DTOs expose neither ownership nor the
+authority-grant digest. Durable receipts bind principal ID/type, exact admitted
+authority digest, fixed operation, run/target, request ID, delegated actor,
+canonical command digest and exact result. Replays preserve the original result;
+changed bindings conflict without mutation. Unbound older journals are preserved
+and fail closed rather than inferring ownership, while namespace cleanup and
+legacy startup remain available.
+
+Validation passed:
+- focused preview/serviceapi/cmd tests, including adversarial HTTP authorization,
+  principal-scoped reads/stops, cross-principal receipt isolation, exact authority
+  file digest changes, durable restart, journal rebinding negatives, private DTO
+  metadata exclusion, and zero additional mutation for rejected commands;
+- `go test ./...`, `go test -race ./...`, and `go vet ./...`;
+- Darwin/amd64 and Windows/amd64 compile-only checks for `internal/preview`,
+  `internal/serviceapi`, and `cmd/abcp`;
+- the opt-in Docker smoke using the existing local pinned Alpine image
+  `alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6`:
+  cleanup passed, and `preview_runtime=false` remained the accepted fail-closed
+  outcome because the full host/profile isolation and presentation proof was
+  unavailable;
+- Go formatting, `git diff --check`, and the exact blocked-candidate
+  `f3f3a2b318d16d0fd76f38dcfd5045921d4f7ca3` allowed-path subset proof.
+
+This correction leaves one committed candidate for a new independent exact-head
+0 Critical / 0 Major publication review. It does not establish live Preview Serve
+or grant publication, merge, runtime cutover, PX-06 or deployment authority.

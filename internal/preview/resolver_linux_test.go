@@ -357,13 +357,13 @@ func TestPreviewLifecycleNeverMutatesRunAdmissionOrGovernedBranch(t *testing.T) 
 	c := createCommand("no-run-mutation")
 	c.ExpectedRunID = f.run
 	c.CheckpointActivityID = f.events.page.Events[0].ActivityID
-	v, err := s.CreatePreview(context.Background(), principal(), f.run, c)
+	v, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, f.run, c)
 	if err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		got, e := s.ReadPreview(context.Background(), f.run, v.PreviewID)
+		got, e := s.ReadPreview(context.Background(), principal(), f.run, v.PreviewID)
 		if e != nil {
 			t.Fatal(e)
 		}

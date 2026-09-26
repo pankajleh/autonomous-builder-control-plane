@@ -16,18 +16,21 @@ import (
 // chain and independently fsynced head reject torn writes and tail loss.
 type receipt struct {
 	Key, Digest string
+	Binding     commandBinding
 	Result      serviceapi.PreviewV1
 }
 type frame struct {
 	Sequence uint64
 	Previous string
 	Preview  serviceapi.PreviewV1
+	Owner    ownerIdentity
 	Receipt  *receipt `json:",omitempty"`
 }
 type store struct {
 	root      string
 	lock, log *os.File
 	records   map[string]serviceapi.PreviewV1
+	owners    map[string]ownerIdentity
 	receipts  map[string]receipt
 	revisions map[string]uint64
 	sequence  uint64
@@ -50,7 +53,7 @@ func openStore(root string) (*store, error) {
 		lock.Close()
 		return nil, err
 	}
-	return &store{root: root, lock: lock, records: map[string]serviceapi.PreviewV1{}, receipts: map[string]receipt{}, revisions: map[string]uint64{}, broken: true}, nil
+	return &store{root: root, lock: lock, records: map[string]serviceapi.PreviewV1{}, owners: map[string]ownerIdentity{}, receipts: map[string]receipt{}, revisions: map[string]uint64{}, broken: true}, nil
 }
 
 // Loading history is separate from exclusive namespace ownership so restart
@@ -123,7 +126,7 @@ func immutable(v serviceapi.PreviewV1) serviceapi.PreviewV1 {
 }
 func (s *store) validate(f frame) error {
 	v := f.Preview
-	if serviceapi.ValidatePreviewV1(v) != nil {
+	if serviceapi.ValidatePreviewV1(v) != nil || !f.Owner.valid() {
 		return ErrIntegrity
 	}
 	old, ok := s.records[v.PreviewID]
@@ -132,7 +135,7 @@ func (s *store) validate(f frame) error {
 			return ErrIntegrity
 		}
 	} else {
-		if immutable(old) != immutable(v) {
+		if immutable(old) != immutable(v) || s.owners[v.PreviewID] != f.Owner {
 			return ErrIntegrity
 		}
 		allowed := old == v || !terminal(old.Status) && (terminal(v.Status) || old.Status == "REQUESTED" && v.Status == "VALIDATING" || old.Status == "VALIDATING" && v.Status == "STARTING" || old.Status == "STARTING" && v.Status == "READY" || old.Status == "READY" && v.Status == "READY")
@@ -142,7 +145,7 @@ func (s *store) validate(f frame) error {
 	}
 	if f.Receipt != nil {
 		r := f.Receipt
-		if !sha256Pattern.MatchString(r.Key) || !sha256Pattern.MatchString(r.Digest) || r.Result != v {
+		if !r.valid(v, f.Owner, !ok) {
 			return ErrIntegrity
 		}
 		if _, exists := s.receipts[r.Key]; exists {
@@ -154,6 +157,7 @@ func (s *store) validate(f frame) error {
 func (s *store) apply(f frame) {
 	v := f.Preview
 	s.records[v.PreviewID] = v
+	s.owners[v.PreviewID] = f.Owner
 	if v.Revision > s.revisions[v.RunID] {
 		s.revisions[v.RunID] = v.Revision
 	}
@@ -166,7 +170,11 @@ func (s *store) append(v serviceapi.PreviewV1, r *receipt) error {
 		s.broken = true
 		return ErrUnavailable
 	}
-	f := frame{Sequence: s.sequence + 1, Previous: s.head, Preview: v, Receipt: r}
+	o := s.owners[v.PreviewID]
+	if _, exists := s.records[v.PreviewID]; !exists && r != nil {
+		o = r.Binding.Principal
+	}
+	f := frame{Sequence: s.sequence + 1, Previous: s.head, Preview: v, Owner: o, Receipt: r}
 	if s.validate(f) != nil {
 		return ErrIntegrity
 	}

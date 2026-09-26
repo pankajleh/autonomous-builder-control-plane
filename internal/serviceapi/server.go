@@ -137,12 +137,14 @@ type ActivityReader interface {
 	OpenActivityStream(context.Context, string, string) (ActivitySubscription, error)
 }
 
+// Mutation methods receive the authenticated principal and exact authority digest
+// from the server, followed by the run/preview target. These are not body fields.
 type PreviewController interface {
 	Available() bool
-	CreatePreview(context.Context, Principal, string, PreviewRequestV1) (PreviewV1, error)
-	ListPreviews(context.Context, string) (PreviewListV1, error)
-	ReadPreview(context.Context, string, string) (PreviewV1, error)
-	StopPreview(context.Context, Principal, string, string, PreviewStopRequestV1) (PreviewV1, error)
+	CreatePreview(context.Context, Principal, string, string, PreviewRequestV1) (PreviewV1, error)
+	ListPreviews(context.Context, Principal, string) (PreviewListV1, error)
+	ReadPreview(context.Context, Principal, string, string) (PreviewV1, error)
+	StopPreview(context.Context, Principal, string, string, string, PreviewStopRequestV1) (PreviewV1, error)
 }
 
 type ServerConfig struct {
@@ -349,7 +351,7 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	request.Body = http.MaxBytesReader(writer, request.Body, MaxRequestBodyBytes)
 	switch request.URL.Path {
 	case "/v1/extensions/pdlc-experience":
-		s.experienceCapabilities(writer, request, requestID)
+		s.experienceCapabilities(writer, request, principal, requestID)
 	case "/v1/capabilities":
 		s.capabilities(writer, request, requestID)
 	case "/v1/runs":
@@ -958,12 +960,12 @@ func (s *Server) writeJSON(writer http.ResponseWriter, status int, value any) {
 	}
 }
 
-func (s *Server) experienceCapabilities(w http.ResponseWriter, r *http.Request, id string) {
+func (s *Server) experienceCapabilities(w http.ResponseWriter, r *http.Request, principal Principal, id string) {
 	if validEmptyReadRequest(r) != nil {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid extension request", RequestID: id})
 		return
 	}
-	s.writeJSON(w, http.StatusOK, PdlcExperienceCapabilitiesV1{SchemaVersion: "PdlcExperienceCapabilitiesV1", ActivityStream: s.reserved.Activity != nil, PreviewRuntime: s.reserved.Preview != nil && s.reserved.Preview.Available()})
+	s.writeJSON(w, http.StatusOK, PdlcExperienceCapabilitiesV1{SchemaVersion: "PdlcExperienceCapabilitiesV1", ActivityStream: s.reserved.Activity != nil, PreviewRuntime: s.mayControlPreview(principal) && s.authority.MayAssertDelegatedActor(principal) && s.reserved.Preview != nil && s.reserved.Preview.Available()})
 }
 func (s *Server) runActivity(w http.ResponseWriter, r *http.Request, id, run string) {
 	if r.Method != http.MethodGet || !requestBodyEmpty(r) {
@@ -1063,7 +1065,15 @@ func (s *Server) runActivityStream(w http.ResponseWriter, r *http.Request, id, r
 	}
 }
 
+func (s *Server) mayControlPreview(principal Principal) bool {
+	return principal.PrincipalType == PrincipalService && s.authority.Match(principal, "preview.control") == nil
+}
+
 func (s *Server) runPreviews(w http.ResponseWriter, r *http.Request, principal Principal, id, run string, tail []string) {
+	if !s.mayControlPreview(principal) {
+		s.writeDependencyError(w, id, ErrAuthorityDenied)
+		return
+	}
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid preview request", RequestID: id})
 	}
@@ -1092,7 +1102,7 @@ func (s *Server) runPreviews(w http.ResponseWriter, r *http.Request, principal P
 			return
 		}
 		if len(tail) == 0 {
-			result, err := s.reserved.Preview.ListPreviews(r.Context(), run)
+			result, err := s.reserved.Preview.ListPreviews(r.Context(), principal, run)
 			if err != nil {
 				s.writeDependencyError(w, id, err)
 				return
@@ -1109,7 +1119,7 @@ func (s *Server) runPreviews(w http.ResponseWriter, r *http.Request, principal P
 			}
 			s.writeJSON(w, http.StatusOK, result)
 		} else {
-			result, err := s.reserved.Preview.ReadPreview(r.Context(), run, tail[0])
+			result, err := s.reserved.Preview.ReadPreview(r.Context(), principal, run, tail[0])
 			if err != nil {
 				s.writeDependencyError(w, id, err)
 				return
@@ -1142,14 +1152,14 @@ func (s *Server) runPreviews(w http.ResponseWriter, r *http.Request, principal P
 			bad()
 			return
 		}
-		result, err = s.reserved.Preview.CreatePreview(r.Context(), principal, run, command)
+		result, err = s.reserved.Preview.CreatePreview(r.Context(), principal, s.authority.Digest(), run, command)
 	} else {
 		var command PreviewStopRequestV1
 		if decodeStrictJSON(data, &command) != nil || ValidatePreviewStopRequestV1(command, run, tail[0]) != nil {
 			bad()
 			return
 		}
-		result, err = s.reserved.Preview.StopPreview(r.Context(), principal, run, tail[0], command)
+		result, err = s.reserved.Preview.StopPreview(r.Context(), principal, s.authority.Digest(), run, tail[0], command)
 	}
 	if err != nil {
 		s.writeDependencyError(w, id, err)
