@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -19,11 +20,8 @@ import (
 type dockerCommand func(context.Context, ...string) (string, error)
 type presentation struct {
 	server                *http.Server
-	listener              net.Listener
 	transport             *http.Transport
 	url, endpoint, handle string
-	containers            []string
-	network               string
 }
 type dockerRuntime struct {
 	mu              sync.Mutex
@@ -56,11 +54,7 @@ func (d *dockerRuntime) container(id string, i int) string {
 }
 func cleanEnv(s ServiceProfileV1) []string {
 	out := []string{"-i", "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/scratch", "TMPDIR=/scratch"}
-	env := environmentArgs(s.Environment)
-	for i := 1; i < len(env); i += 2 {
-		out = append(out, env[i])
-	}
-	return out
+	return append(out, environmentValues(s.Environment)...)
 }
 func scratchOptions(p PreviewProfileV1, s ServiceProfileV1) string {
 	uid, gid, _ := strings.Cut(s.User, ":")
@@ -205,7 +199,7 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 	if !sha256Pattern.MatchString(id) || p.Validate() != nil {
 		return nil, ErrUnavailable
 	}
-	if !probe && (path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n")) {
+	if path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n") {
 		return nil, ErrUnavailable
 	}
 	for _, s := range p.Services {
@@ -219,17 +213,12 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 	if !d.internalNetwork(ctx, id) {
 		return nil, ErrUnavailable
 	}
-	g := &presentation{network: d.network(id), handle: jsonDigest([]string{d.namespace, id, "route"})}
+	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"})}
 	for i, s := range p.Services {
-		mounted := s
-		if probe {
-			mounted.MountSource = false
-		}
-		if _, err := d.run(ctx, d.createArgs(id, path, p, mounted, i)...); err != nil {
+		if _, err := d.run(ctx, d.createArgs(id, path, p, s, i)...); err != nil {
 			return nil, err
 		}
 		name := d.container(id, i)
-		g.containers = append(g.containers, name)
 		if _, err := d.run(ctx, "start", name); err != nil {
 			return nil, err
 		}
@@ -249,7 +238,7 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 		if _, err := d.run(ctx, args...); err != nil {
 			return nil, err
 		}
-		endpoint, err := d.endpoint(ctx, id, p, mounted, i)
+		endpoint, err := d.endpoint(ctx, id, p, s, i)
 		if err != nil {
 			return nil, err
 		}
@@ -275,7 +264,6 @@ func (g *presentation) present() error {
 		listener.Close()
 		return ErrUnavailable
 	}
-	g.listener = listener
 	g.url = "http://" + listener.Addr().String()
 	// The dialer ignores all request-derived destinations, proxy environment,
 	// redirects, and DNS. It can reach this one presented endpoint only.
@@ -359,6 +347,11 @@ func (d *dockerRuntime) Healthy(ctx context.Context, id string, p PreviewProfile
 	g := d.groups[id]
 	d.mu.Unlock()
 	unsafe := func() (bool, error) {
+		// Stop and TTL cancellation interrupt these same inspection commands.
+		// An interrupted observation does not disprove the profile's isolation.
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		d.mu.Lock()
 		delete(d.approved, p.Digest())
 		d.mu.Unlock()
@@ -442,19 +435,45 @@ func (d *dockerRuntime) Reconcile(ctx context.Context) error {
 // prove is intentionally conservative: a local pinned image must also contain
 // the fixed offline probe tools. Missing tools, unusable container IPs, egress,
 // or an unreachable explicit loopback listener all leave capability false.
-func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) bool {
+func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved bool) {
 	if !d.hostSupported(ctx) {
 		return false
 	}
 	id := jsonDigest([]string{d.namespace, p.Digest(), "isolation-probe"})
+	checkout := Checkout{Root: filepath.Join(d.root, "sources")}
+	path := filepath.Join(checkout.Root, id)
+	sourceCreated := false
 	defer func() {
-		if d.Stop(context.Background(), id) != nil {
-			d.mu.Lock()
+		err := d.Stop(context.Background(), id)
+		if err == nil && sourceCreated {
+			err = checkout.Remove(id)
+		}
+		proved = proved && err == nil
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if proved {
+			d.approved[p.Digest()] = true
+		} else {
 			delete(d.approved, p.Digest())
-			d.mu.Unlock()
 		}
 	}()
-	g, err := d.startGroup(ctx, id, "", p, true)
+	for _, s := range p.Services {
+		if s.MountSource {
+			root, err := privateDirectory(checkout.Root, true)
+			if err != nil {
+				return false
+			}
+			root.Close()
+			// Exercise the same mount as candidate execution, with readable offline
+			// input under this namespace rather than any governed worktree.
+			if os.Mkdir(path, 0755) != nil {
+				return false
+			}
+			sourceCreated = true
+			break
+		}
+	}
+	g, err := d.startGroup(ctx, id, path, p, true)
 	if err != nil {
 		return false
 	}
@@ -500,9 +519,6 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) bool {
 	if !reachable {
 		return false
 	}
-	d.mu.Lock()
-	d.approved[p.Digest()] = true
-	d.mu.Unlock()
 	return true
 }
 func (d *dockerRuntime) proveProfiles(ctx context.Context, profiles map[string]PreviewProfileV1) {

@@ -29,6 +29,12 @@ func execute(ctx context.Context, binary string, env []string, args ...string) (
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, args...)
+	if configureProcess(cmd) != nil {
+		return "", ErrUnavailable
+	}
+	cmd.Cancel = func() error { return cancelProcess(cmd) }
+	cmd.WaitDelay = time.Second
+	defer cancelProcess(cmd)
 	cmd.Env = env
 	var out boundedBuffer
 	cmd.Stdout = &out
@@ -91,6 +97,13 @@ func (c Checkout) Materialize(ctx context.Context, id string, s Source) (path st
 	// Drop origin metadata so container source readers learn no host path.
 	if _, err = git(ctx, path, "remote", "remove", "origin"); err != nil {
 		return "", err
+	}
+	// Fetch records and reflogs also contain the local origin path and the
+	// controller's generated committer identity; neither is candidate source.
+	for _, name := range []string{"FETCH_HEAD", "logs"} {
+		if err = os.RemoveAll(filepath.Join(path, ".git", name)); err != nil {
+			return "", err
+		}
 	}
 	success = true
 	return path, nil

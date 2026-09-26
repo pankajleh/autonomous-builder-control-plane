@@ -50,21 +50,30 @@ func openStore(root string) (*store, error) {
 		lock.Close()
 		return nil, err
 	}
-	s := &store{root: root, lock: lock, records: map[string]serviceapi.PreviewV1{}, receipts: map[string]receipt{}, revisions: map[string]uint64{}}
-	fail := func() (*store, error) { s.close(); return nil, ErrIntegrity }
-	s.log, err = openRegular(filepath.Join(root, "history.jsonl"), os.O_RDWR|os.O_CREATE|os.O_APPEND, true)
+	return &store{root: root, lock: lock, records: map[string]serviceapi.PreviewV1{}, receipts: map[string]receipt{}, revisions: map[string]uint64{}, broken: true}, nil
+}
+
+// Loading history is separate from exclusive namespace ownership so restart
+// cleanup remains possible even when a crash damaged the journal or anchor.
+func (s *store) load() error {
+	d, err := privateDirectory(s.root, false)
 	if err != nil {
-		return fail()
+		return ErrIntegrity
+	}
+	defer d.Close()
+	s.log, err = openRegular(filepath.Join(s.root, "history.jsonl"), os.O_RDWR|os.O_CREATE|os.O_APPEND, true)
+	if err != nil {
+		return ErrIntegrity
 	}
 	info, err := s.log.Stat()
 	if err != nil || info.Size() > 64<<20 {
-		return fail()
+		return ErrIntegrity
 	}
 	s.size = info.Size()
 	if s.size > 0 {
 		var last [1]byte
 		if _, err = s.log.ReadAt(last[:], s.size-1); err != nil || last[0] != '\n' {
-			return fail()
+			return ErrIntegrity
 		}
 	}
 	scanner := bufio.NewScanner(s.log)
@@ -72,33 +81,34 @@ func openStore(root string) (*store, error) {
 	for scanner.Scan() {
 		var f frame
 		if strictjson.Decode(scanner.Bytes(), &f) != nil || f.Sequence != s.sequence+1 || f.Previous != s.head || s.validate(f) != nil {
-			return fail()
+			return ErrIntegrity
 		}
 		s.apply(f)
 		s.head = digest(scanner.Bytes())
 		s.sequence = f.Sequence
 	}
 	if scanner.Err() != nil {
-		return fail()
+		return ErrIntegrity
 	}
-	anchor, err := readFile(filepath.Join(root, "head"), 128, true)
+	anchor, err := readFile(filepath.Join(s.root, "head"), 128, true)
 	if s.sequence == 0 {
 		if err == nil && len(anchor) != 0 {
-			return fail()
+			return ErrIntegrity
 		}
 		if err != nil && !os.IsNotExist(err) {
-			return fail()
+			return ErrIntegrity
 		}
 	} else if err != nil || string(anchor) != s.head {
-		return fail()
+		return ErrIntegrity
 	}
 	if _, err = s.log.Seek(0, io.SeekEnd); err != nil {
-		return fail()
+		return ErrIntegrity
 	}
 	if d.Sync() != nil {
-		return fail()
+		return ErrIntegrity
 	}
-	return s, nil
+	s.broken = false
+	return nil
 }
 func terminal(status string) bool {
 	return status == "FAILED" || status == "EXPIRED" || status == "STOPPED"

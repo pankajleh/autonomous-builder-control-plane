@@ -132,7 +132,7 @@ func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, 
 			return fail()
 		}
 		for _, event := range page.Events {
-			if event.RunID != run || event.Ordinal <= last || event.Category == "UNKNOWN" || event.Status == "UNKNOWN" {
+			if event.RunID != run || event.Ordinal <= last || event.Category == "UNKNOWN" || event.Status == "UNKNOWN" && !providerWarning(event) {
 				return fail()
 			}
 			last = event.Ordinal
@@ -165,6 +165,14 @@ func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, 
 		return fail()
 	}
 	return Source{RunID: run, CheckpointActivityID: checkpoint, SHA: e.CheckpointSHA, Repository: scope.Repository, RepositoryIdentityDigest: reg.RepositoryIdentityDigest, Branch: scope.Branch, Base: scope.Base, ProductAuthorizationID: c.Project, ProductTaskID: c.Plan, ProductVersionID: c.ExecutionPack, ValidationID: jsonDigest([]string{jsonDigest(reg), jsonDigest(b), c.CapsuleSHA256, jsonDigest(e)})}, nil
+}
+
+// Ordinary provider warnings retain both hashed provider source identities.
+// Controller integrity/ambiguity markers deliberately have neither identity.
+func providerWarning(e activity.Event) bool {
+	return e.SchemaVersion == "ActivityEventV1" && e.AuthorityLevel == "PROVIDER_DETAIL" && e.SourceKind == "RALPHEX_PROGRESS" && e.Category == "WARNING" &&
+		strings.HasPrefix(e.SourceSessionID, "sha256-") && sha256Pattern.MatchString(strings.TrimPrefix(e.SourceSessionID, "sha256-")) &&
+		strings.HasPrefix(e.SourceEventID, "sha256-") && sha256Pattern.MatchString(strings.TrimPrefix(e.SourceEventID, "sha256-"))
 }
 
 func repositoryIdentity(ctx context.Context, path, identity string) bool {

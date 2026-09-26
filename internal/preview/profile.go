@@ -163,7 +163,7 @@ func LoadProfiles(path string) (map[string]PreviewProfileV1, error) {
 	}
 	return out, nil
 }
-func environmentArgs(env map[string]string) []string {
+func environmentValues(env map[string]string) []string {
 	keys := make([]string, 0, len(env))
 	for k := range env {
 		keys = append(keys, k)
@@ -171,7 +171,7 @@ func environmentArgs(env map[string]string) []string {
 	sort.Strings(keys)
 	out := []string{}
 	for _, k := range keys {
-		out = append(out, "--env", k+"="+env[k])
+		out = append(out, k+"="+env[k])
 	}
 	return out
 }

@@ -3,8 +3,10 @@
 package preview
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,6 +232,23 @@ func TestExactDetachedSourceIgnoresMutableWorktree(t *testing.T) {
 	if strings.Contains(command(t, path, "config", "--list"), f.repo) {
 		t.Fatal("source reveals origin host path")
 	}
+	if err := filepath.WalkDir(filepath.Join(path, ".git"), func(name string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		data, err := os.ReadFile(name)
+		if err == nil && bytes.Contains(data, []byte(f.repo)) {
+			t.Errorf("source metadata retains controller path: %s", name)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"FETCH_HEAD", "logs"} {
+		if _, err := os.Stat(filepath.Join(path, ".git", name)); !os.IsNotExist(err) {
+			t.Fatalf("generated controller metadata retained: %s (%v)", name, err)
+		}
+	}
 	if err = checkout.Remove(id); err != nil {
 		t.Fatal(err)
 	}
@@ -294,5 +313,61 @@ func TestPreviewLifecycleNeverMutatesRunAdmissionOrGovernedBranch(t *testing.T) 
 	}
 	if registration != f.catalog.reg || command(t, f.worktree, "rev-parse", "HEAD") != head {
 		t.Fatal("registration/branch mutated")
+	}
+}
+
+type pagedActivity struct {
+	pages   map[string]activity.Page
+	cursors []string
+}
+
+func (p *pagedActivity) ReadActivity(_ context.Context, _ string, request serviceapi.PageRequestV1) (json.RawMessage, error) {
+	p.cursors = append(p.cursors, request.Cursor)
+	page, ok := p.pages[request.Cursor]
+	if !ok {
+		return nil, ErrIntegrity
+	}
+	return json.Marshal(page)
+}
+func TestResolverTraversesPagesAndDistinguishesProviderWarnings(t *testing.T) {
+	for _, scenario := range []string{"warning-before", "warning-after", "integrity-after", "repeated-cursor", "nonprogressing-ordinal", "empty-page"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newBindingFixture(t)
+			checkpoint := f.events.page.Events[0]
+			warning := activity.Event{SchemaVersion: "ActivityEventV1", RunID: f.run, Ordinal: 2, Category: "WARNING", Status: "UNKNOWN", AuthorityLevel: "PROVIDER_DETAIL", SourceKind: "RALPHEX_PROGRESS", SourceSessionID: "sha256-" + strings.Repeat("a", 64), SourceEventID: "sha256-" + strings.Repeat("b", 64)}
+			reader := &pagedActivity{pages: map[string]activity.Page{
+				"":       {SchemaVersion: "ActivityPageV1", RunID: f.run, Events: []activity.Event{checkpoint}, NextCursor: "page-2"},
+				"page-2": {SchemaVersion: "ActivityPageV1", RunID: f.run, Events: []activity.Event{warning}},
+			}}
+			first, second := reader.pages[""], reader.pages["page-2"]
+			switch scenario {
+			case "warning-before":
+				warning.Ordinal, checkpoint.Ordinal = 1, 2
+				first.Events, second.Events = []activity.Event{warning}, []activity.Event{checkpoint}
+			case "integrity-after":
+				second.Events[0].SourceSessionID, second.Events[0].SourceEventID = "", ""
+			case "repeated-cursor":
+				second.NextCursor = "page-2"
+			case "nonprogressing-ordinal":
+				second.Events[0].Ordinal = 1
+			case "empty-page":
+				first.Events = nil
+			}
+			reader.pages[""], reader.pages["page-2"] = first, second
+			resolver := f.resolver()
+			resolver.Activity = reader
+			_, err := resolver.Resolve(context.Background(), f.run, checkpoint.ActivityID)
+			valid := scenario == "warning-before" || scenario == "warning-after"
+			if (err == nil) != valid {
+				t.Fatalf("eligibility: %v", err)
+			}
+			wantPages := 2
+			if scenario == "empty-page" {
+				wantPages = 1
+			}
+			if len(reader.cursors) != wantPages || reader.cursors[0] != "" || wantPages == 2 && reader.cursors[1] != "page-2" {
+				t.Fatal("incorrect traversal", reader.cursors)
+			}
+		})
 	}
 }

@@ -26,9 +26,11 @@ func (r staticResolver) Resolve(context.Context, string, string) (Source, error)
 }
 
 type memoryCheckout struct {
-	mu            sync.Mutex
-	made, removed []string
-	err           error
+	mu                      sync.Mutex
+	made, removed           []string
+	err                     error
+	removeErr, reconcileErr error
+	reconciled              bool
 }
 
 func (m *memoryCheckout) Materialize(_ context.Context, id string, _ Source) (string, error) {
@@ -41,17 +43,16 @@ func (m *memoryCheckout) Remove(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.removed = append(m.removed, id)
-	return nil
+	return m.removeErr
 }
-func (m *memoryCheckout) Reconcile() error { return nil }
+func (m *memoryCheckout) Reconcile() error { m.reconciled = true; return m.reconcileErr }
 
 type memoryRuntime struct {
-	mu                     sync.Mutex
-	available, healthy     bool
-	started, stopped       []string
-	startErr, reconcileErr error
-	reconciled             bool
-	gate                   <-chan struct{}
+	mu                                         sync.Mutex
+	available, healthy                         bool
+	started, stopped                           []string
+	startErr, reconcileErr, stopErr, healthErr error
+	reconciled                                 bool
 }
 
 func (r *memoryRuntime) Available(PreviewProfileV1) bool {
@@ -60,13 +61,6 @@ func (r *memoryRuntime) Available(PreviewProfileV1) bool {
 	return r.available
 }
 func (r *memoryRuntime) Start(ctx context.Context, id, path string, p PreviewProfileV1) (string, error) {
-	if r.gate != nil {
-		select {
-		case <-r.gate:
-		case <-ctx.Done():
-			return "", ctx.Err()
-		}
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.started = append(r.started, id)
@@ -75,13 +69,13 @@ func (r *memoryRuntime) Start(ctx context.Context, id, path string, p PreviewPro
 func (r *memoryRuntime) Healthy(context.Context, string, PreviewProfileV1) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.healthy, nil
+	return r.healthy, r.healthErr
 }
 func (r *memoryRuntime) Stop(_ context.Context, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stopped = append(r.stopped, id)
-	return nil
+	return r.stopErr
 }
 func (r *memoryRuntime) Reconcile(context.Context) error { r.reconciled = true; return r.reconcileErr }
 func principal() serviceapi.Principal {
@@ -358,16 +352,16 @@ func TestProtectedProfilesAndDurableStorageFailClosed(t *testing.T) {
 		t.Fatal("unknown profile authority accepted")
 	}
 	storeRoot := filepath.Join(root, "store")
-	s, err := openStore(storeRoot)
+	s, err := openLoadedStore(storeRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = openStore(storeRoot); err == nil {
+	if _, err = openLoadedStore(storeRoot); err == nil {
 		t.Fatal("second owner acquired journal")
 	}
 	s.close()
 	os.WriteFile(filepath.Join(storeRoot, "history.jsonl"), []byte("{\n"), 0600)
-	if _, err = openStore(storeRoot); err == nil {
+	if _, err = openLoadedStore(storeRoot); err == nil {
 		t.Fatal("torn journal accepted")
 	}
 }
@@ -384,7 +378,7 @@ func TestJournalRejectsTruncationAndTerminalRebinding(t *testing.T) {
 	if len(parts) < 4 {
 		t.Fatal("history not append-only")
 	}
-	reopened, err := openStore(s.store.root)
+	reopened, err := openLoadedStore(s.store.root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +391,7 @@ func TestJournalRejectsTruncationAndTerminalRebinding(t *testing.T) {
 	reopened.close()
 	truncated := strings.Join(parts[:len(parts)-1], "\n") + "\n"
 	os.WriteFile(filepath.Join(s.store.root, "history.jsonl"), []byte(truncated), 0600)
-	if _, err = openStore(s.store.root); err == nil {
+	if _, err = openLoadedStore(s.store.root); err == nil {
 		t.Fatal("tail deletion not detected")
 	}
 }
@@ -429,5 +423,208 @@ func TestNewCheckpointGetsNextRevisionAndRequestIDsBindTargets(t *testing.T) {
 	historical, err := s.ReadPreview(context.Background(), "run-1", first.PreviewID)
 	if err != nil || historical.SourceSHA != first.SourceSHA {
 		t.Fatal("previous source identity rebound")
+	}
+}
+
+// Tests that inspect journal recovery need both ownership and validated history.
+func openLoadedStore(root string) (*store, error) {
+	s, err := openStore(root)
+	if err != nil {
+		return nil, err
+	}
+	if err = s.load(); err != nil {
+		s.close()
+		return nil, err
+	}
+	return s, nil
+}
+
+type delayedRuntime struct {
+	*memoryRuntime
+	entered chan context.Context
+	release chan struct{}
+}
+
+func (r *delayedRuntime) Start(ctx context.Context, id, path string, p PreviewProfileV1) (string, error) {
+	r.entered <- ctx
+	<-r.release
+	// Model a runtime that completes just as cancellation races its return.
+	return r.memoryRuntime.Start(context.Background(), id, path, p)
+}
+func TestStopAndExpiryDuringStartupCannotPublishLateRoute(t *testing.T) {
+	for _, scenario := range []string{"stop", "expiry"} {
+		t.Run(scenario, func(t *testing.T) {
+			rt := &memoryRuntime{available: true, healthy: true}
+			s, _ := fixtureService(t, rt)
+			delayed := &delayedRuntime{rt, make(chan context.Context, 1), make(chan struct{})}
+			s.runtime = delayed
+			var release sync.Once
+			defer release.Do(func() { close(delayed.release) })
+			if scenario == "expiry" {
+				p := s.profiles["web-v1"]
+				p.TTLSeconds = 1
+				s.profiles[p.ProfileID] = p
+			}
+			v, err := s.CreatePreview(context.Background(), principal(), "run-1", createCommand("startup-race"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ctx context.Context
+			select {
+			case ctx = <-delayed.entered:
+			case <-time.After(3 * time.Second):
+				t.Fatal("runtime did not enter Start")
+			}
+			status := "EXPIRED"
+			if scenario == "stop" {
+				status = "STOPPED"
+				stop := serviceapi.PreviewStopRequestV1{SchemaVersion: 1, RequestID: "stop-race", ExpectedRunID: "run-1", ExpectedPreviewID: v.PreviewID, DelegatedActor: createCommand("").DelegatedActor}
+				if _, err = s.StopPreview(context.Background(), principal(), "run-1", v.PreviewID, stop); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(3 * time.Second):
+				t.Fatal("worker was not canceled")
+			}
+			release.Do(func() { close(delayed.release) })
+			terminal := awaitPreview(t, s, v.PreviewID, status, "")
+			awaitCleanup(t, s)
+			got, err := s.ReadPreview(context.Background(), "run-1", v.PreviewID)
+			if err != nil || got != terminal || got.RouteHandle != "" || !s.Available() {
+				t.Fatal("late runtime result changed terminal identity", got, err)
+			}
+		})
+	}
+}
+func TestCleanupAndRecoveryFailuresDisableAdmission(t *testing.T) {
+	for _, scenario := range []string{"runtime-stop", "source-remove", "runtime-reconcile", "source-reconcile", "health-integrity"} {
+		t.Run(scenario, func(t *testing.T) {
+			rt := &memoryRuntime{available: true, healthy: true}
+			if scenario == "runtime-reconcile" {
+				rt.reconcileErr = ErrUnavailable
+			}
+			if scenario == "runtime-stop" {
+				rt.stopErr = ErrUnavailable
+			}
+			s, m := fixtureService(t, rt)
+			if scenario == "source-remove" {
+				m.removeErr = ErrUnavailable
+			}
+			if scenario == "source-reconcile" {
+				s.Close()
+				m = &memoryCheckout{reconcileErr: ErrUnavailable}
+				var err error
+				s, err = newService(context.Background(), filepath.Join(t.TempDir(), "previews"), s.profiles, s.resolver, m, rt, time.Now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s.Close()
+			}
+			if !strings.HasSuffix(scenario, "reconcile") {
+				v, err := s.CreatePreview(context.Background(), principal(), "run-1", createCommand("cleanup"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				awaitPreview(t, s, v.PreviewID, "READY", "")
+				if scenario == "health-integrity" {
+					rt.mu.Lock()
+					rt.healthErr = ErrIntegrity
+					rt.available = false
+					rt.mu.Unlock()
+					awaitPreview(t, s, v.PreviewID, "FAILED", "")
+				} else {
+					stop := serviceapi.PreviewStopRequestV1{SchemaVersion: 1, RequestID: "stop-cleanup", ExpectedRunID: "run-1", ExpectedPreviewID: v.PreviewID, DelegatedActor: createCommand("").DelegatedActor}
+					if _, err = s.StopPreview(context.Background(), principal(), "run-1", v.PreviewID, stop); err != nil {
+						t.Fatal(err)
+					}
+				}
+				awaitCleanup(t, s)
+			}
+			if s.Available() {
+				t.Fatal("failed cleanup remains available")
+			}
+			if _, err := s.CreatePreview(context.Background(), principal(), "run-1", createCommand("after-failure")); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
+				t.Fatal("admitted after failure", err)
+			}
+			if scenario == "runtime-stop" && len(m.removed) != 0 {
+				t.Fatal("removed source while runtime cleanup failed")
+			}
+			if scenario == "runtime-reconcile" && m.reconciled {
+				t.Fatal("removed orphan source while runtime reconciliation failed")
+			}
+		})
+	}
+}
+func TestDamagedJournalStillReconcilesExclusivelyOwnedObjects(t *testing.T) {
+	for _, damage := range []string{"torn-frame", "wrong-anchor"} {
+		t.Run(damage, func(t *testing.T) {
+			s, _ := fixtureService(t, &memoryRuntime{available: true, healthy: true})
+			v, err := s.CreatePreview(context.Background(), principal(), "run-1", createCommand("before-crash"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			awaitPreview(t, s, v.PreviewID, "READY", "")
+			if err = s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			root := s.store.root
+			file := filepath.Join(root, "history.jsonl")
+			if damage == "wrong-anchor" {
+				file = filepath.Join(root, "head")
+			}
+			original, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			damaged := append(original, []byte("torn")...)
+			if err = os.WriteFile(file, damaged, 0600); err != nil {
+				t.Fatal(err)
+			}
+			sourceRoot := filepath.Join(root, "sources")
+			if err = os.Mkdir(sourceRoot, 0700); err != nil {
+				t.Fatal(err)
+			}
+			orphan := filepath.Join(sourceRoot, v.PreviewID)
+			if err = os.Mkdir(orphan, 0755); err != nil {
+				t.Fatal(err)
+			}
+			f := newDockerFixture(t, testProfile())
+			f.d.root = root
+			f.containers["orphan"] = strings.Repeat("a", 64)
+			f.network = true
+			recovered, err := newService(context.Background(), root, s.profiles, s.resolver, Checkout{sourceRoot}, f.d, time.Now)
+			if err != nil {
+				t.Fatal("damaged preview prevented service startup", err)
+			}
+			defer recovered.Close()
+			if recovered.Available() || len(f.containers) != 0 || f.network {
+				t.Fatal("damaged journal bypassed cleanup or enabled admission")
+			}
+			if _, err = os.Stat(orphan); !os.IsNotExist(err) {
+				t.Fatal("orphan source remains", err)
+			}
+			if _, err = recovered.ReadPreview(context.Background(), "run-1", v.PreviewID); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
+				t.Fatal("untrusted partial history readable", err)
+			}
+			if _, err = recovered.CreatePreview(context.Background(), principal(), "run-1", createCommand("before-crash")); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
+				t.Fatal("damaged receipt replayed", err)
+			}
+			after, err := os.ReadFile(file)
+			if err != nil || string(after) != string(damaged) {
+				t.Fatal("damaged history changed", err)
+			}
+			// A second process must not reconcile resources belonging to the live owner.
+			other := &memoryRuntime{available: true}
+			checkout := &memoryCheckout{}
+			if second, err := newService(context.Background(), root, s.profiles, s.resolver, checkout, other, time.Now); err == nil {
+				second.Close()
+				t.Fatal("second owner admitted")
+			}
+			if other.reconciled || checkout.reconciled {
+				t.Fatal("cleanup ran without namespace ownership")
+			}
+		})
 	}
 }

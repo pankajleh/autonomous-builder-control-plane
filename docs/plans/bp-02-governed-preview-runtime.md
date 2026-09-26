@@ -321,3 +321,33 @@ The complete host/profile isolation and presentation proof was unavailable, so
 capability remained false; probe cleanup passed. This is the authorized fail-closed
 outcome, not live Preview Serve acceptance. Publication, runtime cutover, and
 independent exact-head acceptance/review remain outside this implementation iteration.
+
+### Review corrections — 2026-09-26
+
+The five review scopes completed; their confirmed findings were addressed within
+the frozen allowed paths:
+- health-check cancellation no longer revokes a profile's isolation approval;
+- exclusive namespace ownership is acquired before orphan cleanup, separately
+  from journal loading, so damaged history disables preview while preserving
+  history and allowing the existing service to start;
+- controller subprocesses use process-group cancellation and bounded pipe waits;
+- candidate-visible Git metadata no longer retains generated origin paths or
+  controller reflogs;
+- ordinary provider warnings remain eligible while controller integrity markers
+  still fail closed, including across activity pages;
+- host/profile probes exercise the actual read-only source mount and require
+  successful cleanup before recording approval;
+- deterministic tests cover successful Docker execution/health, partial startup,
+  isolation drift, cancellation/expiry, cleanup failures and damaged recovery;
+- unused runtime bookkeeping and redundant environment conversion were removed;
+- protected configuration, host prerequisites, smoke testing and HTTP receipt
+  usage are documented in `internal/preview/README.md`.
+
+The updated local Docker smoke includes the source mount. It again completed
+with `preview_runtime=false` and successful cleanup because the full host/profile
+isolation and presentation proof was unavailable. This remains the authorized
+fail-closed outcome and does not claim live Preview Serve acceptance.
+
+Review validation passed: `go test ./...`, `go test -race ./...`, `go vet ./...`,
+Darwin/amd64 and Windows/amd64 compile-only checks for the three affected packages,
+Go formatting, `git diff --check`, and the frozen-parent allowed-path subset audit.

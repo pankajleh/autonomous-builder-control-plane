@@ -74,6 +74,12 @@ func newService(parent context.Context, root string, profiles map[string]Preview
 	} else if checkout.Reconcile() != nil {
 		s.unavailable = true
 	}
+	if store.load() != nil {
+		// Retain the lock and damaged files, but keep legacy service startup
+		// independent of preview history recovery. No receipt may be replayed.
+		s.unavailable = true
+		return s, nil
+	}
 	for _, v := range store.records {
 		if !terminal(v.Status) {
 			v = ended(v, "FAILED", now())
@@ -394,7 +400,7 @@ func (s *Service) Close() error {
 	}
 	var closeErr error
 	for id, v := range s.store.records {
-		if !terminal(v.Status) {
+		if !s.store.broken && !terminal(v.Status) {
 			closeErr = errors.Join(closeErr, s.store.append(ended(v, "STOPPED", s.now()), nil))
 			if cancel := s.workers[id]; cancel != nil {
 				cancel()

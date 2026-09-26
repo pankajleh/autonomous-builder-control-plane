@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -590,15 +589,21 @@ func TestServeWiresAdditiveActivityAndSurvivesActivityStorageFailure(t *testing.
 	if runtime.GOOS != "linux" {
 		t.Skip("service strong filesystem guarantees require Linux")
 	}
-	for _, broken := range []bool{false, true} {
-		t.Run(fmt.Sprint("broken-activity-", broken), func(t *testing.T) {
+	for _, broken := range []string{"none", "activity", "preview"} {
+		t.Run("broken-"+broken, func(t *testing.T) {
 			root := t.TempDir()
 			serviceRoot := filepath.Join(root, "service")
 			if err := os.Mkdir(serviceRoot, 0700); err != nil {
 				t.Fatal(err)
 			}
-			if broken {
+			if broken == "activity" {
 				writeCLIFile(t, filepath.Join(serviceRoot, "activity"), []byte("unavailable"), 0600)
+			}
+			if broken == "preview" {
+				if err := os.Mkdir(filepath.Join(serviceRoot, "previews"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				writeCLIFile(t, filepath.Join(serviceRoot, "previews", "history.jsonl"), []byte("torn"), 0600)
 			}
 			token := strings.Repeat("t", 32)
 			tokenPath := filepath.Join(root, "token")

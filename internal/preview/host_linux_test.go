@@ -20,7 +20,6 @@ func TestLocalDockerHostIsolation(t *testing.T) {
 	p := testProfile()
 	p.Services[0].Image = image
 	p.Services[0].Environment = nil
-	p.Services[0].MountSource = false
 	p.Services[0].StartArgv = []string{"/usr/sbin/httpd", "-f", "-p", "8080", "-h", "/scratch"}
 	if p.Validate() != nil {
 		t.Fatal("invalid protected smoke profile")
