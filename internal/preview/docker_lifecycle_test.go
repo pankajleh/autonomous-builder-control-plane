@@ -11,11 +11,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
@@ -94,6 +96,20 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 		}
 	case "exec":
 		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "cat /source/"+probeSourceName) {
+			path := filepath.Join(f.d.root, "sources", f.id)
+			dir, err := os.Stat(path)
+			if err != nil || dir.Mode().Perm()&0005 != 0005 {
+				return "", ErrUnavailable
+			}
+			file := filepath.Join(path, probeSourceName)
+			info, err := os.Stat(file)
+			if err != nil || info.Mode().Perm()&0004 == 0 {
+				return "", ErrUnavailable
+			}
+			data, err := os.ReadFile(file)
+			return string(data), err
+		}
 		if strings.Contains(joined, "/proc/net/route") {
 			return "Iface Destination Gateway Flags\neth0 0000580A 00000000 0001", nil
 		}
@@ -307,5 +323,58 @@ func TestDockerProbeCleanupFailureCannotApproveProfile(t *testing.T) {
 	}
 	if err := checkout.Remove(f.id); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDockerProbeChecksSourceReadability(t *testing.T) {
+	if os.Getenv("ABCP_PREVIEW_PROBE_UMASK_HELPER") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestDockerProbeChecksSourceReadability$")
+		cmd.Env = append(os.Environ(), "ABCP_PREVIEW_PROBE_UMASK_HELPER=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("restrictive umask probe: %v\n%s", err, out)
+		}
+		return
+	}
+	syscall.Umask(0077)
+	for _, failure := range []string{"none", "presented", "sibling", "wrong-bytes"} {
+		t.Run(failure, func(t *testing.T) {
+			p := testProfile()
+			p.Services[0].User = "2345:2345"
+			sibling := p.Services[0]
+			sibling.Name, sibling.User, sibling.Presented = "db", "3456:3456", false
+			p.Services = append(p.Services, sibling)
+			f := newDockerFixture(t, p)
+			f.id = jsonDigest([]string{f.d.namespace, p.Digest(), "isolation-probe"})
+			reads := map[string]bool{}
+			f.reject = func(_ context.Context, args []string) error {
+				if args[0] != "exec" || args[len(args)-1] != "/source/"+probeSourceName {
+					return nil
+				}
+				reads[args[1]] = true
+				if failure == "presented" && args[1] == f.d.container(f.id, 0) || failure == "sibling" && args[1] == f.d.container(f.id, 1) {
+					return os.ErrPermission
+				}
+				if failure == "wrong-bytes" {
+					return os.WriteFile(filepath.Join(f.d.root, "sources", f.id, probeSourceName), []byte("unexpected source"), 0600)
+				}
+				return nil
+			}
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) }))
+			defer target.Close()
+			f.external = func() { connectPresentation(t, f.d.groups[f.id], target.URL) }
+			proved := f.d.prove(context.Background(), p)
+			if proved != (failure == "none") || f.d.Available(p) != proved {
+				t.Fatal("source read did not gate capability", proved)
+			}
+			if !reads[f.d.container(f.id, 0)] || (failure == "none" || failure == "sibling") && !reads[f.d.container(f.id, 1)] {
+				t.Fatal("source was not read as each configured user", reads)
+			}
+			if len(f.containers) != 0 || f.network || len(f.d.groups) != 0 {
+				t.Fatal("source read probe leaked runtime objects")
+			}
+			if _, err := os.Stat(filepath.Join(f.d.root, "sources", f.id)); !os.IsNotExist(err) {
+				t.Fatal("source read probe leaked checkout", err)
+			}
+		})
 	}
 }

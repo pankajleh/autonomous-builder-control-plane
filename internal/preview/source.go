@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -105,9 +106,36 @@ func (c Checkout) Materialize(ctx context.Context, id string, s Source) (path st
 			return "", err
 		}
 	}
+	if err = readableSource(path); err != nil {
+		return "", err
+	}
 	success = true
 	return path, nil
 }
+
+// The bind root must be readable by any configured non-root container UID,
+// independently of the controller's umask. Its parent remains private (0700).
+// WalkDir never follows candidate symlinks, and executable files stay executable.
+func readableSource(path string) error {
+	return filepath.WalkDir(path, func(name string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.Type()&os.ModeSymlink != 0 {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			return ErrIntegrity
+		}
+		mode := os.FileMode(0644)
+		if info.IsDir() || info.Mode().Perm()&0111 != 0 {
+			mode = 0755
+		}
+		return os.Chmod(name, mode)
+	})
+}
+
 func (c Checkout) Remove(id string) error {
 	if !sha256Pattern.MatchString(id) {
 		return ErrIntegrity

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -257,6 +258,78 @@ func TestExactDetachedSourceIgnoresMutableWorktree(t *testing.T) {
 	}
 	if err = checkout.Remove("../escape"); err == nil {
 		t.Fatal("unsafe deletion accepted")
+	}
+}
+
+func TestDetachedSourceReadableWithRestrictiveUmask(t *testing.T) {
+	// Umask is process-wide; isolate it from other tests and their goroutines.
+	if os.Getenv("ABCP_PREVIEW_UMASK_HELPER") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestDetachedSourceReadableWithRestrictiveUmask$")
+		cmd.Env = append(os.Environ(), "ABCP_PREVIEW_UMASK_HELPER=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("restrictive umask checkout: %v\n%s", err, out)
+		}
+		return
+	}
+	syscall.Umask(0077)
+	f := newBindingFixture(t)
+	outside := filepath.Join(t.TempDir(), "private")
+	if err := os.WriteFile(outside, []byte("private\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(f.worktree, "nested"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.worktree, "nested", "executable"), []byte("#!/bin/true\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(f.worktree, "nested", "link")); err != nil {
+		t.Fatal(err)
+	}
+	command(t, f.worktree, "add", "nested")
+	command(t, f.worktree, "commit", "-m", "source permissions")
+	source := Source{SHA: command(t, f.worktree, "rev-parse", "HEAD"), Repository: f.repo, Branch: f.manifest.Worktree.Branch}
+	checkout := Checkout{Root: filepath.Join(t.TempDir(), "sources")}
+	path, err := checkout.Materialize(context.Background(), strings.Repeat("d", 64), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mode := range map[string]os.FileMode{
+		checkout.Root: 0700, path: 0755, filepath.Join(path, "source"): 0644,
+		filepath.Join(path, "nested"): 0755, filepath.Join(path, "nested", "executable"): 0755,
+		outside: 0600, filepath.Join(f.worktree, "source"): 0600,
+	} {
+		info, err := os.Stat(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != mode {
+			t.Errorf("%s: mode %o, want %o", name, info.Mode().Perm(), mode)
+		}
+	}
+	if info, err := os.Lstat(filepath.Join(path, "nested", "link")); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("source symlink was changed", err)
+	}
+	// The container sees the bind root, not its private host parent. Other-user
+	// bits must suffice even when its numeric UID/GID differ from the controller.
+	if err := filepath.WalkDir(path, func(name string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.Type()&os.ModeSymlink != 0 {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		need := os.FileMode(4)
+		if entry.IsDir() {
+			need = 5
+		}
+		if info.Mode().Perm()&need != need {
+			t.Errorf("different container UID cannot read %s: %o", name, info.Mode().Perm())
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

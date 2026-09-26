@@ -94,8 +94,11 @@ Each group uses a dedicated internal bridge with no published container ports,
 a read-only root, dropped capabilities and no-new-privileges. `/scratch` is its
 bounded, non-executable write area. Source, when requested, is mounted at
 `/source` using `readonly,bind-recursive=readonly`; the daemon/kernel must support
-these options. Startup probes exercise that same mount with a private temporary
-source directory. Host-loopback presentation binds an explicit 127.0.0.1 address
+these options. Detached checkout directories and files are made readable for the
+configured non-root users regardless of the controller's umask, preserving
+executable files and symlinks while their host parent remains private. Startup
+probes exercise that same mount and verify source-file contents through each
+service's configured user. Host-loopback presentation binds an explicit 127.0.0.1 address
 and targets only the presented service; siblings remain internal.
 
 Missing profile configuration or an unsupported host/profile leaves

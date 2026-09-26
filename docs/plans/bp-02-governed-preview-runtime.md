@@ -351,3 +351,24 @@ fail-closed outcome and does not claim live Preview Serve acceptance.
 Review validation passed: `go test ./...`, `go test -race ./...`, `go vet ./...`,
 Darwin/amd64 and Windows/amd64 compile-only checks for the three affected packages,
 Go formatting, `git diff --check`, and the frozen-parent allowed-path subset audit.
+
+### Final review corrections — 2026-09-26
+
+The final correctness/security and requirement reviews completed. One confirmed
+major defect was reproduced: controller umask 077 left detached source unreadable
+to a different non-root container user while the isolation probe never read source.
+Detached copies now receive readable directory/file permissions, preserving
+executable status and symlinks without changing the private host parent or governed
+worktree. Every source-mounting service must read exact probe-file contents as its
+configured user before the profile can advertise availability.
+
+Regression tests exercise restrictive umasks in isolated subprocesses, executable
+files, symlink targets, both presented/sibling read failures, incorrect source
+contents, and cleanup. The local Docker smoke was rerun under umask 077 with
+UID/GID 65534; the full host/profile proof remained unavailable, so capability
+stayed false and cleanup passed. This does not establish live Preview Serve.
+
+Final review validation passed: focused tests, `go test ./...`,
+`go test -race ./...`, `go vet ./...`, Darwin/amd64 and Windows/amd64 compile-only
+checks for all affected packages, Go formatting, `git diff --check`, and the
+frozen-parent allowed-path subset audit.

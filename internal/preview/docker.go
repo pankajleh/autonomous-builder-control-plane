@@ -432,6 +432,9 @@ func (d *dockerRuntime) Reconcile(ctx context.Context) error {
 	return d.removeObjects(ctx, "")
 }
 
+const probeSourceName = ".abcp-preview-source-probe"
+const probeSourceContents = "governed preview source probe"
+
 // prove is intentionally conservative: a local pinned image must also contain
 // the fixed offline probe tools. Missing tools, unusable container IPs, egress,
 // or an unreachable explicit loopback listener all leave capability false.
@@ -466,10 +469,13 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 			root.Close()
 			// Exercise the same mount as candidate execution, with readable offline
 			// input under this namespace rather than any governed worktree.
-			if os.Mkdir(path, 0755) != nil {
+			if os.Mkdir(path, 0700) != nil {
 				return false
 			}
 			sourceCreated = true
+			if os.WriteFile(filepath.Join(path, probeSourceName), []byte(probeSourceContents), 0600) != nil || readableSource(path) != nil {
+				return false
+			}
 			break
 		}
 	}
@@ -480,10 +486,18 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 	d.mu.Lock()
 	d.groups[id] = g
 	d.mu.Unlock()
-	for i := range p.Services {
+	for i, s := range p.Services {
 		// A functioning route reader and wget are prerequisites; a missing probe
 		// executable cannot masquerade as evidence of blocked external egress.
 		args := []string{"exec", d.container(id, i), "/usr/bin/env", "-i", "/bin/busybox"}
+		if s.MountSource {
+			// Docker exec inherits the configured container user. Prove that the
+			// real bind mount exposes readable bytes to that user before approval.
+			data, err := d.run(ctx, append(args, "cat", "/source/"+probeSourceName)...)
+			if err != nil || data != probeSourceContents {
+				return false
+			}
+		}
 		if _, err = d.run(ctx, append(args, "wget", "--help")...); err != nil {
 			return false
 		}
