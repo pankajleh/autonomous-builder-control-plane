@@ -294,10 +294,21 @@ type ErrorResponseV1 struct {
 func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	requestID := safeRequestID(request.Header.Get("X-Request-ID"))
 	writer.Header().Set("X-Request-ID", requestID)
-	// Stream requests have their own admission budget and never occupy a
-	// generic request slot for their lifetime. All authentication still runs.
+	// Bound every stream request before authentication, body reads, or catalog
+	// access. Its dedicated slot covers both preprocessing and stream lifetime.
 	streamRoute := request.URL != nil && request.URL.RawPath == "" && strings.HasPrefix(request.URL.Path, "/v1/runs/") && strings.HasSuffix(request.URL.Path, "/activity/stream")
-	if !streamRoute {
+	if streamRoute {
+		select {
+		case s.activityStreams <- struct{}{}:
+			defer func() { <-s.activityStreams }()
+		default:
+			// Skip net/http's implicit body drain on this unadmitted request.
+			writer.Header().Set("Connection", "close")
+			writer.Header().Set("Retry-After", "1")
+			s.writeError(writer, http.StatusServiceUnavailable, ErrorV1{Code: "activity_busy", Message: "activity stream capacity is busy", RequestID: requestID, Retryable: true})
+			return
+		}
+	} else {
 		select {
 		case s.inFlight <- struct{}{}:
 			defer func() { <-s.inFlight }()
@@ -973,14 +984,6 @@ func (s *Server) runActivityStream(w http.ResponseWriter, r *http.Request, id, r
 	}
 	if s.reserved.Activity == nil {
 		s.writeDependencyError(w, id, ErrUnsupportedCapability)
-		return
-	}
-	select {
-	case s.activityStreams <- struct{}{}:
-		defer func() { <-s.activityStreams }()
-	default:
-		w.Header().Set("Retry-After", "1")
-		s.writeError(w, http.StatusServiceUnavailable, ErrorV1{Code: "activity_busy", Message: "activity stream capacity is busy", RequestID: id, Retryable: true})
 		return
 	}
 	if _, ok := w.(http.Flusher); !ok {

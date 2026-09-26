@@ -33,7 +33,10 @@ type Service struct {
 	closed    bool
 	now       func() time.Time
 }
-type worker struct{ touched time.Time }
+type worker struct {
+	touched       time.Time
+	subscriptions int
+}
 type sharedSidecar struct {
 	ready   chan struct{}
 	sc      *sidecar
@@ -114,40 +117,45 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 	return scope, nil
 }
 
-func (s *Service) prepare(ctx context.Context, run string) (string, error) {
+func (s *Service) prepare(ctx context.Context, run string, subscribe bool) (string, *worker, error) {
 	if s == nil || s.store == nil {
-		return "", ErrUnavailable
+		return "", nil, ErrUnavailable
 	}
 	registration, err := s.registration(run)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if _, err = s.refresh(ctx, run, registration); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.faults[run] != nil {
-		return "", ErrUnavailable
+		return "", nil, ErrUnavailable
 	}
 	if w := s.workers[run]; w != nil {
 		w.touched = s.now()
-		return registration, nil
+		if subscribe {
+			w.subscriptions++
+		}
+		return registration, w, nil
 	}
 	if len(s.workers) >= MaxStreams {
-		return "", ErrExhausted
+		return "", nil, ErrExhausted
 	}
 	w := &worker{touched: s.now()}
+	if subscribe {
+		w.subscriptions = 1
+	}
 	s.workers[run] = w
 	s.wg.Add(1)
 	go s.collect(run, registration, w)
-	return registration, nil
+	return registration, w, nil
 }
-func (s *Service) touch(run string) {
+func (s *Service) releaseSubscription(w *worker) {
 	s.mu.Lock()
-	if w := s.workers[run]; w != nil {
-		w.touched = s.now()
-	}
+	w.subscriptions--
+	w.touched = s.now()
 	s.mu.Unlock()
 }
 
@@ -203,7 +211,9 @@ func (s *Service) collect(run, registration string, w *worker) {
 	idleExit := false
 	defer func() {
 		s.mu.Lock()
-		delete(s.workers, run)
+		if s.workers[run] == w {
+			delete(s.workers, run)
+		}
 		if !idleExit && s.ctx.Err() == nil {
 			if s.faults == nil {
 				s.faults = map[string]error{}
@@ -227,7 +237,12 @@ func (s *Service) collect(run, registration string, w *worker) {
 			return
 		}
 		s.mu.Lock()
-		idle := s.now().Sub(w.touched) > time.Minute
+		idle := w.subscriptions == 0 && s.now().Sub(w.touched) > time.Minute
+		if idle {
+			// Retire under the admission lock so a new subscriber cannot attach
+			// to a collector that has already decided to stop.
+			delete(s.workers, run)
+		}
 		s.mu.Unlock()
 		if idle {
 			idleExit = true
@@ -327,6 +342,21 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 	if err != nil {
 		return err
 	}
+	events := make([]Event, len(messages))
+	position := *last
+	for i, message := range messages {
+		if position != math.MaxUint64 && message.id <= position {
+			return ErrIntegrity
+		}
+		events[i], err = normalizeProvider(scope.RunID, selected.ID, strconv.FormatUint(message.id, 10), message.payload, s.now())
+		if err != nil {
+			return err
+		}
+		position = message.id
+	}
+	if err = s.store.checkProviderReplay(scope.RunID, registration, events); err != nil {
+		return err
+	}
 	if err = s.store.saveProof(scope.RunID, registration, proof); err != nil {
 		return err
 	}
@@ -338,10 +368,7 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 		}
 		*last = math.MaxUint64
 	}
-	for _, message := range messages {
-		if *last != math.MaxUint64 && message.id <= *last {
-			return ErrIntegrity
-		}
+	for i, message := range messages {
 		expected := *last + 1 // MaxUint64 denotes no prior source event; wraps to zero.
 		if message.id != expected {
 			gapKey := identity("gap", proof.Generation, strconv.FormatUint(*last, 10), strconv.FormatUint(message.id, 10))
@@ -349,11 +376,7 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 				return err
 			}
 		}
-		event, err := normalizeProvider(scope.RunID, selected.ID, strconv.FormatUint(message.id, 10), message.payload, s.now())
-		if err != nil {
-			return err
-		}
-		if _, err = s.store.Append(scope.RunID, registration, event); err != nil {
+		if _, err = s.store.Append(scope.RunID, registration, events[i]); err != nil {
 			return err
 		}
 		*last = message.id
@@ -379,7 +402,7 @@ func (s *Service) ReadActivity(ctx context.Context, run string, request servicea
 			return nil, serviceapi.ErrInvalidCursor
 		}
 	}
-	registration, err := s.prepare(ctx, run)
+	registration, _, err := s.prepare(ctx, run, false)
 	if err != nil {
 		return nil, apiError(err)
 	}
@@ -414,28 +437,34 @@ func (s *Service) OpenActivityStream(ctx context.Context, run, last string) (ser
 			return nil, serviceapi.ErrInvalidCursor
 		}
 	}
-	registration, err := s.prepare(ctx, run)
+	registration, w, err := s.prepare(ctx, run, true)
 	if err != nil {
 		return nil, apiError(err)
 	}
 	_, generation, _, err := s.store.read(run, registration, after, 1)
 	if err != nil {
+		s.releaseSubscription(w)
 		if last != "" {
 			return nil, serviceapi.ErrInvalidCursor
 		}
 		return nil, apiError(err)
 	}
-	return &subscription{service: s, run: run, registration: registration, generation: generation, after: after}, nil
+	return &subscription{service: s, worker: w, run: run, registration: registration, generation: generation, after: after}, nil
 }
 
 type subscription struct {
 	service                       *Service
+	worker                        *worker
+	closeOnce                     sync.Once
 	run, registration, generation string
 	after                         uint64
 	pending                       []Event
 }
 
-func (s *subscription) Close() error { return nil }
+func (s *subscription) Close() error {
+	s.closeOnce.Do(func() { s.service.releaseSubscription(s.worker) })
+	return nil
+}
 func (s *subscription) Next(ctx context.Context) (serviceapi.ActivityFrame, error) {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -457,7 +486,6 @@ func (s *subscription) Next(ctx context.Context) (serviceapi.ActivityFrame, erro
 			data, _ := json.Marshal(e)
 			return serviceapi.ActivityFrame{Ordinal: e.Ordinal, Data: data}, nil
 		}
-		s.service.touch(s.run)
 		events, generation, _, err := s.service.store.read(s.run, s.registration, s.after, MaxPageSize)
 		if err != nil {
 			return serviceapi.ActivityFrame{}, apiError(err)

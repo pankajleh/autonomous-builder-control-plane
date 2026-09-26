@@ -260,3 +260,80 @@ func TestCollectorIntegrityFailureStillClosesStream(t *testing.T) {
 		}
 	}
 }
+
+func TestSlowSubscriptionRetainsCollectorWhileFramesArePending(t *testing.T) {
+	s, facts := testService(t)
+	var clock atomic.Int64
+	clock.Store(testTime.UnixNano())
+	s.now = func() time.Time { return time.Unix(0, clock.Load()) }
+	facts.events = []ledger.Event{
+		{EventID: "required", StateTo: domain.StateHumanDecisionRequired, Timestamp: testTime},
+		{EventID: "pending", StateTo: domain.StateBranchAcceptancePending, Timestamp: testTime},
+	}
+	refreshed := make(chan struct{}, 10)
+	s.snapshots = snapshotFunc(func(ctx context.Context, run string) (readmodel.Snapshot, error) {
+		snapshot, err := facts.Snapshot(ctx, run)
+		refreshed <- struct{}{}
+		return snapshot, err
+	})
+	stream, err := s.OpenActivityStream(context.Background(), "run", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if _, err = stream.Next(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(stream.(*subscription).pending) == 0 {
+		t.Fatal("fixture did not buffer events")
+	}
+	// Wait for admission and the collector's first refresh, then move past its
+	// idle deadline while the client still has an unconsumed batch.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-refreshed:
+		case <-time.After(4 * time.Second):
+			t.Fatal("initial collection did not run")
+		}
+	}
+	facts.mu.Lock()
+	facts.events = append(facts.events, ledger.Event{EventID: "accepted", StateTo: domain.StateBranchAccepted, Timestamp: testTime})
+	facts.mu.Unlock()
+	clock.Add(int64(2 * time.Minute))
+	select {
+	case <-refreshed:
+	case <-time.After(4 * time.Second):
+		t.Fatal("active subscription lost its collector while delivering buffered events")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	for {
+		frame, err := stream.Next(ctx)
+		if err != nil {
+			t.Fatal("new milestone did not reach slow subscriber", err)
+		}
+		var event Event
+		if err = json.Unmarshal(frame.Data, &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Status == "ACCEPTED" {
+			break
+		}
+	}
+	if rejected, err := s.OpenActivityStream(ctx, "run", "999999"); !errors.Is(err, serviceapi.ErrInvalidCursor) {
+		if rejected != nil {
+			rejected.Close()
+		}
+		t.Fatal("invalid resume accepted", err)
+	}
+	stream.Close()
+	stream.Close()
+	clock.Add(int64(2 * time.Minute))
+	stopped := make(chan struct{})
+	go func() { s.wg.Wait(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(4 * time.Second):
+		t.Fatal("closed or rejected subscriptions retained the idle collector")
+	}
+}

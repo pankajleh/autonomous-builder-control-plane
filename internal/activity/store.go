@@ -62,16 +62,17 @@ type logRecord struct {
 }
 
 type runLog struct {
-	header      logHeader
-	events      []Event
-	identities  map[string]int
-	provider    *providerProof
-	tail        string
-	bytes       int64
-	info        os.FileInfo
-	physical    string
-	lastOrdinal uint64
-	err         error
+	header          logHeader
+	events          []Event
+	identities      map[string]int
+	providerSources map[string]string
+	provider        *providerProof
+	tail            string
+	bytes           int64
+	info            os.FileInfo
+	physical        string
+	lastOrdinal     uint64
+	err             error
 }
 
 func OpenStore(root string) (*Store, error) {
@@ -263,7 +264,7 @@ func (s *Store) load(run, registration string) (*runLog, error) {
 		}
 		return prior, nil
 	}
-	log := &runLog{identities: map[string]int{}, info: info, bytes: info.Size(), physical: anchor.Physical}
+	log := &runLog{identities: map[string]int{}, providerSources: map[string]string{}, info: info, bytes: info.Size(), physical: anchor.Physical}
 	scanner := bufio.NewScanner(io.LimitReader(f, MaxBytes+1))
 	scanner.Buffer(make([]byte, 4096), 32<<10)
 	if !scanner.Scan() || strictjson.Decode(scanner.Bytes(), &log.header) != nil || log.header.Run != run || log.header.Registration != registration || len(log.header.Generation) != 64 || anchor.Generation != log.header.Generation {
@@ -304,6 +305,12 @@ func (s *Store) load(run, registration string) (*runLog, error) {
 		}
 		if _, duplicate := log.identities[event.ActivityID]; duplicate {
 			return nil, ErrIntegrity
+		}
+		if err = log.checkProviderEvent(event); err != nil {
+			return nil, err
+		}
+		if key := providerSourceKey(event); key != "" {
+			log.providerSources[key] = event.SourceDigest
 		}
 		last = event.Ordinal
 		log.identities[event.ActivityID] = len(log.events)
@@ -394,6 +401,9 @@ func (s *Store) Append(run, registration string, event Event) (Event, error) {
 	if event.RunID != run || validateEvent(event) != nil {
 		return Event{}, ErrIntegrity
 	}
+	if err = log.checkProviderEvent(event); err != nil {
+		return Event{}, err
+	}
 	if index, ok := log.identities[event.ActivityID]; ok {
 		return log.events[index], nil
 	}
@@ -411,7 +421,44 @@ func (s *Store) Append(run, registration string, event Event) (Event, error) {
 	}
 	log.identities[event.ActivityID] = len(log.events)
 	log.events = append(log.events, event)
+	if key := providerSourceKey(event); key != "" {
+		log.providerSources[key] = event.SourceDigest
+	}
 	return event, nil
+}
+
+func providerSourceKey(event Event) string {
+	if event.SourceKind != "RALPHEX_PROGRESS" || event.SourceSessionID == "" || event.SourceEventID == "" {
+		return ""
+	}
+	return identity(event.SourceSessionID, event.SourceEventID)
+}
+
+func (log *runLog) checkProviderEvent(event Event) error {
+	if key := providerSourceKey(event); key != "" {
+		if previous, exists := log.providerSources[key]; exists && previous != event.SourceDigest {
+			return ErrIntegrity
+		}
+	}
+	return nil
+}
+
+// A provider restart can change the association between replay ordinals and
+// payloads. Check the entire batch before committing any of it, including when
+// an earlier collection began partway through the available replay window.
+func (s *Store) checkProviderReplay(run, registration string, events []Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	log, err := s.load(run, registration)
+	if err != nil {
+		return err
+	}
+	for _, event := range events {
+		if err = log.checkProviderEvent(event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) read(run, registration string, after uint64, limit int) ([]Event, string, bool, error) {

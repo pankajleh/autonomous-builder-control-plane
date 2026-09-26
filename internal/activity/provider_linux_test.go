@@ -259,6 +259,72 @@ func TestReplayPreservesEventsAcrossProviderAndStoreRestarts(t *testing.T) {
 	}
 }
 
+func TestReplayRejectsChangedSourceOrdinalAssociation(t *testing.T) {
+	for _, start := range []int{0, 2} {
+		t.Run(strconv.Itoa(start), func(t *testing.T) {
+			f := newBindingFixture(t)
+			selected := providerSession(t, f)
+			registration := jsonDigest(f.catalog.runs[f.run])
+			live := []ProviderEvent{
+				{Type: "output", Phase: "task", Text: "seed", Timestamp: stamp(testTime)},
+				{Type: "section", Phase: "review", Section: "review iteration 1", Timestamp: stamp(testTime)},
+				{Type: "output", Phase: "review", Text: "plain review output", Timestamp: stamp(testTime)},
+				{Type: "output", Phase: "review", Text: "timestamped output", Timestamp: stamp(testTime)},
+			}
+			// The native completed-session loader emits plain output before its
+			// pending section; the active tailer emits the section first.
+			completed := []ProviderEvent{live[0], live[2], live[1], live[3]}
+			store := newStore(t)
+			root := store.root
+			var original []Event
+			for lifetime, payloads := range [][]ProviderEvent{live, completed} {
+				if lifetime > 0 {
+					store.Close()
+					var err error
+					store, err = OpenStore(root)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer store.Close()
+				}
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/api/sessions" {
+						json.NewEncoder(w).Encode([]session{selected})
+						return
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					for id, payload := range payloads {
+						if lifetime == 0 && id < start {
+							continue
+						}
+						data, _ := json.Marshal(payload)
+						fmt.Fprintf(w, "id: %d\ndata: %s\n\n", id, data)
+					}
+				}))
+				s := &Service{store: store, resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return testTime }}
+				last := uint64(math.MaxUint64)
+				err := s.collectBatch(f.scope, registration, &sidecar{url: server.URL, client: providerClient()}, &last)
+				server.Close()
+				if lifetime == 0 && err != nil {
+					t.Fatal(err)
+				}
+				if lifetime > 0 && !errors.Is(err, ErrIntegrity) {
+					t.Fatal("changed replay association was accepted", err)
+				}
+				events, _, _, err := store.read(f.run, registration, 0, 100)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if lifetime == 0 {
+					original = events
+				} else if !reflect.DeepEqual(events, original) || last != math.MaxUint64 {
+					t.Fatal("conflicting replay changed durable events or resume position")
+				}
+			}
+		})
+	}
+}
+
 func TestProviderBatchTimeoutPreservesCompleteFramesAndResumes(t *testing.T) {
 	f := newBindingFixture(t)
 	selected := providerSession(t, f)

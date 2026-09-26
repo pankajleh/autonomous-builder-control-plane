@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1156,5 +1157,96 @@ func TestActivitySSEUsesDurableOrdinalAndEscapesFraming(t *testing.T) {
 	}
 	if len(lines) != 3 || lines[0] != "id: 42" || !strings.HasPrefix(lines[1], "data: {") || reader.last != "41" {
 		t.Fatal("invalid framing", lines, reader.last)
+	}
+}
+
+type blockedActivityBody struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (b blockedActivityBody) Read(data []byte) (int, error) {
+	b.entered <- struct{}{}
+	<-b.release
+	data[0] = 'x'
+	return 1, nil
+}
+func (blockedActivityBody) Close() error { return nil }
+
+func TestActivityStreamBoundsBlockedBodyValidation(t *testing.T) {
+	s := newTestServer(t, &testCatalog{}, time.Now())
+	s.reserved.Activity = &activityTestReader{}
+	entered := make(chan struct{}, MaxActivityStreams+1)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	defer func() { close(release); wg.Wait() }()
+	launch := func() <-chan *httptest.ResponseRecorder {
+		done := make(chan *httptest.ResponseRecorder, 1)
+		r := authenticatedRequest(http.MethodGet, "/v1/runs/run/activity/stream", nil)
+		r.Body = blockedActivityBody{entered, release}
+		r.ContentLength = -1
+		r.TransferEncoding = []string{"chunked"}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, r)
+			done <- w
+		}()
+		return done
+	}
+	for i := 0; i < MaxActivityStreams; i++ {
+		launch()
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("body validation did not start")
+		}
+	}
+	select {
+	case w := <-launch():
+		if w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") != "1" || strings.Contains(w.Header().Get("Content-Type"), "event-stream") {
+			t.Fatal("stream preprocessing saturation was not rejected", w.Code)
+		}
+	case <-entered:
+		t.Fatal("request exceeded stream capacity before body validation")
+	case <-time.After(time.Second):
+		t.Fatal("saturated request blocked")
+	}
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodGet, "/v1/capabilities", nil))
+	if w.Code != http.StatusOK || len(s.inFlight) != 0 {
+		t.Fatal("stream preprocessing consumed ordinary request capacity")
+	}
+}
+
+func TestActivityStreamSaturationDoesNotDrainChunkedBody(t *testing.T) {
+	s := newTestServer(t, &testCatalog{}, time.Now())
+	s.reserved.Activity = &activityTestReader{}
+	for i := 0; i < MaxActivityStreams; i++ {
+		s.activityStreams <- struct{}{}
+	}
+	server := httptest.NewServer(s.Handler())
+	defer server.Close()
+	conn, err := net.DialTimeout("tcp", server.Listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err = conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Leave the chunked body unfinished. A saturation response must reach the
+	// client without net/http first draining the pending request body.
+	if _, err = io.WriteString(conn, "GET /v1/runs/run/activity/stream HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer valid\r\nTransfer-Encoding: chunked\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal("saturated request blocked on unfinished body", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != "1" || !response.Close {
+		t.Fatal("saturation did not close the unconsumed request", response.StatusCode)
 	}
 }
