@@ -346,6 +346,14 @@ restart. Activity failures remain isolated from the authoritative run ledger.
 Linux filesystem generation evidence is required for activity storage and provider
 observation; unavailable evidence fails the extension or provider detail closed.
 
+BP-01 activity requires Linux amd64 or arm64. Filesystems holding
+`service_root/activity` and provider progress files must expose both `statx`
+birth timestamps and `FS_IOC_GETVERSION` inode generations. Unsupported activity
+storage returns `activity_unavailable` for activity pages and streams, including
+ledger-derived activity; existing service endpoints remain available. Unsupported
+provider storage leaves provider detail UNKNOWN. Capability discovery advertises
+implementation support and does not certify filesystem readiness.
+
 Validation passed:
 - `go test ./internal/activity ./internal/serviceapi ./cmd/abcp`
 - `go test -race ./internal/activity ./internal/serviceapi ./cmd/abcp`

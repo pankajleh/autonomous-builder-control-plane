@@ -32,6 +32,19 @@ func TestMain(m *testing.M) {
 			os.Exit(3)
 		}
 		root := os.Args[7]
+		// Model the provider's config.Load startup: defaults are installed under
+		// HOME (or cwd when absent), and cwd/.ralphex supplies local overrides.
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = "."
+		}
+		configDir := filepath.Join(home, ".config", "ralphex")
+		if os.MkdirAll(configDir, 0700) != nil || os.WriteFile(filepath.Join(configDir, "config"), []byte("defaults"), 0600) != nil {
+			os.Exit(5)
+		}
+		if _, err := os.Stat(".ralphex/config"); err == nil {
+			os.Exit(6)
+		}
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/api/sessions":
@@ -61,6 +74,10 @@ func TestPinnedWatchOnlySidecarLifecycle(t *testing.T) {
 	f := newBindingFixture(t)
 	selected := providerSession(t, f)
 	writeJSON(t, filepath.Join(f.repo, ".ralphex", "sessions.json"), []session{selected})
+	if err := os.WriteFile(filepath.Join(f.repo, ".ralphex", "config"), []byte("untrusted project overrides"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before := command(t, f.repo, "status", "--porcelain", "--untracked-files=all")
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -87,7 +104,7 @@ func TestPinnedWatchOnlySidecarLifecycle(t *testing.T) {
 	if checkErr = ralphex.VerifyGovernedExecutionCapabilityV1(executable, scope.Ralphex.BinarySHA256, scope.Ralphex.SourceSHA); checkErr != nil {
 		t.Fatal("verify executable", checkErr)
 	}
-	sc, err := startSidecar(ctx, scope)
+	sc, err := startSidecar(ctx, scope, f.root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +116,19 @@ func TestPinnedWatchOnlySidecarLifecycle(t *testing.T) {
 	if !strings.HasPrefix(sc.url, "http://127.0.0.1:") {
 		t.Fatal("sidecar not loopback")
 	}
+	if _, err := os.Stat(filepath.Join(sc.runtimeDir, ".config", "ralphex", "config")); err != nil {
+		t.Fatal("provider did not initialize isolated configuration", err)
+	}
+	if after := command(t, f.repo, "status", "--porcelain", "--untracked-files=all"); after != before {
+		t.Fatalf("watch-only startup changed repository: before %q, after %q", before, after)
+	}
+	if _, err := os.Stat(filepath.Join(f.repo, ".config")); !os.IsNotExist(err) {
+		t.Fatal("configuration written into repository", err)
+	}
 	sc.close()
+	if _, err := os.Stat(sc.runtimeDir); !os.IsNotExist(err) {
+		t.Fatal("sidecar runtime directory leaked", err)
+	}
 	select {
 	case <-sc.done:
 	default:
@@ -118,7 +147,7 @@ func TestPinnedWatchOnlySidecarLifecycle(t *testing.T) {
 				os.Symlink(executable, bad.Ralphex.BinaryPath)
 			}
 			start := time.Now()
-			if unexpected, err := startSidecar(ctx, bad); err == nil {
+			if unexpected, err := startSidecar(ctx, bad, f.root); err == nil {
 				unexpected.close()
 				t.Fatal("unverified sidecar started")
 			}
@@ -150,7 +179,7 @@ func TestSidecarSharedByRepositoryAndExecutablePin(t *testing.T) {
 	scope.Ralphex.BinarySHA256 = digest(data)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	service := &Service{ctx: ctx, sidecars: map[string]*sharedSidecar{}}
+	service := &Service{ctx: ctx, resolver: Resolver{Root: f.root}, sidecars: map[string]*sharedSidecar{}}
 	first, key := service.acquireSidecar(scope)
 	if first.err != nil {
 		service.releaseSidecar(key)
@@ -205,7 +234,7 @@ func TestSidecarAttestationRespectsCallerDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	if sc, err := startSidecar(ctx, scope); err == nil {
+	if sc, err := startSidecar(ctx, scope, t.TempDir()); err == nil {
 		sc.close()
 		t.Fatal("unattested provider started")
 	}

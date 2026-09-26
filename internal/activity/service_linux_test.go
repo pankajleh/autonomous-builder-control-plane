@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,5 +176,87 @@ func TestSubscriptionStopsOnServiceCancellationAndCollectorFailure(t *testing.T)
 	defer cancel()
 	if _, err = stream.Next(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatal("service cancellation did not end stream", err)
+	}
+}
+
+type snapshotFunc func(context.Context, string) (readmodel.Snapshot, error)
+
+func (f snapshotFunc) Snapshot(ctx context.Context, run string) (readmodel.Snapshot, error) {
+	return f(ctx, run)
+}
+
+func TestCollectorRecoversFromTransientSnapshotErrors(t *testing.T) {
+	for _, transient := range []error{serviceapi.ErrAuthoritativeReadBusy, runtimecatalog.ErrBusy, context.DeadlineExceeded, context.Canceled} {
+		t.Run(transient.Error(), func(t *testing.T) {
+			s, _ := testService(t)
+			var calls atomic.Int32
+			failed := make(chan struct{})
+			s.snapshots = snapshotFunc(func(_ context.Context, run string) (readmodel.Snapshot, error) {
+				switch calls.Add(1) {
+				case 1:
+					return readmodel.Snapshot{}, nil // initial stream admission
+				case 2:
+					close(failed)
+					return readmodel.Snapshot{}, transient
+				default:
+					return readmodel.Snapshot{Events: []ledger.Event{{RunID: run, EventID: "accepted", StateTo: domain.StateBranchAccepted, Timestamp: testTime}}}, nil
+				}
+			})
+			stream, err := s.OpenActivityStream(context.Background(), "run", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.Close()
+			select {
+			case <-failed:
+			case <-time.After(time.Second):
+				t.Fatal("collector did not encounter transient error")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			for {
+				frame, err := stream.Next(ctx)
+				if err != nil {
+					t.Fatal("transient error disabled the live stream", err)
+				}
+				var event Event
+				if err := json.Unmarshal(frame.Data, &event); err != nil {
+					t.Fatal(err)
+				}
+				if event.Status == "ACCEPTED" {
+					break
+				}
+			}
+			if _, err := s.ReadActivity(ctx, "run", serviceapi.PageRequestV1{PageSize: 100}); err != nil {
+				t.Fatal("recovered collector left a permanent fault", err)
+			}
+		})
+	}
+}
+
+func TestCollectorIntegrityFailureStillClosesStream(t *testing.T) {
+	s, _ := testService(t)
+	var calls atomic.Int32
+	s.snapshots = snapshotFunc(func(context.Context, string) (readmodel.Snapshot, error) {
+		if calls.Add(1) == 1 {
+			return readmodel.Snapshot{}, nil
+		}
+		return readmodel.Snapshot{}, ErrIntegrity
+	})
+	stream, err := s.OpenActivityStream(context.Background(), "run", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for {
+		_, err := stream.Next(ctx)
+		if errors.Is(err, serviceapi.ErrActivityUnavailable) {
+			break
+		}
+		if err != nil {
+			t.Fatal("integrity failure did not close stream", err)
+		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/readmodel"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
@@ -168,7 +169,7 @@ func (s *Service) acquireSidecar(scope Scope) (*sharedSidecar, string) {
 	shared := &sharedSidecar{ready: make(chan struct{}), refs: 1}
 	s.sidecars[key] = shared
 	s.mu.Unlock()
-	shared.sc, shared.err = startSidecar(s.ctx, scope)
+	shared.sc, shared.err = startSidecar(s.ctx, scope, s.resolver.Root)
 	close(shared.ready)
 	return shared, key
 }
@@ -190,6 +191,11 @@ func (s *Service) releaseSidecar(key string) {
 		close(shared.closing)
 		s.mu.Unlock()
 	}
+}
+
+func transientReadError(err error) bool {
+	return errors.Is(err, serviceapi.ErrAuthoritativeReadBusy) || errors.Is(err, runtimecatalog.ErrBusy) ||
+		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 func (s *Service) collect(run, registration string, w *worker) {
@@ -228,10 +234,10 @@ func (s *Service) collect(run, registration string, w *worker) {
 			return
 		}
 		scope, err := s.refresh(s.ctx, run, registration)
-		if err != nil {
+		if err != nil && !transientReadError(err) {
 			return
 		}
-		if scope.RunID != "" && !providerFailed {
+		if err == nil && scope.RunID != "" && !providerFailed {
 			if shared == nil {
 				shared, key = s.acquireSidecar(scope)
 			}
@@ -265,7 +271,7 @@ func (s *Service) collect(run, registration string, w *worker) {
 			}
 		}
 		delay := backoff
-		if scope.RunID == "" || providerFailed {
+		if err == nil && (scope.RunID == "" || providerFailed) {
 			delay = 2 * time.Second
 		}
 		timer := time.NewTimer(delay)

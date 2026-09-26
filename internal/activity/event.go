@@ -171,7 +171,11 @@ func normalizeProvider(run, session, id string, p ProviderEvent, now time.Time) 
 		e.Category, e.Title = "LIFECYCLE", "Implementation workflow progress"
 	}
 	e.Detail = redact(p.Text, 4096)
-	// Digest the normalized payload, excluding observation time and ordinals.
+	// The provider synthesizes timestamps for plain lines and task/section
+	// boundaries, and historical replay can assign different times from live
+	// parsing. Bind identity to semantic payload, preserving the first stored
+	// timestamps when the same session/event is replayed.
+	p.Timestamp = ""
 	p.Text, p.Section = redact(p.Text, 4096), redact(p.Section, 256)
 	e.SourceDigest = jsonDigest(p)
 	e.ActivityID = identity(run, session, id, e.SourceDigest)

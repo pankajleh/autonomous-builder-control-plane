@@ -47,11 +47,12 @@ type session struct {
 }
 
 type sidecar struct {
-	url     string
-	client  *http.Client
-	command *exec.Cmd
-	done    chan struct{}
-	cancel  context.CancelFunc
+	url        string
+	client     *http.Client
+	command    *exec.Cmd
+	runtimeDir string
+	done       chan struct{}
+	cancel     context.CancelFunc
 }
 
 func providerClient() *http.Client {
@@ -98,7 +99,7 @@ func attest(ctx context.Context, binary *os.File, scope Scope) error {
 	}
 }
 
-func startSidecar(ctx context.Context, scope Scope) (*sidecar, error) {
+func startSidecar(ctx context.Context, scope Scope, root string) (*sidecar, error) {
 	startup, startCancel := context.WithTimeout(ctx, providerTimeout)
 	defer startCancel()
 	if startup.Err() != nil {
@@ -115,6 +116,24 @@ func startSidecar(ctx context.Context, scope Scope) (*sidecar, error) {
 	if startup.Err() != nil {
 		return nil, ErrUnavailable
 	}
+	// The provider installs configuration before entering watch-only mode.
+	// Give it a private home and cwd outside the admitted repository so neither
+	// default installation nor local project configuration can affect the run.
+	parent, err := privateDirectory(root, false)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	parent.Close()
+	runtimeDir, err := os.MkdirTemp(root, "activity-sidecar-")
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	keepRuntime := false
+	defer func() {
+		if !keepRuntime {
+			os.RemoveAll(runtimeDir)
+		}
+	}()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return nil, ErrUnavailable
@@ -123,14 +142,14 @@ func startSidecar(ctx context.Context, scope Scope) (*sidecar, error) {
 	listener.Close()
 	lifetime, cancel := context.WithCancel(ctx)
 	command := exec.CommandContext(lifetime, scope.Ralphex.BinaryPath, "--serve", "--host", "127.0.0.1", "--port", strconv.Itoa(port), "--watch", scope.Repository)
-	command.Env = gitexec.Environment()
-	command.Dir = scope.Repository
+	command.Env = append(gitexec.Environment(), "HOME="+runtimeDir)
+	command.Dir = runtimeDir
 	pinExecutable(command, binary)
 	if err = command.Start(); err != nil {
 		cancel()
 		return nil, ErrUnavailable
 	}
-	sc := &sidecar{url: "http://127.0.0.1:" + strconv.Itoa(port), client: providerClient(), command: command, done: make(chan struct{}), cancel: cancel}
+	sc := &sidecar{url: "http://127.0.0.1:" + strconv.Itoa(port), client: providerClient(), command: command, runtimeDir: runtimeDir, done: make(chan struct{}), cancel: cancel}
 	go func() { _ = command.Wait(); close(sc.done) }()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -149,12 +168,18 @@ func startSidecar(ctx context.Context, scope Scope) (*sidecar, error) {
 				continue
 			}
 			if _, err = sc.sessions(startup); err == nil {
+				keepRuntime = true
 				return sc, nil
 			}
 		}
 	}
 }
-func (s *sidecar) close() { s.cancel(); <-s.done; s.client.CloseIdleConnections() }
+func (s *sidecar) close() {
+	s.cancel()
+	<-s.done
+	s.client.CloseIdleConnections()
+	os.RemoveAll(s.runtimeDir)
+}
 
 func (s *sidecar) sessions(ctx context.Context) ([]session, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url+"/api/sessions", nil)

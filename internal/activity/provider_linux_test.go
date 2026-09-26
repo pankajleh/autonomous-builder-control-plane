@@ -12,8 +12,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -206,5 +208,186 @@ func TestSSEParserBoundsAndPartialFrames(t *testing.T) {
 	parsed, err = parseSSE(strings.NewReader(batch.String()))
 	if err != nil || len(parsed) != 500 {
 		t.Fatal("batch unbounded", err)
+	}
+}
+
+func TestReplayPreservesEventsAcrossProviderAndStoreRestarts(t *testing.T) {
+	f := newBindingFixture(t)
+	selected := providerSession(t, f)
+	root := filepath.Join(t.TempDir(), "activity")
+	registration := jsonDigest(f.catalog.runs[f.run])
+	var original []Event
+	for lifetime := 0; lifetime < 2; lifetime++ {
+		store, err := OpenStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stampAt := testTime.Add(time.Duration(lifetime) * time.Hour)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/sessions" {
+				json.NewEncoder(w).Encode([]session{selected})
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			// Live sections use observation time; historical sections use a
+			// following line's time. Plain output also gets a new time on replay.
+			for id, kind := range []string{"output", "task_start", "section", "task_end", "iteration_start"} {
+				p := ProviderEvent{Type: kind, Phase: "review", Text: kind, Timestamp: stamp(stampAt)}
+				data, _ := json.Marshal(p)
+				fmt.Fprintf(w, "id: %d\ndata: %s\n\n", id, data)
+			}
+		}))
+		s := &Service{store: store, resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return stampAt }}
+		sc := &sidecar{url: server.URL, client: providerClient()}
+		last := uint64(math.MaxUint64)
+		err = s.collectBatch(f.scope, registration, sc, &last)
+		server.Close()
+		if err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		events, _, _, err := store.read(f.run, registration, 0, 100)
+		store.Close()
+		if err != nil || len(events) != 5 || last != 4 {
+			t.Fatal("replay changed durable event count", len(events), last, err)
+		}
+		if lifetime == 0 {
+			original = events
+		} else if !reflect.DeepEqual(events, original) {
+			t.Fatal("replay changed identities, ordinals or first-observed timestamps")
+		}
+	}
+}
+
+func TestProviderBatchTimeoutPreservesCompleteFramesAndResumes(t *testing.T) {
+	f := newBindingFixture(t)
+	selected := providerSession(t, f)
+	s := &Service{store: newStore(t), resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return testTime }}
+	registration := jsonDigest(f.catalog.runs[f.run])
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/sessions" {
+			json.NewEncoder(w).Encode([]session{selected})
+			return
+		}
+		request := requests.Add(1)
+		expected, id := "", 0
+		if request > 1 {
+			expected, id = "0", 1
+		}
+		if r.Header.Get("Last-Event-ID") != expected {
+			t.Errorf("resume header: got %q, want %q", r.Header.Get("Last-Event-ID"), expected)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		payload, _ := json.Marshal(ProviderEvent{Type: "output", Phase: "task", Text: fmt.Sprint(id), Timestamp: stamp(testTime)})
+		fmt.Fprintf(w, "id: %d\ndata: %s\n\nid: %d\ndata: {", id, payload, id+1)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	client := providerClient()
+	client.Timeout = 100 * time.Millisecond
+	sc := &sidecar{url: server.URL, client: client}
+	last := uint64(math.MaxUint64)
+	for i := uint64(0); i < 2; i++ {
+		if err := s.collectBatch(f.scope, registration, sc, &last); err != nil || last != i {
+			t.Fatal("timeout lost complete frame", err, last)
+		}
+	}
+	events, _, _, err := s.store.read(f.run, registration, 0, 100)
+	if err != nil || len(events) != 2 || events[0].Detail != "0" || events[1].Detail != "1" {
+		t.Fatal("partial frame persisted or resume duplicated data", events, err)
+	}
+}
+
+func TestProviderBatchCancellationClosesLiveRequest(t *testing.T) {
+	started, stopped := make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.(http.Flusher).Flush()
+		close(started)
+		<-r.Context().Done()
+		close(stopped)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sc := &sidecar{url: server.URL, client: providerClient()}
+	done := make(chan error, 1)
+	go func() { _, err := sc.batch(ctx, "session", math.MaxUint64); done <- err }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("provider request did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled request succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider read ignored cancellation")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("provider connection remained open")
+	}
+}
+
+func TestProviderBatchRejectsTrustChangesDuringRequest(t *testing.T) {
+	for _, change := range []string{"binding", "session", "progress-replaced", "progress-rewritten"} {
+		t.Run(change, func(t *testing.T) {
+			f := newBindingFixture(t)
+			selected := providerSession(t, f)
+			registration := jsonDigest(f.catalog.runs[f.run])
+			s := &Service{store: newStore(t), resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return testTime }}
+			stored, err := s.store.Append(f.run, registration, provider(t, f.run, "existing"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/sessions" {
+					json.NewEncoder(w).Encode([]session{selected})
+					return
+				}
+				var err error
+				switch change {
+				case "binding":
+					err = os.WriteFile(f.bindingPath, []byte("{}"), 0600)
+				case "session":
+					selected.Project = "changed"
+				case "progress-replaced":
+					path := filepath.Join(selected.DirPath, "progress-plan.txt")
+					if err = os.Rename(path, path+".old"); err == nil {
+						err = os.WriteFile(path, []byte("immutable progress prefix\n"), 0600)
+					}
+				case "progress-rewritten":
+					err = os.WriteFile(filepath.Join(selected.DirPath, "progress-plan.txt"), []byte("rewritten progress prefix\n"), 0600)
+				}
+				if err != nil {
+					t.Error("mutate trust fixture", err)
+					w.WriteHeader(500)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				payload, _ := json.Marshal(ProviderEvent{Type: "task_end", Phase: "task", Text: "done", Timestamp: stamp(testTime)})
+				fmt.Fprintf(w, "id: 1\ndata: %s\n\n", payload)
+			}))
+			defer server.Close()
+			last := uint64(0)
+			sc := &sidecar{url: server.URL, client: providerClient()}
+			if err := s.collectBatch(f.scope, registration, sc, &last); !errors.Is(err, ErrIntegrity) {
+				t.Fatal("changed trust accepted", err)
+			}
+			events, _, _, err := s.store.read(f.run, registration, 0, 100)
+			if err != nil || len(events) != 1 || events[0] != stored || last != 0 {
+				t.Fatal("rejected batch changed events or resume position", events, last, err)
+			}
+			if proof, err := s.store.proof(f.run, registration); err != nil || proof != nil {
+				t.Fatal("rejected batch changed durable proof", proof, err)
+			}
+		})
 	}
 }
