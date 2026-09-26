@@ -367,3 +367,52 @@ Validation passed:
 Publication/release remain subject to the completion-boundary operator runbook,
 including a fresh independent review of the exact candidate commit before a PR.
 The pre-implementation plan review above is not an implementation review verdict.
+
+## Post-run external-review correction authority — 2026-09-26
+
+Status: **CORRECTION AUTHORIZED — SAME BP-01 SCOPE ONLY**
+
+Exact reviewed candidate with blocked publication:
+`122c337a8d2981d8567d90488dbc7748a190b045`
+
+The required independent exact-head publication review returned:
+
+```text
+CRITICAL: 0
+MAJOR: 3
+PUBLICATION_READY: NO
+```
+
+This is a **fresh bounded correction cycle**, not Review 3 of the completed Ralphex run. It may modify only the original BP-01 allowed paths and may not introduce a new shared contract, endpoint, state transition, provider authority, package family outside `internal/activity/**`, or release behavior.
+
+The correction must resolve exactly these three confirmed Major findings:
+
+1. **Checkpoint cleanliness must reject hidden tracked changes.**
+   - Current `git status --porcelain` checks can miss tracked changes hidden by Git index flags such as `skip-worktree` or `assume-unchanged`.
+   - Before emitting `CHECKPOINT / AVAILABLE`, reject any governed worktree whose tracked index contains hidden-worktree/assume-unchanged flags and independently verify tracked content against HEAD in addition to the existing untracked/branch/ancestry checks.
+   - Recheck the hidden-index and tracked-content invariants at the final checkpoint revalidation boundary so a concurrent change cannot inherit `checkpoint_clean=true`.
+   - Add adversarial tests proving hidden tracked modifications cannot produce a checkpoint.
+
+2. **Acknowledged activity history must survive paired log+anchor deletion detection across restart.**
+   - The activity store must persist an independent run-generation/initialization registry before any run history can be acknowledged.
+   - After a run has ever been initialized, absence of both its activity log and anchor must fail integrity rather than silently create a new generation.
+   - The registry must itself be durable, bounded, integrity-protected and tied to the existing service-root activity namespace; it must not become a second activity history or run-state authority.
+   - Add restart/cache-eviction tests for paired log+anchor deletion and prove a genuinely never-initialized run can still initialize normally.
+
+3. **Sidecar processes must not survive abrupt ABCP controller death.**
+   - On Linux, establish parent-death containment for the sidecar child so abrupt controller termination causes the sidecar to terminate without relying on in-process context cancellation.
+   - Reconcile stale BP-01 private sidecar runtime directories on subsequent service/activity startup without deleting unrelated paths or live-owned runtime directories.
+   - Add an abrupt-parent-death/restart lifecycle test proving the watcher/listener is gone and stale private runtime state is safely reconciled.
+   - Non-Linux behavior remains fail-closed and does not gain provider execution.
+
+### Task 2: Correct the three external-review Major findings
+
+- [ ] Preserve exact BP-01 HTTP/activity authority semantics and original path ceiling.
+- [ ] Harden checkpoint cleanliness against hidden index flags and hidden tracked-file changes, including final revalidation.
+- [ ] Add independent durable run-initialization/generation registry so paired log+anchor deletion after acknowledged history fails integrity across restart/cache eviction.
+- [ ] Add Linux parent-death containment and bounded stale sidecar-runtime reconciliation.
+- [ ] Add adversarial regression tests for all three findings.
+- [ ] Re-run focused tests, focused race, vet, full tests, full race, full vet, Darwin compile-only, diff/path checks.
+- [ ] Leave one clean correction candidate commit for a new independent exact-head publication review.
+
+Publication remains blocked until this Task 2 correction completes, all operator-owned acceptance gates pass, and a **new** independent exact-head review returns 0 Critical / 0 Major. The prior 122c337 candidate remains review evidence only.
