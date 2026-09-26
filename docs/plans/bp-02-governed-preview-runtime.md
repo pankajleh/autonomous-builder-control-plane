@@ -24,6 +24,10 @@ This Repo B upgrade therefore follows the current operator runbook §24 isolated
 
 Implement an additive **Governed Preview Runtime** in ABCP.
 
+### Task 1: Implement the frozen BP-02 governed preview runtime
+
+- [ ] Implement every requirement, invariant, endpoint, isolation rule and deterministic verification obligation in this frozen BP-02 plan without widening its allowed paths or authority.
+
 Preview is a development presentation of exact governed candidate bytes. It is never deployment, acceptance, merge authority or a new run state.
 
 BP-02 owns:
