@@ -95,3 +95,10 @@ func TestDevelopmentRunAdmissionValidatesExactCapsuleDigestAndBounds(t *testing.
 		})
 	}
 }
+
+func TestPdlcExperienceCapabilitiesFrozenFields(t *testing.T) {
+	data, err := json.Marshal(PdlcExperienceCapabilitiesV1{SchemaVersion: "PdlcExperienceCapabilitiesV1", ActivityStream: true})
+	if err != nil || string(data) != `{"schema_version":"PdlcExperienceCapabilitiesV1","activity_stream":true,"preview_runtime":false}` {
+		t.Fatal("extension DTO changed", string(data), err)
+	}
+}

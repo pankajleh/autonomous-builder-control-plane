@@ -1,11 +1,13 @@
 package serviceapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -20,6 +22,7 @@ import (
 
 const (
 	MaxInFlightRequests     = 64
+	MaxActivityStreams      = 16
 	MaxRequestBodyBytes     = 1 << 20
 	DefaultRunsPageSize     = 50
 	MaxRunsPageSize         = 200
@@ -38,6 +41,7 @@ const (
 )
 
 var (
+	ErrActivityUnavailable             = errors.New("activity extension unavailable")
 	ErrUnsupportedCapability           = errors.New("unsupported capability")
 	ErrDependencyNotFound              = errors.New("dependency resource not found")
 	ErrAuthoritativeReadBusy           = errors.New("authoritative read busy")
@@ -115,7 +119,23 @@ type DevelopmentRunAdmissionController interface {
 	AdmitDevelopmentRun(context.Context, Principal, DevelopmentRunAdmissionRequestV1) (RunAdmissionResponseV1, error)
 }
 
+// Activity is an additive dependency; provider implementation types never
+// enter the existing run/event DTOs or authority controller interfaces.
+type ActivityFrame struct {
+	Ordinal uint64
+	Data    json.RawMessage
+}
+type ActivitySubscription interface {
+	Next(context.Context) (ActivityFrame, error)
+	Close() error
+}
+type ActivityReader interface {
+	ReadActivity(context.Context, string, PageRequestV1) (json.RawMessage, error)
+	OpenActivityStream(context.Context, string, string) (ActivitySubscription, error)
+}
+
 type ServerConfig struct {
+	Activity                ActivityReader
 	Authenticator           Authenticator
 	Authority               *AuthorityMatcher
 	Catalog                 CatalogReader
@@ -131,6 +151,7 @@ type ServerConfig struct {
 }
 
 type Server struct {
+	activityStreams chan struct{}
 	authenticator   Authenticator
 	authority       *AuthorityMatcher
 	catalog         CatalogReader
@@ -158,7 +179,8 @@ func NewServer(config ServerConfig) (*Server, error) {
 		config.Clock = time.Now
 	}
 	return &Server{
-		authenticator: config.Authenticator, authority: config.Authority,
+		activityStreams: make(chan struct{}, MaxActivityStreams),
+		authenticator:   config.Authenticator, authority: config.Authority,
 		catalog: config.Catalog, cursors: config.CursorSigner, now: config.Clock,
 		inFlight:        make(chan struct{}, MaxInFlightRequests),
 		evidenceBuffers: make(chan struct{}, maxEvidenceBuffers),
@@ -272,12 +294,17 @@ type ErrorResponseV1 struct {
 func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	requestID := safeRequestID(request.Header.Get("X-Request-ID"))
 	writer.Header().Set("X-Request-ID", requestID)
-	select {
-	case s.inFlight <- struct{}{}:
-		defer func() { <-s.inFlight }()
-	default:
-		s.writeError(writer, http.StatusServiceUnavailable, ErrorV1{Code: "service_busy", Message: "service request capacity is busy", RequestID: requestID, Retryable: true})
-		return
+	// Stream requests have their own admission budget and never occupy a
+	// generic request slot for their lifetime. All authentication still runs.
+	streamRoute := request.URL != nil && request.URL.RawPath == "" && strings.HasPrefix(request.URL.Path, "/v1/runs/") && strings.HasSuffix(request.URL.Path, "/activity/stream")
+	if !streamRoute {
+		select {
+		case s.inFlight <- struct{}{}:
+			defer func() { <-s.inFlight }()
+		default:
+			s.writeError(writer, http.StatusServiceUnavailable, ErrorV1{Code: "service_busy", Message: "service request capacity is busy", RequestID: requestID, Retryable: true})
+			return
+		}
 	}
 	if request.URL == nil || (request.URL.Path != "/v1" && !strings.HasPrefix(request.URL.Path, "/v1/")) {
 		s.writeError(writer, http.StatusNotFound, ErrorV1{Code: "not_found", Message: "resource not found", RequestID: requestID})
@@ -298,6 +325,8 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	request.Body = http.MaxBytesReader(writer, request.Body, MaxRequestBodyBytes)
 	switch request.URL.Path {
+	case "/v1/extensions/pdlc-experience":
+		s.experienceCapabilities(writer, request, requestID)
 	case "/v1/capabilities":
 		s.capabilities(writer, request, requestID)
 	case "/v1/runs":
@@ -333,6 +362,10 @@ func (s *Server) runRoute(writer http.ResponseWriter, request *http.Request, pri
 	}
 	runID := parts[0]
 	switch {
+	case len(parts) == 2 && parts[1] == "activity":
+		s.runActivity(writer, request, requestID, runID)
+	case len(parts) == 3 && parts[1] == "activity" && parts[2] == "stream":
+		s.runActivityStream(writer, request, requestID, runID)
 	case len(parts) == 1:
 		s.runDetail(writer, request, requestID, runID)
 	case len(parts) == 2 && parts[1] == "events":
@@ -787,6 +820,8 @@ func (s *Server) writeDependencyError(writer http.ResponseWriter, requestID stri
 		status, apiError.Code, apiError.Message = http.StatusNotFound, "not_found", "resource not found"
 	case errors.Is(err, ErrActionStatusNotFound):
 		status, apiError.Code, apiError.Message = http.StatusNotFound, "action_status_not_found", "action status not found"
+	case errors.Is(err, ErrActivityUnavailable):
+		status, apiError.Code, apiError.Message, apiError.Retryable = http.StatusServiceUnavailable, "activity_unavailable", "activity extension is unavailable", true
 	case errors.Is(err, ErrAuthorityDenied):
 		status, apiError.Code, apiError.Message = http.StatusForbidden, "authority_denied", "authority denied"
 	case errors.Is(err, ErrAuthoritativeReadBusy), errors.Is(err, runtimecatalog.ErrBusy), errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
@@ -889,5 +924,118 @@ func (s *Server) writeJSON(writer http.ResponseWriter, status int, value any) {
 		// Headers are already committed; never copy the encoder error (which may
 		// contain a caller-controlled writer diagnostic) into a response.
 		return
+	}
+}
+
+func (s *Server) experienceCapabilities(w http.ResponseWriter, r *http.Request, id string) {
+	if validEmptyReadRequest(r) != nil {
+		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid extension request", RequestID: id})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, PdlcExperienceCapabilitiesV1{SchemaVersion: "PdlcExperienceCapabilitiesV1", ActivityStream: s.reserved.Activity != nil, PreviewRuntime: false})
+}
+func (s *Server) runActivity(w http.ResponseWriter, r *http.Request, id, run string) {
+	if r.Method != http.MethodGet || !requestBodyEmpty(r) {
+		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid activity request", RequestID: id})
+		return
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		s.writeDependencyError(w, id, ErrInvalidCursor)
+		return
+	}
+	page, err := parsePageQuery(query, 100, 500)
+	if err != nil {
+		s.writeDependencyError(w, id, ErrInvalidCursor)
+		return
+	}
+	if !s.requireRegisteredRun(w, id, run) {
+		return
+	}
+	if s.reserved.Activity == nil {
+		s.writeDependencyError(w, id, ErrUnsupportedCapability)
+		return
+	}
+	data, err := s.reserved.Activity.ReadActivity(r.Context(), run, page)
+	if err != nil {
+		s.writeDependencyError(w, id, err)
+		return
+	}
+	s.writeDependencyJSON(w, id, data)
+}
+func (s *Server) runActivityStream(w http.ResponseWriter, r *http.Request, id, run string) {
+	if validEmptyReadRequest(r) != nil || len(r.Header.Values("Last-Event-ID")) > 1 || len(r.Header.Get("Last-Event-ID")) > 512 {
+		s.writeDependencyError(w, id, ErrInvalidCursor)
+		return
+	}
+	if !s.requireRegisteredRun(w, id, run) {
+		return
+	}
+	if s.reserved.Activity == nil {
+		s.writeDependencyError(w, id, ErrUnsupportedCapability)
+		return
+	}
+	select {
+	case s.activityStreams <- struct{}{}:
+		defer func() { <-s.activityStreams }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusServiceUnavailable, ErrorV1{Code: "activity_busy", Message: "activity stream capacity is busy", RequestID: id, Retryable: true})
+		return
+	}
+	if _, ok := w.(http.Flusher); !ok {
+		s.writeDependencyError(w, id, ErrActivityUnavailable)
+		return
+	}
+	subscription, err := s.reserved.Activity.OpenActivityStream(r.Context(), run, r.Header.Get("Last-Event-ID"))
+	if err != nil {
+		s.writeDependencyError(w, id, err)
+		return
+	}
+	defer subscription.Close()
+	control := http.NewResponseController(w)
+	// Each write gets a bounded deadline, replacing the ordinary request-wide
+	// timeout only for this admitted stream.
+	if err = control.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		s.writeDependencyError(w, id, ErrActivityUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	if err = control.Flush(); err != nil {
+		return
+	}
+	for {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		frame, readErr := subscription.Next(ctx)
+		cancel()
+		if r.Context().Err() != nil {
+			return
+		}
+		if readErr != nil && !errors.Is(readErr, context.DeadlineExceeded) {
+			return
+		}
+		if err = control.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return
+		}
+		if readErr != nil {
+			_, err = io.WriteString(w, ": keepalive\n\n")
+		} else {
+			if frame.Ordinal == 0 || !json.Valid(frame.Data) || len(frame.Data) > 32<<10 {
+				return
+			}
+			// Compact JSON prohibits provider text or a dependency newline from
+			// injecting SSE fields into the frame.
+			var compact bytes.Buffer
+			if json.Compact(&compact, frame.Data) != nil {
+				return
+			}
+			_, err = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", frame.Ordinal, compact.Bytes())
+		}
+		if err != nil || control.Flush() != nil {
+			return
+		}
 	}
 }

@@ -8,12 +8,18 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
@@ -564,4 +570,116 @@ func cliFileHash(t *testing.T, path string) string {
 	}
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
+}
+
+// Run the real serve wiring in a child so termination exercises the service's
+// signal context and all activity cleanup without affecting the test runner.
+func TestActivityServeSubprocess(t *testing.T) {
+	if os.Getenv("ABCP_ACTIVITY_SERVE_TEST") != "1" {
+		return
+	}
+	for i, arg := range os.Args {
+		if arg == "--" {
+			os.Exit(serveCommand(os.Args[i+1:], os.Stderr))
+		}
+	}
+	os.Exit(2)
+}
+
+func TestServeWiresAdditiveActivityAndSurvivesActivityStorageFailure(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("service strong filesystem guarantees require Linux")
+	}
+	for _, broken := range []bool{false, true} {
+		t.Run(fmt.Sprint("broken-activity-", broken), func(t *testing.T) {
+			root := t.TempDir()
+			serviceRoot := filepath.Join(root, "service")
+			if err := os.Mkdir(serviceRoot, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if broken {
+				writeCLIFile(t, filepath.Join(serviceRoot, "activity"), []byte("unavailable"), 0600)
+			}
+			token := strings.Repeat("t", 32)
+			tokenPath := filepath.Join(root, "token")
+			writeCLIFile(t, tokenPath, []byte(token), 0600)
+			cursorPath := filepath.Join(root, "cursor")
+			data, _ := json.Marshal(map[string]string{"key_id": "activity-test", "key_base64": base64.StdEncoding.EncodeToString(make([]byte, 32))})
+			writeCLIFile(t, cursorPath, data, 0600)
+			grants := filepath.Join(root, "grants")
+			writeCLIFile(t, grants, []byte(`{"principals":[]}`), 0600)
+			listener, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			address := listener.Addr().String()
+			listener.Close()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestActivityServeSubprocess$", "--", "--service-root", serviceRoot, "--listen", address, "--token-file", tokenPath, "--principal-id", "activity-test", "--cursor-key-file", cursorPath, "--authority-grants-file", grants)
+			cmd.Env = append(os.Environ(), "ABCP_ACTIVITY_SERVE_TEST=1")
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err = cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			defer func() {
+				cmd.Process.Kill()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Error("serve subprocess did not exit")
+				}
+			}()
+			client := &http.Client{Timeout: time.Second}
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				request, _ := http.NewRequest(http.MethodGet, "http://"+address+"/v1/extensions/pdlc-experience", nil)
+				request.Header.Set("Authorization", "Bearer "+token)
+				response, readErr := client.Do(request)
+				if readErr == nil {
+					body, _ := io.ReadAll(response.Body)
+					response.Body.Close()
+					if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"activity_stream":true`)) {
+						t.Fatalf("extension: %d %s", response.StatusCode, body)
+					}
+					break
+				}
+				select {
+				case childErr := <-done:
+					done <- childErr
+					t.Fatalf("serve failed: %v %s", childErr, stderr.String())
+				default:
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("serve startup deadline", readErr)
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
+			request, _ := http.NewRequest(http.MethodGet, "http://"+address+"/v1/capabilities", nil)
+			request.Header.Set("Authorization", "Bearer "+token)
+			response, err := client.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var capabilities map[string]any
+			json.NewDecoder(response.Body).Decode(&capabilities)
+			response.Body.Close()
+			if response.StatusCode != 200 || len(capabilities) != 7 {
+				t.Fatal("legacy capability changed", capabilities)
+			}
+			if err = cmd.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case childErr := <-done:
+				done <- childErr
+				if childErr != nil {
+					t.Fatalf("serve shutdown: %v %s", childErr, stderr.String())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("serve shutdown deadline")
+			}
+		})
+	}
 }

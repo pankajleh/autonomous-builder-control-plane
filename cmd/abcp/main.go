@@ -18,6 +18,7 @@ import (
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/actionapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/actioncontrol"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/activity"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
@@ -856,7 +857,16 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer actions.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	activityService, err := activity.New(ctx, *serviceRoot, catalog, readService, cursors)
+	if err != nil {
+		fmt.Fprintln(stderr, "construct activity extension")
+		return 1
+	}
+	defer activityService.Close()
 	server, err := serviceapi.NewServer(serviceapi.ServerConfig{
+		Activity:      activityService,
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
 		RunAdmission: admissions, DevelopmentRunAdmission: admissions,
@@ -865,8 +875,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "construct service API")
 		return 1
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+
 	if err := server.ListenAndServe(ctx, *listen); err != nil {
 		fmt.Fprintln(stderr, "serve loopback API")
 		return 1

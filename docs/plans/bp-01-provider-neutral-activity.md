@@ -2,7 +2,7 @@
 
 Date: 2026-09-26
 
-Status: **DOC-FROZEN — PLAN_READY; IMPLEMENTATION AUTHORIZED IN THE ISOLATED REPO B WORKTREE**
+Status: **IMPLEMENTED — LOCAL CANDIDATE; OPERATOR PUBLICATION/RELEASE GATES STILL APPLY**
 
 Exact Repo B base:
 `935114d21cdd79cf444bdea89c6052e27309a5bf`
@@ -294,13 +294,13 @@ At minimum:
 
 ### Task 1: Implement BP-01 provider-neutral activity
 
-- [ ] Verify exact base `935114d21cdd79cf444bdea89c6052e27309a5bf` and this plan.
-- [ ] Implement the trusted run-binding resolver and hidden loopback Ralphex sidecar adapter inside `internal/activity/**`.
-- [ ] Implement durable activity store, provider/ABCP normalization, replay/gap handling and source-checkpoint observer.
-- [ ] Add the additive extension/activity page/SSE HTTP contracts.
-- [ ] Wire BP-01 into `cmd/abcp` without changing existing endpoint semantics.
-- [ ] Add adversarial tests for all frozen trust, replay, resource, redaction and compatibility invariants.
-- [ ] Run focused validation and leave one clean candidate commit within the path ceiling.
+- [x] Verify exact base `935114d21cdd79cf444bdea89c6052e27309a5bf` and this plan.
+- [x] Implement the trusted run-binding resolver and hidden loopback Ralphex sidecar adapter inside `internal/activity/**`.
+- [x] Implement durable activity store, provider/ABCP normalization, replay/gap handling and source-checkpoint observer.
+- [x] Add the additive extension/activity page/SSE HTTP contracts.
+- [x] Wire BP-01 into `cmd/abcp` without changing existing endpoint semantics.
+- [x] Add adversarial tests for all frozen trust, replay, resource, redaction and compatibility invariants.
+- [x] Run focused validation and leave one clean candidate commit within the path ceiling.
 
 ## Completion boundary
 
@@ -329,3 +329,33 @@ Confirmed invariants:
 - additive routes, dedicated SSE capacity and non-Linux fail-closed behavior fit the allowed paths.
 
 This review authorizes implementation only within this plan's path ceiling. Repo B publication and release remain governed by the operator runbook.
+
+
+## Implementation validation — 2026-09-26
+
+Task 1 is complete in the isolated Repo B worktree. The required base
+`935114d21cdd79cf444bdea89c6052e27309a5bf` was verified; the initial worktree
+contained only the subsequent frozen-plan commit.
+
+Implemented controller-bound scope resolution, pinned shared loopback sidecars,
+provider generation/replay checks, redacted deterministic activity records,
+ledger milestones, independent clean-source checkpoints, and additive authenticated
+page/SSE routes. Durable global ordinals disambiguate cross-run resume; committed
+log anchors detect deletion, replacement, and complete-record truncation after
+restart. Activity failures remain isolated from the authoritative run ledger.
+Linux filesystem generation evidence is required for activity storage and provider
+observation; unavailable evidence fails the extension or provider detail closed.
+
+Validation passed:
+- `go test ./internal/activity ./internal/serviceapi ./cmd/abcp`
+- `go test -race ./internal/activity ./internal/serviceapi ./cmd/abcp`
+- `go vet ./internal/activity ./internal/serviceapi ./cmd/abcp`
+- `go test ./...`
+- `go test -race ./...`
+- `go vet ./...`
+- `GOOS=darwin GOARCH=amd64 go test -c` for each affected package
+- `git diff --check` and the exact-base changed-path allowlist check
+
+Publication/release remain subject to the completion-boundary operator runbook,
+including a fresh independent review of the exact candidate commit before a PR.
+The pre-implementation plan review above is not an implementation review verdict.
