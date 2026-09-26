@@ -26,7 +26,7 @@ Implement an additive **Governed Preview Runtime** in ABCP.
 
 ### Task 1: Implement the frozen BP-02 governed preview runtime
 
-- [ ] Implement every requirement, invariant, endpoint, isolation rule and deterministic verification obligation in this frozen BP-02 plan without widening its allowed paths or authority.
+- [x] Implement every requirement, invariant, endpoint, isolation rule and deterministic verification obligation in this frozen BP-02 plan without widening its allowed paths or authority.
 
 Preview is a development presentation of exact governed candidate bytes. It is never deployment, acceptance, merge authority or a new run state.
 
@@ -297,3 +297,27 @@ Accepted invariants:
 6. Implementation stays within allowed paths; V3 activation requires re-derived authority; publication still requires independent acceptance and review.
 
 The earlier broad review attempt timed out without a verdict and is not acceptance evidence.
+
+
+## Implementation completion — 2026-09-26
+
+Task 1 is implemented within the frozen allowed paths. Protected profiles load
+through `abcp serve --preview-profile-file`; absent or unsupported host/profile
+isolation preserves `preview_runtime=false` and `NOT_AVAILABLE`. Preview history
+and receipts are independent of run/acceptance state.
+
+Validation passed:
+- focused `internal/preview`, `internal/serviceapi`, and `cmd/abcp` tests;
+- `go test ./...`, `go test -race ./...`, and `go vet ./...`;
+- Darwin/amd64 and Windows/amd64 compile-only checks for all three affected packages;
+- strict legacy capability compatibility, activity regression tests, binding and
+  profile negatives, exact detached source, request replay/conflicts, lifecycle,
+  concurrency, restart/orphan cleanup, isolation command/proxy and DTO checks;
+- `git diff --check` and the exact frozen-parent allowed-path subset proof.
+
+The opt-in local Docker smoke used the already-present digest-pinned Alpine image
+`alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6`.
+The complete host/profile isolation and presentation proof was unavailable, so
+capability remained false; probe cleanup passed. This is the authorized fail-closed
+outcome, not live Preview Serve acceptance. Publication, runtime cutover, and
+independent exact-head acceptance/review remain outside this implementation iteration.

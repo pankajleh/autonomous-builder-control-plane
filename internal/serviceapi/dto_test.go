@@ -102,3 +102,44 @@ func TestPdlcExperienceCapabilitiesFrozenFields(t *testing.T) {
 		t.Fatal("extension DTO changed", string(data), err)
 	}
 }
+
+func TestPreviewCommandsCannotSupplyRuntimeAuthority(t *testing.T) {
+	create := PreviewRequestV1{SchemaVersion: 1, RequestID: "create-1", ExpectedRunID: "run-1", CheckpointActivityID: strings.Repeat("a", 64), ProfileID: "web-v1", DelegatedActor: DelegatedActorV1{SubjectID: "alice", SubjectType: PrincipalUser}}
+	if ValidatePreviewRequestV1(create, "run-1") != nil {
+		t.Fatal("valid command rejected")
+	}
+	for _, change := range []func(*PreviewRequestV1){func(c *PreviewRequestV1) { c.ExpectedRunID = "run-2" }, func(c *PreviewRequestV1) { c.CheckpointActivityID = "HEAD" }, func(c *PreviewRequestV1) { c.ProfileID = "../host" }, func(c *PreviewRequestV1) { c.DelegatedActor.SubjectType = PrincipalService }} {
+		c := create
+		change(&c)
+		if ValidatePreviewRequestV1(c, "run-1") == nil {
+			t.Fatal("unsafe command accepted")
+		}
+	}
+	stop := PreviewStopRequestV1{SchemaVersion: 1, RequestID: "stop-1", ExpectedRunID: "run-1", ExpectedPreviewID: strings.Repeat("b", 64), DelegatedActor: create.DelegatedActor}
+	if ValidatePreviewStopRequestV1(stop, "run-1", stop.ExpectedPreviewID) != nil {
+		t.Fatal("valid stop rejected")
+	}
+	if ValidatePreviewStopRequestV1(stop, "run-1", strings.Repeat("c", 64)) == nil {
+		t.Fatal("stop rebound")
+	}
+	valid := previewDTO()
+	if ValidatePreviewV1(valid) != nil {
+		t.Fatal("valid preview rejected")
+	}
+	for _, field := range []string{"status", "health", "expiry", "route"} {
+		v := valid
+		switch field {
+		case "status":
+			v.Status = "ACCEPTED"
+		case "health":
+			v.Health = "secret"
+		case "expiry":
+			v.ExpiresAt = v.CreatedAt
+		case "route":
+			v.RouteHandle = "/var/run/docker.sock"
+		}
+		if ValidatePreviewV1(v) == nil {
+			t.Fatal("invalid preview accepted", field)
+		}
+	}
+}

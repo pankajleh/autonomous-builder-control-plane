@@ -640,7 +640,7 @@ func TestServeWiresAdditiveActivityAndSurvivesActivityStorageFailure(t *testing.
 				if readErr == nil {
 					body, _ := io.ReadAll(response.Body)
 					response.Body.Close()
-					if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"activity_stream":true`)) {
+					if response.StatusCode != 200 || !bytes.Contains(body, []byte(`"activity_stream":true`)) || !bytes.Contains(body, []byte(`"preview_runtime":false`)) {
 						t.Fatalf("extension: %d %s", response.StatusCode, body)
 					}
 					break
@@ -681,5 +681,24 @@ func TestServeWiresAdditiveActivityAndSurvivesActivityStorageFailure(t *testing.
 				t.Fatal("serve shutdown deadline")
 			}
 		})
+	}
+}
+
+func TestServeRejectsUnsafePreviewProfileConfiguration(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("protected controller filesystem requires Linux")
+	}
+	root := t.TempDir()
+	token := filepath.Join(root, "token")
+	cursor := filepath.Join(root, "cursor")
+	grants := filepath.Join(root, "grants")
+	writeCLIFile(t, token, []byte(strings.Repeat("t", 32)), 0600)
+	data, _ := json.Marshal(map[string]string{"key_id": "preview-test", "key_base64": base64.StdEncoding.EncodeToString(make([]byte, 32))})
+	writeCLIFile(t, cursor, data, 0600)
+	writeCLIFile(t, grants, []byte(`{"principals":[]}`), 0600)
+	var stderr bytes.Buffer
+	code := serveCommand([]string{"--service-root", filepath.Join(root, "service"), "--token-file", token, "--principal-id", "preview-test", "--cursor-key-file", cursor, "--authority-grants-file", grants, "--preview-profile-file", filepath.Join(root, "missing-profile")}, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "construct preview extension") {
+		t.Fatalf("unsafe profile startup: %d %s", code, stderr.String())
 	}
 }

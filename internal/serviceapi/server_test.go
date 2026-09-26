@@ -1250,3 +1250,121 @@ func TestActivityStreamSaturationDoesNotDrainChunkedBody(t *testing.T) {
 		t.Fatal("saturation did not close the unconsumed request", response.StatusCode)
 	}
 }
+
+type testPreviewController struct {
+	available bool
+	result    PreviewV1
+	calls     int
+	err       error
+}
+
+func (p *testPreviewController) Available() bool { return p.available }
+func (p *testPreviewController) CreatePreview(context.Context, Principal, string, PreviewRequestV1) (PreviewV1, error) {
+	p.calls++
+	return p.result, p.err
+}
+func (p *testPreviewController) StopPreview(context.Context, Principal, string, string, PreviewStopRequestV1) (PreviewV1, error) {
+	p.calls++
+	return p.result, p.err
+}
+func (p *testPreviewController) ReadPreview(context.Context, string, string) (PreviewV1, error) {
+	p.calls++
+	return p.result, p.err
+}
+func (p *testPreviewController) ListPreviews(_ context.Context, run string) (PreviewListV1, error) {
+	p.calls++
+	return PreviewListV1{SchemaVersion: "PreviewListV1", RunID: run, Previews: []PreviewV1{p.result}}, p.err
+}
+func previewDTO() PreviewV1 {
+	return PreviewV1{SchemaVersion: "PreviewV1", PreviewID: strings.Repeat("a", 64), Revision: 1, ProductAuthorizationID: "authorization-1", ProductTaskID: "task-1", ProductVersionID: "version-1", RunID: "run-1", CheckpointActivityID: strings.Repeat("b", 64), SourceSHA: strings.Repeat("c", 40), ProfileID: "web-v1", ProfileDigest: strings.Repeat("d", 64), Status: "REQUESTED", Health: "UNKNOWN", CreatedAt: "2026-09-26T10:00:00Z", ExpiresAt: "2026-09-26T10:01:00Z", ValidationID: strings.Repeat("e", 64), EvidenceID: strings.Repeat("f", 64), RequestID: "request-1", RequestDigest: strings.Repeat("a", 64)}
+}
+func TestPreviewRoutesAreAdditiveStrictAndDelegated(t *testing.T) {
+	now := time.Date(2026, 9, 26, 10, 0, 0, 0, time.UTC)
+	s := newTestServer(t, &testCatalog{runs: []runtimecatalog.RunRegistrationV1{{RunID: "run-1"}}}, now)
+	legacy := httptest.NewRecorder()
+	s.Handler().ServeHTTP(legacy, authenticatedRequest(http.MethodGet, "/v1/capabilities", nil))
+	original := legacy.Body.String()
+	backend := &testPreviewController{available: true, result: previewDTO()}
+	s.reserved.Preview = backend
+	again := httptest.NewRecorder()
+	s.Handler().ServeHTTP(again, authenticatedRequest(http.MethodGet, "/v1/capabilities", nil))
+	if again.Body.String() != original {
+		t.Fatal("legacy capabilities changed")
+	}
+	extension := httptest.NewRecorder()
+	s.Handler().ServeHTTP(extension, authenticatedRequest(http.MethodGet, "/v1/extensions/pdlc-experience", nil))
+	if extension.Body.String() != `{"schema_version":"PdlcExperienceCapabilitiesV1","activity_stream":false,"preview_runtime":true}`+"\n" {
+		t.Fatal(extension.Body.String())
+	}
+	c := PreviewRequestV1{SchemaVersion: 1, RequestID: "create-1", ExpectedRunID: "run-1", CheckpointActivityID: strings.Repeat("b", 64), ProfileID: "web-v1", DelegatedActor: DelegatedActorV1{SubjectID: "alice", SubjectType: PrincipalUser}}
+	data, _ := json.Marshal(c)
+	denied := httptest.NewRecorder()
+	s.Handler().ServeHTTP(denied, authenticatedRequest(http.MethodPost, "/v1/runs/run-1/previews", bytes.NewReader(data)))
+	if denied.Code != 403 || backend.calls != 0 {
+		t.Fatal("delegation bypass", denied.Code)
+	}
+	grantRunAdmission(s)
+	for _, route := range []struct {
+		method, path string
+		body         []byte
+		status       int
+	}{
+		{http.MethodPost, "/v1/runs/run-1/previews", data, 202},
+		{http.MethodGet, "/v1/runs/run-1/previews", nil, 200},
+		{http.MethodGet, "/v1/runs/run-1/previews/" + backend.result.PreviewID, nil, 200},
+		{http.MethodGet, "/v1/runs/run-1/previews?route=host", nil, 400},
+		{http.MethodPost, "/v1/runs/run-1/previews", []byte(strings.TrimSuffix(string(data), "}") + `,"image":"untrusted:latest"}`), 400},
+		{http.MethodPost, "/v1/runs/run-1/previews", []byte(strings.TrimSuffix(string(data), "}") + `,"request_id":"again"}`), 400},
+		{http.MethodPost, "/v1/runs/run-1/previews", []byte(strings.Replace(string(data), "run-1", "run-2", 1)), 400},
+		{http.MethodGet, "/v1/runs/run-1/previews/../../host", nil, 404},
+		{http.MethodDelete, "/v1/runs/run-1/previews", nil, 400},
+	} {
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, authenticatedRequest(route.method, route.path, bytes.NewReader(route.body)))
+		if w.Code != route.status {
+			t.Fatalf("%s %s: %d %s", route.method, route.path, w.Code, w.Body.String())
+		}
+	}
+	stop := PreviewStopRequestV1{SchemaVersion: 1, RequestID: "stop-1", ExpectedRunID: "run-1", ExpectedPreviewID: backend.result.PreviewID, DelegatedActor: c.DelegatedActor}
+	body, _ := json.Marshal(stop)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodPost, "/v1/runs/run-1/previews/"+stop.ExpectedPreviewID+"/stop", bytes.NewReader(body)))
+	if w.Code != 202 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	backend.available = false
+	backend.err = ErrPreviewUnavailable
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodPost, "/v1/runs/run-1/previews", bytes.NewReader(data)))
+	if w.Code != 503 || !strings.Contains(w.Body.String(), "NOT_AVAILABLE") {
+		t.Fatal("unavailable runtime", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodGet, "/v1/extensions/pdlc-experience", nil))
+	if !strings.Contains(w.Body.String(), `"preview_runtime":false`) {
+		t.Fatal("unsupported runtime advertised")
+	}
+}
+func TestPreviewDTORejectsDependencyLeaks(t *testing.T) {
+	s := newTestServer(t, &testCatalog{runs: []runtimecatalog.RunRegistrationV1{{RunID: "run-1"}}}, time.Now())
+	backend := &testPreviewController{result: previewDTO()}
+	s.reserved.Preview = backend
+	for _, field := range []string{"route", "profile", "evidence", "product"} {
+		backend.result = previewDTO()
+		switch field {
+		case "route":
+			backend.result.RouteHandle = "http://127.0.0.1:23456/"
+		case "profile":
+			backend.result.ProfileID = "/private/path"
+		case "evidence":
+			backend.result.EvidenceID = "container-id-secret"
+		case "product":
+			backend.result.ProductTaskID = "Bearer secret"
+		}
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodGet, "/v1/runs/run-1/previews/"+backend.result.PreviewID, nil))
+		if w.Code != 500 || strings.Contains(w.Body.String(), "secret") || strings.Contains(w.Body.String(), "/private/") {
+			t.Fatal("private dependency field escaped", w.Code, w.Body.String())
+		}
+	}
+}

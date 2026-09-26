@@ -25,6 +25,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/preview"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/readmodel"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/recovery"
 	runctl "github.com/pankajleh/autonomous-builder-control-plane/internal/run"
@@ -775,12 +776,13 @@ func serveCommand(args []string, stderr io.Writer) int {
 	principalID := flags.String("principal-id", "", "stable service principal identifier")
 	cursorKeyFile := flags.String("cursor-key-file", "", "protected cursor key file")
 	grantsFile := flags.String("authority-grants-file", "", "protected exact authority grant file")
+	previewProfileFile := flags.String("preview-profile-file", "", "optional protected preview profile file")
 	admissionProfileFile := flags.String("admission-profile-file", "", "optional protected run admission profile file")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>]")
 		return 2
 	}
 	if err := serviceapi.ValidateLoopbackAddress(*listen); err != nil {
@@ -865,8 +867,15 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer activityService.Close()
+	previewService, err := preview.New(ctx, *serviceRoot, *previewProfileFile, catalog, activityService)
+	if err != nil {
+		fmt.Fprintln(stderr, "construct preview extension")
+		return 1
+	}
+	defer previewService.Close()
 	server, err := serviceapi.NewServer(serviceapi.ServerConfig{
 		Activity:      activityService,
+		Preview:       previewService,
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
 		RunAdmission: admissions, DevelopmentRunAdmission: admissions,

@@ -9,6 +9,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
@@ -227,4 +228,97 @@ type PdlcExperienceCapabilitiesV1 struct {
 	SchemaVersion  string `json:"schema_version"`
 	ActivityStream bool   `json:"activity_stream"`
 	PreviewRuntime bool   `json:"preview_runtime"`
+}
+
+// Preview commands identify governed objects only. Runtime policy is protected
+// controller configuration and has no representation in these commands.
+type PreviewRequestV1 struct {
+	SchemaVersion        int              `json:"schema_version"`
+	RequestID            string           `json:"request_id"`
+	ExpectedRunID        string           `json:"expected_run_id"`
+	CheckpointActivityID string           `json:"checkpoint_activity_id"`
+	ProfileID            string           `json:"profile_id"`
+	DelegatedActor       DelegatedActorV1 `json:"delegated_actor"`
+}
+type PreviewStopRequestV1 struct {
+	SchemaVersion     int              `json:"schema_version"`
+	RequestID         string           `json:"request_id"`
+	ExpectedRunID     string           `json:"expected_run_id"`
+	ExpectedPreviewID string           `json:"expected_preview_id"`
+	DelegatedActor    DelegatedActorV1 `json:"delegated_actor"`
+}
+type PreviewV1 struct {
+	SchemaVersion          string `json:"schema_version"`
+	PreviewID              string `json:"preview_id"`
+	Revision               uint64 `json:"revision"`
+	ProductAuthorizationID string `json:"product_authorization_id"`
+	ProductTaskID          string `json:"product_task_id"`
+	ProductVersionID       string `json:"product_version_id"`
+	RunID                  string `json:"run_id"`
+	CheckpointActivityID   string `json:"checkpoint_activity_id"`
+	SourceSHA              string `json:"source_sha"`
+	ProfileID              string `json:"profile_id"`
+	ProfileDigest          string `json:"profile_digest"`
+	Status                 string `json:"status"`
+	Health                 string `json:"health"`
+	CreatedAt              string `json:"created_at"`
+	ExpiresAt              string `json:"expires_at"`
+	StoppedAt              string `json:"stopped_at,omitempty"`
+	ValidationID           string `json:"validation_id"`
+	EvidenceID             string `json:"evidence_id"`
+	RequestID              string `json:"request_id"`
+	RequestDigest          string `json:"request_digest"`
+	// RouteHandle is opaque, server-only and usable only while READY. It is
+	// neither a public URL nor a browser access grant.
+	RouteHandle string `json:"route_handle,omitempty"`
+}
+type PreviewListV1 struct {
+	SchemaVersion string      `json:"schema_version"`
+	RunID         string      `json:"run_id"`
+	Previews      []PreviewV1 `json:"previews"`
+}
+
+func validPreviewActor(a DelegatedActorV1) bool {
+	return ValidatePrincipalID(a.SubjectID) == nil && (a.SubjectType == PrincipalUser || a.SubjectType == PrincipalOperator)
+}
+func ValidatePreviewRequestV1(c PreviewRequestV1, run string) error {
+	if c.SchemaVersion != 1 || ValidatePrincipalID(c.RequestID) != nil || runtimecatalog.ValidateIdentifier(run) != nil || c.ExpectedRunID != run || !isLowerSHA256(c.CheckpointActivityID) || ValidatePrincipalID(c.ProfileID) != nil || !validPreviewActor(c.DelegatedActor) {
+		return errors.New("invalid preview command")
+	}
+	return nil
+}
+func ValidatePreviewStopRequestV1(c PreviewStopRequestV1, run, preview string) error {
+	if c.SchemaVersion != 1 || ValidatePrincipalID(c.RequestID) != nil || runtimecatalog.ValidateIdentifier(run) != nil || c.ExpectedRunID != run || !isLowerSHA256(preview) || c.ExpectedPreviewID != preview || !validPreviewActor(c.DelegatedActor) {
+		return errors.New("invalid preview stop command")
+	}
+	return nil
+}
+
+func ValidatePreviewV1(v PreviewV1) error {
+	if v.SchemaVersion != "PreviewV1" || !isLowerSHA256(v.PreviewID) || v.Revision == 0 || runtimecatalog.ValidateIdentifier(v.RunID) != nil || ValidatePrincipalID(v.ProductAuthorizationID) != nil || ValidatePrincipalID(v.ProductTaskID) != nil || ValidatePrincipalID(v.ProductVersionID) != nil || !isLowerSHA256(v.CheckpointActivityID) || !isLowerGitObjectID(v.SourceSHA) || ValidatePrincipalID(v.ProfileID) != nil || !isLowerSHA256(v.ProfileDigest) || !isLowerSHA256(v.ValidationID) || !isLowerSHA256(v.EvidenceID) || ValidatePrincipalID(v.RequestID) != nil || !isLowerSHA256(v.RequestDigest) {
+		return errors.New("invalid preview identity")
+	}
+	created, e1 := time.Parse(time.RFC3339Nano, v.CreatedAt)
+	expires, e2 := time.Parse(time.RFC3339Nano, v.ExpiresAt)
+	if e1 != nil || e2 != nil || !expires.After(created) || expires.Sub(created) > time.Hour {
+		return errors.New("invalid preview lifetime")
+	}
+	switch v.Status {
+	case "REQUESTED", "VALIDATING", "STARTING":
+		if v.Health != "UNKNOWN" || v.StoppedAt != "" || v.RouteHandle != "" {
+			return errors.New("invalid pending preview")
+		}
+	case "READY":
+		if (v.Health != "HEALTHY" && v.Health != "DEGRADED") || v.StoppedAt != "" || !isLowerSHA256(v.RouteHandle) {
+			return errors.New("invalid ready preview")
+		}
+	case "FAILED", "STOPPED", "EXPIRED":
+		stopped, err := time.Parse(time.RFC3339Nano, v.StoppedAt)
+		if err != nil || stopped.Before(created) || v.Health != "UNKNOWN" || v.RouteHandle != "" {
+			return errors.New("invalid terminal preview")
+		}
+	default:
+		return errors.New("invalid preview state")
+	}
+	return nil
 }
