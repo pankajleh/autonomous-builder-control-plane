@@ -372,3 +372,129 @@ Final review validation passed: focused tests, `go test ./...`,
 `go test -race ./...`, `go vet ./...`, Darwin/amd64 and Windows/amd64 compile-only
 checks for all affected packages, Go formatting, `git diff --check`, and the
 frozen-parent allowed-path subset audit.
+
+
+## Post-run preview-control correction authority — 2026-09-26
+
+Status: **CORRECTION AUTHORIZED CANDIDATE — SAME BP-02 SCOPE ONLY — IMPLEMENTATION FORBIDDEN UNTIL INDEPENDENT 0C/0M CORRECTION REVIEW**
+
+Exact blocked candidate:
+`f3f3a2b318d16d0fd76f38dcfd5045921d4f7ca3`
+
+Independent exact-facts publication review:
+
+```text
+CRITICAL: 3
+MAJOR: 2
+PUBLICATION_READY: NO
+```
+
+A broader exact-head reviewer timed out before a verdict and is not acceptance evidence.
+
+This is a **fresh bounded correction cycle**, not an additional internal Ralphex review pass. It may modify only the original BP-02 allowed paths:
+- `internal/preview/**`;
+- `internal/serviceapi/server.go`;
+- `internal/serviceapi/server_test.go`;
+- `internal/serviceapi/dto.go`;
+- `internal/serviceapi/dto_test.go`;
+- `internal/serviceapi/config.go` and focused tests only if required;
+- `cmd/abcp/main.go`;
+- `cmd/abcp/main_test.go`;
+- this completed plan file.
+
+No run-state, acceptance, integration, GitHub, merge, activity, runadmission, runtimecatalog, context, governance, deployment or Repo C behavior may change.
+
+The correction must resolve exactly these confirmed findings:
+
+1. **Fixed preview-control authority is missing.**
+   - Preview create/stop currently require only authenticated service principal plus `MayAssertDelegatedActor=true`.
+   - Every preview route MUST require the server-side fixed authority `preview.control` using the existing `AuthorityMatcher.Match`.
+   - State-changing create/stop MUST additionally require `MayAssertDelegatedActor=true` and an existing valid delegated actor of type `user` or `operator`.
+   - No caller-supplied authority string is permitted.
+   - Missing grant, wrong principal type, disabled delegation or invalid actor must perform zero preview mutation.
+   - Existing action/admission authority semantics must remain unchanged.
+
+2. **Preview reads are not principal-scoped.**
+   - The authenticated service principal MUST be threaded through preview list/detail reads.
+   - A preview is visible only to the same authenticated service principal that created it.
+   - Cross-principal list/detail requests must disclose no preview metadata and behave as not found/empty according to the existing bounded API shape.
+   - Public `PreviewV1` DTOs MUST NOT expose the owner principal ID or authority-grant digest.
+
+3. **Stop is not bound to preview ownership.**
+   - Durable preview state must persist an internal immutable owner principal identity from creation.
+   - Stop requires both `preview.control` and exact same-principal ownership.
+   - Cross-principal stop returns the bounded not-found/authority-safe outcome and performs zero mutation.
+   - No override/admin stop authority is introduced in this correction.
+
+4. **Durable mutation receipts are not authority-config bound.**
+   - Durable create/stop receipts must bind:
+     - authenticated principal ID and type;
+     - exact `AuthorityMatcher.Digest()` used for admission;
+     - fixed operation kind;
+     - run ID;
+     - request ID;
+     - delegated actor;
+     - canonical command/body digest;
+     - exact resulting preview identity/result.
+   - Exact replay by the same principal under the same authority digest returns the same result.
+   - Same request ID with changed operation/run/target/body/delegated actor conflicts with zero additional mutation.
+   - A different principal cannot inherit another principal's receipt.
+   - A changed authority-grant digest must not silently inherit a prior mutation receipt; fail closed with conflict/reconciliation-safe behavior.
+
+5. **Tests currently encode the insufficient authority behavior.**
+   - Replace tests that allow preview mutation with `mayDelegate=true` and an empty authority set.
+   - Add tests for:
+     - missing/present `preview.control`;
+     - non-service principal denial;
+     - delegation disabled/invalid delegated actor;
+     - principal-scoped list/detail;
+     - cross-principal stop denial;
+     - principal-bound replay isolation;
+     - authority-digest replay mismatch;
+     - unchanged legacy `/v1/capabilities`;
+     - `PdlcExperienceCapabilitiesV1.preview_runtime` truthful for the authenticated principal: true only when the runtime is available **and** that principal is a service principal with `preview.control` and delegated-actor authority; otherwise false.
+
+### Required implementation shape
+
+Prefer additive changes inside the existing BP-02 package/API seam:
+- update the `PreviewController` read methods to accept authenticated `Principal`;
+- pass `AuthorityMatcher.Digest()` into preview create/stop as controller-side admission context, or an equivalently bounded internal value;
+- persist owner principal and authority digest only in internal preview journal metadata/receipts, not public DTOs;
+- keep request bodies free of authority strings, owner IDs, image/argv/path authority, or other controller-owned values;
+- preserve exact product-admission/checkpoint/profile/source/runtime isolation behavior already accepted in BP-02.
+
+If satisfying these findings requires changing any path outside the original BP-02 ceiling or changing a shared public contract beyond the existing additive preview interfaces/DTO validation, report ROADBLOCK before mutation.
+
+### Task 2: Correct preview-control authorization and ownership
+
+- [ ] Require fixed `preview.control` grant on all preview routes; create/stop additionally require delegated-actor authority.
+- [ ] Make list/detail principal-scoped without exposing owner identity in public DTOs.
+- [ ] Persist immutable internal preview ownership and deny cross-principal stop.
+- [ ] Bind durable mutation receipts/replay to authenticated principal and exact authority-grant digest.
+- [ ] Correct/add adversarial tests for grant, delegation, cross-principal reads/stops, replay and capability truth.
+- [ ] Re-run focused preview/serviceapi/cmd tests.
+- [ ] Re-run `go test ./...`, `go test -race ./...`, `go vet ./...`.
+- [ ] Re-run Darwin/amd64 and Windows/amd64 compile-only checks for affected packages.
+- [ ] Re-run opt-in Docker smoke with the existing local digest-pinned image; `preview_runtime=false` remains an accepted fail-closed host outcome.
+- [ ] Run `git diff --check` and exact blocked-candidate-to-head allowed-path proof.
+- [ ] Leave one clean correction candidate for a **new** independent exact-head 0C/0M publication review.
+
+Publication, PR merge, runtime cutover, PX-06 and deployment remain blocked until this correction completes, independent acceptance is green, and a new exact-head publication review returns 0 Critical / 0 Major.
+
+### Independent correction-authority review
+
+```text
+CRITICAL: 0
+MAJOR: 0
+CORRECTION_READY: YES
+```
+
+Confirmed invariants:
+- all preview routes require fixed `preview.control` authority;
+- mutations additionally require service identity and valid delegated-actor authority;
+- immutable internal ownership scopes reads/stops without exposing owner metadata;
+- receipts bind principal, exact authority digest, command and result; mismatches fail closed;
+- adversarial tests cover authorization, ownership, replay and capability truth;
+- original BP-02 path/authority ceilings remain and publication still requires fresh acceptance/review.
+
+This review authorizes only Task 2 above. It grants no merge, publication, runtime cutover, PX-06 or deployment authority.
