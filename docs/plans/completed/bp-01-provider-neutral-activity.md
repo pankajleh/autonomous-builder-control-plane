@@ -416,3 +416,13 @@ The correction must resolve exactly these three confirmed Major findings:
 - [ ] Leave one clean correction candidate commit for a new independent exact-head publication review.
 
 Publication remains blocked until this Task 2 correction completes, all operator-owned acceptance gates pass, and a **new** independent exact-head review returns 0 Critical / 0 Major. The prior 122c337 candidate remains review evidence only.
+
+### Independent correction-authority review
+
+```text
+CRITICAL: 0
+MAJOR: 0
+CORRECTION_READY: YES
+```
+
+The review confirmed the three fixes are implementable inside `internal/activity/**`, add no shared contract or authority, constitute a fresh correction run rather than Review 3, and preserve all operator-owned validation/publication gates.
