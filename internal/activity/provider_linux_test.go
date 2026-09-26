@@ -226,6 +226,9 @@ func TestReplayPreservesEventsAcrossProviderAndStoreRestarts(t *testing.T) {
 	f := newBindingFixture(t)
 	selected := providerSession(t, f)
 	root := filepath.Join(t.TempDir(), "activity")
+	if err := os.Chmod(filepath.Dir(root), 0700); err != nil {
+		t.Fatal(err)
+	}
 	registration := jsonDigest(f.catalog.runs[f.run])
 	var original []Event
 	for lifetime := 0; lifetime < 2; lifetime++ {

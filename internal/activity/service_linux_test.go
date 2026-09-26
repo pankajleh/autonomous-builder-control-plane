@@ -40,6 +40,9 @@ func (s *fakeSnapshots) Snapshot(_ context.Context, run string) (readmodel.Snaps
 func testService(t *testing.T) (*Service, *fakeSnapshots) {
 	t.Helper()
 	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
 	catalog := &fakeCatalog{runs: map[string]runtimecatalog.RunRegistrationV1{"run": {RunID: "run"}, "other": {RunID: "other"}}}
 	signer, err := serviceapi.NewCursorSigner("activity-key", make([]byte, 32))
 	if err != nil {
@@ -149,6 +152,48 @@ func TestActivityExtensionFailureDoesNotMutateFacts(t *testing.T) {
 	defer disabled.Close()
 	if _, err = disabled.ReadActivity(context.Background(), "run", serviceapi.PageRequestV1{PageSize: 100}); !errors.Is(err, serviceapi.ErrActivityUnavailable) {
 		t.Fatal("unsafe store accepted", err)
+	}
+}
+
+func TestActivityResumeFailsAfterNamespaceLoss(t *testing.T) {
+	for _, target := range []string{"run", "other"} {
+		t.Run(target, func(t *testing.T) {
+			s, facts := testService(t)
+			facts.events = []ledger.Event{{EventID: "pending", StateTo: domain.StateBranchAcceptancePending, Timestamp: testTime}}
+			data, err := s.ReadActivity(context.Background(), "run", serviceapi.PageRequestV1{PageSize: 100})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var page Page
+			if err = json.Unmarshal(data, &page); err != nil || len(page.Events) == 0 {
+				t.Fatal("missing original activity", err)
+			}
+			last := strconv.FormatUint(page.Events[0].Ordinal, 10)
+			s.Close()
+			if err = os.RemoveAll(s.store.root); err != nil {
+				t.Fatal(err)
+			}
+			facts.events = []ledger.Event{{EventID: "accepted", StateTo: domain.StateBranchAccepted, Timestamp: testTime}}
+			fresh, err := New(context.Background(), s.resolver.Root, s.resolver.Catalog, facts, s.cursors)
+			if err != nil {
+				t.Fatal("activity loss prevented service startup", err)
+			}
+			defer fresh.Close()
+			stream, err := fresh.OpenActivityStream(context.Background(), target, last)
+			if stream != nil {
+				stream.Close()
+			}
+			if !errors.Is(err, serviceapi.ErrActivityUnavailable) {
+				t.Fatal("stale or cross-run resume accepted after namespace loss", err)
+			}
+			if _, err = fresh.ReadActivity(context.Background(), target, serviceapi.PageRequestV1{PageSize: 100}); !errors.Is(err, serviceapi.ErrActivityUnavailable) {
+				t.Fatal("lost history silently recreated", err)
+			}
+			snapshot, err := facts.Snapshot(context.Background(), target)
+			if err != nil || len(snapshot.Events) != 1 || snapshot.Events[0].StateTo != domain.StateBranchAccepted {
+				t.Fatal("activity loss affected authoritative facts", err)
+			}
+		})
 	}
 }
 

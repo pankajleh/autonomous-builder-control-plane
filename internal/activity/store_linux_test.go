@@ -16,7 +16,11 @@ import (
 
 func newStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := OpenStore(filepath.Join(t.TempDir(), "activity"))
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenStore(filepath.Join(root, "activity"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +68,171 @@ func TestStoreRestartDedupeAndGlobalResumeIdentity(t *testing.T) {
 	events, _, more, err := recovered.read("a", "registration", a.Ordinal, 100)
 	if err != nil || more || len(events) != 1 || events[0].Ordinal != next.Ordinal {
 		t.Fatal("resume was not strictly after", err)
+	}
+}
+
+func TestStoreNamespaceLossCannotReuseResumeOrdinals(t *testing.T) {
+	for _, mode := range []string{"deleted", "replaced", "emptied", "copied"} {
+		t.Run(mode, func(t *testing.T) {
+			s := newStore(t)
+			if _, err := s.Append("run", "reg", provider(t, "run", "1")); err != nil {
+				t.Fatal(err)
+			}
+			s.Close()
+			if mode == "emptied" {
+				entries, err := os.ReadDir(s.root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, entry := range entries {
+					if err := os.Remove(filepath.Join(s.root, entry.Name())); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else if mode == "copied" {
+				if err := os.Rename(s.root, s.root+".old"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(s.root, 0700); err != nil {
+					t.Fatal(err)
+				}
+				entries, err := os.ReadDir(s.root + ".old")
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, entry := range entries {
+					data, err := os.ReadFile(filepath.Join(s.root+".old", entry.Name()))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err = os.WriteFile(filepath.Join(s.root, entry.Name()), data, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else {
+				if err := os.RemoveAll(s.root); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "replaced" {
+					if err := os.Mkdir(s.root, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			fresh, err := OpenStore(s.root)
+			if fresh != nil {
+				fresh.Close()
+			}
+			if !errors.Is(err, ErrIntegrity) {
+				t.Fatal("lost namespace allowed ordinal reuse", err)
+			}
+			if mode == "deleted" {
+				if _, err := os.Lstat(s.root); !os.IsNotExist(err) {
+					t.Fatal("missing initialized namespace was recreated", err)
+				}
+			}
+		})
+	}
+}
+
+func TestStoreNamespaceWitnessIntegrity(t *testing.T) {
+	for _, mode := range []string{"deleted", "truncated", "changed", "oversized", "symlink", "hardlink", "permissions"} {
+		t.Run(mode, func(t *testing.T) {
+			s := newStore(t)
+			if _, err := s.Append("run", "reg", provider(t, "run", "1")); err != nil {
+				t.Fatal(err)
+			}
+			path := s.root + ".namespace.json"
+			s.Close()
+			var err error
+			switch mode {
+			case "deleted":
+				err = os.Remove(path)
+			case "truncated":
+				err = os.Truncate(path, 0)
+			case "changed":
+				witness := namespaceWitness{Kind: "ActivityNamespaceV1", Namespace: strings.Repeat("f", 64)}
+				witness.Checksum = jsonDigest(witness)
+				writeJSON(t, path, witness)
+			case "oversized":
+				err = os.Truncate(path, 1025)
+			case "symlink":
+				if err = os.Rename(path, path+".old"); err == nil {
+					err = os.Symlink(path+".old", path)
+				}
+			case "hardlink":
+				err = os.Link(path, path+".link")
+			case "permissions":
+				err = os.Chmod(path, 0644)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := OpenStore(s.root)
+			if fresh != nil {
+				fresh.Close()
+			}
+			if !errors.Is(err, ErrIntegrity) {
+				t.Fatal("missing or invalid namespace witness accepted", err)
+			}
+		})
+	}
+}
+
+func TestStoreNamespaceWitnessProtectsLiveOwner(t *testing.T) {
+	t.Run("deleted-witness", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.Append("run", "reg", provider(t, "run", "1")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(s.root + ".namespace.json"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := s.read("run", "reg", 0, 100); !errors.Is(err, ErrIntegrity) {
+			t.Fatal("cached history ignored witness deletion", err)
+		}
+		if _, err := s.Append("other", "reg", provider(t, "other", "1")); !errors.Is(err, ErrIntegrity) {
+			t.Fatal("allocated an ordinal without namespace witness", err)
+		}
+	})
+	t.Run("deleted-directory", func(t *testing.T) {
+		s := newStore(t)
+		if err := os.RemoveAll(s.root); err != nil {
+			t.Fatal(err)
+		}
+		fresh, err := OpenStore(s.root)
+		if fresh != nil {
+			fresh.Close()
+		}
+		if !errors.Is(err, ErrUnavailable) {
+			t.Fatal("second owner acquired missing live namespace", err)
+		}
+	})
+}
+
+func TestStoreInitializesEmptyNamespaceOnlyOnce(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "activity")
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenStore(path)
+	if err != nil {
+		t.Fatal("genuinely empty namespace rejected", err)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = OpenStore(path)
+	if err != nil {
+		t.Fatal("initialized namespace did not restart", err)
+	}
+	defer s.Close()
+	if _, err = s.Append("new", "reg", provider(t, "new", "1")); err != nil {
+		t.Fatal("new run rejected after namespace restart", err)
 	}
 }
 

@@ -481,3 +481,35 @@ This correction candidate still requires a new independent review of its exact
 commit with 0 Critical / 0 Major before publication. The prior blocked candidate
 and correction-authority review do not substitute for that implementation review.
 No PR publication, deployment, merge, or activation was performed.
+
+## Final internal review correction — 2026-09-26
+
+The final internal review identified a remaining resume-integrity gap: loss of
+the entire activity directory also removed its initialization registry and
+ordinal allocator, allowing stale or cross-run SSE ordinals to identify newly
+created events after restart.
+
+A bounded, checksummed `activity.namespace.json` witness now lives directly in
+the protected service root, outside the activity directory. It is durably
+written before activity initialization, bound to the directory's filesystem
+generation, and locked for the store lifetime. Missing, emptied, or replaced
+previously initialized activity storage fails closed without resetting ordinals.
+Missing or invalid witnesses also fail closed for existing activity storage;
+older candidate storage without this witness is not automatically adopted.
+An interrupted first initialization fails closed. A genuinely new namespace and
+new runs in an intact namespace still initialize normally.
+
+Regression tests cover complete directory deletion, replacement, copied storage,
+emptying, witness corruption and deletion, exclusive ownership after directory
+loss, normal restart, and stale same-run/cross-run resume rejection. Activity
+failure remains isolated from service startup and authoritative run facts.
+
+Validation passed:
+- `go test ./internal/activity ./internal/serviceapi ./cmd/abcp`
+- `go test -race ./internal/activity ./internal/serviceapi ./cmd/abcp`
+- `go vet ./internal/activity ./internal/serviceapi ./cmd/abcp`
+- `go test ./...`
+- `go test -race ./...`
+- `go vet ./...`
+- Darwin amd64 compile-only checks for all three affected packages
+- formatting, whitespace, and exact-base allowed-path checks

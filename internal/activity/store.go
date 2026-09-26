@@ -21,16 +21,18 @@ import (
 // makes a bare SSE ordinal unambiguous across runs and recreated generations.
 // Allocation gaps after a crash are harmless; allocated values are never reused.
 type Store struct {
-	mu           sync.Mutex
-	root         string
-	dir, lock    *os.File
-	next         uint64
-	sequenceInfo os.FileInfo
-	registryInfo os.FileInfo
-	registry     initializationRegistry
-	registryHash string
-	cache        map[string]*runLog
-	closed       bool
+	mu            sync.Mutex
+	root          string
+	dir, lock     *os.File
+	namespace     *os.File
+	namespaceInfo os.FileInfo
+	next          uint64
+	sequenceInfo  os.FileInfo
+	registryInfo  os.FileInfo
+	registry      initializationRegistry
+	registryHash  string
+	cache         map[string]*runLog
+	closed        bool
 }
 
 type providerProof struct {
@@ -80,24 +82,35 @@ type runLog struct {
 }
 
 func OpenStore(root string) (*Store, error) {
-	dir, err := privateDirectory(root, true)
+	dir, namespace, fresh, err := openStoreNamespace(root)
 	if err != nil {
-		return nil, ErrUnavailable
+		return nil, err
 	}
 	lock, err := openRegular(filepath.Join(root, ".lock"), os.O_RDWR|os.O_CREATE, true)
 	if err != nil {
+		namespace.Close()
 		dir.Close()
 		return nil, ErrUnavailable
 	}
 	if err = lockFile(lock); err != nil {
+		namespace.Close()
 		lock.Close()
 		dir.Close()
 		return nil, err
 	}
-	s := &Store{root: root, dir: dir, lock: lock, cache: map[string]*runLog{}}
+	s := &Store{root: root, dir: dir, lock: lock, namespace: namespace, cache: map[string]*runLog{}}
+	s.namespaceInfo, err = namespace.Stat()
+	if err != nil {
+		s.Close()
+		return nil, ErrIntegrity
+	}
 	data, err := readFile(filepath.Join(root, "sequence"), 256, true)
 	var sequence sequenceState
 	if errors.Is(err, os.ErrNotExist) {
+		if !fresh {
+			s.Close()
+			return nil, ErrIntegrity
+		}
 		entries, e := dir.ReadDir(2*runtimecatalog.MaxRuns + 11)
 		if e != nil && e != io.EOF || len(entries) > 2*runtimecatalog.MaxRuns+10 {
 			s.Close()
@@ -174,7 +187,7 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
-	return errors.Join(s.lock.Close(), s.dir.Close())
+	return errors.Join(s.lock.Close(), s.dir.Close(), s.namespace.Close())
 }
 
 func (s *Store) saveSequence(next uint64) error {
@@ -222,6 +235,9 @@ func (s *Store) path(run string) string { return filepath.Join(s.root, digest([]
 func (s *Store) load(run, registration string) (*runLog, error) {
 	if s.closed || runtimecatalog.ValidateIdentifier(run) != nil {
 		return nil, ErrUnavailable
+	}
+	if err := s.checkNamespace(); err != nil {
+		return nil, err
 	}
 	dir, err := privateDirectory(s.root, false)
 	if err != nil {
