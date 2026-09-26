@@ -221,3 +221,10 @@ func jsonDepth(data []byte) int {
 	}
 	return maximum
 }
+
+// PdlcExperienceCapabilitiesV1 leaves the original strict capabilities DTO intact.
+type PdlcExperienceCapabilitiesV1 struct {
+	SchemaVersion  string `json:"schema_version"`
+	ActivityStream bool   `json:"activity_stream"`
+	PreviewRuntime bool   `json:"preview_runtime"`
+}

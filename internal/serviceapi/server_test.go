@@ -1,11 +1,14 @@
 package serviceapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -972,5 +975,278 @@ func TestFrozenServiceResourceCeilings(t *testing.T) {
 	}
 	if MaxCommandReasonBytes != 1<<10 || MaxActionPayloadBytes != 16<<10 || MaxActionPayloadDepth != 8 {
 		t.Fatal("command envelope ceiling changed")
+	}
+}
+
+type activityTestReader struct {
+	err   error
+	frame bool
+	page  PageRequestV1
+	last  string
+}
+
+func (a *activityTestReader) ReadActivity(_ context.Context, run string, p PageRequestV1) (json.RawMessage, error) {
+	a.page = p
+	return json.RawMessage(`{"schema_version":"ActivityPageV1","run_id":"` + run + `","events":[],"next_cursor":""}`), a.err
+}
+func (a *activityTestReader) OpenActivityStream(_ context.Context, _ string, last string) (ActivitySubscription, error) {
+	a.last = last
+	if a.err != nil {
+		return nil, a.err
+	}
+	return &activityTestSubscription{frame: a.frame}, nil
+}
+
+type activityTestSubscription struct{ frame bool }
+
+func (a *activityTestSubscription) Close() error { return nil }
+func (a *activityTestSubscription) Next(ctx context.Context) (ActivityFrame, error) {
+	if a.frame {
+		a.frame = false
+		return ActivityFrame{Ordinal: 42, Data: json.RawMessage("{\n\"status\":\"COMPLETED\",\"title\":\"safe\\nid: 99\"\n}")}, nil
+	}
+	<-ctx.Done()
+	return ActivityFrame{}, ctx.Err()
+}
+
+func TestActivityRoutesAreAdditiveAndAuthenticated(t *testing.T) {
+	s := newTestServer(t, &testCatalog{}, time.Now())
+	activity := &activityTestReader{}
+	s.reserved.Activity = activity
+	for _, target := range []string{"/v1/extensions/pdlc-experience", "/v1/runs/run/activity", "/v1/runs/run/activity/stream"} {
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+		if w.Code != http.StatusUnauthorized {
+			t.Fatal(target, w.Code)
+		}
+	}
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodGet, "/v1/extensions/pdlc-experience", nil))
+	var extension map[string]any
+	if json.Unmarshal(w.Body.Bytes(), &extension) != nil || len(extension) != 3 || extension["schema_version"] != "PdlcExperienceCapabilitiesV1" || extension["activity_stream"] != true || extension["preview_runtime"] != false {
+		t.Fatal(w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodGet, "/v1/capabilities", nil))
+	var existing map[string]any
+	json.Unmarshal(w.Body.Bytes(), &existing)
+	if len(existing) != 7 {
+		t.Fatal("existing capabilities changed", w.Body.String())
+	}
+	for _, target := range []string{"/v1/runs/run/activity", "/v1/runs/run/activity?page_size=500&cursor=opaque"} {
+		w = httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodGet, target, nil))
+		if w.Code != 200 {
+			t.Fatal(target, w.Code, w.Body.String())
+		}
+	}
+	if activity.page.PageSize != 500 || activity.page.Cursor != "opaque" {
+		t.Fatal(activity.page)
+	}
+	for _, query := range []string{"page_size=501", "page_size=0", "page_size=01", "page_size=1&page_size=2", "path=/tmp", "cursor=%zz", "page_size=1;cursor=x"} {
+		w = httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodGet, "/v1/runs/run/activity?"+query, nil))
+		if w.Code != 400 {
+			t.Fatal(query, w.Code)
+		}
+	}
+}
+
+func TestActivityStreamRejectsBeforeHeaders(t *testing.T) {
+	for _, scenario := range []string{"resume", "generation", "unregistered", "unavailable", "method", "query", "duplicate-header"} {
+		t.Run(scenario, func(t *testing.T) {
+			catalog := &testCatalog{}
+			s := newTestServer(t, catalog, time.Now())
+			reader := &activityTestReader{}
+			s.reserved.Activity = reader
+			r := authenticatedRequest(http.MethodGet, "/v1/runs/run/activity/stream", nil)
+			switch scenario {
+			case "resume":
+				reader.err = ErrInvalidCursor
+			case "generation":
+				reader.err = ErrProjectionLineageChanged
+			case "unregistered":
+				catalog.readErr = os.ErrNotExist
+			case "unavailable":
+				reader.err = ErrActivityUnavailable
+			case "method":
+				r.Method = http.MethodPost
+			case "query":
+				r.URL.RawQuery = "cursor=1"
+			case "duplicate-header":
+				r.Header.Add("Last-Event-ID", "1")
+				r.Header.Add("Last-Event-ID", "2")
+			}
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, r)
+			if w.Code < 400 || strings.Contains(w.Header().Get("Content-Type"), "event-stream") {
+				t.Fatal("committed SSE before rejecting", w.Code, w.Body.String())
+			}
+			if len(s.activityStreams) != 0 {
+				t.Fatal("capacity leaked")
+			}
+		})
+	}
+}
+
+func TestActivityStreamCapacityIsolationAndWireFrames(t *testing.T) {
+	s := newTestServer(t, &testCatalog{}, time.Now())
+	s.reserved.Activity = &activityTestReader{}
+	server := httptest.NewServer(s.Handler())
+	defer server.Close()
+	client := server.Client()
+	client.Timeout = 3 * time.Second
+	var bodies []io.ReadCloser
+	defer func() {
+		for _, body := range bodies {
+			body.Close()
+		}
+	}()
+	for i := 0; i < MaxActivityStreams; i++ {
+		r, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/runs/run/activity/stream", nil)
+		r.Header.Set("Authorization", "Bearer valid")
+		response, err := client.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != 200 || response.Header.Get("Content-Type") != "text/event-stream" {
+			t.Fatal(response.StatusCode)
+		}
+		bodies = append(bodies, response.Body)
+	}
+	if len(s.inFlight) != 0 {
+		t.Fatal("streams consumed generic slots", len(s.inFlight))
+	}
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodGet, "/v1/runs/run/activity/stream", nil))
+	if w.Code != 503 || w.Header().Get("Retry-After") != "1" || strings.Contains(w.Header().Get("Content-Type"), "event-stream") {
+		t.Fatal("saturation", w.Code, w.Body.String())
+	}
+	for _, path := range []string{"/v1/capabilities", "/v1/runs/run/activity"} {
+		w = httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodGet, path, nil))
+		if w.Code != 200 {
+			t.Fatal("ordinary route starved", w.Code)
+		}
+	}
+}
+
+func TestActivitySSEUsesDurableOrdinalAndEscapesFraming(t *testing.T) {
+	s := newTestServer(t, &testCatalog{}, time.Now())
+	reader := &activityTestReader{frame: true}
+	s.reserved.Activity = reader
+	server := httptest.NewServer(s.Handler())
+	defer server.Close()
+	r, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/runs/run/activity/stream", nil)
+	r.Header.Set("Authorization", "Bearer valid")
+	r.Header.Set("Last-Event-ID", "41")
+	client := server.Client()
+	client.Timeout = 3 * time.Second
+	response, err := client.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	scanner := bufio.NewScanner(response.Body)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+		if scanner.Text() == "" {
+			break
+		}
+	}
+	if len(lines) != 3 || lines[0] != "id: 42" || !strings.HasPrefix(lines[1], "data: {") || reader.last != "41" {
+		t.Fatal("invalid framing", lines, reader.last)
+	}
+}
+
+type blockedActivityBody struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (b blockedActivityBody) Read(data []byte) (int, error) {
+	b.entered <- struct{}{}
+	<-b.release
+	data[0] = 'x'
+	return 1, nil
+}
+func (blockedActivityBody) Close() error { return nil }
+
+func TestActivityStreamBoundsBlockedBodyValidation(t *testing.T) {
+	s := newTestServer(t, &testCatalog{}, time.Now())
+	s.reserved.Activity = &activityTestReader{}
+	entered := make(chan struct{}, MaxActivityStreams+1)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	defer func() { close(release); wg.Wait() }()
+	launch := func() <-chan *httptest.ResponseRecorder {
+		done := make(chan *httptest.ResponseRecorder, 1)
+		r := authenticatedRequest(http.MethodGet, "/v1/runs/run/activity/stream", nil)
+		r.Body = blockedActivityBody{entered, release}
+		r.ContentLength = -1
+		r.TransferEncoding = []string{"chunked"}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, r)
+			done <- w
+		}()
+		return done
+	}
+	for i := 0; i < MaxActivityStreams; i++ {
+		launch()
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("body validation did not start")
+		}
+	}
+	select {
+	case w := <-launch():
+		if w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") != "1" || strings.Contains(w.Header().Get("Content-Type"), "event-stream") {
+			t.Fatal("stream preprocessing saturation was not rejected", w.Code)
+		}
+	case <-entered:
+		t.Fatal("request exceeded stream capacity before body validation")
+	case <-time.After(time.Second):
+		t.Fatal("saturated request blocked")
+	}
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodGet, "/v1/capabilities", nil))
+	if w.Code != http.StatusOK || len(s.inFlight) != 0 {
+		t.Fatal("stream preprocessing consumed ordinary request capacity")
+	}
+}
+
+func TestActivityStreamSaturationDoesNotDrainChunkedBody(t *testing.T) {
+	s := newTestServer(t, &testCatalog{}, time.Now())
+	s.reserved.Activity = &activityTestReader{}
+	for i := 0; i < MaxActivityStreams; i++ {
+		s.activityStreams <- struct{}{}
+	}
+	server := httptest.NewServer(s.Handler())
+	defer server.Close()
+	conn, err := net.DialTimeout("tcp", server.Listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err = conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Leave the chunked body unfinished. A saturation response must reach the
+	// client without net/http first draining the pending request body.
+	if _, err = io.WriteString(conn, "GET /v1/runs/run/activity/stream HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer valid\r\nTransfer-Encoding: chunked\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal("saturated request blocked on unfinished body", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != "1" || !response.Close {
+		t.Fatal("saturation did not close the unconsumed request", response.StatusCode)
 	}
 }
