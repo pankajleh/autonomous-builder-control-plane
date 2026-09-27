@@ -36,6 +36,9 @@ type Service struct {
 	now       func() time.Time
 	// diagnostics receives one bounded operator line per controller marker.
 	diagnostics io.Writer
+	// worktreeMissing records when a run's governed worktree was first seen
+	// missing after a provider proof, bounding the finish transition grace.
+	worktreeMissing map[string]time.Time
 }
 type worker struct {
 	touched       time.Time
@@ -65,7 +68,7 @@ func New(parent context.Context, root string, catalog Catalog, snapshots Snapsho
 	// Runtime cleanup is provider-only: failure cannot disable ledger reads.
 	_ = reconcileSidecarRuntime(ctx, root)
 	store, _ := OpenStore(root + "/activity")
-	return &Service{store: store, resolver: Resolver{root, catalog}, snapshots: snapshots, cursors: cursors, ctx: ctx, cancel: cancel, workers: map[string]*worker{}, faults: map[string]error{}, sidecars: map[string]*sharedSidecar{}, now: time.Now, diagnostics: os.Stderr}, nil
+	return &Service{store: store, resolver: Resolver{root, catalog}, snapshots: snapshots, cursors: cursors, ctx: ctx, cancel: cancel, workers: map[string]*worker{}, faults: map[string]error{}, sidecars: map[string]*sharedSidecar{}, now: time.Now, diagnostics: os.Stderr, worktreeMissing: map[string]time.Time{}}, nil
 }
 func (s *Service) Close() error {
 	s.mu.Lock()
@@ -125,6 +128,12 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 		if terminalActivityState(snapshot) {
 			return Scope{}, nil
 		}
+		// The provider removes its governed worktree when it finishes, before
+		// the controller records acceptance. Once implementation has completed
+		// that removal is the same expected cleanup, not missing detail.
+		if errors.Is(err, errWorktreeMissing) && implementationFinished(snapshot) {
+			return Scope{}, nil
+		}
 		if s.worktreePending(run, registration, snapshot, err) {
 			return Scope{}, nil
 		}
@@ -134,6 +143,7 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 		}
 		return Scope{}, nil
 	}
+	s.worktreePresent(run)
 	if e, ok := checkpoint(ctx, scope, s.now()); ok {
 		if _, err = s.store.Append(run, registration, e); err != nil {
 			return Scope{}, err
@@ -142,16 +152,24 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 	return scope, nil
 }
 
-// A newly admitted run's governed worktree is created by the provider shortly
-// after admission, so an immediate subscriber can resolve the binding before
-// its branch exists. Treat only that case as pending, only before any provider
-// proof exists, and only within a bounded window after admission; afterwards an
-// unresolved binding remains a fail-closed controller marker.
-const worktreeStartupWindow = 30 * time.Second
+// The governed worktree is absent at both ends of a healthy run: the provider
+// creates it shortly after admission and removes it when it finishes, shortly
+// before the controller records completion. Treat an absent worktree as pending
+// only within a bounded window: after admission while no provider proof exists,
+// or from its first observation once a proof exists. Afterwards an unresolved
+// binding remains a fail-closed controller marker.
+const worktreeTransitionWindow = 30 * time.Second
 
 func (s *Service) worktreePending(run, registration string, snapshot readmodel.Snapshot, err error) bool {
 	if !errors.Is(err, errWorktreeMissing) {
 		return false
+	}
+	proof, proofErr := s.store.proof(run, registration)
+	if proofErr != nil {
+		return false
+	}
+	if proof != nil {
+		return s.worktreeMissingFor(run) < worktreeTransitionWindow
 	}
 	var admitted time.Time
 	for _, fact := range snapshot.Events {
@@ -159,14 +177,41 @@ func (s *Service) worktreePending(run, registration string, snapshot readmodel.S
 			admitted = fact.Timestamp
 		}
 	}
-	if admitted.IsZero() || s.now().Sub(admitted) >= worktreeStartupWindow {
-		return false
-	}
-	proof, proofErr := s.store.proof(run, registration)
-	return proofErr == nil && proof == nil
+	return !admitted.IsZero() && s.now().Sub(admitted) < worktreeTransitionWindow
 }
 
-func terminalActivityState(snapshot readmodel.Snapshot) bool {
+// worktreeMissingFor returns how long the run's worktree has been observed
+// missing, recording the first observation.
+func (s *Service) worktreeMissingFor(run string) time.Duration {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.worktreeMissing == nil {
+		s.worktreeMissing = map[string]time.Time{}
+	}
+	first, seen := s.worktreeMissing[run]
+	if !seen {
+		s.worktreeMissing[run] = now
+		return 0
+	}
+	return now.Sub(first)
+}
+
+func (s *Service) worktreePresent(run string) {
+	s.mu.Lock()
+	delete(s.worktreeMissing, run)
+	s.mu.Unlock()
+}
+
+func implementationFinished(snapshot readmodel.Snapshot) bool {
+	switch activityState(snapshot) {
+	case "IMPLEMENTATION_COMPLETED", "BRANCH_ACCEPTANCE_PENDING":
+		return true
+	}
+	return false
+}
+
+func activityState(snapshot readmodel.Snapshot) string {
 	state := snapshot.Projection.CurrentState
 	if state == "" {
 		for i := len(snapshot.Events) - 1; i >= 0; i-- {
@@ -176,7 +221,11 @@ func terminalActivityState(snapshot readmodel.Snapshot) bool {
 			}
 		}
 	}
-	switch state {
+	return state
+}
+
+func terminalActivityState(snapshot readmodel.Snapshot) bool {
+	switch activityState(snapshot) {
 	case "BRANCH_ACCEPTED", "FAILED", "CANCELLED":
 		return true
 	default:
@@ -333,7 +382,9 @@ func (s *Service) collect(run, registration string, w *worker) {
 				shared = nil
 			} else {
 				err = s.collectBatch(scope, registration, shared.sc, &last)
-				if errors.Is(err, ErrIntegrity) {
+				if errors.Is(err, errWorktreeMissing) {
+					// Refresh classifies an absent worktree on its next pass.
+				} else if errors.Is(err, ErrIntegrity) {
 					providerFailed = true
 					s.diagnose(run, "provider-integrity", err)
 					if s.appendUnknown(run, registration, "provider-integrity", "Implementation detail integrity failure") != nil {
@@ -412,6 +463,12 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 	// detail from this bounded batch.
 	current, err := s.resolver.Resolve(s.ctx, scope.RunID)
 	if err != nil {
+		if errors.Is(err, errWorktreeMissing) {
+			// The provider removes its worktree when it finishes. Discard this
+			// batch; refresh decides between expected cleanup, a bounded
+			// transition and a fail-closed marker.
+			return atStep("revalidate-binding", err)
+		}
 		return annotate("revalidate-binding", err, ErrIntegrity)
 	}
 	if jsonDigest(current) != jsonDigest(scope) {
