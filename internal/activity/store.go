@@ -521,6 +521,28 @@ func (s *Store) checkProviderReplay(run, registration string, events []Event) er
 	return nil
 }
 
+// checkCommittedProviderReplay verifies events the provider re-sent at or
+// before the committed resume position. Each must already be committed with the
+// same source digest; a never-committed or changed event there fails closed.
+func (s *Store) checkCommittedProviderReplay(run, registration string, events []Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	log, err := s.load(run, registration)
+	if err != nil {
+		return err
+	}
+	for _, event := range events {
+		key := providerSourceKey(event)
+		if previous, exists := log.providerSources[key]; key == "" || !exists || previous != event.SourceDigest {
+			return ErrIntegrity
+		}
+	}
+	return nil
+}
+
 func (s *Store) read(run, registration string, after uint64, limit int) ([]Event, string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
