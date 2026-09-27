@@ -349,8 +349,13 @@ func (s *sidecar) batch(ctx context.Context, id string, last uint64) ([]provider
 	if err != nil {
 		return nil, ErrIntegrity
 	}
-	if last != math.MaxUint64 {
-		req.Header.Set("Last-Event-ID", strconv.FormatUint(last, 10))
+	// The pinned sidecar treats a Last-Event-ID equal to its newest event as
+	// unknown and replays the whole session, including a live-only ID 0 frame,
+	// so a caught-up collector would read its own history as reordered. Resume
+	// one event early so the sidecar always takes its exact resume path;
+	// collectBatch verifies that re-sent event against the committed one.
+	if last != math.MaxUint64 && last > 1 {
+		req.Header.Set("Last-Event-ID", strconv.FormatUint(last-1, 10))
 	}
 	response, err := s.client.Do(req)
 	if err != nil {

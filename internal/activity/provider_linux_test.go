@@ -177,7 +177,8 @@ func TestProviderReplayGapDedupeAndLastEventID(t *testing.T) {
 	if err := s.collectBatch(f.scope, registration, sc, &last); err != nil {
 		t.Fatal(err)
 	}
-	if lastHeader != "3" || last != 6 {
+	// Resume one event early so a caught-up sidecar never replays everything.
+	if lastHeader != "2" || last != 6 {
 		t.Fatal("resume", lastHeader, last)
 	}
 	events, _, _, _ = s.store.read(f.run, registration, 0, 100)
@@ -385,17 +386,21 @@ func TestProviderBatchTimeoutPreservesCompleteFramesAndResumes(t *testing.T) {
 			json.NewEncoder(w).Encode([]session{selected})
 			return
 		}
-		request := requests.Add(1)
-		expected, id := "", 1
-		if request > 1 {
-			expected, id = "1", 2
+		ids := []int{1}
+		if requests.Add(1) > 1 {
+			// With only event 1 committed the collector sends no Last-Event-ID,
+			// so the sidecar replays from event 1; it is verified, not re-appended.
+			ids = []int{1, 2}
 		}
-		if r.Header.Get("Last-Event-ID") != expected {
-			t.Errorf("resume header: got %q, want %q", r.Header.Get("Last-Event-ID"), expected)
+		if r.Header.Get("Last-Event-ID") != "" {
+			t.Errorf("resume header: got %q, want none", r.Header.Get("Last-Event-ID"))
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		payload, _ := json.Marshal(ProviderEvent{Type: "output", Phase: "task", Text: fmt.Sprint(id), Timestamp: stamp(testTime)})
-		fmt.Fprintf(w, "id: %d\ndata: %s\n\nid: %d\ndata: {", id, payload, id+1)
+		for _, id := range ids {
+			payload, _ := json.Marshal(ProviderEvent{Type: "output", Phase: "task", Text: fmt.Sprint(id), Timestamp: stamp(testTime)})
+			fmt.Fprintf(w, "id: %d\ndata: %s\n\n", id, payload)
+		}
+		fmt.Fprintf(w, "id: %d\ndata: {", ids[len(ids)-1]+1)
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	}))

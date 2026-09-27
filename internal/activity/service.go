@@ -125,6 +125,9 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 		if terminalActivityState(snapshot) {
 			return Scope{}, nil
 		}
+		if s.worktreePending(run, registration, snapshot, err) {
+			return Scope{}, nil
+		}
 		s.diagnose(run, "binding-unavailable", err)
 		if err = s.appendUnknown(run, registration, "binding-unavailable", "Implementation detail unavailable"); err != nil {
 			return Scope{}, err
@@ -137,6 +140,30 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 		}
 	}
 	return scope, nil
+}
+
+// A newly admitted run's governed worktree is created by the provider shortly
+// after admission, so an immediate subscriber can resolve the binding before
+// its branch exists. Treat only that case as pending, only before any provider
+// proof exists, and only within a bounded window after admission; afterwards an
+// unresolved binding remains a fail-closed controller marker.
+const worktreeStartupWindow = 30 * time.Second
+
+func (s *Service) worktreePending(run, registration string, snapshot readmodel.Snapshot, err error) bool {
+	if !errors.Is(err, errWorktreeMissing) {
+		return false
+	}
+	var admitted time.Time
+	for _, fact := range snapshot.Events {
+		if !fact.Timestamp.IsZero() && (admitted.IsZero() || fact.Timestamp.Before(admitted)) {
+			admitted = fact.Timestamp
+		}
+	}
+	if admitted.IsZero() || s.now().Sub(admitted) >= worktreeStartupWindow {
+		return false
+	}
+	proof, proofErr := s.store.proof(run, registration)
+	return proofErr == nil && proof == nil
 }
 
 func terminalActivityState(snapshot readmodel.Snapshot) bool {
@@ -402,17 +429,30 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 	if err != nil {
 		return atStep("progress-after", err)
 	}
-	events := make([]Event, len(messages))
-	position := *last
+	// Source IDs must strictly increase within a batch. Events at or before the
+	// committed position are the provider re-sending history from the overlapping
+	// resume; they must match what was committed and are not appended again.
+	committed := *last
+	events := make([]Event, 0, len(messages))
+	fresh := make([]providerMessage, 0, len(messages))
+	var resent []Event
 	for i, message := range messages {
-		if position != math.MaxUint64 && message.id <= position {
+		if i > 0 && message.id <= messages[i-1].id {
 			return atStep("ordering", ErrIntegrity)
 		}
-		events[i], err = normalizeProvider(scope.RunID, selected.ID, strconv.FormatUint(message.id, 10), message.payload, s.now())
+		event, err := normalizeProvider(scope.RunID, selected.ID, strconv.FormatUint(message.id, 10), message.payload, s.now())
 		if err != nil {
 			return atStep("normalize", err)
 		}
-		position = message.id
+		if committed != math.MaxUint64 && message.id <= committed {
+			resent = append(resent, event)
+			continue
+		}
+		events = append(events, event)
+		fresh = append(fresh, message)
+	}
+	if err = s.store.checkCommittedProviderReplay(scope.RunID, registration, resent); err != nil {
+		return atStep("resume-overlap", err)
 	}
 	if err = s.store.checkProviderReplay(scope.RunID, registration, events); err != nil {
 		return atStep("replay", err)
@@ -425,14 +465,16 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 	}
 	// A grown progress source with no resumable events does not prove
 	// continuity. Retry its available replay and make the uncertainty explicit.
-	if len(messages) == 0 && previous != nil && proof.Size > previous.Size {
+	// Only growth observed before this read counts: bytes appended after the
+	// bounded read ended are delivered by the next batch, not missing.
+	if len(fresh) == 0 && previous != nil && before.Size > previous.Size {
 		s.diagnose(scope.RunID, "provider-silent-gap", nil)
 		if err = s.appendUnknown(scope.RunID, registration, identity("silent-gap", proof.Generation, proof.PrefixDigest), "Implementation detail replay gap"); err != nil {
 			return err
 		}
 		*last = math.MaxUint64
 	}
-	for i, message := range messages {
+	for i, message := range fresh {
 		expected := *last + 1
 		if *last == math.MaxUint64 {
 			// Ralphex's finite SSE replayer assigns the first source event ID as 1.

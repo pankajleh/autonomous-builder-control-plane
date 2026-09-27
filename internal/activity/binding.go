@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -18,6 +19,10 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/strictjson"
 )
+
+// errWorktreeMissing reports that the governed worktree branch does not exist
+// yet. It remains ErrUnavailable for every caller.
+var errWorktreeMissing = fmt.Errorf("%w: governed worktree branch is not present", ErrUnavailable)
 
 type Catalog interface {
 	ReadRun(string) (runtimecatalog.RunRegistrationV1, error)
@@ -125,6 +130,10 @@ func (r Resolver) Resolve(ctx context.Context, run string) (Scope, error) {
 	scope := Scope{RunID: run, Repository: b.RepositoryPath, RepositoryIdentity: b.RepositoryIdentity, Project: project, Branch: manifest.Worktree.Branch, Base: manifest.Repository.StartSHA, AuthorityDigest: reg.AuthorityDigest, Ralphex: manifest.Ralphex}
 	scope.Worktree, err = resolveWorktree(ctx, scope)
 	if err != nil {
+		if errors.Is(err, errWorktreeMissing) {
+			// Keep the identity so refresh can recognise a not-yet-created worktree.
+			return Scope{}, atStep("worktree", err)
+		}
 		return Scope{}, annotate("worktree", err, ErrUnavailable)
 	}
 	return scope, nil
@@ -224,7 +233,7 @@ func resolveWorktree(ctx context.Context, scope Scope) (string, error) {
 		}
 	}
 	if found == "" {
-		return "", atStep("branch-missing", ErrUnavailable)
+		return "", atStep("branch-missing", errWorktreeMissing)
 	}
 	d, err := openDirectory(found)
 	if err != nil {
