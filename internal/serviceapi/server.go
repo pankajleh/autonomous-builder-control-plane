@@ -144,6 +144,7 @@ type PreviewController interface {
 	CreatePreview(context.Context, Principal, string, string, PreviewRequestV1) (PreviewV1, error)
 	ListPreviews(context.Context, Principal, string) (PreviewListV1, error)
 	ReadPreview(context.Context, Principal, string, string) (PreviewV1, error)
+	ResolvePreviewRoute(context.Context, Principal, string, string) (PreviewRouteV1, error)
 	StopPreview(context.Context, Principal, string, string, string, PreviewStopRequestV1) (PreviewV1, error)
 }
 
@@ -1085,7 +1086,7 @@ func (s *Server) runPreviews(w http.ResponseWriter, r *http.Request, principal P
 		bad()
 		return
 	}
-	if len(tail) == 2 && tail[1] != "stop" {
+	if len(tail) == 2 && tail[1] != "stop" && tail[1] != "route" {
 		s.writeDependencyError(w, id, ErrDependencyNotFound)
 		return
 	}
@@ -1094,6 +1095,28 @@ func (s *Server) runPreviews(w http.ResponseWriter, r *http.Request, principal P
 	}
 	if s.reserved.Preview == nil {
 		s.writeDependencyError(w, id, ErrPreviewUnavailable)
+		return
+	}
+	if len(tail) == 2 && tail[1] == "route" {
+		if r.Method != http.MethodGet || !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		result, err := s.reserved.Preview.ResolvePreviewRoute(r.Context(), principal, run, tail[0])
+		if err != nil {
+			s.writeDependencyError(w, id, err)
+			return
+		}
+		if result.RunID != run || result.PreviewID != tail[0] || ValidatePreviewRouteV1(result) != nil {
+			s.writeDependencyError(w, id, ErrInternalDurableSubstrate)
+			return
+		}
+		expires, _ := time.Parse(time.RFC3339Nano, result.ExpiresAt)
+		if !s.now().Before(expires) {
+			s.writeDependencyError(w, id, ErrPreviewUnavailable)
+			return
+		}
+		s.writeJSON(w, http.StatusOK, result)
 		return
 	}
 	if r.Method == http.MethodGet && len(tail) < 2 {

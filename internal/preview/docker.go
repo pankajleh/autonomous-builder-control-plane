@@ -14,7 +14,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
 type dockerCommand func(context.Context, ...string) (string, error)
@@ -22,6 +25,7 @@ type presentation struct {
 	server                *http.Server
 	transport             *http.Transport
 	url, endpoint, handle string
+	closed                atomic.Bool
 }
 type dockerRuntime struct {
 	mu              sync.Mutex
@@ -304,7 +308,10 @@ func (g *presentation) present() error {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		proxy.ServeHTTP(w, r)
 	})}
-	go func() { _ = g.server.Serve(listener) }()
+	go func() {
+		defer g.closed.Store(true)
+		_ = g.server.Serve(listener)
+	}()
 	return nil
 }
 func (d *dockerRuntime) Start(ctx context.Context, id, path string, p PreviewProfileV1) (string, error) {
@@ -368,6 +375,19 @@ func (d *dockerRuntime) Healthy(ctx context.Context, id string, p PreviewProfile
 	}
 	return requestHealth(ctx, g.url, p.HealthPath, false), nil
 }
+
+// ResolveRoute exposes only the listener owned by this runtime for the exact
+// preview/handle pair, never a container endpoint or a reconstructed URL.
+func (d *dockerRuntime) ResolveRoute(ctx context.Context, id, handle string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	g := d.groups[id]
+	if ctx.Err() != nil || !sha256Pattern.MatchString(id) || !sha256Pattern.MatchString(handle) || g == nil || g.handle != handle || g.server == nil || g.transport == nil || g.closed.Load() || serviceapi.ValidatePreviewTargetURL(g.url) != nil {
+		return "", ErrUnavailable
+	}
+	return g.url, nil
+}
+
 func (d *dockerRuntime) Stop(ctx context.Context, id string) error {
 	if !sha256Pattern.MatchString(id) {
 		return ErrIntegrity
@@ -379,6 +399,7 @@ func (d *dockerRuntime) Stop(ctx context.Context, id string) error {
 	delete(d.groups, id)
 	d.mu.Unlock()
 	if g != nil {
+		g.closed.Store(true)
 		_ = g.server.Close()
 		g.transport.CloseIdleConnections()
 	}
