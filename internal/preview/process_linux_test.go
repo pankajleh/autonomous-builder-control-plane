@@ -4,11 +4,13 @@ package preview
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -82,7 +84,9 @@ func TestExecuteTerminatesDescendantsAndBoundsInheritedPipes(t *testing.T) {
 			deadline = time.Now().Add(time.Second)
 			for {
 				stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
-				if os.IsNotExist(err) {
+				// The process can disappear after procfs opens stat but before
+				// it reads the task, which returns ESRCH rather than ENOENT.
+				if os.IsNotExist(err) || errors.Is(err, syscall.ESRCH) {
 					break
 				}
 				if err != nil {
