@@ -106,6 +106,15 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 	}
 	scope, err := s.resolver.Resolve(ctx, run)
 	if err != nil {
+		// Governed execution worktrees are intentionally removed after the run
+		// reaches an authoritative terminal branch outcome. Provider detail can
+		// no longer be refreshed at that point, but that expected cleanup is not
+		// an integrity ambiguity and must not poison an otherwise clean accepted
+		// checkpoint with a controller UNKNOWN marker. Any provider warning or
+		// integrity marker observed before the terminal transition remains durable.
+		if terminalActivityState(snapshot) {
+			return Scope{}, nil
+		}
 		if err = s.appendUnknown(run, registration, "binding-unavailable", "Implementation detail unavailable"); err != nil {
 			return Scope{}, err
 		}
@@ -117,6 +126,24 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 		}
 	}
 	return scope, nil
+}
+
+func terminalActivityState(snapshot readmodel.Snapshot) bool {
+	state := snapshot.Projection.CurrentState
+	if state == "" {
+		for i := len(snapshot.Events) - 1; i >= 0; i-- {
+			if snapshot.Events[i].StateTo != "" {
+				state = string(snapshot.Events[i].StateTo)
+				break
+			}
+		}
+	}
+	switch state {
+	case "BRANCH_ACCEPTED", "FAILED", "CANCELLED":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) prepare(ctx context.Context, run string, subscribe bool) (string, *worker, error) {
@@ -374,7 +401,16 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 		*last = math.MaxUint64
 	}
 	for i, message := range messages {
-		expected := *last + 1 // MaxUint64 denotes no prior source event; wraps to zero.
+		expected := *last + 1
+		if *last == math.MaxUint64 {
+			// Ralphex's finite SSE replayer assigns the first source event ID as 1.
+			// MaxUint64 is our local sentinel for "no prior source event", so treating
+			// the wrapped value 0 as the expected first ID creates a false replay-gap
+			// marker on every healthy run and makes the checkpoint ineligible for
+			// Preview Runtime. Preserve gap detection while honoring the provider's
+			// documented first-event identity.
+			expected = 1
+		}
 		if message.id != expected {
 			gapKey := identity("gap", proof.Generation, strconv.FormatUint(*last, 10), strconv.FormatUint(message.id, 10))
 			if err = s.appendUnknown(scope.RunID, registration, gapKey, "Implementation detail replay gap"); err != nil {

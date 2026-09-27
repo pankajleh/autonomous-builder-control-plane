@@ -137,7 +137,7 @@ func TestProviderReplayGapDedupeAndLastEventID(t *testing.T) {
 	selected := providerSession(t, f)
 	s := &Service{store: newStore(t), resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return testTime }}
 	registration := jsonDigest(f.catalog.runs[f.run])
-	ids := []uint64{0, 1, 2}
+	ids := []uint64{1, 2, 3}
 	lastHeader := ""
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/sessions" {
@@ -162,7 +162,7 @@ func TestProviderReplayGapDedupeAndLastEventID(t *testing.T) {
 	if err := s.collectBatch(f.scope, registration, sc, &last); err != nil {
 		t.Fatal(err)
 	}
-	if last != 2 || lastHeader != "" {
+	if last != 3 || lastHeader != "" {
 		t.Fatal(last, lastHeader)
 	}
 	last = math.MaxUint64
@@ -173,15 +173,15 @@ func TestProviderReplayGapDedupeAndLastEventID(t *testing.T) {
 	if len(events) != 3 {
 		t.Fatal("duplicate replay", len(events))
 	}
-	ids = []uint64{5}
+	ids = []uint64{6}
 	if err := s.collectBatch(f.scope, registration, sc, &last); err != nil {
 		t.Fatal(err)
 	}
-	if lastHeader != "2" || last != 5 {
+	if lastHeader != "3" || last != 6 {
 		t.Fatal("resume", lastHeader, last)
 	}
 	events, _, _, _ = s.store.read(f.run, registration, 0, 100)
-	if len(events) != 5 || events[3].Status != "UNKNOWN" || !strings.Contains(events[3].Title, "gap") || events[4].TaskNumber != 5 {
+	if len(events) != 5 || events[3].Status != "UNKNOWN" || !strings.Contains(events[3].Title, "gap") || events[4].TaskNumber != 6 {
 		t.Fatalf("gap guessed missing events: %+v", events)
 	}
 	for _, event := range events {
@@ -245,7 +245,8 @@ func TestReplayPreservesEventsAcrossProviderAndStoreRestarts(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			// Live sections use observation time; historical sections use a
 			// following line's time. Plain output also gets a new time on replay.
-			for id, kind := range []string{"output", "task_start", "section", "task_end", "iteration_start"} {
+			for index, kind := range []string{"output", "task_start", "section", "task_end", "iteration_start"} {
+				id := index + 1
 				p := ProviderEvent{Type: kind, Phase: "review", Text: kind, Timestamp: stamp(stampAt)}
 				data, _ := json.Marshal(p)
 				fmt.Fprintf(w, "id: %d\ndata: %s\n\n", id, data)
@@ -262,7 +263,7 @@ func TestReplayPreservesEventsAcrossProviderAndStoreRestarts(t *testing.T) {
 		}
 		events, _, _, err := store.read(f.run, registration, 0, 100)
 		store.Close()
-		if err != nil || len(events) != 5 || last != 4 {
+		if err != nil || len(events) != 5 || last != 5 {
 			t.Fatal("replay changed durable event count", len(events), last, err)
 		}
 		if lifetime == 0 {
@@ -351,9 +352,9 @@ func TestProviderBatchTimeoutPreservesCompleteFramesAndResumes(t *testing.T) {
 			return
 		}
 		request := requests.Add(1)
-		expected, id := "", 0
+		expected, id := "", 1
 		if request > 1 {
-			expected, id = "0", 1
+			expected, id = "1", 2
 		}
 		if r.Header.Get("Last-Event-ID") != expected {
 			t.Errorf("resume header: got %q, want %q", r.Header.Get("Last-Event-ID"), expected)
@@ -368,13 +369,13 @@ func TestProviderBatchTimeoutPreservesCompleteFramesAndResumes(t *testing.T) {
 	sc := testSidecar(server)
 	sc.client.Timeout = 100 * time.Millisecond
 	last := uint64(math.MaxUint64)
-	for i := uint64(0); i < 2; i++ {
-		if err := s.collectBatch(f.scope, registration, sc, &last); err != nil || last != i {
+	for want := uint64(1); want <= 2; want++ {
+		if err := s.collectBatch(f.scope, registration, sc, &last); err != nil || last != want {
 			t.Fatal("timeout lost complete frame", err, last)
 		}
 	}
 	events, _, _, err := s.store.read(f.run, registration, 0, 100)
-	if err != nil || len(events) != 2 || events[0].Detail != "0" || events[1].Detail != "1" {
+	if err != nil || len(events) != 2 || events[0].Detail != "1" || events[1].Detail != "2" {
 		t.Fatal("partial frame persisted or resume duplicated data", events, err)
 	}
 }
