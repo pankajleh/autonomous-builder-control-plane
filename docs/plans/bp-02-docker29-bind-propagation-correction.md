@@ -14,7 +14,7 @@ is rejected with:
 
 This prevents the frozen BP-02 host/profile isolation probe from creating the preview container, so `preview_runtime` truthfully remains false even though the host otherwise reports the required Linux resource/security capabilities.
 
-## Bounded correction
+### Task 1: Apply Docker 29 mount compatibility correction
 
 Implement only the minimum provider-neutral BP-02 correction needed for current Docker compatibility:
 
