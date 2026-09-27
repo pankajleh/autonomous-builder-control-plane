@@ -227,8 +227,8 @@ func TestMissingWorktreeIsPendingOnlyAtStartup(t *testing.T) {
 		wantPending bool
 	}{
 		{"worktree not yet created", 5 * time.Second, false, false, true},
-		{"worktree still absent after the window", worktreeStartupWindow, false, false, false},
-		{"worktree lost after provider proof", 5 * time.Second, true, false, false},
+		{"worktree still absent after the window", worktreeTransitionWindow, false, false, false},
+		{"worktree lost after provider proof starts a bounded transition", 5 * time.Second, true, false, true},
 		{"other binding failure at startup", 5 * time.Second, false, true, false},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
