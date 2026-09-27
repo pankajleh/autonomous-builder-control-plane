@@ -45,6 +45,12 @@ type sharedSidecar struct {
 	closing chan struct{}
 }
 
+const initialProviderUnavailableRetryBudget = 6
+
+func deferInitialProviderUnavailable(err error, previous *providerProof, misses int) bool {
+	return errors.Is(err, ErrUnavailable) && previous == nil && misses < initialProviderUnavailableRetryBudget
+}
+
 // A failed activity substrate disables only this extension. Existing run reads
 // and execution remain available through their unchanged dependencies.
 func New(parent context.Context, root string, catalog Catalog, snapshots SnapshotReader, cursors *serviceapi.CursorSigner) (*Service, error) {
@@ -261,6 +267,7 @@ func (s *Service) collect(run, registration string, w *worker) {
 	}()
 	backoff := 250 * time.Millisecond
 	providerFailed := false
+	initialUnavailableMisses := 0
 	for {
 		if s.ctx.Err() != nil {
 			return
@@ -299,10 +306,21 @@ func (s *Service) collect(run, registration string, w *worker) {
 						return
 					}
 				} else if err != nil {
-					if s.appendUnknown(run, registration, "provider-unavailable", "Implementation detail unavailable") != nil {
+					previous, proofErr := s.store.proof(run, registration)
+					if proofErr != nil {
+						return
+					}
+					if deferInitialProviderUnavailable(err, previous, initialUnavailableMisses) {
+						// A newly admitted run can briefly precede the provider session's
+						// appearance in the sidecar. Retry a bounded number of times before
+						// declaring provider detail unavailable; after the first verified
+						// provider proof, any loss remains immediately fail-closed.
+						initialUnavailableMisses++
+					} else if s.appendUnknown(run, registration, "provider-unavailable", "Implementation detail unavailable") != nil {
 						return
 					}
 				} else {
+					initialUnavailableMisses = 0
 					backoff = 250 * time.Millisecond
 				}
 				select {
