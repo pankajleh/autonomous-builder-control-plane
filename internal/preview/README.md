@@ -167,6 +167,31 @@ requires the exact creating principal and returns 404 across principals. There i
 no administrative ownership override. Owner identities and authority-grant digests
 are internal journal metadata and never appear in public preview DTOs.
 
+Resolve route: `GET /v1/runs/{runId}/previews/{previewId}/route` requires the
+owning authenticated service principal with `preview.control`. Like other GETs,
+it accepts no body or query parameters and does not require delegated-actor
+permission. HTTP 200 returns `PreviewRouteV1` with `Cache-Control: no-store`:
+
+```json
+{
+  "schema_version": "PreviewRouteV1",
+  "run_id": "run-1",
+  "preview_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "route_handle": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "expires_at": "2026-09-27T10:05:00Z",
+  "target_url": "http://127.0.0.1:23456"
+}
+```
+
+The response binds the exact run, preview, current route handle and preview
+expiry to one server-only presentation target. `target_url` is a canonical HTTP
+origin with a literal loopback IP and explicit nonzero port; it has no credentials,
+path, query or fragment. Keep it server-side: it is not a browser access grant or
+public sharing URL. Only unexpired `READY` previews resolve, including those with
+`DEGRADED` health. Unknown, cross-run and cross-owner previews return 404. Pending,
+terminal or expired previews, unavailable runtimes, stale handles, and missing or
+invalid runtime targets return 503 `NOT_AVAILABLE`.
+
 Stop: `POST /v1/runs/{runId}/previews/{previewId}/stop`
 
 ```json

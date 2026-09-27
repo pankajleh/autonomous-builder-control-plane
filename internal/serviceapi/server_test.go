@@ -1252,12 +1252,14 @@ func TestActivityStreamSaturationDoesNotDrainChunkedBody(t *testing.T) {
 }
 
 type testPreviewController struct {
-	principal       Principal
-	authorityDigest string
-	available       bool
-	result          PreviewV1
-	calls           int
-	err             error
+	principal         Principal
+	authorityDigest   string
+	available         bool
+	result            PreviewV1
+	route             PreviewRouteV1
+	routeRun, routeID string
+	calls             int
+	err               error
 }
 
 func grantPreviewControl(s *Server) {
@@ -1265,6 +1267,12 @@ func grantPreviewControl(s *Server) {
 }
 
 func (p *testPreviewController) Available() bool { return p.available }
+func (p *testPreviewController) ResolvePreviewRoute(_ context.Context, principal Principal, run, id string) (PreviewRouteV1, error) {
+	p.calls++
+	p.principal = principal
+	p.routeRun, p.routeID = run, id
+	return p.route, p.err
+}
 func (p *testPreviewController) CreatePreview(_ context.Context, principal Principal, authorityDigest, _ string, _ PreviewRequestV1) (PreviewV1, error) {
 	p.calls++
 	p.principal = principal

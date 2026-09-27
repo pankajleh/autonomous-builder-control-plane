@@ -79,6 +79,10 @@ func (r *memoryRuntime) Stop(_ context.Context, id string) error {
 }
 func (r *memoryRuntime) Reconcile(context.Context) error { r.reconciled = true; return r.reconcileErr }
 
+func (r *memoryRuntime) ResolveRoute(context.Context, string, string) (string, error) {
+	return "", ErrUnavailable
+}
+
 const testAuthorityDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func principal() serviceapi.Principal {

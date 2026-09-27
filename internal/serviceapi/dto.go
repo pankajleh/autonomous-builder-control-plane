@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
+	"net/netip"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -276,6 +279,44 @@ type PreviewListV1 struct {
 	SchemaVersion string      `json:"schema_version"`
 	RunID         string      `json:"run_id"`
 	Previews      []PreviewV1 `json:"previews"`
+}
+
+// PreviewRouteV1 is a server-only presentation target, never a browser access
+// grant. It binds one current route handle to its exact preview and expiry.
+type PreviewRouteV1 struct {
+	SchemaVersion string `json:"schema_version"`
+	RunID         string `json:"run_id"`
+	PreviewID     string `json:"preview_id"`
+	RouteHandle   string `json:"route_handle"`
+	ExpiresAt     string `json:"expires_at"`
+	TargetURL     string `json:"target_url"`
+}
+
+func ValidatePreviewRouteV1(v PreviewRouteV1) error {
+	if v.SchemaVersion != "PreviewRouteV1" || runtimecatalog.ValidateIdentifier(v.RunID) != nil || !isLowerSHA256(v.PreviewID) || !isLowerSHA256(v.RouteHandle) {
+		return errors.New("invalid preview route identity")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, v.ExpiresAt); err != nil {
+		return errors.New("invalid preview route expiry")
+	}
+	return ValidatePreviewTargetURL(v.TargetURL)
+}
+
+// ValidatePreviewTargetURL accepts only a canonical HTTP origin with a literal
+// loopback IP and explicit nonzero port. DNS, credentials, paths, queries and
+// fragments cannot supply alternate destinations or private runtime details.
+func ValidatePreviewTargetURL(value string) error {
+	authority, ok := strings.CutPrefix(value, "http://")
+	host, port, err := net.SplitHostPort(authority)
+	if !ok || err != nil {
+		return errors.New("invalid preview target")
+	}
+	ip, err := netip.ParseAddr(host)
+	n, portErr := strconv.Atoi(port)
+	if err != nil || !ip.IsLoopback() || ip.Zone() != "" || portErr != nil || n < 1 || n > 65535 || value != "http://"+net.JoinHostPort(ip.String(), strconv.Itoa(n)) {
+		return errors.New("invalid preview target")
+	}
+	return nil
 }
 
 func validPreviewActor(a DelegatedActorV1) bool {

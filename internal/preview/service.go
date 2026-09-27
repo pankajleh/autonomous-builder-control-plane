@@ -16,6 +16,8 @@ type Runtime interface {
 	Available(PreviewProfileV1) bool
 	Start(context.Context, string, string, PreviewProfileV1) (string, error)
 	Healthy(context.Context, string, PreviewProfileV1) (bool, error)
+	// ResolveRoute looks up the exact preview ID and current handle without I/O.
+	ResolveRoute(context.Context, string, string) (string, error)
 	Stop(context.Context, string) error
 	Reconcile(context.Context) error
 }
@@ -352,6 +354,42 @@ func (s *Service) ReadPreview(ctx context.Context, p serviceapi.Principal, run, 
 	}
 	return v, nil
 }
+func (s *Service) ResolvePreviewRoute(ctx context.Context, p serviceapi.Principal, run, id string) (serviceapi.PreviewRouteV1, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	empty := serviceapi.PreviewRouteV1{}
+	if s.closed || s.unavailable || s.store.broken || s.ctx.Err() != nil || ctx.Err() != nil {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	v, ok := s.store.records[id]
+	if !ok || v.PreviewID != id || v.RunID != run || !owner(p).valid() || s.store.owners[id] != owner(p) {
+		return empty, serviceapi.ErrDependencyNotFound
+	}
+	v = s.expire(v)
+	if s.store.broken || v.Status != "READY" || serviceapi.ValidatePreviewV1(v) != nil {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	profile, ok := s.profiles[v.ProfileID]
+	if !ok || profile.Digest() != v.ProfileDigest || !s.runtime.Available(profile) {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	// Keep ownership, lifecycle and handle stable until the runtime lookup is
+	// complete. Stop and health transitions use this same lock.
+	target, err := s.runtime.ResolveRoute(ctx, id, v.RouteHandle)
+	if err != nil || ctx.Err() != nil || s.ctx.Err() != nil {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	v = s.expire(v)
+	if s.store.broken || v.Status != "READY" {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	out := serviceapi.PreviewRouteV1{SchemaVersion: "PreviewRouteV1", RunID: v.RunID, PreviewID: v.PreviewID, RouteHandle: v.RouteHandle, ExpiresAt: v.ExpiresAt, TargetURL: target}
+	if serviceapi.ValidatePreviewRouteV1(out) != nil {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	return out, nil
+}
+
 func (s *Service) StopPreview(ctx context.Context, p serviceapi.Principal, authorityDigest, run, id string, c serviceapi.PreviewStopRequestV1) (serviceapi.PreviewV1, error) {
 	empty := serviceapi.PreviewV1{}
 	if serviceapi.ValidatePreviewStopRequestV1(c, run, id) != nil || !owner(p).valid() || !sha256Pattern.MatchString(authorityDigest) {
