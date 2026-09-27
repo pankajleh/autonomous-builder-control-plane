@@ -128,6 +128,23 @@ func TestActivityServiceCursorAndResumeBoundaries(t *testing.T) {
 	}
 }
 
+func TestInitialProviderUnavailableRetryBudgetIsBounded(t *testing.T) {
+	for misses := 0; misses < initialProviderUnavailableRetryBudget; misses++ {
+		if !deferInitialProviderUnavailable(ErrUnavailable, nil, misses) {
+			t.Fatalf("startup miss %d was not deferred", misses)
+		}
+	}
+	if deferInitialProviderUnavailable(ErrUnavailable, nil, initialProviderUnavailableRetryBudget) {
+		t.Fatal("startup unavailability remained suppressed past the retry budget")
+	}
+	if deferInitialProviderUnavailable(ErrUnavailable, &providerProof{}, 0) {
+		t.Fatal("provider loss after a verified proof was suppressed")
+	}
+	if deferInitialProviderUnavailable(ErrIntegrity, nil, 0) {
+		t.Fatal("integrity failure was treated as startup unavailability")
+	}
+}
+
 func TestNonTerminalBindingFailureRemainsUnknown(t *testing.T) {
 	s, facts := testService(t)
 	facts.events = []ledger.Event{{EventID: "pending", StateTo: domain.StateBranchAcceptancePending, Timestamp: testTime}}

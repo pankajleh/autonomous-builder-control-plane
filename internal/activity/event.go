@@ -177,6 +177,15 @@ func normalizeProvider(run, session, id string, p ProviderEvent, now time.Time) 
 	// timestamps when the same session/event is replayed.
 	p.Timestamp = ""
 	p.Text, p.Section = redact(p.Text, 4096), redact(p.Section, 256)
+	if p.Type == "section" {
+		// Ralphex live tailing historically emitted section boundaries with the
+		// label only in Text, while historical replay can also populate Section
+		// with the same provider-only label. Section is not projected into
+		// ActivityEventV1, and Text already binds the displayed section meaning.
+		// Canonicalize the redundant field away so replay stays compatible with
+		// already-persisted BP-01 section digests as well as new live events.
+		p.Section = ""
+	}
 	e.SourceDigest = jsonDigest(p)
 	e.ActivityID = identity(run, session, id, e.SourceDigest)
 	return e, nil

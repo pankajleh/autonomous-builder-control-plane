@@ -274,6 +274,40 @@ func TestReplayPreservesEventsAcrossProviderAndStoreRestarts(t *testing.T) {
 	}
 }
 
+func TestSectionReplayAcceptsPersistedBaseFormatDigest(t *testing.T) {
+	store := newStore(t)
+	registration := "registration"
+	livePayload := ProviderEvent{Type: "section", Phase: "task", Text: "task iteration 1", Timestamp: stamp(testTime)}
+
+	legacyPayload := livePayload
+	legacyPayload.Timestamp = ""
+	legacyPayload.Text = redact(legacyPayload.Text, 4096)
+	legacyPayload.Section = ""
+	legacyDigest := jsonDigest(legacyPayload)
+
+	stored, err := normalizeProvider("run", "session", "2", livePayload, testTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.SourceDigest != legacyDigest {
+		t.Fatalf("candidate no longer preserves base-format section digest: got %s want %s", stored.SourceDigest, legacyDigest)
+	}
+	if _, err = store.Append("run", registration, stored); err != nil {
+		t.Fatal(err)
+	}
+
+	replayPayload := livePayload
+	replayPayload.Timestamp = stamp(testTime.Add(time.Minute))
+	replayPayload.Section = "task iteration 1"
+	replay, err := normalizeProvider("run", "session", "2", replayPayload, testTime.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.checkProviderReplay("run", registration, []Event{replay}); err != nil {
+		t.Fatalf("historical section replay rejected persisted base-format identity: %v", err)
+	}
+}
+
 func TestReplayRejectsChangedSourceOrdinalAssociation(t *testing.T) {
 	for _, start := range []int{0, 2} {
 		t.Run(strconv.Itoa(start), func(t *testing.T) {

@@ -72,6 +72,33 @@ func TestProviderNormalizationAndAuthoritySeparation(t *testing.T) {
 	}
 }
 
+func TestSectionReplayCanonicalizesProviderOnlySectionField(t *testing.T) {
+	live := ProviderEvent{Type: "section", Phase: "task", Timestamp: stamp(testTime), Text: "task iteration 1"}
+	historical := live
+	historical.Timestamp = stamp(testTime.Add(time.Second))
+	historical.Section = "task iteration 1"
+
+	first, err := normalizeProvider("run", "session", "2", live, testTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := normalizeProvider("run", "session", "2", historical, testTime.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SourceDigest != replay.SourceDigest || first.ActivityID != replay.ActivityID {
+		t.Fatalf("live/historical section replay changed identity: first=%s replay=%s", first.SourceDigest, replay.SourceDigest)
+	}
+	historical.Text = "different section"
+	changed, err := normalizeProvider("run", "session", "2", historical, testTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.SourceDigest == first.SourceDigest || changed.ActivityID == first.ActivityID {
+		t.Fatal("semantic section text change was not bound")
+	}
+}
+
 func TestRedactionAndBounds(t *testing.T) {
 	text := `<script>secret=topsecret token: abc123 Bearer bearer-secret https://private.example/abc /home/user/private C:\Users\secret sk-testsecret ghp_secretkey eyJabcdefgh.abc.def` + "\x00\xff"
 	text += ` "api_key": "two word secret" Authorization: Basic dXNlcjpwYXNzd29yZA==`
