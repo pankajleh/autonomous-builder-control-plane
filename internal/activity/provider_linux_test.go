@@ -451,6 +451,8 @@ func TestProviderBatchCancellationClosesLiveRequest(t *testing.T) {
 }
 
 func TestProviderBatchRejectsTrustChangesDuringRequest(t *testing.T) {
+	// Diagnostics must name the rejecting step without changing its class.
+	wantStep := map[string]string{"binding": "revalidate-binding/binding-", "session": "revalidate-correlate", "progress-replaced": "progress-after", "progress-rewritten": "progress-after"}
 	for _, change := range []string{"binding", "session", "progress-replaced", "progress-rewritten"} {
 		t.Run(change, func(t *testing.T) {
 			f := newBindingFixture(t)
@@ -492,8 +494,12 @@ func TestProviderBatchRejectsTrustChangesDuringRequest(t *testing.T) {
 			defer server.Close()
 			last := uint64(0)
 			sc := testSidecar(server)
-			if err := s.collectBatch(f.scope, registration, sc, &last); !errors.Is(err, ErrIntegrity) {
+			err = s.collectBatch(f.scope, registration, sc, &last)
+			if !errors.Is(err, ErrIntegrity) {
 				t.Fatal("changed trust accepted", err)
+			}
+			if step := diagnosticStep(err); !strings.HasPrefix(step, wantStep[change]) {
+				t.Fatalf("diagnostic step = %q, want prefix %q", step, wantStep[change])
 			}
 			events, _, _, err := s.store.read(f.run, registration, 0, 100)
 			if err != nil || len(events) != 1 || events[0] != stored || last != 0 {

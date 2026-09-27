@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"math"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -32,6 +34,8 @@ type Service struct {
 	wg        sync.WaitGroup
 	closed    bool
 	now       func() time.Time
+	// diagnostics receives one bounded operator line per controller marker.
+	diagnostics io.Writer
 }
 type worker struct {
 	touched       time.Time
@@ -61,7 +65,7 @@ func New(parent context.Context, root string, catalog Catalog, snapshots Snapsho
 	// Runtime cleanup is provider-only: failure cannot disable ledger reads.
 	_ = reconcileSidecarRuntime(ctx, root)
 	store, _ := OpenStore(root + "/activity")
-	return &Service{store: store, resolver: Resolver{root, catalog}, snapshots: snapshots, cursors: cursors, ctx: ctx, cancel: cancel, workers: map[string]*worker{}, faults: map[string]error{}, sidecars: map[string]*sharedSidecar{}, now: time.Now}, nil
+	return &Service{store: store, resolver: Resolver{root, catalog}, snapshots: snapshots, cursors: cursors, ctx: ctx, cancel: cancel, workers: map[string]*worker{}, faults: map[string]error{}, sidecars: map[string]*sharedSidecar{}, now: time.Now, diagnostics: os.Stderr}, nil
 }
 func (s *Service) Close() error {
 	s.mu.Lock()
@@ -121,6 +125,7 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 		if terminalActivityState(snapshot) {
 			return Scope{}, nil
 		}
+		s.diagnose(run, "binding-unavailable", err)
 		if err = s.appendUnknown(run, registration, "binding-unavailable", "Implementation detail unavailable"); err != nil {
 			return Scope{}, err
 		}
@@ -293,6 +298,7 @@ func (s *Service) collect(run, registration string, w *worker) {
 				shared, key = s.acquireSidecar(scope)
 			}
 			if shared.err != nil {
+				s.diagnose(run, "sidecar-unavailable", shared.err)
 				if s.appendUnknown(run, registration, "sidecar-unavailable", "Implementation detail unavailable") != nil {
 					return
 				}
@@ -302,6 +308,7 @@ func (s *Service) collect(run, registration string, w *worker) {
 				err = s.collectBatch(scope, registration, shared.sc, &last)
 				if errors.Is(err, ErrIntegrity) {
 					providerFailed = true
+					s.diagnose(run, "provider-integrity", err)
 					if s.appendUnknown(run, registration, "provider-integrity", "Implementation detail integrity failure") != nil {
 						return
 					}
@@ -316,8 +323,11 @@ func (s *Service) collect(run, registration string, w *worker) {
 						// declaring provider detail unavailable; after the first verified
 						// provider proof, any loss remains immediately fail-closed.
 						initialUnavailableMisses++
-					} else if s.appendUnknown(run, registration, "provider-unavailable", "Implementation detail unavailable") != nil {
-						return
+					} else {
+						s.diagnose(run, "provider-unavailable", err)
+						if s.appendUnknown(run, registration, "provider-unavailable", "Implementation detail unavailable") != nil {
+							return
+						}
 					}
 				} else {
 					initialUnavailableMisses = 0
@@ -353,66 +363,70 @@ func (s *Service) collect(run, registration string, w *worker) {
 func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, last *uint64) error {
 	list, err := sc.sessions(s.ctx)
 	if err != nil {
-		return err
+		return atStep("sessions", err)
 	}
 	selected, err := correlate(scope, list)
 	if err != nil {
-		return err
+		return atStep("correlate", err)
 	}
 	previous, err := s.store.proof(scope.RunID, registration)
 	if err != nil {
-		return err
+		return atStep("proof-read", err)
 	}
 	before, err := progressProof(scope, selected, previous)
 	if err != nil {
-		return err
+		return atStep("progress-before", err)
 	}
 	messages, err := sc.batch(s.ctx, selected.ID, *last)
 	if err != nil {
-		return err
+		return atStep("provider-read", err)
 	}
 	// Revalidate controller binding and provider metadata before persisting any
 	// detail from this bounded batch.
 	current, err := s.resolver.Resolve(s.ctx, scope.RunID)
-	if err != nil || jsonDigest(current) != jsonDigest(scope) {
-		return ErrIntegrity
+	if err != nil {
+		return annotate("revalidate-binding", err, ErrIntegrity)
+	}
+	if jsonDigest(current) != jsonDigest(scope) {
+		return atStep("revalidate-scope", ErrIntegrity)
 	}
 	list, err = sc.sessions(s.ctx)
 	if err != nil {
-		return err
+		return atStep("revalidate-sessions", err)
 	}
 	again, err := correlate(scope, list)
 	if err != nil {
-		return err
+		return atStep("revalidate-correlate", err)
 	}
 	proof, err := progressProof(scope, again, &before)
 	if err != nil {
-		return err
+		return atStep("progress-after", err)
 	}
 	events := make([]Event, len(messages))
 	position := *last
 	for i, message := range messages {
 		if position != math.MaxUint64 && message.id <= position {
-			return ErrIntegrity
+			return atStep("ordering", ErrIntegrity)
 		}
 		events[i], err = normalizeProvider(scope.RunID, selected.ID, strconv.FormatUint(message.id, 10), message.payload, s.now())
 		if err != nil {
-			return err
+			return atStep("normalize", err)
 		}
 		position = message.id
 	}
 	if err = s.store.checkProviderReplay(scope.RunID, registration, events); err != nil {
-		return err
+		return atStep("replay", err)
 	}
 	if err = sc.verifyOwner(); err != nil {
-		return err
+		return atStep("owner", err)
 	}
 	if err = s.store.saveProof(scope.RunID, registration, proof); err != nil {
-		return err
+		return atStep("proof-save", err)
 	}
 	// A grown progress source with no resumable events does not prove
 	// continuity. Retry its available replay and make the uncertainty explicit.
 	if len(messages) == 0 && previous != nil && proof.Size > previous.Size {
+		s.diagnose(scope.RunID, "provider-silent-gap", nil)
 		if err = s.appendUnknown(scope.RunID, registration, identity("silent-gap", proof.Generation, proof.PrefixDigest), "Implementation detail replay gap"); err != nil {
 			return err
 		}
@@ -430,6 +444,7 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 			expected = 1
 		}
 		if message.id != expected {
+			s.diagnose(scope.RunID, "provider-replay-gap", nil)
 			gapKey := identity("gap", proof.Generation, strconv.FormatUint(*last, 10), strconv.FormatUint(message.id, 10))
 			if err = s.appendUnknown(scope.RunID, registration, gapKey, "Implementation detail replay gap"); err != nil {
 				return err
