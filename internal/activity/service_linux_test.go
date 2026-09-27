@@ -104,15 +104,16 @@ func TestActivityServiceCursorAndResumeBoundaries(t *testing.T) {
 	if _, err = s.OpenActivityStream(context.Background(), "other", last); err == nil {
 		t.Fatal("run mismatch resume accepted")
 	}
-	// Binding failure contributes UNKNOWN while authoritative ledger facts remain.
+	// Expected worktree cleanup after authoritative branch acceptance is not
+	// provider ambiguity and must not append a controller UNKNOWN marker.
 	data, err = s.ReadActivity(context.Background(), "run", serviceapi.PageRequestV1{PageSize: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var all Page
 	json.Unmarshal(data, &all)
-	if len(all.Events) != 3 || all.Events[2].Status != "UNKNOWN" {
-		t.Fatal("unbound run missing unknown", string(data))
+	if len(all.Events) != 2 || all.Events[1].Status != "ACCEPTED" {
+		t.Fatal("accepted cleanup poisoned activity", string(data))
 	}
 	expiredAt := time.Now().Add(-time.Hour)
 	expired, _ := s.cursors.Sign(serviceapi.CursorKindLedger, "activity-v1:run", activityCursor{Run: "run", Generation: "gen", After: 1}, expiredAt, expiredAt.Add(time.Minute))
@@ -124,6 +125,22 @@ func TestActivityServiceCursorAndResumeBoundaries(t *testing.T) {
 	token, _ := s.cursors.Sign(serviceapi.CursorKindLedger, "activity-v1:run", activityCursor{Run: "run", Generation: gen + "wrong", After: first.Events[0].Ordinal}, time.Now(), time.Now().Add(time.Minute))
 	if _, err = s.ReadActivity(context.Background(), "run", serviceapi.PageRequestV1{PageSize: 1, Cursor: token}); !errors.Is(err, serviceapi.ErrProjectionLineageChanged) {
 		t.Fatal("generation cursor", err)
+	}
+}
+
+func TestNonTerminalBindingFailureRemainsUnknown(t *testing.T) {
+	s, facts := testService(t)
+	facts.events = []ledger.Event{{EventID: "pending", StateTo: domain.StateBranchAcceptancePending, Timestamp: testTime}}
+	data, err := s.ReadActivity(context.Background(), "run", serviceapi.PageRequestV1{PageSize: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page Page
+	if err = json.Unmarshal(data, &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 2 || page.Events[0].Status != "PROGRESS" || page.Events[1].Status != "UNKNOWN" || page.Events[1].Title != "Implementation detail unavailable" {
+		t.Fatalf("non-terminal binding failure did not fail closed: %s", data)
 	}
 }
 
