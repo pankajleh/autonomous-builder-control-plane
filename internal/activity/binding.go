@@ -3,6 +3,7 @@ package activity
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -37,24 +38,25 @@ var gitSHA = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
 func (r Resolver) Resolve(ctx context.Context, run string) (Scope, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	fail := func() (Scope, error) { return Scope{}, ErrUnavailable }
+	// Every failure remains ErrUnavailable; the step only names it for diagnostics.
+	fail := func(step string) (Scope, error) { return Scope{}, atStep(step, ErrUnavailable) }
 	root, rootErr := privateDirectory(r.Root, false)
 	if rootErr != nil {
-		return fail()
+		return fail("service-root")
 	}
 	root.Close()
 	reg, err := r.Catalog.ReadRun(run)
 	if err != nil || reg.RunID != run {
-		return fail()
+		return fail("registration")
 	}
 	dir, err := privateDirectory(filepath.Join(r.Root, "admissions"), false)
 	if err != nil {
-		return fail()
+		return fail("admissions")
 	}
 	entries, err := dir.ReadDir(20001)
 	dir.Close()
 	if err != nil && err != io.EOF || len(entries) > 20000 {
-		return fail()
+		return fail("admissions")
 	}
 	var binding runadmission.AdmissionBindingV1
 	matches := 0
@@ -64,11 +66,11 @@ func (r Resolver) Resolve(ctx context.Context, run string) (Scope, error) {
 		}
 		data, e := readFile(filepath.Join(r.Root, "admissions", entry.Name()), runadmission.MaxBindingBytes, true)
 		if e != nil {
-			return fail()
+			return fail("binding-read")
 		}
 		var b runadmission.AdmissionBindingV1
 		if strictjson.Decode(data, &b) != nil {
-			return fail()
+			return fail("binding-decode")
 		}
 		if b.RunID == run {
 			matches++
@@ -77,31 +79,31 @@ func (r Resolver) Resolve(ctx context.Context, run string) (Scope, error) {
 	}
 	b := binding
 	if matches != 1 || b.Kind != "AdmissionBindingV1" || b.SchemaVersion != 1 || b.AuthorityDigest != reg.AuthorityDigest || b.RepositoryIdentityDigest != reg.RepositoryIdentityDigest || runtimecatalog.RepositoryIdentityDigest(b.RepositoryIdentity) != reg.RepositoryIdentityDigest || b.CanonicalLedgerPath != reg.CanonicalLedgerPath || b.CanonicalEvidenceRoot != reg.CanonicalEvidenceRoot || b.CanonicalLedgerPath != filepath.Join(b.LedgerRoot, run, "events.jsonl") || b.CanonicalEvidenceRoot != filepath.Join(b.EvidenceRoot, run) {
-		return fail()
+		return fail("binding-match")
 	}
 	if !filepath.IsAbs(b.RepositoryPath) || filepath.Clean(b.RepositoryPath) != b.RepositoryPath || b.InputDirectory == "" || filepath.IsAbs(b.InputDirectory) || filepath.Clean(b.InputDirectory) != b.InputDirectory || b.InputDirectory == ".." || strings.HasPrefix(b.InputDirectory, "../") {
-		return fail()
+		return fail("binding-paths")
 	}
 	admittedDir := filepath.Join(b.RepositoryPath, b.InputDirectory, run)
 	if b.ManifestPath != filepath.Join(admittedDir, "manifest.json") || b.PlanPath != filepath.Join(admittedDir, "plan.md") {
-		return fail()
+		return fail("binding-paths")
 	}
 	data, err := readFile(b.ManifestPath, runadmission.MaxManifestTemplateBytes, false)
 	if err != nil || digest(data) != reg.AuthorityDigest {
-		return fail()
+		return fail("manifest-digest")
 	}
 	var manifest authority.Manifest
 	if strictjson.Decode(data, &manifest) != nil || manifest.RunID != run || manifest.Repository.Path != b.RepositoryPath || manifest.Repository.Identity != b.RepositoryIdentity || !gitSHA.MatchString(manifest.Repository.StartSHA) || !manifest.Worktree.Enabled || manifest.Worktree.Branch != "abcp/"+run || !filepath.IsAbs(manifest.Ralphex.BinaryPath) || filepath.Clean(manifest.Ralphex.BinaryPath) != manifest.Ralphex.BinaryPath || len(manifest.Ralphex.BinarySHA256) != 64 || !gitSHA.MatchString(manifest.Ralphex.SourceSHA) || manifest.Plan.Path != b.PlanPath {
-		return fail()
+		return fail("manifest")
 	}
 	repo, err := openDirectory(b.RepositoryPath)
 	if err != nil {
-		return fail()
+		return fail("repository")
 	}
 	repo.Close()
 	plan, err := readFile(b.PlanPath, runadmission.MaxManifestTemplateBytes, false)
 	if err != nil || digest(plan) != manifest.Plan.SHA256 {
-		return fail()
+		return fail("plan-digest")
 	}
 	// Admission writes these metadata lines immediately after the heading.
 	// Read only that controller-created prefix, never later task prose.
@@ -110,7 +112,7 @@ func (r Resolver) Resolve(ctx context.Context, run string) (Scope, error) {
 	for _, line := range lines[1:] {
 		if strings.HasPrefix(line, "Project: ") {
 			if project != "" {
-				return fail()
+				return fail("plan-project")
 			}
 			project = strings.TrimPrefix(line, "Project: ")
 			continue
@@ -123,7 +125,7 @@ func (r Resolver) Resolve(ctx context.Context, run string) (Scope, error) {
 	scope := Scope{RunID: run, Repository: b.RepositoryPath, RepositoryIdentity: b.RepositoryIdentity, Project: project, Branch: manifest.Worktree.Branch, Base: manifest.Repository.StartSHA, AuthorityDigest: reg.AuthorityDigest, Ralphex: manifest.Ralphex}
 	scope.Worktree, err = resolveWorktree(ctx, scope)
 	if err != nil {
-		return fail()
+		return Scope{}, annotate("worktree", err, ErrUnavailable)
 	}
 	return scope, nil
 }
@@ -143,7 +145,15 @@ func gitEnvironment(ctx context.Context, path string, extra []string, args ...st
 	cmd.Stdout = &out
 	cmd.Stderr = io.Discard
 	if err := cmd.Run(); err != nil || out.exceeded {
-		return "", ErrUnavailable
+		switch {
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			return "", atStep("git-deadline", ErrUnavailable)
+		case ctx.Err() != nil:
+			return "", atStep("git-canceled", ErrUnavailable)
+		case out.exceeded:
+			return "", atStep("git-output-limit", ErrUnavailable)
+		}
+		return "", atStep("git-exit", ErrUnavailable)
 	}
 	return strings.TrimSpace(out.String()), nil
 }
@@ -199,7 +209,7 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 func resolveWorktree(ctx context.Context, scope Scope) (string, error) {
 	text, err := git(ctx, scope.Repository, "worktree", "list", "--porcelain", "-z")
 	if err != nil {
-		return "", err
+		return "", annotate("list", err, ErrUnavailable)
 	}
 	path, found := "", ""
 	for _, field := range strings.Split(text, "\x00") {
@@ -208,34 +218,43 @@ func resolveWorktree(ctx context.Context, scope Scope) (string, error) {
 		}
 		if field == "branch refs/heads/"+scope.Branch {
 			if found != "" {
-				return "", ErrIntegrity
+				return "", atStep("duplicate-branch", ErrIntegrity)
 			}
 			found = path
 		}
 	}
 	if found == "" {
-		return "", ErrUnavailable
+		return "", atStep("branch-missing", ErrUnavailable)
 	}
 	d, err := openDirectory(found)
 	if err != nil {
-		return "", err
+		return "", atStep("open", err)
 	}
 	defer d.Close()
 	branch, err := git(ctx, found, "symbolic-ref", "--quiet", "HEAD")
-	if err != nil || branch != "refs/heads/"+scope.Branch {
-		return "", ErrIntegrity
+	if err != nil {
+		return "", annotate("head", err, ErrIntegrity)
+	}
+	if branch != "refs/heads/"+scope.Branch {
+		return "", atStep("head-branch", ErrIntegrity)
 	}
 	root, err := git(ctx, found, "rev-parse", "--show-toplevel")
-	if err != nil || root != found {
-		return "", ErrIntegrity
+	if err != nil {
+		return "", annotate("toplevel", err, ErrIntegrity)
+	}
+	if root != found {
+		return "", atStep("toplevel-path", ErrIntegrity)
 	}
 	common, err := git(ctx, scope.Repository, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
-		return "", ErrIntegrity
+		return "", annotate("common-dir", err, ErrIntegrity)
 	}
 	workCommon, err := git(ctx, found, "rev-parse", "--path-format=absolute", "--git-common-dir")
-	if err != nil || workCommon != common {
-		return "", ErrIntegrity
+	if err != nil {
+		return "", annotate("worktree-common-dir", err, ErrIntegrity)
+	}
+	if workCommon != common {
+		return "", atStep("worktree-common-dir-path", ErrIntegrity)
 	}
 	return found, nil
 }
