@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -172,7 +173,7 @@ func TestDockerStartHealthIsolationAndCleanup(t *testing.T) {
 	prepared, mounted := false, false
 	for _, args := range f.commands {
 		prepared = prepared || reflect.DeepEqual(args, prepare)
-		mounted = mounted || strings.Contains(strings.Join(args, " "), "dst=/source,readonly,bind-recursive=readonly")
+		mounted = mounted || slices.Contains(args, "type=bind,src="+filepath.Join(f.d.root, "sources", f.id)+",dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate")
 	}
 	if !prepared || !mounted {
 		t.Fatal("prepare/source mount missing")
@@ -214,7 +215,7 @@ func TestDockerStartHealthIsolationAndCleanup(t *testing.T) {
 	}
 }
 func TestDockerStartupFailuresRemovePartiallyCreatedObjects(t *testing.T) {
-	for _, stage := range []string{"start", "prepare", "launch", "inspect"} {
+	for _, stage := range []string{"create", "start", "prepare", "launch", "inspect"} {
 		t.Run(stage, func(t *testing.T) {
 			p := testProfile()
 			p.Services[0].PrepareArgv = []string{"/usr/bin/node", "/source/prepare.js"}
@@ -226,7 +227,7 @@ func TestDockerStartupFailuresRemovePartiallyCreatedObjects(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := f.d.Start(context.Background(), f.id, filepath.Join(f.d.root, "sources", f.id), p); err == nil {
+			if route, err := f.d.Start(context.Background(), f.id, filepath.Join(f.d.root, "sources", f.id), p); err == nil || route != "" {
 				t.Fatal("failed stage accepted")
 			}
 			if len(f.containers) != 0 || f.network || len(f.d.groups) != 0 {
@@ -269,9 +270,15 @@ func TestDockerProbeExercisesSourceMountAndCleansIt(t *testing.T) {
 			f.id = jsonDigest([]string{f.d.namespace, f.p.Digest(), "isolation-probe"})
 			path := filepath.Join(f.d.root, "sources", f.id)
 			sawMount := false
+			createAttempts := 0
+			if rejectMount {
+				// A failed re-probe must also revoke an earlier approval.
+				f.d.approved[f.p.Digest()] = true
+			}
 			f.reject = func(_ context.Context, args []string) error {
 				if args[0] == "create" {
-					sawMount = strings.Contains(strings.Join(args, " "), "src="+path+",dst=/source,readonly,bind-recursive=readonly")
+					createAttempts++
+					sawMount = slices.Contains(args, "type=bind,src="+path+",dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate")
 					if _, err := os.Stat(path); err != nil {
 						t.Error("probe source absent", err)
 					}
@@ -287,6 +294,20 @@ func TestDockerProbeExercisesSourceMountAndCleansIt(t *testing.T) {
 			proved := f.d.prove(context.Background(), f.p)
 			if !sawMount || proved == rejectMount || f.d.Available(f.p) != proved {
 				t.Fatal("incorrect mount proof", sawMount, proved)
+			}
+			if createAttempts != 1 {
+				t.Fatal("mount creation retried", createAttempts)
+			}
+			if rejectMount {
+				for _, args := range f.commands {
+					if args[0] == "start" || args[0] == "exec" || args[0] == "inspect" {
+						t.Fatal("probe continued after rejected mount", args)
+					}
+				}
+				commandCount := len(f.commands)
+				if route, err := f.d.Start(context.Background(), f.id, path, f.p); !errors.Is(err, ErrUnavailable) || route != "" || len(f.commands) != commandCount {
+					t.Fatal("rejected mount allowed preview start", route, err)
+				}
 			}
 			if _, err := os.Stat(path); !os.IsNotExist(err) {
 				t.Fatal("probe source remains", err)

@@ -29,7 +29,7 @@ func TestDockerStructuredIsolationAndInjectionBoundary(t *testing.T) {
 	id := strings.Repeat("c", 64)
 	args := d.createArgs(id, filepath.Join(d.root, "sources", id), p, p.Services[0], 0)
 	joined := strings.Join(args, " ")
-	for _, required := range []string{"--pull=never", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", "--cpu-quota=10000", "--memory=67108864", "--memory-swap=67108864", "--pids-limit=32", "--restart=no", "--log-driver=none", "--ipc=none", "--entrypoint=/usr/bin/env", "1000:1000", "dst=/source,readonly,bind-recursive=readonly", "noexec,size=8388608", "/bin/sleep 60"} {
+	for _, required := range []string{"--pull=never", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", "--cpu-quota=10000", "--memory=67108864", "--memory-swap=67108864", "--pids-limit=32", "--restart=no", "--log-driver=none", "--ipc=none", "--entrypoint=/usr/bin/env", "1000:1000", "dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate", "noexec,size=8388608", "/bin/sleep 60"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("missing %s", required)
 		}
@@ -50,6 +50,41 @@ func TestDockerStructuredIsolationAndInjectionBoundary(t *testing.T) {
 	d.run = func(context.Context, ...string) (string, error) { called = true; return "", nil }
 	if _, err := d.Start(context.Background(), id, "/host/secret", p); err == nil || called {
 		t.Fatal("host path accepted")
+	}
+}
+func TestDockerSourceBindMountOptions(t *testing.T) {
+	for _, mountSource := range []bool{true, false} {
+		name := "without-source"
+		if mountSource {
+			name = "with-source"
+		}
+		t.Run(name, func(t *testing.T) {
+			d := newDocker("/private/preview data")
+			p := testProfile()
+			s := p.Services[0]
+			s.MountSource = mountSource
+			id := strings.Repeat("c", 64)
+			path := filepath.Join(d.root, "sources", id)
+			args := d.createArgs(id, path, p, s, 0)
+			mounts := 0
+			for i, arg := range args {
+				if arg != "--mount" {
+					continue
+				}
+				mounts++
+				want := "type=bind,src=" + path + ",dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate"
+				if i+1 >= len(args) || args[i+1] != want {
+					t.Fatalf("source mount must be one exact argument %q; got %q", want, args[i:])
+				}
+			}
+			wantMounts := 0
+			if mountSource {
+				wantMounts = 1
+			}
+			if mounts != wantMounts {
+				t.Fatalf("got %d mounts, want %d", mounts, wantMounts)
+			}
+		})
 	}
 }
 func TestDockerRejectsIsolationDrift(t *testing.T) {

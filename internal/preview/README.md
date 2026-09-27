@@ -93,8 +93,11 @@ The configured non-root user must be able to run these tools.
 Each group uses a dedicated internal bridge with no published container ports,
 a read-only root, dropped capabilities and no-new-privileges. `/scratch` is its
 bounded, non-executable write area. Source, when requested, is mounted at
-`/source` using `readonly,bind-recursive=readonly`; the daemon/kernel must support
-these options. Detached checkout directories and files are made readable for the
+`/source` using `readonly,bind-recursive=readonly,bind-propagation=rprivate`.
+Docker 29 requires explicit `bind-propagation=rprivate` with recursive read-only
+binds; the daemon/kernel must support these options. A rejected mount leaves
+preview unavailable without retrying with weaker mount options.
+Detached checkout directories and files are made readable for the
 configured non-root users regardless of the controller's umask, preserving
 executable files and symlinks while their host parent remains private. Startup
 probes exercise that same mount and verify source-file contents through each
