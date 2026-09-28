@@ -127,7 +127,7 @@ func TestControllerEvictedWorktreeIsExpectedCleanupInAnyLaterState(t *testing.T)
 			now := testTime.Add(time.Hour)
 			// MERGED follows acceptance and is not an activity terminal state.
 			s, registration := worktreeService(t, f, &now, domain.StateBranchAccepted, domain.StateIntegrationPending, domain.StateMerged)
-			s.SetEvicted(func(run string) bool { return sealed && run == f.run })
+			s.SetEvictions(func(run string) (string, time.Time, bool) { return "idle", testTime, sealed && run == f.run })
 			markers := 0
 			for i := 0; i < 3; i++ {
 				markers = refreshMarkers(t, s, f.run, registration)
@@ -187,5 +187,50 @@ func TestShutdownOrCancelledReadRecordsNoMarker(t *testing.T) {
 	s.ctx = context.Background()
 	if refreshMarkers(t, s, f.run, registration) != 1 {
 		t.Fatal("a real gap after the window was not marked")
+	}
+}
+
+func TestSealedEvictionIsRecordedOnceAsAnABCPStateEvent(t *testing.T) {
+	f := newBindingFixture(t)
+	command(t, f.repo, "worktree", "remove", "--force", f.worktree)
+	now := testTime.Add(time.Hour)
+	s, registration := worktreeService(t, f, &now, domain.StateBranchAccepted)
+	evictedAt := testTime.Add(30 * time.Minute)
+	s.SetEvictions(func(run string) (string, time.Time, bool) { return "task-closed", evictedAt, run == f.run })
+	for i := 0; i < 3; i++ {
+		if _, err := s.refresh(context.Background(), f.run, registration); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, _, _, err := s.store.read(f.run, registration, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var released []Event
+	for _, e := range events {
+		if e.SourceKind == "ABCP_WORKTREE_EVICTION" {
+			released = append(released, e)
+		}
+	}
+	if len(released) != 1 {
+		t.Fatalf("eviction events = %d, want 1", len(released))
+	}
+	e := released[0]
+	if e.AuthorityLevel != "ABCP_STATE" || e.Category != "WORKSPACE" || e.Status != "RELEASED" || e.Phase != "abcp" ||
+		e.Title != "Worktree released: task closed" || e.OccurredAt != stamp(evictedAt) || e.CheckpointSHA != "" || e.CheckpointClean ||
+		e.SourceSessionID != "" || e.SourceEventID != "" || e.ActivityID != identity(f.run, "worktree-eviction") {
+		t.Fatalf("eviction event = %+v", e)
+	}
+	if unknown := unknownEvents(t, s, f.run, registration); len(unknown) != 0 {
+		t.Fatal("an evicted run recorded a marker", unknown)
+	}
+	// Every reason has a fixed title; an unknown reason records nothing.
+	for reason := range evictionTitles {
+		if _, ok := evictionEvent(f.run, reason, evictedAt, now); !ok {
+			t.Fatalf("reason %q has no event", reason)
+		}
+	}
+	if _, ok := evictionEvent(f.run, "manual", evictedAt, now); ok {
+		t.Fatal("an unknown eviction reason produced an event")
 	}
 }

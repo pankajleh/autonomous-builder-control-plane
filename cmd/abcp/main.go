@@ -881,25 +881,28 @@ func serveCommand(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "open worktree eviction store safely")
 		return 1
 	}
-	activityService.SetEvicted(evictions.Evicted)
+	activityService.SetEvictions(evictions.Fact)
 	previewService, err := preview.New(ctx, *serviceRoot, *previewProfileFile, catalog, activityService, evictions)
 	if err != nil {
 		fmt.Fprintln(stderr, "construct preview extension")
 		return 1
 	}
 	defer previewService.Close()
+	// The sweeper also serves product-requested releases, so it exists even when
+	// periodic eviction is disabled.
+	sweeper := &eviction.Sweeper{
+		Policy: eviction.Policy{Idle: *evictionIdle, MaxAge: *evictionMaxAge, QuotaBytes: *evictionQuota},
+		Store:  evictions, Runs: catalog, Binder: activity.Resolver{Root: *serviceRoot, Catalog: catalog},
+		States: readService, Activity: activityService, Previews: previewService,
+		Now: time.Now, Started: time.Now(), Log: stderr,
+	}
 	if *evictionInterval > 0 {
-		sweeper := &eviction.Sweeper{
-			Policy: eviction.Policy{Idle: *evictionIdle, MaxAge: *evictionMaxAge, QuotaBytes: *evictionQuota},
-			Store:  evictions, Runs: catalog, Binder: activity.Resolver{Root: *serviceRoot, Catalog: catalog},
-			States: readService, Activity: activityService, Previews: previewService,
-			Now: time.Now, Started: time.Now(), Log: stderr,
-		}
 		go sweeper.Run(ctx, *evictionInterval)
 	}
 	server, err := serviceapi.NewServer(serviceapi.ServerConfig{
 		Activity:      activityService,
 		Preview:       previewService,
+		Worktrees:     eviction.API{Sweeper: sweeper},
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
 		RunAdmission: admissions, DevelopmentRunAdmission: admissions,

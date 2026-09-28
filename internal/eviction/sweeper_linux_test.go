@@ -65,7 +65,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	return &fixture{
-		scope:    activity.Scope{RunID: testRun, Repository: repo, Branch: "abcp/" + testRun, Base: base, AuthorityDigest: strings.Repeat("a", 64), Retain: true},
+		scope:    activity.Scope{RunID: testRun, Repository: repo, RepositoryIdentity: "owner/repo", Branch: "abcp/" + testRun, Base: base, AuthorityDigest: strings.Repeat("a", 64), Retain: true},
 		worktree: worktree, checkpoint: run(t, worktree, "rev-parse", "HEAD"), store: store,
 		state: string(domain.StateBranchAccepted), finishedAt: now.Add(-25 * time.Hour),
 	}

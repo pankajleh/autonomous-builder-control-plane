@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/activity"
@@ -47,6 +48,8 @@ var finished = map[domain.State]bool{
 const maxRuns = 20000
 
 type Sweeper struct {
+	// mu serialises sweeps and product-requested releases.
+	mu       sync.Mutex
 	Policy   Policy
 	Store    *Store
 	Runs     Runs
@@ -98,6 +101,8 @@ func (s *Sweeper) Sweep(ctx context.Context) ([]RecordV1, error) {
 }
 
 func (s *Sweeper) sweep(ctx context.Context) ([]RecordV1, Summary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	now := s.Now()
 	var summary Summary
 	var candidates []candidate
@@ -189,23 +194,9 @@ func (s *Sweeper) inspect(ctx context.Context, run string) (candidate, outcome) 
 		return candidate{}, notRetained
 	}
 	c := candidate{scope: scope, Candidate: Candidate{Run: run, Repository: scope.Repository, Worktree: path}}
-	snapshot, err := s.States.Snapshot(ctx, run)
-	if err != nil {
+	if c.Terminal, c.TerminalAt, err = s.finished(ctx, run); err != nil {
 		return candidate{}, unverified
 	}
-	state := snapshot.Projection.CurrentState
-	for i := len(snapshot.Events) - 1; i >= 0; i-- {
-		if e := snapshot.Events[i]; e.StateTo != "" {
-			if state == "" {
-				state = string(e.StateTo)
-			}
-			if string(e.StateTo) == state {
-				c.TerminalAt = e.Timestamp
-				break
-			}
-		}
-	}
-	c.Terminal = finished[domain.State(state)] && !c.TerminalAt.IsZero()
 	streaming, last := s.Activity.Engagement(run)
 	if last.Before(s.Started) {
 		last = s.Started
@@ -224,6 +215,28 @@ func (s *Sweeper) inspect(ctx context.Context, run string) (candidate, outcome) 
 		return candidate{}, unverified
 	}
 	return c, inspected
+}
+
+// finished reports whether the run reached a finished state, and when.
+func (s *Sweeper) finished(ctx context.Context, run string) (bool, time.Time, error) {
+	snapshot, err := s.States.Snapshot(ctx, run)
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	state := snapshot.Projection.CurrentState
+	var at time.Time
+	for i := len(snapshot.Events) - 1; i >= 0; i-- {
+		if e := snapshot.Events[i]; e.StateTo != "" {
+			if state == "" {
+				state = string(e.StateTo)
+			}
+			if string(e.StateTo) == state {
+				at = e.Timestamp
+				break
+			}
+		}
+	}
+	return finished[domain.State(state)] && !at.IsZero(), at, nil
 }
 
 func (s *Sweeper) evict(ctx context.Context, c candidate, reason string, now time.Time) (RecordV1, error) {

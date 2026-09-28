@@ -3,7 +3,8 @@
     {
       "principal_id": "repo-c-service",
       "required_authorities": [
-        "preview.control"
+        "preview.control",
+        "worktree.release"
       ],
       "may_assert_delegated_actor": true
     }

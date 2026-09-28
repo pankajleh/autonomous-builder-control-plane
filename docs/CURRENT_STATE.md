@@ -31,7 +31,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 | P01 final tested executable | `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` | product-facing admission + replay/reconciliation hardening; all required gates passed, PostgreSQL integration skipped only because the authorized DSN was unavailable |
 | P01 publication | PR #22 head `f1ae22fc3132513bbe5c411058e506676d9fb069`; merge `3d6a841e722c9c67c83d835a52178b09ca16776d` | product run admission is integrated on `main` |
 
-Everything after P01, PRs #23–#51, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
+Everything after P01, PRs #23–#53, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
 
 ## Current product-facing service boundary
 
