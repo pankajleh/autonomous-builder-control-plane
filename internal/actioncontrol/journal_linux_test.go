@@ -180,7 +180,7 @@ func TestJournalIssuanceHistoryAdvancesWithinOneCanonicalShard(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("second same-shard receipt=%+v created=%v err=%v", receiptB, created, err)
 	}
-	authorityData, found, err := fgetRootXattr(first.rootFD, journalShardAuthorityXattr(lookupA[:2]))
+	authorityData, found, err := fgetRootXattr(shardAuthorityFD(t, first, lookupA[:2]), requestShardAuthorityXattr)
 	if err != nil || !found {
 		t.Fatalf("same-shard authority found=%v err=%v", found, err)
 	}
@@ -397,8 +397,8 @@ func TestJournalIssuedRequestIdentityDeletionFailsClosed(t *testing.T) {
 		_ = journal.Close()
 		t.Fatal(err)
 	}
-	authorityName := journalShardAuthorityXattr(lookup[:2])
-	authorityBefore, found, err := fgetRootXattr(journal.rootFD, authorityName)
+	authorityShard := lookup[:2]
+	authorityBefore, found, err := fgetRootXattr(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr)
 	if err != nil || !found {
 		_ = journal.Close()
 		t.Fatalf("issuance authority found=%v err=%v", found, err)
@@ -447,7 +447,7 @@ func TestJournalIssuedRequestIdentityDeletionFailsClosed(t *testing.T) {
 	if err != nil || !bytes.Equal(historyAfter, historyBefore) {
 		t.Fatalf("deletion mutated issuance history: before=%d after=%d err=%v", len(historyBefore), len(historyAfter), err)
 	}
-	authorityAfter, found, err := fgetRootXattr(reopened.rootFD, authorityName)
+	authorityAfter, found, err := fgetRootXattr(shardAuthorityFD(t, reopened, authorityShard), requestShardAuthorityXattr)
 	if err != nil || !found || !bytes.Equal(authorityAfter, authorityBefore) {
 		t.Fatalf("deletion mutated issuance authority: found=%v err=%v", found, err)
 	}
@@ -505,8 +505,8 @@ func TestJournalIssuedRequestIdentityReplacementFailsClosed(t *testing.T) {
 				_ = journal.Close()
 				t.Fatal(err)
 			}
-			authorityName := journalShardAuthorityXattr(lookup[:2])
-			authorityBefore, found, err := fgetRootXattr(journal.rootFD, authorityName)
+			authorityShard := lookup[:2]
+			authorityBefore, found, err := fgetRootXattr(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr)
 			if err != nil || !found {
 				_ = journal.Close()
 				t.Fatalf("replacement authority found=%v err=%v", found, err)
@@ -597,7 +597,7 @@ func TestJournalIssuedRequestIdentityReplacementFailsClosed(t *testing.T) {
 			if err != nil || !bytes.Equal(historyAfter, historyBefore) {
 				t.Fatalf("replacement mutated issuance history: before=%d after=%d err=%v", len(historyBefore), len(historyAfter), err)
 			}
-			authorityAfter, found, err := fgetRootXattr(reopened.rootFD, authorityName)
+			authorityAfter, found, err := fgetRootXattr(shardAuthorityFD(t, reopened, authorityShard), requestShardAuthorityXattr)
 			if err != nil || !found || !bytes.Equal(authorityAfter, authorityBefore) {
 				t.Fatalf("replacement mutated issuance authority: found=%v err=%v", found, err)
 			}
@@ -662,8 +662,8 @@ func TestJournalOrphanRequestIdentityIsNotAdopted(t *testing.T) {
 		_ = journal.Close()
 		t.Fatal(err)
 	}
-	authorityName := journalShardAuthorityXattr(lookup[:2])
-	authorityBefore, found, err := fgetRootXattr(journal.rootFD, authorityName)
+	authorityShard := lookup[:2]
+	authorityBefore, found, err := fgetRootXattr(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr)
 	if err != nil || !found {
 		_ = journal.Close()
 		t.Fatalf("orphan authority found=%v err=%v", found, err)
@@ -708,7 +708,7 @@ func TestJournalOrphanRequestIdentityIsNotAdopted(t *testing.T) {
 	if err != nil || !bytes.Equal(historyAfter, historyBefore) {
 		t.Fatalf("orphan identity mutated history: before=%d after=%d err=%v", len(historyBefore), len(historyAfter), err)
 	}
-	authorityAfter, found, err := fgetRootXattr(reopened.rootFD, authorityName)
+	authorityAfter, found, err := fgetRootXattr(shardAuthorityFD(t, reopened, authorityShard), requestShardAuthorityXattr)
 	if err != nil || !found || !bytes.Equal(authorityAfter, authorityBefore) {
 		t.Fatalf("orphan identity mutated authority: found=%v err=%v", found, err)
 	}
@@ -752,8 +752,8 @@ func TestJournalIssuanceHistoryGenerationIsNonReissuable(t *testing.T) {
 				_ = journal.Close()
 				t.Fatal(err)
 			}
-			authorityName := journalShardAuthorityXattr(lookup[:2])
-			authorityBefore, found, err := fgetRootXattr(journal.rootFD, authorityName)
+			authorityShard := lookup[:2]
+			authorityBefore, found, err := fgetRootXattr(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr)
 			if err != nil || !found {
 				_ = journal.Close()
 				t.Fatalf("history-generation authority found=%v err=%v", found, err)
@@ -814,7 +814,7 @@ func TestJournalIssuanceHistoryGenerationIsNonReissuable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			authorityAfter, found, authorityErr := fgetRootXattr(rootFD, authorityName)
+			authorityAfter, found, authorityErr := readShardAuthorityAt(root, authorityShard)
 			closeErr := syscall.Close(rootFD)
 			if authorityErr != nil || closeErr != nil || !found || !bytes.Equal(authorityAfter, authorityBefore) {
 				t.Fatalf("failed opens mutated history authority: found=%v authorityErr=%v closeErr=%v", found, authorityErr, closeErr)
@@ -1234,8 +1234,8 @@ func TestJournalIssuancePublicationFaultsRecoverOnlyFrozenIdentity(t *testing.T)
 				_ = journal.Close()
 				t.Fatal(err)
 			}
-			authorityName := journalShardAuthorityXattr(lookup[:2])
-			authorityBefore, found, err := fgetRootXattr(journal.rootFD, authorityName)
+			authorityShard := lookup[:2]
+			authorityBefore, found, err := fgetRootXattr(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr)
 			if err != nil || !found {
 				_ = journal.Close()
 				t.Fatalf("publication fault authority found=%v err=%v", found, err)
@@ -1282,7 +1282,7 @@ func TestJournalIssuancePublicationFaultsRecoverOnlyFrozenIdentity(t *testing.T)
 			if err != nil || !bytes.Equal(historyAfter, historyBefore) {
 				t.Fatalf("publication fault %s mutated issuance history: before=%d after=%d err=%v", fault, len(historyBefore), len(historyAfter), err)
 			}
-			authorityAfter, found, err := fgetRootXattr(restarted.rootFD, authorityName)
+			authorityAfter, found, err := fgetRootXattr(shardAuthorityFD(t, restarted, authorityShard), requestShardAuthorityXattr)
 			if err != nil || !found || !bytes.Equal(authorityAfter, authorityBefore) {
 				t.Fatalf("publication fault %s mutated authority: found=%v err=%v", fault, found, err)
 			}
@@ -1366,8 +1366,8 @@ func TestJournalIssuanceHistoryRejectsNonCanonicalDuplicateAndBrokenChronology(t
 				_ = journal.Close()
 				t.Fatal(err)
 			}
-			authorityName := journalShardAuthorityXattr(shard)
-			authority, _, found, err := readRootGenerationAuthority(journal.rootFD, authorityName,
+			authorityShard := shard
+			authority, _, found, err := readRootGenerationAuthority(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr,
 				journalShardAuthorityKind, journal.rootDev, journal.rootIno)
 			if err != nil || !found {
 				_ = journal.Close()
@@ -1375,7 +1375,7 @@ func TestJournalIssuanceHistoryRejectsNonCanonicalDuplicateAndBrokenChronology(t
 			}
 			authority.IssuanceFinalRecordSHA256 = sha256Hex(lines[1])
 			authorityData, err := json.Marshal(authority)
-			if err != nil || fsetRootXattr(journal.rootFD, authorityName, authorityData, rootGenerationXattrReplace) != nil {
+			if err != nil || fsetRootXattr(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr, authorityData, rootGenerationXattrReplace) != nil {
 				_ = journal.Close()
 				t.Fatalf("cannot checkpoint altered history: %v", err)
 			}
@@ -1480,8 +1480,8 @@ func TestJournalIssuanceAuthorityRejectsCountAboveShardCeiling(t *testing.T) {
 		t.Fatal(err)
 	}
 	shard := LookupKey(input.PrincipalID, input.RequestID)[:2]
-	authorityName := journalShardAuthorityXattr(shard)
-	authority, _, found, err := readRootGenerationAuthority(journal.rootFD, authorityName,
+	authorityShard := shard
+	authority, _, found, err := readRootGenerationAuthority(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr,
 		journalShardAuthorityKind, journal.rootDev, journal.rootIno)
 	if err != nil || !found {
 		_ = journal.Close()
@@ -1489,7 +1489,7 @@ func TestJournalIssuanceAuthorityRejectsCountAboveShardCeiling(t *testing.T) {
 	}
 	authority.IssuanceCount = MaxRequestsPerShard + 1
 	authorityData, err := json.Marshal(authority)
-	if err != nil || fsetRootXattr(journal.rootFD, authorityName, authorityData, rootGenerationXattrReplace) != nil {
+	if err != nil || fsetRootXattr(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr, authorityData, rootGenerationXattrReplace) != nil {
 		_ = journal.Close()
 		t.Fatalf("cannot install over-limit issuance authority: %v", err)
 	}
@@ -2694,8 +2694,8 @@ func TestJournalRootGenerationAuthorityIsDurableAndNonReissuable(t *testing.T) {
 		t.Fatalf("journal root authority = %+v, established=%v err=%v", authority, established, err)
 	}
 	lookup := LookupKey(input.PrincipalID, input.RequestID)
-	shardAuthorityName := journalShardAuthorityXattr(lookup[:2])
-	shardAuthority, found, err := fgetRootXattr(journal.rootFD, shardAuthorityName)
+	authorityShard := lookup[:2]
+	shardAuthority, found, err := fgetRootXattr(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr)
 	if err != nil || !found {
 		_ = journal.Close()
 		t.Fatalf("journal shard authority found=%v err=%v", found, err)
@@ -2719,7 +2719,7 @@ func TestJournalRootGenerationAuthorityIsDurableAndNonReissuable(t *testing.T) {
 		_ = reopened.Close()
 		t.Fatalf("journal root authority changed across reopen: err=%v", err)
 	}
-	observedShard, _, err := fgetRootXattr(reopened.rootFD, shardAuthorityName)
+	observedShard, _, err := fgetRootXattr(shardAuthorityFD(t, reopened, authorityShard), requestShardAuthorityXattr)
 	if err != nil || !bytes.Equal(observedShard, shardAuthority) {
 		_ = reopened.Close()
 		t.Fatalf("journal shard authority changed across reopen: err=%v", err)
@@ -3028,8 +3028,8 @@ func TestJournalCrossProcessPairedGenerationReplacementPreservesRequestHistory(t
 				t.Fatal(err)
 			}
 			rootAuthority := append([]byte(nil), journal.rootAuthorityData...)
-			shardAuthorityName := journalShardAuthorityXattr(lookup[:2])
-			shardAuthority, found, err := fgetRootXattr(journal.rootFD, shardAuthorityName)
+			authorityShard := lookup[:2]
+			shardAuthority, found, err := fgetRootXattr(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr)
 			if err != nil || !found {
 				t.Fatalf("initial shard authority found=%v err=%v", found, err)
 			}
@@ -3048,7 +3048,7 @@ func TestJournalCrossProcessPairedGenerationReplacementPreservesRequestHistory(t
 			if err != nil || !found || !bytes.Equal(observedRoot, rootAuthority) {
 				t.Fatalf("paired attack changed journal root authority: found=%v err=%v", found, err)
 			}
-			observedShard, found, err := fgetRootXattr(journal.rootFD, shardAuthorityName)
+			observedShard, found, err := fgetRootXattr(shardAuthorityFD(t, journal, authorityShard), requestShardAuthorityXattr)
 			if err != nil || !found || !bytes.Equal(observedShard, shardAuthority) {
 				t.Fatalf("paired attack changed shard authority: found=%v err=%v", found, err)
 			}

@@ -132,14 +132,16 @@ type namespacePin struct {
 	anchorDev  uint64
 	anchorIno  uint64
 	anchorData []byte
-	// rootAuthorityName/rootAuthorityData are set for request-index shards.
-	// Every shard generation has an independent authority record on the trusted
-	// service-root inode. Its object identities never change; its bounded
-	// issuance checkpoint advances only after a frozen identity is durable.
-	rootAuthorityName string
-	rootAuthorityData []byte
+	// authorityName/authorityData are set for request-index shards. Every
+	// established shard generation keeps an independent authority record on
+	// its own directory inode (fd), bound to the service root and listed in
+	// the request-index registry. Its object identities never change; its
+	// bounded issuance checkpoint advances only after a frozen identity is
+	// durable.
+	authorityName string
+	authorityData []byte
 	// Request-index shard generations also bind the single bounded issuance
-	// history file. The service-root authority checkpoints its committed prefix,
+	// history file. The shard authority checkpoints its committed prefix,
 	// while these fields prevent loss or same-name inode replacement.
 	historyName string
 	historyDev  uint64
@@ -311,13 +313,19 @@ const (
 	journalRunAuthorityXattr       = "user.abcp.actioncontrol.journal-runs-generation-v1"
 	journalRootAuthorityKind       = "ActionJournalRootGenerationV1"
 	journalShardAuthorityKind      = "ActionJournalRequestShardGenerationV1"
-	journalRunAuthorityKind        = "ActionJournalRunGenerationsV1"
-	rootGenerationInitializing     = "initializing"
-	rootGenerationEstablished      = "established"
-	rootGenerationPrepared         = "prepared"
-	rootGenerationMaxBytes         = 8192
-	rootGenerationXattrCreate      = 1
-	rootGenerationXattrReplace     = 2
+	// An established request-index shard keeps its generation authority on its own directory inode, and the
+	// request-index directory registers which shards exist. The service root holds a shard record only while
+	// that shard is being created (or, in journals written before shards moved, until the next open moves it).
+	requestShardAuthorityXattr = "user.abcp.actioncontrol.request-shard-generation-v1"
+	requestShardRegistryXattr  = "user.abcp.actioncontrol.request-shard-registry-v1"
+	requestShardRegistryKind   = "ActionJournalRequestShardRegistryV1"
+	journalRunAuthorityKind    = "ActionJournalRunGenerationsV1"
+	rootGenerationInitializing = "initializing"
+	rootGenerationEstablished  = "established"
+	rootGenerationPrepared     = "prepared"
+	rootGenerationMaxBytes     = 8192
+	rootGenerationXattrCreate  = 1
+	rootGenerationXattrReplace = 2
 )
 
 // journalBootstrapBoundaryHook is overridden only by subprocess crash tests.
@@ -2768,7 +2776,7 @@ func (g *journalGuard) loadRequestIssuanceState(shardFD int, shard string) (requ
 	if err != nil || g.journal.verifyShardGenerationAuthority(pin) != nil {
 		return requestIssuanceState{}, nil, syscall.Stat_t{}, ErrIntegrity
 	}
-	authority, authorityData, found, err := readRootGenerationAuthority(g.journal.rootFD, pin.rootAuthorityName,
+	authority, authorityData, found, err := readRootGenerationAuthority(pin.fd, pin.authorityName,
 		journalShardAuthorityKind, g.journal.rootDev, g.journal.rootIno)
 	if err != nil || !found || authority.State != rootGenerationEstablished {
 		return requestIssuanceState{}, nil, syscall.Stat_t{}, ErrIntegrity
@@ -3037,12 +3045,12 @@ func (g *journalGuard) commitRequestIssuance(shardFD int, shard string, expected
 	if err != nil {
 		return rollback(err)
 	}
-	setErr := fsetRootXattr(g.journal.rootFD, pin.rootAuthorityName, nextData, rootGenerationXattrReplace)
+	setErr := fsetRootXattr(pin.fd, pin.authorityName, nextData, rootGenerationXattrReplace)
 	var syncErr error
 	if setErr == nil {
-		syncErr = g.journal.io.syncDir("request-issuance-authority", g.journal.rootFD)
+		syncErr = g.journal.io.syncDir("request-issuance-authority", pin.fd)
 	}
-	observed, found, readErr := fgetRootXattr(g.journal.rootFD, pin.rootAuthorityName)
+	observed, found, readErr := fgetRootXattr(pin.fd, pin.authorityName)
 	if readErr == nil && found && bytes.Equal(observed, nextData) {
 		if _, canonical, established, decodeErr := decodeRootGenerationAuthority(observed, journalShardAuthorityKind, g.journal.rootDev, g.journal.rootIno); decodeErr != nil || !established || !bytes.Equal(canonical, nextData) || nextAuthority.IssuanceCount != record.Sequence {
 			g.journal.failedClosed.Store(true)
@@ -3050,7 +3058,7 @@ func (g *journalGuard) commitRequestIssuance(shardFD int, shard string, expected
 			return true, errors.Join(ErrIntegrity, setErr, syncErr, decodeErr)
 		}
 		g.journal.shardMu.Lock()
-		pin.rootAuthorityData = append(pin.rootAuthorityData[:0], nextData...)
+		pin.authorityData = append(pin.authorityData[:0], nextData...)
 		g.journal.shardMu.Unlock()
 		return true, errors.Join(setErr, syncErr)
 	}
@@ -4161,7 +4169,7 @@ func (j *Journal) verifyNamespacePin(parent int, pin *namespacePin) error {
 	if count, readErr := pin.anchorFile.ReadAt(observed, 0); readErr != nil || count != len(observed) || !bytes.Equal(observed, pin.anchorData) {
 		return ErrIntegrity
 	}
-	if pin.rootAuthorityName != "" {
+	if pin.authorityName != "" {
 		if err := j.verifyShardGenerationAuthority(pin); err != nil {
 			return err
 		}
@@ -4170,7 +4178,7 @@ func (j *Journal) verifyNamespacePin(parent int, pin *namespacePin) error {
 }
 
 func (j *Journal) verifyShardGenerationAuthority(pin *namespacePin) error {
-	if pin == nil || pin.rootAuthorityName == "" || pin.historyName != requestIssuanceHistoryName || pin.historyIno == 0 {
+	if pin == nil || pin.authorityName == "" || pin.historyName != requestIssuanceHistoryName || pin.historyIno == 0 {
 		return ErrIntegrity
 	}
 	historyFD, err := syscall.Openat(pin.fd, pin.historyName, syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
@@ -4186,7 +4194,7 @@ func (j *Journal) verifyShardGenerationAuthority(pin *namespacePin) error {
 	if err := verifyOpenAndNamedFile(pin.fd, pin.historyName, historyFD, pin.historyDev, pin.historyIno); err != nil {
 		return err
 	}
-	authority, authorityData, found, err := readRootGenerationAuthority(j.rootFD, pin.rootAuthorityName, journalShardAuthorityKind, j.rootDev, j.rootIno)
+	authority, authorityData, found, err := readRootGenerationAuthority(pin.fd, pin.authorityName, journalShardAuthorityKind, j.rootDev, j.rootIno)
 	if err != nil || !found || authority.State != rootGenerationEstablished {
 		return ErrIntegrity
 	}
@@ -4385,11 +4393,11 @@ func (j *Journal) loadEstablishedShards(rootLocked bool) error {
 }
 
 func (j *Journal) openShardGeneration(parent int, name string, create, rootLocked bool) (*namespacePin, error) {
-	authorityName := journalShardAuthorityXattr(name)
-	authority, authorityData, found, err := readRootGenerationAuthority(j.rootFD, authorityName, journalShardAuthorityKind, j.rootDev, j.rootIno)
+	index, err := requestShardIndex(name)
 	if err != nil {
 		return nil, err
 	}
+	rootName := journalShardAuthorityXattr(name)
 	anchorName := "." + name + ".identity.json"
 	ownedRootLock := false
 	defer func() {
@@ -4397,67 +4405,68 @@ func (j *Journal) openShardGeneration(parent int, name string, create, rootLocke
 			_ = syscall.Flock(j.rootFD, syscall.LOCK_UN)
 		}
 	}()
-	if !rootLocked && found && authority.State == rootGenerationInitializing {
-		if err := lockRootGeneration(j.rootFD, JournalLockTimeout); err != nil {
-			return nil, err
-		}
-		ownedRootLock = true
-		rootLocked = true
-		authority, authorityData, found, err = readRootGenerationAuthority(j.rootFD, authorityName, journalShardAuthorityKind, j.rootDev, j.rootIno)
+	for {
+		// A root record means the shard is being created, or was established before shards kept their own
+		// authority; either way it is finished here and moved onto the shard. Without one, the registry decides.
+		authority, authorityData, pending, err := readRootGenerationAuthority(j.rootFD, rootName, journalShardAuthorityKind, j.rootDev, j.rootIno)
 		if err != nil {
 			return nil, err
 		}
-	}
-	if !found {
-		absentErr := requireGenerationEntriesAbsent(parent,
-			generationEntry{name: name, directory: true},
-			generationEntry{name: anchorName})
-		if absentErr != nil && !rootLocked {
+		registered := false
+		if !pending {
+			registry, _, err := j.readShardRegistry(parent)
+			if err != nil {
+				return nil, err
+			}
+			registered = registry.has(index)
+		}
+		var absentErr error
+		if !pending && !registered {
+			absentErr = requireGenerationEntriesAbsent(parent,
+				generationEntry{name: name, directory: true},
+				generationEntry{name: anchorName})
+		}
+		switch {
+		case registered:
+			return j.openRegisteredShard(parent, name)
+		case !pending && absentErr == nil && !create:
+			return nil, ErrNotFound
+		case !rootLocked:
+			// Creating, finishing or moving a shard record, and looking again at entries that appeared without one,
+			// happen under the root generation lock.
 			if err := lockRootGeneration(j.rootFD, JournalLockTimeout); err != nil {
 				return nil, err
 			}
-			ownedRootLock = true
-			rootLocked = true
-			authority, authorityData, found, err = readRootGenerationAuthority(j.rootFD, authorityName, journalShardAuthorityKind, j.rootDev, j.rootIno)
-			if err != nil {
-				return nil, err
-			}
-			if !found {
-				absentErr = requireGenerationEntriesAbsent(parent,
-					generationEntry{name: name, directory: true},
-					generationEntry{name: anchorName})
-			}
-		}
-		if !found && absentErr != nil {
+			ownedRootLock, rootLocked = true, true
+			continue
+		case absentErr != nil:
 			return nil, absentErr
-		}
-		if !found && !create {
-			return nil, ErrNotFound
-		}
-		if !found {
-			if !rootLocked {
-				if err := lockRootGeneration(j.rootFD, JournalLockTimeout); err != nil {
-					return nil, err
-				}
-				ownedRootLock = true
-				rootLocked = true
-			}
-			authority, authorityData, err = createInitializingRootGeneration(j.rootFD, authorityName, journalShardAuthorityKind, j.rootDev, j.rootIno)
+		case !pending:
+			authority, authorityData, err = createInitializingRootGeneration(j.rootFD, rootName, journalShardAuthorityKind, j.rootDev, j.rootIno)
 			if err != nil {
 				return nil, err
 			}
 		}
+		return j.establishShardGeneration(parent, name, index, authority, authorityData)
 	}
+}
+
+// establishShardGeneration finishes a shard that has a root record and moves its authority onto the shard directory.
+// The caller holds the root generation lock.
+func (j *Journal) establishShardGeneration(parent int, name string, index int, authority rootGenerationAuthorityV1,
+	authorityData []byte) (*namespacePin, error) {
+	rootName := journalShardAuthorityXattr(name)
+	anchorName := "." + name + ".identity.json"
 	allowCreate := authority.State == rootGenerationInitializing
 	fd, err := j.openDirectoryAt(parent, name, allowCreate)
 	if err != nil {
-		if found && errors.Is(err, ErrNotFound) {
+		if errors.Is(err, ErrNotFound) {
 			return nil, ErrIntegrity
 		}
 		return nil, err
 	}
 	pin, err := j.pinNamespace(parent, "actions/"+requestIndexDirectory, name, anchorName, fd, true, allowCreate,
-		authorityName, journalShardAuthorityKind)
+		rootName, journalShardAuthorityKind)
 	if err != nil {
 		syscall.Close(fd)
 		return nil, err
@@ -4473,27 +4482,200 @@ func (j *Journal) openShardGeneration(parent int, name string, create, rootLocke
 	if allowCreate {
 		count, finalDigest = 0, ""
 	}
-	expectedAuthority, expectedData, err := makeShardGenerationAuthority(j.rootDev, j.rootIno, objects, count, finalDigest)
-	if err != nil {
-		_ = closeNamespacePin(pin)
-		return nil, err
-	}
-	if allowCreate {
-		authorityData, err = publishRootGeneration(j.rootFD, authorityName, expectedAuthority, expectedData)
-	} else if !bytes.Equal(authorityData, expectedData) {
+	_, expectedData, err := makeShardGenerationAuthority(j.rootDev, j.rootIno, objects, count, finalDigest)
+	if err == nil && !allowCreate && !bytes.Equal(authorityData, expectedData) {
 		err = ErrIntegrity
 	}
+	if err == nil {
+		err = j.moveShardAuthority(parent, pin, index, rootName, expectedData)
+	}
 	if err != nil {
 		_ = closeNamespacePin(pin)
 		return nil, err
 	}
-	pin.rootAuthorityName = authorityName
-	pin.rootAuthorityData = append([]byte(nil), authorityData...)
+	pin.authorityName = requestShardAuthorityXattr
+	pin.authorityData = append([]byte(nil), expectedData...)
 	if err := j.verifyNamespacePin(parent, pin); err != nil {
 		_ = closeNamespacePin(pin)
 		return nil, err
 	}
 	return pin, nil
+}
+
+// moveShardAuthority writes the established authority onto the shard directory, registers the shard and then drops
+// the root record. Each step is durable before the next and is repeated safely after a crash: the root record stays
+// until the end, so the next open finds the shard pending and finishes the move.
+func (j *Journal) moveShardAuthority(parent int, pin *namespacePin, index int, rootName string, data []byte) error {
+	observed, found, err := fgetRootXattr(pin.fd, requestShardAuthorityXattr)
+	if err != nil || (found && !bytes.Equal(observed, data)) {
+		return ErrIntegrity
+	}
+	if !found {
+		if err := fsetRootXattr(pin.fd, requestShardAuthorityXattr, data, rootGenerationXattrCreate); err != nil {
+			return xattrWriteFailure(err)
+		}
+		if err := j.io.syncDir("request-shard-authority", pin.fd); err != nil {
+			return err
+		}
+		if err := verifyRootGenerationData(pin.fd, requestShardAuthorityXattr, data); err != nil {
+			return err
+		}
+	}
+	if err := j.registerShard(parent, index); err != nil {
+		return err
+	}
+	if err := fremoveRootXattr(j.rootFD, rootName); err != nil {
+		return ErrIntegrity
+	}
+	if err := j.io.syncDir("request-shard-authority", j.rootFD); err != nil {
+		return err
+	}
+	if _, found, err := fgetRootXattr(j.rootFD, rootName); err != nil || found {
+		return ErrIntegrity
+	}
+	return nil
+}
+
+// openRegisteredShard opens an established shard whose authority lives on its own directory.
+func (j *Journal) openRegisteredShard(parent int, name string) (*namespacePin, error) {
+	anchorName := "." + name + ".identity.json"
+	fd, err := j.openDirectoryAt(parent, name, false)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, ErrIntegrity
+		}
+		return nil, err
+	}
+	pin, err := j.pinNamespace(parent, "actions/"+requestIndexDirectory, name, anchorName, fd, true, false,
+		requestShardAuthorityXattr, journalShardAuthorityKind)
+	if err != nil {
+		syscall.Close(fd)
+		return nil, err
+	}
+	historyStat, err := j.openShardIssuanceHistory(pin.fd, false)
+	if err != nil {
+		_ = closeNamespacePin(pin)
+		return nil, err
+	}
+	pin.historyName, pin.historyDev, pin.historyIno = requestIssuanceHistoryName, uint64(historyStat.Dev), historyStat.Ino
+	pin.authorityName = requestShardAuthorityXattr
+	authority, authorityData, found, err := readRootGenerationAuthority(pin.fd, pin.authorityName, journalShardAuthorityKind, j.rootDev, j.rootIno)
+	if err == nil && (!found || authority.State != rootGenerationEstablished) {
+		err = ErrIntegrity
+	}
+	if err == nil {
+		var expectedData []byte
+		_, expectedData, err = makeShardGenerationAuthority(j.rootDev, j.rootIno,
+			rootGenerationObjectsForShardPin("actions/"+requestIndexDirectory, pin), authority.IssuanceCount, authority.IssuanceFinalRecordSHA256)
+		if err == nil && !bytes.Equal(authorityData, expectedData) {
+			err = ErrIntegrity
+		}
+	}
+	if err != nil {
+		_ = closeNamespacePin(pin)
+		return nil, err
+	}
+	pin.authorityData = append([]byte(nil), authorityData...)
+	if err := j.verifyNamespacePin(parent, pin); err != nil {
+		_ = closeNamespacePin(pin)
+		return nil, err
+	}
+	return pin, nil
+}
+
+// requestShardRegistryV1 lists the established shards as a 256-bit set, kept on the request-index directory so the
+// loss of a whole shard (directory, identity and authority together) is still detected.
+type requestShardRegistryV1 struct {
+	Kind          string `json:"kind"`
+	SchemaVersion int    `json:"schema_version"`
+	RootDevice    uint64 `json:"root_device"`
+	RootInode     uint64 `json:"root_inode"`
+	Established   string `json:"established"`
+}
+
+type requestShardSet [RequestIndexShards / 8]byte
+
+func (s requestShardSet) has(index int) bool { return s[index/8]&(1<<(index%8)) != 0 }
+
+// readShardRegistry reads the registry on the request-index directory. A journal written before the registry
+// existed has none, which reads as an empty set; any shard it holds is still pending on the root.
+func (j *Journal) readShardRegistry(indexFD int) (requestShardSet, bool, error) {
+	var set requestShardSet
+	data, found, err := fgetRootXattr(indexFD, requestShardRegistryXattr)
+	if err != nil {
+		return set, false, ErrIntegrity
+	}
+	if !found {
+		return set, false, nil
+	}
+	var registry requestShardRegistryV1
+	if json.Unmarshal(data, &registry) != nil || registry.Kind != requestShardRegistryKind || registry.SchemaVersion != 1 ||
+		registry.RootDevice != j.rootDev || registry.RootInode != j.rootIno {
+		return set, false, ErrIntegrity
+	}
+	decoded, err := hex.DecodeString(registry.Established)
+	canonical, marshalErr := json.Marshal(registry)
+	if err != nil || len(decoded) != len(set) || hex.EncodeToString(decoded) != registry.Established ||
+		marshalErr != nil || !bytes.Equal(canonical, data) {
+		return set, false, ErrIntegrity
+	}
+	copy(set[:], decoded)
+	return set, true, nil
+}
+
+// registerShard adds one shard to the registry. The caller holds the root generation lock, so the registry cannot
+// change between this read and write.
+func (j *Journal) registerShard(indexFD, index int) error {
+	set, found, err := j.readShardRegistry(indexFD)
+	if err != nil || set.has(index) {
+		return err
+	}
+	set[index/8] |= 1 << (index % 8)
+	data, err := json.Marshal(requestShardRegistryV1{Kind: requestShardRegistryKind, SchemaVersion: 1,
+		RootDevice: j.rootDev, RootInode: j.rootIno, Established: hex.EncodeToString(set[:])})
+	if err != nil {
+		return ErrIntegrity
+	}
+	flags := rootGenerationXattrCreate
+	if found {
+		flags = rootGenerationXattrReplace
+	}
+	if err := fsetRootXattr(indexFD, requestShardRegistryXattr, data, flags); err != nil {
+		return xattrWriteFailure(err)
+	}
+	if err := j.io.syncDir("request-shard-registry", indexFD); err != nil {
+		return err
+	}
+	return verifyRootGenerationData(indexFD, requestShardRegistryXattr, data)
+}
+
+func requestShardIndex(name string) (int, error) {
+	decoded, err := hex.DecodeString(name)
+	if err != nil || len(decoded) != 1 || hex.EncodeToString(decoded) != name {
+		return 0, ErrIntegrity
+	}
+	return int(decoded[0]), nil
+}
+
+// xattrWriteFailure keeps a failed extended-attribute write an integrity failure while saying when the inode has
+// simply run out of extended-attribute space, so an operator is not left guessing.
+func xattrWriteFailure(err error) error {
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.E2BIG) || errors.Is(err, syscall.EDQUOT) {
+		return fmt.Errorf("%w: extended attribute space exhausted: %v", ErrIntegrity, err)
+	}
+	return ErrIntegrity
+}
+
+func fremoveRootXattr(fd int, name string) error {
+	namePointer, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return ErrIntegrity
+	}
+	_, _, errno := syscall.Syscall(syscall.SYS_FREMOVEXATTR, uintptr(fd), uintptr(unsafe.Pointer(namePointer)), 0)
+	if errno != 0 && errno != syscall.ENODATA {
+		return errno
+	}
+	return nil
 }
 
 func (j *Journal) openShardIssuanceHistory(shardFD int, allowCreate bool) (syscall.Stat_t, error) {
