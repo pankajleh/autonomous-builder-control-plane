@@ -7,8 +7,8 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 ## Repository checkpoint
 
 - Repository: `pankajleh/autonomous-builder-control-plane`.
-- Executable baseline: PR #50 (no activity marker on shutdown) on `b187536aa194ff667b17102efb54d1ecac7d94fe`. That base carries worktree eviction and its corrections (PRs #46–#49). Later documentation-only commits may advance `main`; Git/GitHub are authoritative for the latest head.
-- Live controller: `abcp serve` built from exactly `a5383a6` (binary SHA-256 `1aebdb08d4deec62020e62ef15ebe9cbc022215837f41864d78e35c1eab94096`) on the local-integration host, serving Repo C. See [live runtime](#live-runtime-2026-09-28).
+- Executable baseline: PR #50 merge `e8ab2c97285e8767d8b9e4ad80d3b47f6a7f4a1b`. It carries worktree eviction and its corrections (PRs #46–#50). Later documentation-only commits may advance `main`. Later documentation-only commits may advance `main`; Git/GitHub are authoritative for the latest head.
+- Live controller: `abcp serve` built from exactly `e8ab2c9` (binary SHA-256 `089becb50b8a6c65a096f33c712ba396417397bbd06ff77e89034bf9145e92bb`) on the local-integration host, serving Repo C. See [live runtime](#live-runtime-2026-09-28).
 - Platform boundary: **the EP-006 service/API baseline, plus these extensions:**
   - Repo C product run admission (P01);
   - the controller-owned Ralphex execution profile;
@@ -31,7 +31,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 | P01 final tested executable | `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` | product-facing admission + replay/reconciliation hardening; all required gates passed, PostgreSQL integration skipped only because the authorized DSN was unavailable |
 | P01 publication | PR #22 head `f1ae22fc3132513bbe5c411058e506676d9fb069`; merge `3d6a841e722c9c67c83d835a52178b09ca16776d` | product run admission is integrated on `main` |
 
-Everything after P01, PRs #23–#50, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
+Everything after P01, PRs #23–#51, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
 
 ## Current product-facing service boundary
 
@@ -57,7 +57,7 @@ Manifest templates may set `worktree.retain`. ABCP then passes `--keep-worktree`
 
 | Component | Identity |
 |---|---|
-| ABCP | `a5383a6`, binary SHA-256 `1aebdb08…4096`, listener `127.0.0.1:18888` |
+| ABCP | `e8ab2c9`, binary SHA-256 `089becb5…92bb`, listener `127.0.0.1:18888`; worktree eviction on the default policy (24 h without a live stream, 7 days, 5 GiB per repository) |
 | Pinned Ralphex | `ralphex-v1.7.0-abcp`: upstream release `v1.7.0` plus the ABCP patch series, source `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `2275e23adba99bb22c23679ae3e8152c0323aba1`, SHA-256 `fe5a7c46…4058` |
 | Manifest templates | both `worktree.retain: true`; versioned in `deploy/local-integration/abcp-config/` |
 | Preview profiles | `demo-v1` and `web-v1` (busybox `/bin/httpd`, health `/README.md`); versioned in the same directory |
@@ -68,6 +68,26 @@ Retention proof run `admission-2b69b2cd89c1c0cba2ab77c840587345a2512dc6d7944f007
 - activity grew from 79 events at acceptance to 86, including "Review completed", with 0 `UNKNOWN` markers;
 - a preview created only after acceptance was `READY/HEALTHY` and served the marker file (`200`);
 - the run state was unchanged.
+
+Worktree eviction proof run `admission-3ce5345c4792fc37113251cfb9ca1a1fb03291838ee41f0eaa5461c75f0d4280` (task `317c9266-0ae6-496e-99f1-ec7d6cc99b89`) ran on `e8ab2c9` with a short proof policy (sweep every minute, 2-minute idle):
+
+- `BRANCH_ACCEPTED` at 05:27:41Z. At acceptance the run had 83 activity events and 0 `UNKNOWN` markers.
+- ABCP evicted the worktree on its own at 05:29:58Z (`reason=idle`).
+- The `abcp/<run>` branch was kept, and all 3 clean checkpoints were pinned under `refs/abcp/checkpoints/<run>/`.
+- The record `evictions/<run>.json` was written with mode `0600`.
+- After eviction, activity had 96 events (trailing provider detail collected before eviction) and still 0 `UNKNOWN` markers.
+- Two previews were created only after eviction (`aebb78eb…`, `5c747a06…`). Both were `READY/HEALTHY` from the final pinned checkpoint `e4eaacd678d8d5be3a80fed62d95296d377aa647`, fetched by pinned ref with no origin remote. Both served `docs/EVICTION_PROOF_MARKER.md` through the Repo C preview gateway (`200`, line `P1-CLOSURE-VERIFICATION-OK`).
+- ABCP was then restarted on `e8ab2c9` with the default policy.
+
+The earlier proof runs `admission-2b69b2cd…` and `admission-f7e2967f…` were also evicted (05:18:02Z, `idle`, 3 pinned checkpoints each). Previews of them are refused as ineligible because each history carries an `UNKNOWN` marker:
+
+- `2b69b2cd…` ordinal 807 was written by provider polling after acceptance (fixed in #47);
+- `f7e2967f…` ordinal 882 was written by a controller shutdown (fixed in #50).
+
+Two observations came out of the proof:
+
+- **Repo C error mapping.** Repo C reported those refusals as `PREVIEW_IDENTITY_CONFLICT`, because it read ABCP's error `code` at the top level instead of `error.code`. It is corrected in Repo C P0057.
+- **Restart race.** A restart attempt at 05:35:27Z failed with `construct preview extension`. The old process still held the preview store lock while removing its live preview containers, and the start script waited only for the port. The service was down about 25 seconds. The host `runtime/start-abcp.sh` now waits for the old process itself to exit.
 
 Operator configuration drift is checked with `tools/operator/check_local_integration_config.py`.
 
