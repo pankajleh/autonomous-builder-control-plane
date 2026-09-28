@@ -108,3 +108,5 @@ The full `go test ./...` fails only in `internal/mergelifecycle` (`TestTask3Fina
    - verify that activity reads add no `UNKNOWN` marker;
    - verify that a preview created after eviction is `READY` and serves the checkpoint;
    - restart with the default policy.
+
+Done on 2026-09-28 on `e8ab2c9` (PR #51, `docs/CURRENT_STATE.md`). The proof also found the corrections in PRs #47–#50 and Repo C P0057.
