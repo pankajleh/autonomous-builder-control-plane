@@ -57,4 +57,10 @@ The patch series has two commits:
 4. Push the branch to `pankajleh/ralphex-governance` and make it the default branch.
 5. Update the binary path, SHA-256 and source in both templates here and on the host (`runtime/pin-ralphex.py`). Restart `abcp serve` (`runtime/start-abcp.sh`) with no run executing, run one governed proof run, and record it.
 
-If `--keep-worktree` is accepted upstream, drop commit 2 at the next upgrade. The capability-probe bit stays in commit 1, because the probe is ABCP's.
+If `--keep-worktree` is accepted upstream, adjust the patch series once, at the first upgrade to a release that contains it:
+
+- Drop commit 2.
+- Move its one probe line, `WorktreeRetentionV1` / `worktree_retention_v1: true`, into commit 1, which owns the ABCP capability probe.
+- If upstream names the flag differently, change the flag name that ABCP passes in `internal/ralphex/command.go`.
+
+Nothing changes when the upstream PR merges: the live binary is pinned by hash until the next deliberate upgrade. Commit 1 is ABCP-specific, so this repository remains necessary unless upstream also accepts the governance budgets.
