@@ -174,6 +174,17 @@ func TestProviderReplayGapDedupeAndLastEventID(t *testing.T) {
 		t.Fatal("duplicate replay", len(events))
 	}
 	ids = []uint64{6}
+	// A first sighting only stops at the gap and resumes from the last contiguous event.
+	if err := s.collectBatch(f.scope, registration, sc, &last); err != nil {
+		t.Fatal(err)
+	}
+	if lastHeader != "2" || last != 3 {
+		t.Fatal("first sighting of a gap advanced", lastHeader, last)
+	}
+	if events, _, _, _ = s.store.read(f.run, registration, 0, 100); len(events) != 3 {
+		t.Fatalf("first sighting of a gap recorded: %+v", events)
+	}
+	// The same gap again is real.
 	if err := s.collectBatch(f.scope, registration, sc, &last); err != nil {
 		t.Fatal(err)
 	}
@@ -354,6 +365,10 @@ func TestReplayRejectsChangedSourceOrdinalAssociation(t *testing.T) {
 				s := &Service{store: store, resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return testTime }}
 				last := uint64(math.MaxUint64)
 				err := s.collectBatch(f.scope, registration, testSidecar(server), &last)
+				if lifetime == 0 && err == nil {
+					// A gap at the start of the stream is confirmed by a second read.
+					err = s.collectBatch(f.scope, registration, testSidecar(server), &last)
+				}
 				server.Close()
 				if lifetime == 0 && err != nil {
 					t.Fatal(err)
@@ -514,5 +529,44 @@ func TestProviderBatchRejectsTrustChangesDuringRequest(t *testing.T) {
 				t.Fatal("rejected batch changed durable proof", proof, err)
 			}
 		})
+	}
+}
+
+// The live sidecar can deliver an event before an earlier one it is still
+// persisting. The resumed read contains the event, so no marker is recorded.
+func TestLiveReplayGapResolvedByResumeRecordsNoMarker(t *testing.T) {
+	f := newBindingFixture(t)
+	selected := providerSession(t, f)
+	s := &Service{store: newStore(t), resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return testTime }}
+	registration := jsonDigest(f.catalog.runs[f.run])
+	var ids []uint64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/sessions" {
+			json.NewEncoder(w).Encode([]session{selected})
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, id := range ids {
+			payload, _ := json.Marshal(ProviderEvent{Type: "task_end", Phase: "task", Timestamp: stamp(testTime), Text: "done", TaskNum: int(id)})
+			fmt.Fprintf(w, "id: %d\ndata: %s\n\n", id, payload)
+		}
+	}))
+	defer server.Close()
+	sc := testSidecar(server)
+	last := uint64(math.MaxUint64)
+	for _, batch := range [][]uint64{{2, 3}, {1, 2, 3}, {5}, {3, 4, 5}} {
+		ids = batch
+		if err := s.collectBatch(f.scope, registration, sc, &last); err != nil {
+			t.Fatal(batch, err)
+		}
+	}
+	events, _, _, _ := s.store.read(f.run, registration, 0, 100)
+	if len(events) != 5 || last != 5 {
+		t.Fatalf("events = %d, last = %d", len(events), last)
+	}
+	for i, event := range events {
+		if event.Status == "UNKNOWN" || event.TaskNumber != i+1 {
+			t.Fatalf("event %d = %+v", i, event)
+		}
 	}
 }

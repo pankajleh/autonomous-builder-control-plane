@@ -101,6 +101,16 @@ func (s *Sweeper) release(ctx context.Context, run, reason string) (ReleaseResul
 	if err != nil {
 		return ReleaseResult{}, err
 	}
+	// A run that can still use its worktree is refused first, whether or not
+	// the worktree exists yet or is retained: a product must not treat a
+	// running build as released.
+	terminal, terminalAt, err := s.finished(ctx, run)
+	if err != nil {
+		return ReleaseResult{}, err
+	}
+	if !terminal {
+		return ReleaseResult{}, ErrRunNotFinished
+	}
 	if !scope.Retain {
 		return ReleaseResult{Status: NotRetained}, nil
 	}
@@ -124,13 +134,6 @@ func (s *Sweeper) release(ctx context.Context, run, reason string) (ReleaseResul
 	}
 	if !inside(scope.Repository, path) {
 		return ReleaseResult{}, ErrIntegrity
-	}
-	terminal, terminalAt, err := s.finished(ctx, run)
-	if err != nil {
-		return ReleaseResult{}, err
-	}
-	if !terminal {
-		return ReleaseResult{}, ErrRunNotFinished
 	}
 	bytes, err := size(path)
 	if err != nil {

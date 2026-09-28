@@ -46,6 +46,20 @@ func TestReleaseRefusesUnfinishedRunsAndPolicyReasons(t *testing.T) {
 			t.Fatalf("%s: an unfinished run's worktree was removed: %v", state, err)
 		}
 	}
+	// Before its worktree exists, or when it retains none, a running build is still refused.
+	for name, mutate := range map[string]func(*testing.T, *fixture){
+		"no worktree yet": func(t *testing.T, f *fixture) {
+			run(t, f.scope.Repository, "worktree", "remove", "--force", f.worktree)
+		},
+		"not retained": func(_ *testing.T, f *fixture) { f.scope.Retain = false },
+	} {
+		f := newFixture(t)
+		f.state = string(domain.StateImplementing)
+		mutate(t, f)
+		if _, err := f.sweeper().Release(context.Background(), testRun, ReasonTaskClosed); !errors.Is(err, ErrRunNotFinished) {
+			t.Fatalf("%s: running build release = %v", name, err)
+		}
+	}
 	f := newFixture(t)
 	for _, reason := range []string{ReasonIdle, ReasonQuota, "manual", ""} {
 		if _, err := f.sweeper().Release(context.Background(), testRun, reason); !errors.Is(err, ErrInvalidReason) {
