@@ -1,0 +1,11 @@
+{
+  "principals": [
+    {
+      "principal_id": "repo-c-service",
+      "required_authorities": [
+        "preview.control"
+      ],
+      "may_assert_delegated_actor": true
+    }
+  ]
+}
