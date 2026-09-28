@@ -35,7 +35,7 @@ type Candidate struct {
 	Run, Repository, Worktree string
 	Terminal                  bool      // the run reached a finished state
 	TerminalAt                time.Time // when it did
-	LastAccess                time.Time // latest activity read, stream or preview resolution
+	LastAccess                time.Time // latest live activity stream opened or closed
 	Bytes                     int64
 	// Protected worktrees are never evicted: the run is not finished, a client
 	// is streaming its activity, or one of its previews is live.

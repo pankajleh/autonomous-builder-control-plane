@@ -16,7 +16,7 @@ Only worktrees that ABCP retains (manifest `worktree.retain`) are considered. A 
 
 | Rule | Default | Measured from |
 |---|---|---|
-| Idle | 24 hours | the later of the run finishing and the last activity read, stream or preview resolution |
+| Idle | 24 hours | the later of the run finishing and the last time a live activity stream of the run was opened or closed |
 | Maximum age | 7 days | the run finishing, regardless of use |
 | Quota | 5 GiB per governed repository | across all retained worktrees in that repository; least recently used first |
 
@@ -35,7 +35,11 @@ Runs are skipped, never evicted, in any of these cases:
 - the binding, state or worktree path cannot be verified;
 - the worktree is outside the governed repository.
 
-Last access is tracked in memory and floored at process start, so a restart never shortens an idle window.
+Last use is tracked in memory and floored at process start, so a restart never shortens an idle window.
+
+Only live activity streams count as use (PR #49). Paged activity reads do not: Repo C's notification poller pages every task's run every 10 seconds, including finished runs, so counting those reads meant the idle rule could never fire. The #46 live proof showed this; only the 7-day maximum age would have evicted. A person watching a run uses the live stream, and a live preview protects the worktree on its own.
+
+The worktree is only a cache. After eviction, activity stays readable and previews come from pinned refs, so an early eviction costs only trailing provider detail, which is already bounded to 15 minutes (PR #47).
 
 `abcp serve` flags (a zero value disables that rule; negative values are rejected):
 

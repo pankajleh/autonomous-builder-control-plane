@@ -780,7 +780,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	previewProfileFile := flags.String("preview-profile-file", "", "optional protected preview profile file")
 	admissionProfileFile := flags.String("admission-profile-file", "", "optional protected run admission profile file")
 	evictionInterval := flags.Duration("worktree-eviction-interval", eviction.DefaultInterval, "how often to evict retained governed worktrees (0 disables eviction)")
-	evictionIdle := flags.Duration("worktree-eviction-idle", eviction.DefaultIdle, "evict a finished run's worktree after this long without use (0 disables the rule)")
+	evictionIdle := flags.Duration("worktree-eviction-idle", eviction.DefaultIdle, "evict a finished run's worktree after this long without a live activity stream (0 disables the rule)")
 	evictionMaxAge := flags.Duration("worktree-eviction-max-age", eviction.DefaultMaxAge, "evict a finished run's worktree this long after it finished (0 disables the rule)")
 	evictionQuota := flags.Int64("worktree-eviction-quota-bytes", eviction.DefaultQuotaBytes, "per-repository retained worktree quota; least recently used evicted first (0 disables the rule)")
 	if err := flags.Parse(args); err != nil {

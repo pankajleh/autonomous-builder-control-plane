@@ -67,7 +67,7 @@ Nothing changes when the upstream PR merges: the live binary is pinned by hash u
 
 ## Worktree eviction
 
-`abcp serve` evicts finished runs' retained worktrees. The rules are 24 hours without use, 7 days after the run finished, or least recently used first when a repository exceeds 5 GiB. Unfinished runs, live previews and streaming clients protect a worktree (PR #46, `docs/plans/completed/bp02-worktree-eviction.md`). The defaults apply without flags. To override them:
+`abcp serve` evicts finished runs' retained worktrees. The rules are 24 hours without a live activity stream (paged reads, such as Repo C's notification poller, do not count), 7 days after the run finished, or least recently used first when a repository exceeds 5 GiB. Unfinished runs, live previews and streaming clients protect a worktree (PR #46, `docs/plans/completed/bp02-worktree-eviction.md`). The defaults apply without flags. To override them:
 
 ```text
 --worktree-eviction-interval 10m  --worktree-eviction-idle 24h

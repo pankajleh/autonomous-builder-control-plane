@@ -7,7 +7,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 ## Repository checkpoint
 
 - Repository: `pankajleh/autonomous-builder-control-plane`.
-- Executable baseline: PR #48 (eviction sweep summary) on `bef3cd5729f7753ab1800d0292d95b1d7a701230`. That base carries PR #47 (bounded trailing provider detail) and PR #46 (controller-owned worktree eviction). Later documentation-only commits may advance `main`; Git/GitHub are authoritative for the latest head.
+- Executable baseline: PR #49 (eviction idle counts only live streams) on `880d9c66c79c45f16822a66b90b0a6f6c9efa8f9`. That base carries eviction, the bounded trailing detail and the sweep summary (PRs #46–#48). Later documentation-only commits may advance `main`; Git/GitHub are authoritative for the latest head.
 - Live controller: `abcp serve` built from exactly `a5383a6` (binary SHA-256 `1aebdb08d4deec62020e62ef15ebe9cbc022215837f41864d78e35c1eab94096`) on the local-integration host, serving Repo C. See [live runtime](#live-runtime-2026-09-28).
 - Platform boundary: **the EP-006 service/API baseline, plus these extensions:**
   - Repo C product run admission (P01);
@@ -31,7 +31,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 | P01 final tested executable | `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` | product-facing admission + replay/reconciliation hardening; all required gates passed, PostgreSQL integration skipped only because the authorized DSN was unavailable |
 | P01 publication | PR #22 head `f1ae22fc3132513bbe5c411058e506676d9fb069`; merge `3d6a841e722c9c67c83d835a52178b09ca16776d` | product run admission is integrated on `main` |
 
-Everything after P01, PRs #23–#48, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
+Everything after P01, PRs #23–#49, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
 
 ## Current product-facing service boundary
 
@@ -51,7 +51,7 @@ A run whose Ralphex failure classifies as a human decision pauses at `HUMAN_DECI
 
 ## Governed worktree retention
 
-Manifest templates may set `worktree.retain`. ABCP then passes `--keep-worktree` to a pinned Ralphex whose capability probe proves `worktree_retention_v1`, so the governed worktree survives the run and its removal is controller-owned (PR #42). This keeps the activity binding resolvable after acceptance. Trailing provider detail, such as the final "Review completed" signal, is collected for 15 minutes after the run finishes (PR #47), and a checkpoint stays preview-eligible after `BRANCH_ACCEPTED`. Retention is bounded by controller-owned eviction (PR #46). A finished run's worktree is evicted after 24 hours without use or 7 days after the run finished, and least-recently-used worktrees go first when a repository exceeds 5 GiB. Unfinished runs, live previews and streaming clients protect a worktree. Before removal, ABCP pins every clean checkpoint at `refs/abcp/checkpoints/<run>/<sha>` and seals a `WorktreeEvictionV1` record. A preview of an evicted run then resolves from the sealed record and the pinned ref, even if the branch is deleted, and activity reads stay free of markers. The design, flags and tests are in `docs/plans/completed/bp02-worktree-eviction.md`.
+Manifest templates may set `worktree.retain`. ABCP then passes `--keep-worktree` to a pinned Ralphex whose capability probe proves `worktree_retention_v1`, so the governed worktree survives the run and its removal is controller-owned (PR #42). This keeps the activity binding resolvable after acceptance. Trailing provider detail, such as the final "Review completed" signal, is collected for 15 minutes after the run finishes (PR #47), and a checkpoint stays preview-eligible after `BRANCH_ACCEPTED`. Retention is bounded by controller-owned eviction (PR #46). A finished run's worktree is evicted after 24 hours without a live activity stream (paged reads do not count) or 7 days after the run finished, and least-recently-used worktrees go first when a repository exceeds 5 GiB. Unfinished runs, live previews and streaming clients protect a worktree. Before removal, ABCP pins every clean checkpoint at `refs/abcp/checkpoints/<run>/<sha>` and seals a `WorktreeEvictionV1` record. A preview of an evicted run then resolves from the sealed record and the pinned ref, even if the branch is deleted, and activity reads stay free of markers. The design, flags and tests are in `docs/plans/completed/bp02-worktree-eviction.md`.
 
 ## Live runtime (2026-09-28)
 
