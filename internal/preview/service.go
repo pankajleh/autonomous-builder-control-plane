@@ -38,7 +38,7 @@ type Service struct {
 
 // New wires only read interfaces to existing controller substrates. Missing
 // host isolation leaves history/stop usable while capability remains false.
-func New(parent context.Context, root, profileFile string, catalog activity.Catalog, events ActivityReader) (*Service, error) {
+func New(parent context.Context, root, profileFile string, catalog activity.Catalog, events ActivityReader, evictions EvictionReader) (*Service, error) {
 	profiles, err := LoadProfiles(profileFile)
 	if err != nil {
 		return nil, ErrUnavailable
@@ -50,7 +50,7 @@ func New(parent context.Context, root, profileFile string, catalog activity.Cata
 	private.Close()
 	previewRoot := filepath.Join(root, "previews")
 	runtime := newDocker(previewRoot)
-	s, err := newService(parent, previewRoot, profiles, Resolver{root, catalog, events}, Checkout{filepath.Join(previewRoot, "sources")}, runtime, time.Now)
+	s, err := newService(parent, previewRoot, profiles, Resolver{root, catalog, events, evictions}, Checkout{filepath.Join(previewRoot, "sources")}, runtime, time.Now)
 	if err == nil && !s.unavailable {
 		runtime.proveProfiles(parent, profiles)
 	}
@@ -319,6 +319,28 @@ func (s *Service) work(ctx context.Context, id string, source Source, p PreviewP
 		}
 	}
 }
+
+// Live reports whether any preview of the run is still running, so worktree
+// eviction leaves its source in place until the preview ends or expires.
+func (s *Service) Live(run string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store == nil {
+		return false
+	}
+	now := s.now()
+	for _, v := range s.store.records {
+		if v.RunID != run || terminal(v.Status) {
+			continue
+		}
+		if expires, err := time.Parse(time.RFC3339Nano, v.ExpiresAt); err == nil && !now.Before(expires) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (s *Service) ListPreviews(ctx context.Context, p serviceapi.Principal, run string) (serviceapi.PreviewListV1, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

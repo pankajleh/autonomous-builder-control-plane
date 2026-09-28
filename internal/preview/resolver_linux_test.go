@@ -123,7 +123,7 @@ func (f *bindingFixture) save(t *testing.T) {
 	f.catalog.reg.AuthorityDigest = f.binding.AuthorityDigest
 	writeJSON(t, f.bindingPath, f.binding)
 }
-func (f *bindingFixture) resolver() Resolver { return Resolver{f.root, f.catalog, f.events} }
+func (f *bindingFixture) resolver() Resolver { return Resolver{f.root, f.catalog, f.events, nil} }
 func (f *bindingFixture) resolve() (Source, error) {
 	return f.resolver().Resolve(context.Background(), f.run, f.events.page.Events[0].ActivityID)
 }

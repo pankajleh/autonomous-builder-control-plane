@@ -7,7 +7,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 ## Repository checkpoint
 
 - Repository: `pankajleh/autonomous-builder-control-plane`.
-- Executable baseline: PR #42 merge `a5383a672f99b68413cb946a6d93f89116a2769b`. Later documentation-only commits may advance `main`; Git/GitHub are authoritative for the latest head.
+- Executable baseline: PR #46 (controller-owned worktree eviction) on `fbf1ab8a1cb6a8f44286472de5d6d9a9491f9cfd`. Later documentation-only commits may advance `main`; Git/GitHub are authoritative for the latest head.
 - Live controller: `abcp serve` built from exactly `a5383a6` (binary SHA-256 `1aebdb08d4deec62020e62ef15ebe9cbc022215837f41864d78e35c1eab94096`) on the local-integration host, serving Repo C. See [live runtime](#live-runtime-2026-09-28).
 - Platform boundary: **the EP-006 service/API baseline, plus these extensions:**
   - Repo C product run admission (P01);
@@ -16,7 +16,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
   - human-decision pause/resume;
   - BP-01 provider-neutral activity;
   - BP-02 governed preview runtime;
-  - controller-owned worktree retention.
+  - controller-owned worktree retention and eviction.
 - The post-EP-006 A/B/C assurance expansion remains discarded and is not part of current runtime authority.
 - Repo C is the product/UX authority. ABCP owns execution admission, the authoritative run lifecycle, projections, evidence and actions, provider coordination after admission, activity normalization and preview runtime.
 - Repo A / Dev-Agent and Ralphex remain execution/provider mechanisms beneath ABCP; Repo C does not call them directly.
@@ -31,7 +31,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 | P01 final tested executable | `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` | product-facing admission + replay/reconciliation hardening; all required gates passed, PostgreSQL integration skipped only because the authorized DSN was unavailable |
 | P01 publication | PR #22 head `f1ae22fc3132513bbe5c411058e506676d9fb069`; merge `3d6a841e722c9c67c83d835a52178b09ca16776d` | product run admission is integrated on `main` |
 
-Everything after P01, PRs #23–#43, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
+Everything after P01, PRs #23–#46, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
 
 ## Current product-facing service boundary
 
@@ -51,7 +51,7 @@ A run whose Ralphex failure classifies as a human decision pauses at `HUMAN_DECI
 
 ## Governed worktree retention
 
-Manifest templates may set `worktree.retain`. ABCP then passes `--keep-worktree` to a pinned Ralphex whose capability probe proves `worktree_retention_v1`, so the governed worktree survives the run and its removal is controller-owned (PR #42). This keeps the activity binding resolvable after acceptance. Trailing provider detail, such as the final "Review completed" signal, is collected, and a checkpoint stays preview-eligible after `BRANCH_ACCEPTED`. Retention is currently indefinite, and disk is the only bound. The persistent-state design that would allow controller-owned pruning is in `docs/plans/completed/bp02-controller-owned-worktree-retention.md`.
+Manifest templates may set `worktree.retain`. ABCP then passes `--keep-worktree` to a pinned Ralphex whose capability probe proves `worktree_retention_v1`, so the governed worktree survives the run and its removal is controller-owned (PR #42). This keeps the activity binding resolvable after acceptance. Trailing provider detail, such as the final "Review completed" signal, is collected, and a checkpoint stays preview-eligible after `BRANCH_ACCEPTED`. Retention is bounded by controller-owned eviction (PR #46). A finished run's worktree is evicted after 24 hours without use or 7 days after the run finished, and least-recently-used worktrees go first when a repository exceeds 5 GiB. Unfinished runs, live previews and streaming clients protect a worktree. Before removal, ABCP pins every clean checkpoint at `refs/abcp/checkpoints/<run>/<sha>` and seals a `WorktreeEvictionV1` record. A preview of an evicted run then resolves from the sealed record and the pinned ref, even if the branch is deleted, and activity reads stay free of markers. The design, flags and tests are in `docs/plans/completed/bp02-worktree-eviction.md`.
 
 ## Live runtime (2026-09-28)
 
@@ -76,7 +76,7 @@ Operator configuration drift is checked with `tools/operator/check_local_integra
 Current `main` does **not** claim:
 
 - general retry/recovery, or advertised `retry`/`resume`/`recovery` capabilities;
-- persistent checkpoint state independent of the governed worktree, or controller-owned worktree pruning;
+- a customer-visible "worktree evicted" activity entry (needs a Repo B and Repo C contract change), or eviction on task closure or tenant deletion;
 - provider-selection redesign;
 - live production/AWS deployment;
 - restored Assurance Capsule / post-EP-006 A-B-C methodology.
@@ -90,4 +90,4 @@ Current `main` does **not** claim:
 
 ## Next bounded integration boundary
 
-The next ABCP capability is the persistent checkpoint state: pinned checkpoint refs, a sealed binding, and eligibility from sealed state. It is added only when a concrete Repo C product workflow needs it and its design authority is frozen. Review/discovery alone does not create new scope.
+Persistent checkpoint state and eviction are in place (PR #46). Candidate follow-ups are a customer-visible eviction entry and eviction on task closure or tenant deletion. Each is added only when a concrete Repo C product workflow needs it. Review/discovery alone does not create new scope.

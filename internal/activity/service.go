@@ -39,6 +39,11 @@ type Service struct {
 	// worktreeMissing records when a run's governed worktree was first seen
 	// missing after a provider proof, bounding the finish transition grace.
 	worktreeMissing map[string]time.Time
+	// lastAccess records the latest activity read, stream or preview
+	// resolution per run since this process started (worktree eviction idle).
+	lastAccess map[string]time.Time
+	// evicted reports a controller-sealed worktree eviction (see SetEvicted).
+	evicted func(run string) bool
 }
 type worker struct {
 	touched       time.Time
@@ -68,7 +73,7 @@ func New(parent context.Context, root string, catalog Catalog, snapshots Snapsho
 	// Runtime cleanup is provider-only: failure cannot disable ledger reads.
 	_ = reconcileSidecarRuntime(ctx, root)
 	store, _ := OpenStore(root + "/activity")
-	return &Service{store: store, resolver: Resolver{root, catalog}, snapshots: snapshots, cursors: cursors, ctx: ctx, cancel: cancel, workers: map[string]*worker{}, faults: map[string]error{}, sidecars: map[string]*sharedSidecar{}, now: time.Now, diagnostics: os.Stderr, worktreeMissing: map[string]time.Time{}}, nil
+	return &Service{store: store, resolver: Resolver{root, catalog}, snapshots: snapshots, cursors: cursors, ctx: ctx, cancel: cancel, workers: map[string]*worker{}, faults: map[string]error{}, sidecars: map[string]*sharedSidecar{}, now: time.Now, diagnostics: os.Stderr, worktreeMissing: map[string]time.Time{}, lastAccess: map[string]time.Time{}}, nil
 }
 func (s *Service) Close() error {
 	s.mu.Lock()
@@ -134,6 +139,11 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 		// finishes, before the controller records acceptance. Once implementation
 		// has completed that removal is the same expected cleanup, not missing detail.
 		if errors.Is(err, errWorktreeMissing) && implementationFinished(snapshot) {
+			return Scope{}, nil
+		}
+		// A controller eviction seals its record before removing the retained
+		// worktree, whatever finished state the run has since reached.
+		if errors.Is(err, errWorktreeMissing) && s.wasEvicted(run) {
 			return Scope{}, nil
 		}
 		if s.worktreePending(run, registration, snapshot, err) {
@@ -248,6 +258,10 @@ func (s *Service) prepare(ctx context.Context, run string, subscribe bool) (stri
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.lastAccess == nil {
+		s.lastAccess = map[string]time.Time{}
+	}
+	s.lastAccess[run] = s.now()
 	if s.closed || s.faults[run] != nil {
 		return "", nil, ErrUnavailable
 	}
@@ -270,6 +284,70 @@ func (s *Service) prepare(ctx context.Context, run string, subscribe bool) (stri
 	go s.collect(run, registration, w)
 	return registration, w, nil
 }
+
+// SetEvicted installs the check for controller-evicted worktrees. It is set
+// once before serving; an evicted run's missing worktree is expected cleanup.
+func (s *Service) SetEvicted(evicted func(run string) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.evicted = evicted
+}
+
+func (s *Service) wasEvicted(run string) bool {
+	s.mu.Lock()
+	evicted := s.evicted
+	s.mu.Unlock()
+	return evicted != nil && evicted(run)
+}
+
+// Engagement reports whether a client is streaming the run's activity and when
+// it was last read, streamed or resolved for preview by this process. A zero
+// time means no access since startup.
+func (s *Service) Engagement(run string) (streaming bool, last time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w := s.workers[run]; w != nil && w.subscriptions > 0 {
+		streaming = true
+	}
+	return streaming, s.lastAccess[run]
+}
+
+// Checkpoints records the run's current clean worktree head, then returns every
+// clean checkpoint SHA recorded for the run, in activity order. It starts no
+// collection worker and does not count as use of the run.
+func (s *Service) Checkpoints(ctx context.Context, run string) ([]string, error) {
+	if s == nil || s.store == nil {
+		return nil, ErrUnavailable
+	}
+	registration, err := s.registration(run)
+	if err != nil {
+		return nil, err
+	}
+	// Eviction pins what is recorded here, so observe the final head first.
+	if _, err = s.refresh(ctx, run, registration); err != nil {
+		return nil, err
+	}
+	var shas []string
+	seen := map[string]bool{}
+	after := uint64(0)
+	for {
+		events, _, more, err := s.store.read(run, registration, after, MaxPageSize)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range events {
+			if e.SourceKind == "ABCP_CHECKPOINT_OBSERVER" && e.Category == "CHECKPOINT" && e.Status == "AVAILABLE" && e.CheckpointClean && gitSHA.MatchString(e.CheckpointSHA) && !seen[e.CheckpointSHA] {
+				seen[e.CheckpointSHA] = true
+				shas = append(shas, e.CheckpointSHA)
+			}
+			after = e.Ordinal
+		}
+		if !more || len(events) == 0 {
+			return shas, nil
+		}
+	}
+}
+
 func (s *Service) releaseSubscription(w *worker) {
 	s.mu.Lock()
 	w.subscriptions--

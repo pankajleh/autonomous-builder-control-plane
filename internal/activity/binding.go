@@ -31,6 +31,8 @@ type Catalog interface {
 type Scope struct {
 	RunID, Repository, RepositoryIdentity, Project, Branch, Worktree, Base, AuthorityDigest string
 	Ralphex                                                                                 authority.RalphexManifest
+	// Retain reports the manifest's controller-owned worktree retention policy.
+	Retain bool
 }
 
 type Resolver struct {
@@ -40,9 +42,36 @@ type Resolver struct {
 
 var gitSHA = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
 
+// Resolve verifies the run's immutable admission binding and its live governed
+// worktree.
 func (r Resolver) Resolve(ctx context.Context, run string) (Scope, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	scope, err := r.resolveBinding(ctx, run)
+	if err != nil {
+		return Scope{}, err
+	}
+	scope.Worktree, err = resolveWorktree(ctx, scope)
+	if err != nil {
+		if errors.Is(err, errWorktreeMissing) {
+			// Keep the identity so refresh can recognise a not-yet-created worktree.
+			return Scope{}, atStep("worktree", err)
+		}
+		return Scope{}, annotate("worktree", err, ErrUnavailable)
+	}
+	return scope, nil
+}
+
+// ResolveBinding verifies everything Resolve does except the live worktree:
+// registration, admission binding, manifest, plan and repository. It is the
+// binding a controller-evicted run keeps once its worktree is removed.
+func (r Resolver) ResolveBinding(ctx context.Context, run string) (Scope, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return r.resolveBinding(ctx, run)
+}
+
+func (r Resolver) resolveBinding(ctx context.Context, run string) (Scope, error) {
 	// Every failure remains ErrUnavailable; the step only names it for diagnostics.
 	fail := func(step string) (Scope, error) { return Scope{}, atStep(step, ErrUnavailable) }
 	root, rootErr := privateDirectory(r.Root, false)
@@ -127,16 +156,17 @@ func (r Resolver) Resolve(ctx context.Context, run string) (Scope, error) {
 		}
 		break
 	}
-	scope := Scope{RunID: run, Repository: b.RepositoryPath, RepositoryIdentity: b.RepositoryIdentity, Project: project, Branch: manifest.Worktree.Branch, Base: manifest.Repository.StartSHA, AuthorityDigest: reg.AuthorityDigest, Ralphex: manifest.Ralphex}
-	scope.Worktree, err = resolveWorktree(ctx, scope)
-	if err != nil {
-		if errors.Is(err, errWorktreeMissing) {
-			// Keep the identity so refresh can recognise a not-yet-created worktree.
-			return Scope{}, atStep("worktree", err)
-		}
-		return Scope{}, annotate("worktree", err, ErrUnavailable)
+	return Scope{RunID: run, Repository: b.RepositoryPath, RepositoryIdentity: b.RepositoryIdentity, Project: project, Branch: manifest.Worktree.Branch, Base: manifest.Repository.StartSHA, AuthorityDigest: reg.AuthorityDigest, Ralphex: manifest.Ralphex, Retain: manifest.Worktree.Retain}, nil
+}
+
+// WorktreePath returns the path of the run's governed worktree, or "" when no
+// worktree holds its branch.
+func WorktreePath(ctx context.Context, scope Scope) (string, error) {
+	path, err := resolveWorktree(ctx, scope)
+	if errors.Is(err, errWorktreeMissing) {
+		return "", nil
 	}
-	return scope, nil
+	return path, err
 }
 
 // Git subprocesses are bounded and inherit the repository's existing sanitized

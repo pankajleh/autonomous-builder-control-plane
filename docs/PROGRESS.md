@@ -13,7 +13,7 @@ Operational role: this file projects roadmap progress and the next eligible plan
 | Phase 2 — Recovery and blocker control | COMPLETE | PR #5 merged |
 | Phase 3 — Cross-plan scheduler and integration | COMPLETE | PR #6 merge `94e14ca749d31ac214e979aab03fbde37502dd7f` |
 | Phase 4 — GitHub lifecycle | **COMPLETE** | CI Task 4 merged in PR #15; governance hardening PR #16; merge authorization Task 1/2/3 closed; exact convergence PR #17 merged as `ed74fad…`; durable post-merge acceptance/reconciliation PASS |
-| Phase 5 — Service/API and dashboard | **IN PROGRESS** | EP-006 service/API baseline retained (PR #21). Product-integration extensions merged through PR #43 and live at `a5383a6` (see the post-rebaseline ledger below). The customer dashboard is owned by Repo C. |
+| Phase 5 — Service/API and dashboard | **IN PROGRESS** | EP-006 service/API baseline retained (PR #21). Product-integration extensions merged through PR #46 (controller-owned worktree eviction) (see the post-rebaseline ledger below). The customer dashboard is owned by Repo C. |
 | Phase 6 — Production hardening | NOT STARTED | Roadmap only |
 
 ## Phase-4 completion ledger
@@ -80,7 +80,9 @@ After the 2026-09-19 EP-006 rebaseline (PR #21), Repo B work followed concrete R
 | #41 | `0d99f7d` | BP-01 provider worktree cleanup transition | `docs/plans/completed/bp01-worktree-cleanup-transition.md` |
 | #42 | `a5383a6` | Controller-owned governed worktree retention (`worktree.retain`, Ralphex `--keep-worktree`) | `docs/plans/completed/bp02-controller-owned-worktree-retention.md` |
 | #43 | `f364222` | Ledger reconciliation; versioned local-integration operator configuration and drift check | `deploy/local-integration/README.md` |
-| #44 | this PR | Ralphex governance patch series rebuilt on upstream release `v1.7.0` (`ralphex-v1.7.0-abcp`), source moved to private `pankajleh/ralphex-governance`, upgrade procedure. Proof run `admission-f7e2967f…`: retained worktree, 61→74 events, 0 `UNKNOWN`, preview after acceptance `READY`/`200` | `deploy/local-integration/README.md` |
+| #44 | `65992f7` | Ralphex governance patch series rebuilt on upstream release `v1.7.0` (`ralphex-v1.7.0-abcp`), source moved to private `pankajleh/ralphex-governance`, upgrade procedure. Proof run `admission-f7e2967f…`: retained worktree, 61→74 events, 0 `UNKNOWN`, preview after acceptance `READY`/`200` | `deploy/local-integration/README.md` |
+| #45 | `fbf1ab8` | Upgrade note corrected: an upstream `--keep-worktree` needs a one-time patch-series adjustment | `deploy/local-integration/README.md` |
+| #46 | this PR | Controller-owned worktree eviction: 24 h idle, 7 days max age, 5 GiB per repository. Checkpoints are pinned and the eviction record is sealed before removal, so preview and activity survive eviction | `docs/plans/completed/bp02-worktree-eviction.md` |
 
 Repo C closed its PX-07 integrated journey on live Repo B `0d99f7d` (Repo C P0052, DEC-0021). BP-01/BP-02 therefore carry the Repo C PDLC Experience foundation. PR #42 was then proven live on `a5383a6` by run `admission-2b69b2cd…`:
 
@@ -97,4 +99,4 @@ Known issues (not regressions of this ledger's PRs):
 
 ## Next authorized action
 
-Phase 5 continues only where Repo C needs a capability. The first candidate is persistent checkpoint state (pinned refs, a sealed binding and eligibility from sealed state), which enables controller-owned worktree pruning. It needs a frozen design before implementation. No EP-005 authority may be carried forward as Phase-5 implementation authority.
+Phase 5 continues only where Repo C needs a capability. Persistent checkpoint state and controller-owned eviction are merged (#46). The candidates are a customer-visible eviction entry and eviction on task closure or tenant deletion. No EP-005 authority may be carried forward as Phase-5 implementation authority.
