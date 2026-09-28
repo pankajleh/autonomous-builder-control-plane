@@ -54,7 +54,7 @@ A sweep evicts in this order:
 2. **Seal.** A `WorktreeEvictionV1` record is written to `<service-root>/evictions/<run>.json`. The directory has mode `0700` and must be owned by the service user; the file has mode `0600` and is written atomically (temp file, fsync, rename, directory fsync). The record holds the authority digest, repository, branch, base, worktree path, reason, time, size and every pinned checkpoint. Reads refuse symlinks, loose permissions, unknown fields and invalid values.
 3. **Remove.** `git worktree remove --force` runs only while the path still holds `abcp/<run>` and lies inside the repository. The branch is kept.
 
-If a sweep is interrupted after sealing, the next sweep finds the record and completes the removal instead of deciding again. Each eviction is logged as `abcp worktree evicted at=… run=… reason=… bytes=… checkpoints=N`.
+If a sweep is interrupted after sealing, the next sweep finds the record and completes the removal instead of deciding again. Each eviction is logged as `abcp worktree evicted at=… run=… reason=… bytes=… checkpoints=N`. Each sweep that finds retained worktrees also logs why each one is kept (PR #48): `abcp worktree eviction sweep at=… retained=N kept-unfinished=… kept-streaming=… kept-preview=… unverified=… evicted=… failed=…`. A retained worktree that is none of these is simply not yet due.
 
 ## Preview after eviction (sealed state)
 

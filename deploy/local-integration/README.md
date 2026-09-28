@@ -80,6 +80,6 @@ Each eviction does three things:
 
 - keeps the `abcp/<run>` branch;
 - pins every clean checkpoint at `refs/abcp/checkpoints/<run>/<sha>`;
-- writes `<service-root>/evictions/<run>.json` (mode `0600`) and logs `abcp worktree evicted …` to the service log.
+- writes `<service-root>/evictions/<run>.json` (mode `0600`) and logs `abcp worktree evicted …` to the service log. Every sweep that finds retained worktrees also logs `abcp worktree eviction sweep …`, which counts why each worktree is kept.
 
 A preview of an evicted run is still created from the pinned ref. Do not delete `refs/abcp/checkpoints/*` or the eviction records: without them, previews of evicted runs are refused.

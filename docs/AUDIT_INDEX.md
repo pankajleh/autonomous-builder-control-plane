@@ -43,7 +43,8 @@ Operational role: this file indexes accepted, reviewed, merged, and durable evid
 | Ralphex governance on upstream release v1.7.0 | #44 | `9b8b03e860b44929b87a7c9ac87c841b0f0e6c17` | `65992f746541f2794710f75d670e3b1dc297c084` | `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `2275e23`; binary `fe5a7c46…4058`. Proof run `admission-f7e2967f1e7e3085a03f4d16ec5f68e0799e70ddeaca90090051754e945d6dcb`: `BRANCH_ACCEPTED`, worktree retained, 61→74 events, 0 `UNKNOWN`, preview after acceptance `READY` with marker `200` |
 | Ralphex upstream-acceptance upgrade note | #45 | `303bb916e339eefdaf62c772b440ea1543c5f97f` | `fbf1ab8a1cb6a8f44286472de5d6d9a9491f9cfd` | documentation only |
 | Controller-owned worktree eviction | #46 | `0fb3f0f82caefd8a3535de3acfdcc85db7dd3c32` | `7ae1a5f2d520a2d46a09620544dc0ddeb9ddfa09` | `docs/plans/completed/bp02-worktree-eviction.md` |
-| Bounded trailing provider detail for retained worktrees | #47 | this PR | this PR | `docs/plans/completed/bp01-bounded-trailing-detail.md` |
+| Bounded trailing provider detail for retained worktrees | #47 | `c63423065f8d1c7e63f6ffd3dc42d55c3c853df5` | `bef3cd5729f7753ab1800d0292d95b1d7a701230` | `docs/plans/completed/bp01-bounded-trailing-detail.md` |
+| Eviction sweep summary | #48 | this PR | this PR | `docs/plans/completed/bp02-worktree-eviction.md` |
 
 EP-005 foundation merged earlier in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 
@@ -102,7 +103,7 @@ PR #22 published exact head `f1ae22fc3132513bbe5c411058e506676d9fb069` and merge
 
 ## Current cutoff and non-claims
 
-The current recordable source cutoff is Repo B PR #47, bounded trailing provider detail, on top of `main@7ae1a5f2d520a2d46a09620544dc0ddeb9ddfa09` (PR #46). It covers retained EP-006, bounded product and development admission, the Ralphex execution profile, human-decision pause/resume, BP-01 activity, BP-02 preview runtime, and controller-owned worktree retention and eviction. The pinned Ralphex is `ralphex-v1.7.0-abcp` (#44).
+The current recordable source cutoff is Repo B PR #48, eviction sweep summary, on top of `main@bef3cd5729f7753ab1800d0292d95b1d7a701230` (PR #47, after eviction in PR #46). It covers retained EP-006, bounded product and development admission, the Ralphex execution profile, human-decision pause/resume, BP-01 activity, BP-02 preview runtime, and controller-owned worktree retention and eviction. The pinned Ralphex is `ralphex-v1.7.0-abcp` (#44).
 
 This cutoff does not claim general retry/recovery or the advertised `retry`/`resume`/`recovery` capabilities. Nor does it claim a customer-visible eviction entry, eviction on task closure or tenant deletion, provider redesign, live production/AWS deployment, or restoration of the discarded post-EP-006 assurance framework.
 

@@ -64,6 +64,13 @@ type Sweeper struct {
 type candidate struct {
 	Candidate
 	scope activity.Scope
+	kept  string // why a protected worktree is kept: unfinished, streaming or preview
+}
+
+// Summary counts one sweep's retained worktrees by outcome, so an operator can
+// see why a worktree is still kept.
+type Summary struct {
+	Retained, Unfinished, Streaming, Preview, Unverified, Evicted, Failed int
 }
 
 // Run sweeps every interval until ctx ends.
@@ -86,19 +93,39 @@ func (s *Sweeper) Run(ctx context.Context, interval time.Duration) {
 // selects. Runs whose binding, state or worktree cannot be verified are skipped,
 // never evicted.
 func (s *Sweeper) Sweep(ctx context.Context) ([]RecordV1, error) {
+	evicted, _, err := s.sweep(ctx)
+	return evicted, err
+}
+
+func (s *Sweeper) sweep(ctx context.Context) ([]RecordV1, Summary, error) {
 	now := s.Now()
+	var summary Summary
 	var candidates []candidate
 	after := ""
 	for count := 0; count < maxRuns; {
 		runs, more, err := s.Runs.ListRuns(after, 100)
 		if err != nil {
-			return nil, err
+			return nil, summary, err
 		}
 		for _, reg := range runs {
 			count++
 			after = reg.RunID
-			if c, ok := s.inspect(ctx, reg.RunID); ok {
+			c, outcome := s.inspect(ctx, reg.RunID)
+			switch outcome {
+			case inspected:
+				summary.Retained++
 				candidates = append(candidates, c)
+				switch c.kept {
+				case "unfinished":
+					summary.Unfinished++
+				case "streaming":
+					summary.Streaming++
+				case "preview":
+					summary.Preview++
+				}
+			case unverified:
+				summary.Retained++
+				summary.Unverified++
 			}
 		}
 		if !more || len(runs) == 0 {
@@ -115,26 +142,43 @@ func (s *Sweeper) Sweep(ctx context.Context) ([]RecordV1, error) {
 	for _, d := range s.Policy.Decide(plain, now) {
 		record, err := s.evict(ctx, byRun[d.Run], d.Reason, now)
 		if err != nil {
+			summary.Failed++
 			s.logf("abcp worktree eviction failed run=%s reason=%s class=%s", d.Run, d.Reason, class(err))
 			continue
 		}
+		summary.Evicted++
 		evicted = append(evicted, record)
 		s.logf("abcp worktree evicted at=%s run=%s reason=%s bytes=%d checkpoints=%d", record.EvictedAt, record.RunID, record.Reason, record.WorktreeBytes, len(record.Checkpoints))
 	}
-	return evicted, nil
+	if summary.Retained > 0 {
+		s.logf("abcp worktree eviction sweep at=%s retained=%d kept-unfinished=%d kept-streaming=%d kept-preview=%d unverified=%d evicted=%d failed=%d",
+			now.UTC().Format(time.RFC3339), summary.Retained, summary.Unfinished, summary.Streaming, summary.Preview, summary.Unverified, summary.Evicted, summary.Failed)
+	}
+	return evicted, summary, nil
 }
 
-func (s *Sweeper) inspect(ctx context.Context, run string) (candidate, bool) {
+type outcome int
+
+const (
+	notRetained outcome = iota // not a retained worktree: not the sweeper's concern
+	inspected
+	unverified // retained, but its state or size could not be verified: kept
+)
+
+func (s *Sweeper) inspect(ctx context.Context, run string) (candidate, outcome) {
 	scope, err := s.Binder.ResolveBinding(ctx, run)
 	if err != nil || !scope.Retain {
-		return candidate{}, false
+		return candidate{}, notRetained
 	}
 	path, err := activity.WorktreePath(ctx, scope)
-	if err != nil || path == "" || !inside(scope.Repository, path) {
-		return candidate{}, false
+	if err == nil && path == "" {
+		return candidate{}, notRetained
+	}
+	if err != nil || !inside(scope.Repository, path) {
+		return candidate{}, unverified
 	}
 	if record, ok, err := s.Store.Read(run); err != nil {
-		return candidate{}, false
+		return candidate{}, unverified
 	} else if ok {
 		// An eviction sealed before an interruption is finished, not re-decided.
 		if err := removeWorktree(ctx, scope, path); err != nil {
@@ -142,12 +186,12 @@ func (s *Sweeper) inspect(ctx context.Context, run string) (candidate, bool) {
 		} else {
 			s.logf("abcp worktree eviction resumed run=%s reason=%s", run, record.Reason)
 		}
-		return candidate{}, false
+		return candidate{}, notRetained
 	}
 	c := candidate{scope: scope, Candidate: Candidate{Run: run, Repository: scope.Repository, Worktree: path}}
 	snapshot, err := s.States.Snapshot(ctx, run)
 	if err != nil {
-		return candidate{}, false
+		return candidate{}, unverified
 	}
 	state := snapshot.Projection.CurrentState
 	for i := len(snapshot.Events) - 1; i >= 0; i-- {
@@ -167,11 +211,19 @@ func (s *Sweeper) inspect(ctx context.Context, run string) (candidate, bool) {
 		last = s.Started
 	}
 	c.LastAccess = last
-	c.Protected = !c.Terminal || streaming || s.Previews.Live(run)
-	if c.Bytes, err = size(path); err != nil {
-		return candidate{}, false
+	switch {
+	case !c.Terminal:
+		c.kept = "unfinished"
+	case streaming:
+		c.kept = "streaming"
+	case s.Previews.Live(run):
+		c.kept = "preview"
 	}
-	return c, true
+	c.Protected = c.kept != ""
+	if c.Bytes, err = size(path); err != nil {
+		return candidate{}, unverified
+	}
+	return c, inspected
 }
 
 func (s *Sweeper) evict(ctx context.Context, c candidate, reason string, now time.Time) (RecordV1, error) {

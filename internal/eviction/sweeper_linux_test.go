@@ -40,6 +40,7 @@ type fixture struct {
 	state      string
 	finishedAt time.Time
 	live       bool
+	streaming  bool
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -84,7 +85,7 @@ func (f *fixture) Snapshot(context.Context, string) (readmodel.Snapshot, error) 
 	s.Projection.CurrentState = f.state
 	return s, nil
 }
-func (f *fixture) Engagement(string) (bool, time.Time) { return false, time.Time{} }
+func (f *fixture) Engagement(string) (bool, time.Time) { return f.streaming, time.Time{} }
 func (f *fixture) Checkpoints(context.Context, string) ([]string, error) {
 	return []string{f.checkpoint}, nil
 }
@@ -121,25 +122,33 @@ func TestSweepEvictsIdleWorktreeAfterPinningCheckpoints(t *testing.T) {
 }
 
 func TestSweepNeverEvictsProtectedUnfinishedOrUnretainedWorktrees(t *testing.T) {
-	for name, mutate := range map[string]func(*fixture){
-		"live preview":     func(f *fixture) { f.live = true },
-		"unfinished run":   func(f *fixture) { f.state = string(domain.StateImplementing) },
-		"paused for human": func(f *fixture) { f.state = string(domain.StateHumanDecisionRequired) },
-		"not retained":     func(f *fixture) { f.scope.Retain = false },
-		"recently finished": func(f *fixture) {
-			f.finishedAt = now.Add(-time.Hour)
-		},
+	for name, tc := range map[string]struct {
+		mutate func(*fixture)
+		want   Summary
+	}{
+		"live preview":      {func(f *fixture) { f.live = true }, Summary{Retained: 1, Preview: 1}},
+		"streaming client":  {func(f *fixture) { f.streaming = true }, Summary{Retained: 1, Streaming: 1}},
+		"unfinished run":    {func(f *fixture) { f.state = string(domain.StateImplementing) }, Summary{Retained: 1, Unfinished: 1}},
+		"paused for human":  {func(f *fixture) { f.state = string(domain.StateHumanDecisionRequired) }, Summary{Retained: 1, Unfinished: 1}},
+		"not retained":      {func(f *fixture) { f.scope.Retain = false }, Summary{}},
+		"recently finished": {func(f *fixture) { f.finishedAt = now.Add(-time.Hour) }, Summary{Retained: 1}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
-			mutate(f)
+			tc.mutate(f)
 			sweeper := f.sweeper()
 			sweeper.Started = now.Add(-time.Hour)
-			if evicted, err := sweeper.Sweep(context.Background()); err != nil || len(evicted) != 0 {
-				t.Fatalf("sweep evicted %+v, %v", evicted, err)
+			var log bytes.Buffer
+			sweeper.Log = &log
+			evicted, summary, err := sweeper.sweep(context.Background())
+			if err != nil || len(evicted) != 0 || summary != tc.want {
+				t.Fatalf("sweep evicted %+v, summary %+v, %v; want summary %+v", evicted, summary, err, tc.want)
 			}
 			if _, err := os.Stat(f.worktree); err != nil {
 				t.Fatal("protected worktree was removed", err)
+			}
+			if logged := strings.Contains(log.String(), "abcp worktree eviction sweep "); logged != (tc.want.Retained > 0) {
+				t.Fatalf("sweep summary logged=%v: %q", logged, log.String())
 			}
 		})
 	}
