@@ -161,7 +161,31 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 			return Scope{}, err
 		}
 	}
+	// A retained worktree keeps resolving after the run finishes, but its
+	// provider session has ended. Trailing detail is read only for a bounded
+	// window after the first finished transition; afterwards no provider read
+	// can turn a complete history into a false marker, for example when a
+	// restarted sidecar has not yet listed the old session.
+	if at, ok := finishedAt(snapshot); ok && s.now().Sub(at) > trailingDetailWindow {
+		return Scope{}, nil
+	}
 	return scope, nil
+}
+
+// trailingDetailWindow bounds provider reads after a run first finishes.
+// Ralphex writes its final detail within seconds of finishing.
+const trailingDetailWindow = 15 * time.Minute
+
+// finishedAt returns when the run first reached an authoritative terminal
+// branch outcome. Later lifecycle states, such as MERGED, follow it.
+func finishedAt(snapshot readmodel.Snapshot) (time.Time, bool) {
+	for _, fact := range snapshot.Events {
+		switch fact.StateTo {
+		case "BRANCH_ACCEPTED", "FAILED", "CANCELLED":
+			return fact.Timestamp, !fact.Timestamp.IsZero()
+		}
+	}
+	return time.Time{}, false
 }
 
 // The governed worktree is absent at both ends of a healthy run: the provider
