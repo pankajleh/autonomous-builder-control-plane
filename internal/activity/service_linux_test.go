@@ -416,3 +416,27 @@ func TestSlowSubscriptionRetainsCollectorWhileFramesArePending(t *testing.T) {
 		t.Fatal("closed or rejected subscriptions retained the idle collector")
 	}
 }
+
+func TestOnlyLiveStreamsCountAsEvictionEngagement(t *testing.T) {
+	s, facts := testService(t)
+	facts.events = []ledger.Event{{EventID: "accepted", StateTo: domain.StateBranchAccepted, Timestamp: testTime}}
+	if _, err := s.ReadActivity(context.Background(), "run", serviceapi.PageRequestV1{PageSize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	// Background readers page every run's activity; that is not use.
+	if streaming, last := s.Engagement("run"); streaming || !last.IsZero() {
+		t.Fatal("a paged read counted as engagement", streaming, last)
+	}
+	sub, err := s.OpenActivityStream(context.Background(), "run", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	streaming, opened := s.Engagement("run")
+	if !streaming || opened.IsZero() {
+		t.Fatal("an open live stream is not engagement", streaming, opened)
+	}
+	sub.Close()
+	if streaming, closed := s.Engagement("run"); streaming || closed.Before(opened) {
+		t.Fatal("closing the stream must end streaming and count as the last use", streaming, closed)
+	}
+}

@@ -39,8 +39,10 @@ type Service struct {
 	// worktreeMissing records when a run's governed worktree was first seen
 	// missing after a provider proof, bounding the finish transition grace.
 	worktreeMissing map[string]time.Time
-	// lastAccess records the latest activity read, stream or preview
-	// resolution per run since this process started (worktree eviction idle).
+	// lastAccess records, per run, when a client last opened or closed a live
+	// activity stream since this process started (worktree eviction idle).
+	// Paged reads do not count: background readers, such as Repo C's
+	// notification poller, page every run's activity every few seconds.
 	lastAccess map[string]time.Time
 	// evicted reports a controller-sealed worktree eviction (see SetEvicted).
 	evicted func(run string) bool
@@ -282,10 +284,9 @@ func (s *Service) prepare(ctx context.Context, run string, subscribe bool) (stri
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.lastAccess == nil {
-		s.lastAccess = map[string]time.Time{}
+	if subscribe {
+		s.noteEngagement(run)
 	}
-	s.lastAccess[run] = s.now()
 	if s.closed || s.faults[run] != nil {
 		return "", nil, ErrUnavailable
 	}
@@ -325,8 +326,8 @@ func (s *Service) wasEvicted(run string) bool {
 }
 
 // Engagement reports whether a client is streaming the run's activity and when
-// it was last read, streamed or resolved for preview by this process. A zero
-// time means no access since startup.
+// a live stream of it was last opened or closed by this process. A zero time
+// means no stream since startup. Paged reads are not engagement.
 func (s *Service) Engagement(run string) (streaming bool, last time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -372,11 +373,20 @@ func (s *Service) Checkpoints(ctx context.Context, run string) ([]string, error)
 	}
 }
 
-func (s *Service) releaseSubscription(w *worker) {
+func (s *Service) releaseSubscription(w *worker, run string) {
 	s.mu.Lock()
 	w.subscriptions--
 	w.touched = s.now()
+	s.noteEngagement(run)
 	s.mu.Unlock()
+}
+
+// noteEngagement records live-stream use of the run. Callers hold s.mu.
+func (s *Service) noteEngagement(run string) {
+	if s.lastAccess == nil {
+		s.lastAccess = map[string]time.Time{}
+	}
+	s.lastAccess[run] = s.now()
 }
 
 func (s *Service) acquireSidecar(scope Scope) (*sharedSidecar, string) {
@@ -720,7 +730,7 @@ func (s *Service) OpenActivityStream(ctx context.Context, run, last string) (ser
 	}
 	_, generation, _, err := s.store.read(run, registration, after, 1)
 	if err != nil {
-		s.releaseSubscription(w)
+		s.releaseSubscription(w, run)
 		if last != "" {
 			return nil, serviceapi.ErrInvalidCursor
 		}
@@ -739,7 +749,7 @@ type subscription struct {
 }
 
 func (s *subscription) Close() error {
-	s.closeOnce.Do(func() { s.service.releaseSubscription(s.worker) })
+	s.closeOnce.Do(func() { s.service.releaseSubscription(s.worker, s.run) })
 	return nil
 }
 func (s *subscription) Next(ctx context.Context) (serviceapi.ActivityFrame, error) {
