@@ -13,6 +13,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/activity"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	capsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/eviction"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runadmission"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
@@ -26,14 +27,23 @@ type Source struct {
 	RunID, CheckpointActivityID, SHA, Repository, RepositoryIdentityDigest, Branch, Base string
 	ProductAuthorizationID, ProductTaskID, ProductVersionID                              string
 	ValidationID                                                                         string
+	// FetchRef is set for a controller-evicted run: the checkpoint is fetched by
+	// its pinned ref, so the source stays available even without the branch.
+	FetchRef string
 }
 type SourceResolver interface {
 	Resolve(context.Context, string, string) (Source, error)
 }
+
+// EvictionReader returns the sealed record of a controller-evicted worktree.
+type EvictionReader interface {
+	Read(run string) (eviction.RecordV1, bool, error)
+}
 type Resolver struct {
-	Root     string
-	Catalog  activity.Catalog
-	Activity ActivityReader
+	Root      string
+	Catalog   activity.Catalog
+	Activity  ActivityReader
+	Evictions EvictionReader
 }
 
 func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, error) {
@@ -45,9 +55,24 @@ func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, 
 	}
 	// BP-01 verifies the registration, manifest, plan, repository and governed
 	// worktree without granting this extension any ledger or transition methods.
-	scope, err := (activity.Resolver{Root: r.Root, Catalog: r.Catalog}).Resolve(ctx, run)
+	binding := activity.Resolver{Root: r.Root, Catalog: r.Catalog}
+	scope, err := binding.Resolve(ctx, run)
+	var sealed *eviction.RecordV1
 	if err != nil {
-		return fail()
+		// A controller-evicted run keeps its verified binding without the
+		// worktree; its checkpoints must then resolve through pinned refs.
+		if r.Evictions == nil {
+			return fail()
+		}
+		record, ok, readErr := r.Evictions.Read(run)
+		if readErr != nil || !ok {
+			return fail()
+		}
+		if scope, err = binding.ResolveBinding(ctx, run); err != nil || record.AuthorityDigest != scope.AuthorityDigest ||
+			record.Repository != scope.Repository || record.Branch != scope.Branch || record.Base != scope.Base {
+			return fail()
+		}
+		sealed = &record
 	}
 	if !repositoryIdentity(ctx, scope.Repository, scope.RepositoryIdentity) {
 		return fail()
@@ -157,14 +182,24 @@ func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, 
 	if _, err = git(ctx, scope.Repository, "merge-base", "--is-ancestor", scope.Base, e.CheckpointSHA); err != nil {
 		return fail()
 	}
-	if _, err = git(ctx, scope.Repository, "merge-base", "--is-ancestor", e.CheckpointSHA, "refs/heads/"+scope.Branch); err != nil {
+	fetchRef := ""
+	if sealed != nil {
+		ref := eviction.CheckpointRef(run, e.CheckpointSHA)
+		if !sealed.Pinned(e.CheckpointSHA) {
+			return fail()
+		}
+		if pinned, err := git(ctx, scope.Repository, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil || pinned != e.CheckpointSHA {
+			return fail()
+		}
+		fetchRef = ref
+	} else if _, err = git(ctx, scope.Repository, "merge-base", "--is-ancestor", e.CheckpointSHA, "refs/heads/"+scope.Branch); err != nil {
 		return fail()
 	}
 	again, err := r.Catalog.ReadRun(run)
 	if err != nil || again != reg {
 		return fail()
 	}
-	return Source{RunID: run, CheckpointActivityID: checkpoint, SHA: e.CheckpointSHA, Repository: scope.Repository, RepositoryIdentityDigest: reg.RepositoryIdentityDigest, Branch: scope.Branch, Base: scope.Base, ProductAuthorizationID: c.Project, ProductTaskID: c.Plan, ProductVersionID: c.ExecutionPack, ValidationID: jsonDigest([]string{jsonDigest(reg), jsonDigest(b), c.CapsuleSHA256, jsonDigest(e)})}, nil
+	return Source{RunID: run, CheckpointActivityID: checkpoint, SHA: e.CheckpointSHA, Repository: scope.Repository, RepositoryIdentityDigest: reg.RepositoryIdentityDigest, Branch: scope.Branch, Base: scope.Base, ProductAuthorizationID: c.Project, ProductTaskID: c.Plan, ProductVersionID: c.ExecutionPack, ValidationID: jsonDigest([]string{jsonDigest(reg), jsonDigest(b), c.CapsuleSHA256, jsonDigest(e)}), FetchRef: fetchRef}, nil
 }
 
 // Ordinary provider warnings retain both hashed provider source identities.

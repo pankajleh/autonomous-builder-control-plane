@@ -40,7 +40,9 @@ Operational role: this file indexes accepted, reviewed, merged, and durable evid
 | BP-01 worktree cleanup transition | #41 | `512725720f6ffd400dc676c995a4406ce2097b8a` | `0d99f7d340cec40336728c6c59dcb66a41d2a77c` | `docs/plans/completed/bp01-worktree-cleanup-transition.md`; Repo C PX-07 closure ran on this merge |
 | Controller-owned worktree retention | #42 | `a5ee44ae30fc98a5676695347a6694fb8a82ba47` | `a5383a672f99b68413cb946a6d93f89116a2769b` | `docs/plans/completed/bp02-controller-owned-worktree-retention.md`; live proof run `admission-2b69b2cd…` |
 | Ledger reconciliation and versioned operator configuration | #43 | `d723b01b7fbb3ef08492aeb117feb509ba6244f8` | `f36422201591e81a336d4e43690cb68efa64d17e` | `deploy/local-integration/README.md`; host drift check clean |
-| Ralphex governance on upstream release v1.7.0 | #44 | this PR | this PR | `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `2275e23`; binary `fe5a7c46…4058`. Proof run `admission-f7e2967f1e7e3085a03f4d16ec5f68e0799e70ddeaca90090051754e945d6dcb`: `BRANCH_ACCEPTED`, worktree retained, 61→74 events, 0 `UNKNOWN`, preview after acceptance `READY` with marker `200` |
+| Ralphex governance on upstream release v1.7.0 | #44 | `9b8b03e860b44929b87a7c9ac87c841b0f0e6c17` | `65992f746541f2794710f75d670e3b1dc297c084` | `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `2275e23`; binary `fe5a7c46…4058`. Proof run `admission-f7e2967f1e7e3085a03f4d16ec5f68e0799e70ddeaca90090051754e945d6dcb`: `BRANCH_ACCEPTED`, worktree retained, 61→74 events, 0 `UNKNOWN`, preview after acceptance `READY` with marker `200` |
+| Ralphex upstream-acceptance upgrade note | #45 | `303bb916e339eefdaf62c772b440ea1543c5f97f` | `fbf1ab8a1cb6a8f44286472de5d6d9a9491f9cfd` | documentation only |
+| Controller-owned worktree eviction | #46 | this PR | this PR | `docs/plans/completed/bp02-worktree-eviction.md` |
 
 EP-005 foundation merged earlier in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 
@@ -99,9 +101,9 @@ PR #22 published exact head `f1ae22fc3132513bbe5c411058e506676d9fb069` and merge
 
 ## Current cutoff and non-claims
 
-The current recordable source cutoff is Repo B `main@a5383a672f99b68413cb946a6d93f89116a2769b` (PR #42) plus the documentation and operator-configuration PR #43. It covers retained EP-006, bounded product and development admission, the Ralphex execution profile, human-decision pause/resume, BP-01 activity, BP-02 preview runtime and controller-owned worktree retention. That same executable is live on the local-integration host.
+The current recordable source cutoff is Repo B PR #46, controller-owned worktree eviction, on top of `main@fbf1ab8a1cb6a8f44286472de5d6d9a9491f9cfd`. It covers retained EP-006, bounded product and development admission, the Ralphex execution profile, human-decision pause/resume, BP-01 activity, BP-02 preview runtime, and controller-owned worktree retention and eviction. The pinned Ralphex is `ralphex-v1.7.0-abcp` (#44).
 
-This cutoff does not claim general retry/recovery or the advertised `retry`/`resume`/`recovery` capabilities. Nor does it claim persistent checkpoint state independent of the worktree, provider redesign, live production/AWS deployment, or restoration of the discarded post-EP-006 assurance framework.
+This cutoff does not claim general retry/recovery or the advertised `retry`/`resume`/`recovery` capabilities. Nor does it claim a customer-visible eviction entry, eviction on task closure or tenant deletion, provider redesign, live production/AWS deployment, or restoration of the discarded post-EP-006 assurance framework.
 
 Earlier entries (PRs #23–#41) were recorded retrospectively on 2026-09-28; they merged without updating these projections.
 

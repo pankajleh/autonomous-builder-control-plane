@@ -22,6 +22,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/eviction"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -778,11 +779,19 @@ func serveCommand(args []string, stderr io.Writer) int {
 	grantsFile := flags.String("authority-grants-file", "", "protected exact authority grant file")
 	previewProfileFile := flags.String("preview-profile-file", "", "optional protected preview profile file")
 	admissionProfileFile := flags.String("admission-profile-file", "", "optional protected run admission profile file")
+	evictionInterval := flags.Duration("worktree-eviction-interval", eviction.DefaultInterval, "how often to evict retained governed worktrees (0 disables eviction)")
+	evictionIdle := flags.Duration("worktree-eviction-idle", eviction.DefaultIdle, "evict a finished run's worktree after this long without use (0 disables the rule)")
+	evictionMaxAge := flags.Duration("worktree-eviction-max-age", eviction.DefaultMaxAge, "evict a finished run's worktree this long after it finished (0 disables the rule)")
+	evictionQuota := flags.Int64("worktree-eviction-quota-bytes", eviction.DefaultQuotaBytes, "per-repository retained worktree quota; least recently used evicted first (0 disables the rule)")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
 		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>]")
+		return 2
+	}
+	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
+		fmt.Fprintln(stderr, "worktree eviction settings must not be negative")
 		return 2
 	}
 	if err := serviceapi.ValidateLoopbackAddress(*listen); err != nil {
@@ -867,12 +876,27 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer activityService.Close()
-	previewService, err := preview.New(ctx, *serviceRoot, *previewProfileFile, catalog, activityService)
+	evictions, err := eviction.OpenStore(*serviceRoot)
+	if err != nil {
+		fmt.Fprintln(stderr, "open worktree eviction store safely")
+		return 1
+	}
+	activityService.SetEvicted(evictions.Evicted)
+	previewService, err := preview.New(ctx, *serviceRoot, *previewProfileFile, catalog, activityService, evictions)
 	if err != nil {
 		fmt.Fprintln(stderr, "construct preview extension")
 		return 1
 	}
 	defer previewService.Close()
+	if *evictionInterval > 0 {
+		sweeper := &eviction.Sweeper{
+			Policy: eviction.Policy{Idle: *evictionIdle, MaxAge: *evictionMaxAge, QuotaBytes: *evictionQuota},
+			Store:  evictions, Runs: catalog, Binder: activity.Resolver{Root: *serviceRoot, Catalog: catalog},
+			States: readService, Activity: activityService, Previews: previewService,
+			Now: time.Now, Started: time.Now(), Log: stderr,
+		}
+		go sweeper.Run(ctx, *evictionInterval)
+	}
 	server, err := serviceapi.NewServer(serviceapi.ServerConfig{
 		Activity:      activityService,
 		Preview:       previewService,

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -114,5 +116,42 @@ func TestWorktreeRemovedDuringBatchDefersToRefresh(t *testing.T) {
 	}
 	if proof, err := s.store.proof(f.run, registration); err != nil || proof != nil {
 		t.Fatal("discarded batch changed durable proof", proof, err)
+	}
+}
+
+func TestControllerEvictedWorktreeIsExpectedCleanupInAnyLaterState(t *testing.T) {
+	for _, sealed := range []bool{true, false} {
+		t.Run(fmt.Sprint("sealed=", sealed), func(t *testing.T) {
+			f := newBindingFixture(t)
+			command(t, f.repo, "worktree", "remove", "--force", f.worktree)
+			now := testTime.Add(time.Hour)
+			// MERGED follows acceptance and is not an activity terminal state.
+			s, registration := worktreeService(t, f, &now, domain.StateBranchAccepted, domain.StateIntegrationPending, domain.StateMerged)
+			s.SetEvicted(func(run string) bool { return sealed && run == f.run })
+			markers := 0
+			for i := 0; i < 3; i++ {
+				markers = refreshMarkers(t, s, f.run, registration)
+				now = now.Add(worktreeTransitionWindow)
+			}
+			if want := map[bool]int{true: 0, false: 1}[sealed]; markers != want {
+				t.Fatalf("markers = %d, want %d", markers, want)
+			}
+		})
+	}
+}
+
+func TestCheckpointsRecordTheFinalHeadBeforeEviction(t *testing.T) {
+	f := newBindingFixture(t)
+	now := testTime.Add(time.Hour)
+	s, _ := worktreeService(t, f, &now, domain.StateBranchAccepted)
+	os.WriteFile(filepath.Join(f.worktree, "source"), []byte("final\n"), 0600)
+	command(t, f.worktree, "add", "source")
+	command(t, f.worktree, "commit", "-m", "final")
+	shas, err := s.Checkpoints(context.Background(), f.run)
+	if err != nil || len(shas) != 1 || shas[0] != command(t, f.worktree, "rev-parse", "HEAD") {
+		t.Fatalf("checkpoints = %v, %v", shas, err)
+	}
+	if streaming, last := s.Engagement(f.run); streaming || !last.IsZero() {
+		t.Fatal("collecting checkpoints for eviction counted as use of the run")
 	}
 }

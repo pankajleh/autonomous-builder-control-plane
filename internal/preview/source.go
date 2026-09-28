@@ -78,12 +78,29 @@ func (c Checkout) Materialize(ctx context.Context, id string, s Source) (path st
 	// Clone into a fresh repository, so candidate .gitattributes cannot activate
 	// executable filters from the governed repository's local configuration.
 	// --no-local avoids hardlinks and permits the depth bound for local transport.
-	_, err = execute(ctx, "git", gitexec.Environment(), "-c", "protocol.file.allow=always", "clone", "--no-local", "--no-checkout", "--no-tags", "--depth=1", "--single-branch", "--branch", s.Branch, "--", s.Repository, path)
-	if err != nil {
-		return "", err
-	}
-	if _, err = git(ctx, path, "-c", "protocol.file.allow=always", "fetch", "--no-tags", "--depth=1", "origin", s.SHA); err != nil {
-		return "", err
+	if s.FetchRef != "" {
+		// An evicted run's branch may be gone; fetch the checkpoint by its pinned
+		// ref into an empty repository instead of cloning the branch.
+		if !strings.HasPrefix(s.FetchRef, "refs/abcp/checkpoints/"+s.RunID+"/") {
+			return "", ErrIntegrity
+		}
+		if _, err = execute(ctx, "git", gitexec.Environment(), "init", "--quiet", "--", path); err != nil {
+			return "", err
+		}
+		if _, err = git(ctx, path, "remote", "add", "origin", s.Repository); err != nil {
+			return "", err
+		}
+		if _, err = git(ctx, path, "-c", "protocol.file.allow=always", "fetch", "--no-tags", "--depth=1", "origin", s.FetchRef); err != nil {
+			return "", err
+		}
+	} else {
+		_, err = execute(ctx, "git", gitexec.Environment(), "-c", "protocol.file.allow=always", "clone", "--no-local", "--no-checkout", "--no-tags", "--depth=1", "--single-branch", "--branch", s.Branch, "--", s.Repository, path)
+		if err != nil {
+			return "", err
+		}
+		if _, err = git(ctx, path, "-c", "protocol.file.allow=always", "fetch", "--no-tags", "--depth=1", "origin", s.SHA); err != nil {
+			return "", err
+		}
 	}
 	if _, err = git(ctx, path, "-c", "core.hooksPath="+os.DevNull, "checkout", "--detach", s.SHA, "--"); err != nil {
 		return "", err

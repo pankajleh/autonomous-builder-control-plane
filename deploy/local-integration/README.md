@@ -64,3 +64,22 @@ If `--keep-worktree` is accepted upstream, adjust the patch series once, at the 
 - If upstream names the flag differently, change the flag name that ABCP passes in `internal/ralphex/command.go`.
 
 Nothing changes when the upstream PR merges: the live binary is pinned by hash until the next deliberate upgrade. Commit 1 is ABCP-specific, so this repository remains necessary unless upstream also accepts the governance budgets.
+
+## Worktree eviction
+
+`abcp serve` evicts finished runs' retained worktrees. The rules are 24 hours without use, 7 days after the run finished, or least recently used first when a repository exceeds 5 GiB. Unfinished runs, live previews and streaming clients protect a worktree (PR #46, `docs/plans/completed/bp02-worktree-eviction.md`). The defaults apply without flags. To override them:
+
+```text
+--worktree-eviction-interval 10m  --worktree-eviction-idle 24h
+--worktree-eviction-max-age 168h  --worktree-eviction-quota-bytes 5368709120
+```
+
+A zero value disables a rule, and an interval of `0` disables eviction.
+
+Each eviction does three things:
+
+- keeps the `abcp/<run>` branch;
+- pins every clean checkpoint at `refs/abcp/checkpoints/<run>/<sha>`;
+- writes `<service-root>/evictions/<run>.json` (mode `0600`) and logs `abcp worktree evicted …` to the service log.
+
+A preview of an evicted run is still created from the pinned ref. Do not delete `refs/abcp/checkpoints/*` or the eviction records: without them, previews of evicted runs are refused.
