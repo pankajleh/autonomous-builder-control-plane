@@ -7,8 +7,8 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 ## Repository checkpoint
 
 - Repository: `pankajleh/autonomous-builder-control-plane`.
-- Executable baseline: PR #50 merge `e8ab2c97285e8767d8b9e4ad80d3b47f6a7f4a1b`. It carries worktree eviction and its corrections (PRs #46–#50). Later documentation-only commits may advance `main`. Later documentation-only commits may advance `main`; Git/GitHub are authoritative for the latest head.
-- Live controller: `abcp serve` built from exactly `e8ab2c9` (binary SHA-256 `089becb50b8a6c65a096f33c712ba396417397bbd06ff77e89034bf9145e92bb`) on the local-integration host, serving Repo C. See [live runtime](#live-runtime-2026-09-28).
+- Executable baseline: PR #54 merge `109e15b45ae1f75316f3b3ba75b93e6ae6a6d128`. It carries worktree eviction, product-requested worktree release, and their corrections (PRs #46–#54). Later documentation-only commits may advance `main`; Git/GitHub are authoritative for the latest head.
+- Live controller: `abcp serve` built from exactly `109e15b` (binary SHA-256 `403d104aa741fbfc93f4716ef6defdc916434940c7b1a96bcc78a7cc58b78b78`) on the local-integration host, serving Repo C. See [live runtime](#live-runtime-2026-09-28).
 - Platform boundary: **the EP-006 service/API baseline, plus these extensions:**
   - Repo C product run admission (P01);
   - the controller-owned Ralphex execution profile;
@@ -31,7 +31,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 | P01 final tested executable | `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` | product-facing admission + replay/reconciliation hardening; all required gates passed, PostgreSQL integration skipped only because the authorized DSN was unavailable |
 | P01 publication | PR #22 head `f1ae22fc3132513bbe5c411058e506676d9fb069`; merge `3d6a841e722c9c67c83d835a52178b09ca16776d` | product run admission is integrated on `main` |
 
-Everything after P01, PRs #23–#54, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
+Everything after P01, PRs #23–#55, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
 
 ## Current product-facing service boundary
 
@@ -57,7 +57,7 @@ Manifest templates may set `worktree.retain`. ABCP then passes `--keep-worktree`
 
 | Component | Identity |
 |---|---|
-| ABCP | `e8ab2c9`, binary SHA-256 `089becb5…92bb`, listener `127.0.0.1:18888`; worktree eviction on the default policy (24 h without a live stream, 7 days, 5 GiB per repository) |
+| ABCP | `109e15b` since 07:36Z, binary SHA-256 `403d104a…8b78`, listener `127.0.0.1:18888`; worktree eviction on the default policy (24 h without a live stream, 7 days, 5 GiB per repository); worktree release enabled by the `worktree.release` grant |
 | Pinned Ralphex | `ralphex-v1.7.0-abcp`: upstream release `v1.7.0` plus the ABCP patch series, source `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `2275e23adba99bb22c23679ae3e8152c0323aba1`, SHA-256 `fe5a7c46…4058` |
 | Manifest templates | both `worktree.retain: true`; versioned in `deploy/local-integration/abcp-config/` |
 | Preview profiles | `demo-v1` and `web-v1` (busybox `/bin/httpd`, health `/README.md`); versioned in the same directory |
@@ -88,6 +88,19 @@ Two observations came out of the proof:
 
 - **Repo C error mapping.** Repo C reported those refusals as `PREVIEW_IDENTITY_CONFLICT`, because it read ABCP's error `code` at the top level instead of `error.code`. It is corrected in Repo C P0057.
 - **Restart race.** A restart attempt at 05:35:27Z failed with `construct preview extension`. The old process still held the preview store lock while removing its live preview containers, and the start script waited only for the port. The service was down about 25 seconds. The host `runtime/start-abcp.sh` now waits for the old process itself to exit.
+
+Task-closure proof (2026-09-28, ABCP `7ac0cff` with Repo C P0060 `27748d8`):
+
+- **Already evicted run.** Closing task `317c9266…` asked ABCP to release `admission-3ce5345c…`, which had been evicted for inactivity. The answer was `ALREADY_RELEASED` with the original eviction time. Its activity already showed the eviction event (Repo C text "Build workspace removed after inactivity").
+- **Fresh run.** Task `259dc838-14ee-4e1b-85cb-852a113ea764` ran `admission-6f80645d…` to `BRANCH_ACCEPTED` with 3 checkpoints.
+  - Closing it took 0.27 s, and the release answered `RELEASED`.
+  - ABCP sealed a `task-closed` record (mode `0600`), removed the worktree and pinned all 3 checkpoints.
+  - Activity gained one `WORKSPACE`/`RELEASED` event (Repo C text "Task closed; build workspace removed").
+  - Repo C then refused preview create and build submission with `409 TASK_CLOSED`.
+- **Defects found.** The proof found two defects, both fixed in #54:
+  - A close attempt during the build returned `503` instead of `409 TASK_HAS_ACTIVE_BUILD`. Release looked at the worktree before checking whether the run had finished.
+  - A false `provider-replay-gap` marker (ordinal 983) was recorded about 3 s into the run, although a later full replay was contiguous.
+- **Cutover.** ABCP was cut over to `109e15b` at 07:36Z with no run executing. It was down about a minute: the operator's wrapper command contained the text that `start-abcp.sh` looks for, so the script waited for a process that had already exited. Starting the script by itself worked.
 
 Operator configuration drift is checked with `tools/operator/check_local_integration_config.py`.
 
