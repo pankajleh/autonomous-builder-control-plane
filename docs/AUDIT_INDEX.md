@@ -39,7 +39,8 @@ Operational role: this file indexes accepted, reviewed, merged, and durable evid
 | BP-01 sidecar resume overlap | #40 | `60efc66c7f704726a7ec527e5f4d6ad461eea901` | `20f2319d9291252e2c641971235faac1405d1bec` | `docs/plans/completed/bp01-sidecar-resume-overlap.md` |
 | BP-01 worktree cleanup transition | #41 | `512725720f6ffd400dc676c995a4406ce2097b8a` | `0d99f7d340cec40336728c6c59dcb66a41d2a77c` | `docs/plans/completed/bp01-worktree-cleanup-transition.md`; Repo C PX-07 closure ran on this merge |
 | Controller-owned worktree retention | #42 | `a5ee44ae30fc98a5676695347a6694fb8a82ba47` | `a5383a672f99b68413cb946a6d93f89116a2769b` | `docs/plans/completed/bp02-controller-owned-worktree-retention.md`; live proof run `admission-2b69b2cd…` |
-| Ledger reconciliation and versioned operator configuration | #43 | this PR | this PR | `deploy/local-integration/README.md` |
+| Ledger reconciliation and versioned operator configuration | #43 | `d723b01b7fbb3ef08492aeb117feb509ba6244f8` | `f36422201591e81a336d4e43690cb68efa64d17e` | `deploy/local-integration/README.md`; host drift check clean |
+| Ralphex governance on upstream release v1.7.0 | #44 | this PR | this PR | `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `2275e23`; binary `fe5a7c46…4058`. Proof run `admission-f7e2967f1e7e3085a03f4d16ec5f68e0799e70ddeaca90090051754e945d6dcb`: `BRANCH_ACCEPTED`, worktree retained, 61→74 events, 0 `UNKNOWN`, preview after acceptance `READY` with marker `200` |
 
 EP-005 foundation merged earlier in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 

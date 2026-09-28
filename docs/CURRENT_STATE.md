@@ -58,7 +58,7 @@ Manifest templates may set `worktree.retain`. ABCP then passes `--keep-worktree`
 | Component | Identity |
 |---|---|
 | ABCP | `a5383a6`, binary SHA-256 `1aebdb08…4096`, listener `127.0.0.1:18888` |
-| Pinned Ralphex | `ralphex-governance-v2`, source `055dfbdb4d92120a8249ae58923d7608d583e82f`, SHA-256 `54300a18…de94bc` |
+| Pinned Ralphex | `ralphex-v1.7.0-abcp`: upstream release `v1.7.0` plus the ABCP patch series, source `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `2275e23adba99bb22c23679ae3e8152c0323aba1`, SHA-256 `fe5a7c46…4058` |
 | Manifest templates | both `worktree.retain: true`; versioned in `deploy/local-integration/abcp-config/` |
 | Preview profiles | `demo-v1` and `web-v1` (busybox `/bin/httpd`, health `/README.md`); versioned in the same directory |
 
@@ -86,7 +86,7 @@ Current `main` does **not** claim:
 - `internal/mergelifecycle`: two recovery subtests of `TestTask3FinalClosureM02BudgetExhaustionDisposition` fail ("leased append cannot bypass an unresolved transition barrier"). So does `TestTask3FinalClosureM03PreTargetBudgetCrashRecovery`. The failures are identical at every merge back to PR #17 (`ed74fad`), whose post-merge acceptance passed at the time, so they depend on the environment rather than being a regression from any later PR.
 - `internal/actionapi` has an intermittent failure.
 - `internal/run/resume.go` is not `gofmt`-clean on `main`.
-- The pinned Ralphex governance fork (branches `abcp/governance-bundle-v1-20260922` and `abcp/governance-bundle-v2-20260928`) exists only in the integration host clone and has no remote.
+- The pinned Ralphex governance patch series is maintained in the private `pankajleh/ralphex-governance` repository, on upstream release tags. The upgrade procedure is in `deploy/local-integration/README.md`.
 
 ## Next bounded integration boundary
 
