@@ -130,6 +130,10 @@ type ExecutorPolicy struct {
 type WorktreePolicy struct {
 	Enabled bool   `json:"enabled"`
 	Branch  string `json:"branch,omitempty"`
+	// Retain keeps the governed worktree after Ralphex finishes, so activity
+	// collection and preview eligibility can continue to resolve the binding.
+	// Its removal is then owned by the controller operator, not the provider.
+	Retain bool `json:"retain,omitempty"`
 }
 
 // AcceptanceCommand is one controller-owned deterministic acceptance check.
@@ -253,6 +257,11 @@ func newAuthority(input Manifest, controller *governancev3.ControllerV1) (Author
 	}
 	if governedExecutionPolicy(manifest.PolicyVersion) {
 		if err := ralphex.VerifyGovernedExecutionCapabilityV1(manifest.Ralphex.BinaryPath, manifest.Ralphex.BinarySHA256, manifest.Ralphex.SourceSHA); err != nil {
+			return Authority{}, err
+		}
+	}
+	if manifest.Worktree.Retain {
+		if err := ralphex.VerifyWorktreeRetentionCapabilityV1(manifest.Ralphex.BinaryPath, manifest.Ralphex.BinarySHA256, manifest.Ralphex.SourceSHA); err != nil {
 			return Authority{}, err
 		}
 	}
@@ -645,6 +654,9 @@ func validateRequired(manifest Manifest) error {
 	}
 	if !manifest.Worktree.Enabled && manifest.Worktree.Branch != "" {
 		return errors.New("worktree.branch requires worktree.enabled")
+	}
+	if !manifest.Worktree.Enabled && manifest.Worktree.Retain {
+		return errors.New("worktree.retain requires worktree.enabled")
 	}
 	if manifest.Worktree.Branch != strings.TrimSpace(manifest.Worktree.Branch) || strings.HasPrefix(manifest.Worktree.Branch, "-") {
 		return errors.New("worktree.branch must be a non-option Git branch name without surrounding whitespace")

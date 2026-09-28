@@ -191,6 +191,29 @@ func TestNewRejectsUnsupportedMode(t *testing.T) {
 	}
 }
 
+func TestNewWorktreeRetentionRequiresWorktreeAndProvenCapability(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Worktree = WorktreePolicy{Retain: true}
+	if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "worktree.retain requires worktree.enabled") {
+		t.Fatalf("retention without a worktree was accepted: %v", err)
+	}
+	manifest = fixtureManifest(t)
+	manifest.Worktree.Retain = true
+	if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "GOVERNED_EXECUTION_CAPABILITY_INVALID") {
+		t.Fatalf("retention was accepted without a probed capability: %v", err)
+	}
+	probe := `{"kind":"RalphexCapabilityProbeV1","source_sha":"abcdef0123456789","max_iterations_flag":true,"session_timeout_flag":true,"idle_timeout_flag":true,"skip_finalize_flag":true,"base_ref_flag":true,"executor_model_effort_flags":true,"isolated_config":true,"governed_handoff":"LEGACY_INTERNAL_REVIEW","linux_containment":false,"internal_review_budget_v1":true,"orchestrator_subprocess_wait_v1":true,"human_session_identity_v1":true,"worktree_retention_v1":true}`
+	writeFile(t, manifest.Ralphex.BinaryPath, []byte("#!/bin/sh\nif [ \"$1\" = \"--abcp-governance-capability-v1\" ]; then printf '%s\\n' '"+probe+"'; exit 0; fi\nexit 0\n"), 0o700)
+	manifest.Ralphex.BinarySHA256 = fileHash(t, manifest.Ralphex.BinaryPath)
+	governed, err := New(manifest)
+	if err != nil {
+		t.Fatalf("retention with a proven capability was rejected: %v", err)
+	}
+	if !governed.Worktree().Retain {
+		t.Fatal("canonical authority dropped the retention policy")
+	}
+}
+
 func TestNewRequiresExplicitBranchForWorktree(t *testing.T) {
 	manifest := fixtureManifest(t)
 	manifest.Worktree.Branch = ""
