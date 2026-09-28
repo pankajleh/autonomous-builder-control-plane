@@ -801,6 +801,7 @@ func (r *Runner) invocation(configDir, executionPlanPath string) (ralphex.Invoca
 		Codex:                     executor == "codex",
 		Worktree:                  r.governed.Worktree().Enabled,
 		Branch:                    r.governed.Worktree().Branch,
+		KeepWorktree:              r.governed.Worktree().Retain,
 		TaskModel:                 policy.TaskModel,
 		TaskEffort:                policy.TaskEffort,
 		ReviewModel:               policy.ReviewModel,

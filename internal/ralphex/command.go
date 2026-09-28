@@ -41,6 +41,7 @@ type Invocation struct {
 	Codex                     bool
 	Worktree                  bool
 	Branch                    string
+	KeepWorktree              bool
 	TaskModel                 string
 	TaskEffort                string
 	ReviewModel               string
@@ -103,6 +104,7 @@ type CapabilityProbeV1 struct {
 	InternalReviewBudgetV1       bool        `json:"internal_review_budget_v1,omitempty"`
 	OrchestratorSubprocessWaitV1 bool        `json:"orchestrator_subprocess_wait_v1,omitempty"`
 	HumanSessionIdentityV1       bool        `json:"human_session_identity_v1,omitempty"`
+	WorktreeRetentionV1          bool        `json:"worktree_retention_v1,omitempty"`
 }
 
 // ExecutionStateV1 contains durable B-wide counters which process restarts do
@@ -136,6 +138,9 @@ func (i Invocation) Argv() ([]string, error) {
 	}
 	if i.Branch != "" && !i.Worktree {
 		return nil, fmt.Errorf("branch override requires worktree invocation")
+	}
+	if i.KeepWorktree && !i.Worktree {
+		return nil, fmt.Errorf("worktree retention requires worktree invocation")
 	}
 	if i.Bounds != nil {
 		if i.Capability == nil {
@@ -218,6 +223,9 @@ func (i Invocation) Argv() ([]string, error) {
 	if i.Worktree {
 		argv = append(argv, "--worktree")
 		argv = append(argv, "--branch", i.Branch)
+		if i.KeepWorktree {
+			argv = append(argv, "--keep-worktree")
+		}
 	}
 	argv = append(argv, i.PlanPath)
 	return argv, nil
@@ -310,43 +318,62 @@ func VerifyBinaryCapabilityV1(binaryPath string, expected CapabilityV1, binarySH
 // VerifyGovernedExecutionCapabilityV1 attests the bounded review/wait/identity
 // features required by ABCP product-default and Repo-C development-v2 profiles.
 func VerifyGovernedExecutionCapabilityV1(binaryPath, binarySHA256, sourceSHA string) error {
+	_, err := probeGovernedExecutionCapabilityV1(binaryPath, binarySHA256, sourceSHA)
+	return err
+}
+
+// VerifyWorktreeRetentionCapabilityV1 additionally proves that the pinned
+// binary honours --keep-worktree, so a retained worktree is never assumed of a
+// provider that would still remove it.
+func VerifyWorktreeRetentionCapabilityV1(binaryPath, binarySHA256, sourceSHA string) error {
+	probe, err := probeGovernedExecutionCapabilityV1(binaryPath, binarySHA256, sourceSHA)
+	if err != nil {
+		return err
+	}
+	if !probe.WorktreeRetentionV1 {
+		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: pinned Ralphex lacks controller-owned worktree retention")
+	}
+	return nil
+}
+
+func probeGovernedExecutionCapabilityV1(binaryPath, binarySHA256, sourceSHA string) (CapabilityProbeV1, error) {
 	file, err := os.Open(binaryPath)
 	if err != nil {
-		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: open pinned Ralphex binary: %w", err)
+		return CapabilityProbeV1{}, fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: open pinned Ralphex binary: %w", err)
 	}
 	hasher := sha256.New()
 	_, copyErr := io.Copy(hasher, io.LimitReader(file, 1<<30))
 	closeErr := file.Close()
 	if copyErr != nil || closeErr != nil || hex.EncodeToString(hasher.Sum(nil)) != binarySHA256 {
-		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: selected Ralphex binary does not match its pinned digest")
+		return CapabilityProbeV1{}, fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: selected Ralphex binary does not match its pinned digest")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, binaryPath, "--abcp-governance-capability-v1").Output()
 	if err != nil {
-		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe failed: %w", err)
+		return CapabilityProbeV1{}, fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe failed: %w", err)
 	}
 	if len(output) == 0 || len(output) > 64<<10 {
-		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe output is empty or oversized")
+		return CapabilityProbeV1{}, fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe output is empty or oversized")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	decoder.DisallowUnknownFields()
 	probe := CapabilityProbeV1{}
 	if err := decoder.Decode(&probe); err != nil {
-		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: decode capability probe: %w", err)
+		return CapabilityProbeV1{}, fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: decode capability probe: %w", err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
-		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe contains trailing JSON")
+		return CapabilityProbeV1{}, fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe contains trailing JSON")
 	}
 	canonical, err := json.Marshal(probe)
 	if err != nil || !bytes.Equal(bytes.TrimSpace(output), canonical) {
-		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe is not strict canonical JSON")
+		return CapabilityProbeV1{}, fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: capability probe is not strict canonical JSON")
 	}
 	if probe.Kind != "RalphexCapabilityProbeV1" || probe.SourceSHA != sourceSHA || !probe.MaxIterationsFlag || !probe.SessionTimeoutFlag || !probe.IdleTimeoutFlag || !probe.IsolatedConfig || !probe.InternalReviewBudgetV1 || !probe.OrchestratorSubprocessWaitV1 || !probe.HumanSessionIdentityV1 {
-		return fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: pinned Ralphex lacks required governed execution capability")
+		return CapabilityProbeV1{}, fmt.Errorf("GOVERNED_EXECUTION_CAPABILITY_INVALID: pinned Ralphex lacks required governed execution capability")
 	}
-	return nil
+	return probe, nil
 }
 
 // ValidateExecutionStateV1 enforces B-wide cumulative ceilings without reset.

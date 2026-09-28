@@ -119,18 +119,20 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 	}
 	scope, err := s.resolver.Resolve(ctx, run)
 	if err != nil {
-		// Governed execution worktrees are intentionally removed after the run
-		// reaches an authoritative terminal branch outcome. Provider detail can
-		// no longer be refreshed at that point, but that expected cleanup is not
-		// an integrity ambiguity and must not poison an otherwise clean accepted
-		// checkpoint with a controller UNKNOWN marker. Any provider warning or
-		// integrity marker observed before the terminal transition remains durable.
+		// Unless the manifest retains it (worktree.retain), the governed worktree
+		// is removed once the run reaches an authoritative terminal branch
+		// outcome. Provider detail can no longer be refreshed at that point, but
+		// that expected cleanup is not an integrity ambiguity and must not poison
+		// an otherwise clean accepted checkpoint with a controller UNKNOWN marker.
+		// Any provider warning or integrity marker observed before the terminal
+		// transition remains durable. A retained worktree keeps resolving here,
+		// so trailing provider detail is still collected after acceptance.
 		if terminalActivityState(snapshot) {
 			return Scope{}, nil
 		}
-		// The provider removes its governed worktree when it finishes, before
-		// the controller records acceptance. Once implementation has completed
-		// that removal is the same expected cleanup, not missing detail.
+		// Without retention the provider removes its governed worktree when it
+		// finishes, before the controller records acceptance. Once implementation
+		// has completed that removal is the same expected cleanup, not missing detail.
 		if errors.Is(err, errWorktreeMissing) && implementationFinished(snapshot) {
 			return Scope{}, nil
 		}
