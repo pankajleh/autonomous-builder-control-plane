@@ -217,6 +217,43 @@ func TestSilentGapCountsOnlyGrowthBeforeTheRead(t *testing.T) {
 	}
 }
 
+func TestQueuedRunWaitingForTheRepositoryIsNeverMarked(t *testing.T) {
+	// Runs of one repository build one at a time. A queued run has no worktree
+	// until it reaches implementation, however long the build ahead takes.
+	queued := []ledger.Event{
+		{EventID: "created", EventType: string(domain.StateRunCreated), Timestamp: testTime},
+		{EventID: "validated", EventType: "STATE_TRANSITION", StateFrom: domain.StateRunCreated, StateTo: domain.StateAuthorityValidated, Timestamp: testTime},
+	}
+	f := newBindingFixture(t)
+	command(t, f.repo, "worktree", "remove", "--force", f.worktree)
+	command(t, f.repo, "branch", "-D", "abcp/"+f.run)
+	registration := jsonDigest(f.catalog.runs[f.run])
+	now := testTime
+	snapshots := &fakeSnapshots{events: queued}
+	s := &Service{store: newStore(t), resolver: Resolver{f.root, f.catalog}, snapshots: snapshots, ctx: context.Background(), now: func() time.Time { return now }}
+	for _, waited := range []time.Duration{5 * time.Second, worktreeTransitionWindow, 45 * time.Minute} {
+		now = testTime.Add(waited)
+		if _, err := s.refresh(context.Background(), f.run, registration); err != nil {
+			t.Fatal(err)
+		}
+		if unknown := unknownEvents(t, s, f.run, registration); len(unknown) != 0 {
+			t.Fatalf("queued run marked after %v: %+v", waited, unknown)
+		}
+	}
+	// Once implementation has begun, a missing worktree is bounded as before.
+	snapshots.mu.Lock()
+	snapshots.events = append(snapshots.events, ledger.Event{EventID: "implementing", EventType: "STATE_TRANSITION",
+		StateFrom: domain.StateExecutionStarting, StateTo: domain.StateImplementing, Timestamp: now})
+	snapshots.mu.Unlock()
+	now = now.Add(worktreeTransitionWindow + time.Second)
+	if _, err := s.refresh(context.Background(), f.run, registration); err != nil {
+		t.Fatal(err)
+	}
+	if len(unknownEvents(t, s, f.run, registration)) != 1 {
+		t.Fatal("a worktree still missing well after implementation began was not marked")
+	}
+}
+
 func TestMissingWorktreeIsPendingOnlyAtStartup(t *testing.T) {
 	admitted := []ledger.Event{{EventID: "implementing", StateTo: domain.StateImplementing, Timestamp: testTime}}
 	for _, scenario := range []struct {

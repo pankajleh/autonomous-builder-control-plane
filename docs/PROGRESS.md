@@ -13,7 +13,7 @@ Operational role: this file projects roadmap progress and the next eligible plan
 | Phase 2 — Recovery and blocker control | COMPLETE | PR #5 merged |
 | Phase 3 — Cross-plan scheduler and integration | COMPLETE | PR #6 merge `94e14ca749d31ac214e979aab03fbde37502dd7f` |
 | Phase 4 — GitHub lifecycle | **COMPLETE** | CI Task 4 merged in PR #15; governance hardening PR #16; merge authorization Task 1/2/3 closed; exact convergence PR #17 merged as `ed74fad…`; durable post-merge acceptance/reconciliation PASS |
-| Phase 5 — Service/API and dashboard | **IN PROGRESS** | EP-006 service/API baseline retained (PR #21). Product-integration extensions merged through PR #55; live controller `109e15b` with worktree eviction and release (PRs #51 and #55 record the live proofs) (see the post-rebaseline ledger below). The customer dashboard is owned by Repo C. |
+| Phase 5 — Service/API and dashboard | **IN PROGRESS** | EP-006 service/API baseline retained (PR #21). Product-integration extensions merged through PR #56; live controller `109e15b` with worktree eviction and release (PRs #51 and #55 record the live proofs) (see the post-rebaseline ledger below). The customer dashboard is owned by Repo C. |
 | Phase 6 — Production hardening | NOT STARTED | Roadmap only |
 
 ## Phase-4 completion ledger
@@ -91,7 +91,8 @@ After the 2026-09-19 EP-006 rebaseline (PR #21), Repo B work followed concrete R
 | #52 | `928f94a` | A freshly started provider sidecar gets the bounded retry grace, so a controller restart during or just after a run no longer marks it | `docs/plans/completed/bp01-fresh-sidecar-grace.md` |
 | #53 | `7ac0cff` | Product-requested worktree release (task closed, tenant deleted) through a new `worktree.release` grant. Every eviction appears in activity as a `WORKSPACE`/`RELEASED` event. Deploy after Repo C P0059 | `docs/plans/completed/bp02-worktree-release.md` |
 | #54 | `109e15b` | A provider replay gap is marked only if the resumed read confirms it (a live-sidecar race produced a false marker at run start). Releasing a running build is refused before any worktree inspection | `docs/plans/completed/bp01-confirmed-replay-gaps.md` |
-| #55 | this PR | Live task-closure proof on `7ac0cff` with Repo C P0060. The already evicted run answered `ALREADY_RELEASED`. The fresh run `admission-6f80645d…` was `RELEASED` in 0.27 s, with 3 checkpoints pinned and a `task-closed` activity event. The two defects the proof found are fixed in #54, live as `109e15b` | `docs/CURRENT_STATE.md` |
+| #55 | `bd40083` | Live task-closure proof on `7ac0cff` with Repo C P0060. The already evicted run answered `ALREADY_RELEASED`. The fresh run `admission-6f80645d…` was `RELEASED` in 0.27 s, with 3 checkpoints pinned and a `task-closed` activity event. The two defects the proof found are fixed in #54, live as `109e15b` | `docs/CURRENT_STATE.md` |
+| #56 | this PR | A queued run is never marked for its missing worktree. Runs of one repository build one at a time, and a run waiting behind another had been marked after 30 s, which would have made its checkpoints ineligible for preview | `docs/plans/completed/bp01-queued-run-no-marker.md` |
 
 Repo C closed its PX-07 integrated journey on live Repo B `0d99f7d` (Repo C P0052, DEC-0021). BP-01/BP-02 therefore carry the Repo C PDLC Experience foundation. PR #42 was then proven live on `a5383a6` by run `admission-2b69b2cd…`:
 
