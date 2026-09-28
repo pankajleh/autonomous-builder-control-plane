@@ -79,7 +79,8 @@ After the 2026-09-19 EP-006 rebaseline (PR #21), Repo B work followed concrete R
 | #40 | `20f2319` | BP-01 sidecar resume overlap; startup worktree deferral | `docs/plans/completed/bp01-sidecar-resume-overlap.md` |
 | #41 | `0d99f7d` | BP-01 provider worktree cleanup transition | `docs/plans/completed/bp01-worktree-cleanup-transition.md` |
 | #42 | `a5383a6` | Controller-owned governed worktree retention (`worktree.retain`, Ralphex `--keep-worktree`) | `docs/plans/completed/bp02-controller-owned-worktree-retention.md` |
-| #43 | this PR | Ledger reconciliation; versioned local-integration operator configuration and drift check | `deploy/local-integration/README.md` |
+| #43 | `f364222` | Ledger reconciliation; versioned local-integration operator configuration and drift check | `deploy/local-integration/README.md` |
+| #44 | this PR | Ralphex governance patch series rebuilt on upstream release `v1.7.0` (`ralphex-v1.7.0-abcp`), source moved to private `pankajleh/ralphex-governance`, upgrade procedure. Proof run `admission-f7e2967f…`: retained worktree, 61→74 events, 0 `UNKNOWN`, preview after acceptance `READY`/`200` | `deploy/local-integration/README.md` |
 
 Repo C closed its PX-07 integrated journey on live Repo B `0d99f7d` (Repo C P0052, DEC-0021). BP-01/BP-02 therefore carry the Repo C PDLC Experience foundation. PR #42 was then proven live on `a5383a6` by run `admission-2b69b2cd…`:
 
@@ -92,7 +93,7 @@ Known issues (not regressions of this ledger's PRs):
 - `internal/mergelifecycle` has environment-dependent failures, identical back to PR #17;
 - `internal/actionapi` fails intermittently;
 - `internal/run/resume.go` is not `gofmt`-clean;
-- the Ralphex governance fork source exists only on the integration host.
+- the Ralphex governance patch series now lives in private `pankajleh/ralphex-governance` on upstream release tags (#44).
 
 ## Next authorized action
 
