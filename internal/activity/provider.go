@@ -2,6 +2,7 @@ package activity
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -331,7 +333,50 @@ func progressProof(scope Scope, selected session, previous *providerProof) (prov
 		return providerProof{}, ErrIntegrity
 	}
 	p.PrefixDigest = hex.EncodeToString(hash.Sum(nil))
+	if previous != nil && p.Size > previous.Size {
+		p.quietGrowth = pendingFrom(f, p.Size) <= previous.Size
+	}
 	return p, nil
+}
+
+// sectionLine is ralphex's progress section header (its web sectionRegex).
+var sectionLine = regexp.MustCompile(`^--- (.+) ---$`)
+
+// pendingFrom returns where the progress file's trailing bytes that owe no
+// provider event yet begin: blank lines, which ralphex skips, and at most one
+// section header, the newest, which ralphex publishes together with the first
+// line after it. Any other line owes events, as does a partial last line or a
+// tail longer than the bounded window (size is returned).
+func pendingFrom(f *os.File, size int64) int64 {
+	const window = 16 << 10
+	start := size - window
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, size-start)
+	if n, err := f.ReadAt(buf, start); n != len(buf) || err != nil && err != io.EOF {
+		return size
+	}
+	if len(buf) == 0 || buf[len(buf)-1] != '\n' {
+		return size
+	}
+	end, section := len(buf), false
+	for end > 0 {
+		lineStart := bytes.LastIndexByte(buf[:end-1], '\n') + 1
+		if lineStart == 0 && start > 0 {
+			return size
+		}
+		line := strings.TrimSuffix(string(buf[lineStart:end-1]), "\r")
+		switch {
+		case line == "":
+		case !section && sectionLine.MatchString(line):
+			section = true
+		default:
+			return start + int64(end)
+		}
+		end = lineStart
+	}
+	return start
 }
 
 type providerMessage struct {

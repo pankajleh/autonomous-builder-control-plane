@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -172,13 +173,25 @@ func TestResumeOverlapFailsClosed(t *testing.T) {
 }
 
 func TestSilentGapCountsOnlyGrowthBeforeTheRead(t *testing.T) {
+	const line = "[26-09-26 01:00:01] appended line\n"
 	for _, scenario := range []struct {
-		name    string
-		growAt  int // /api/sessions call that appends provider bytes
-		wantGap bool
+		name     string
+		growAt   int // /api/sessions call that appends provider bytes
+		appended string
+		wantGap  bool
 	}{
-		{"growth after the bounded read", 4, false},
-		{"growth before the bounded read", 3, true},
+		{"growth after the bounded read", 4, line, false},
+		{"growth before the bounded read", 3, line, true},
+		// Ralphex skips blank lines and publishes a section header with the
+		// first line after it, so neither owes an event yet.
+		{"a section header not yet published", 3, "\n--- codex iteration 2 ---\n", false},
+		{"blank lines only", 3, "\n\n", false},
+		{"CRLF section header", 3, "\r\n--- codex iteration 2 ---\r\n", false},
+		// A second header publishes the first; a line before a header is owed.
+		{"two section headers", 3, "\n--- review iteration 1 ---\n\n--- codex iteration 2 ---\n", true},
+		{"a line before a header", 3, line + "--- codex iteration 2 ---\n", true},
+		{"a partial last line", 3, "--- codex iteration 2 ---", true},
+		{"a whitespace line", 3, " \n", true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			f := newBindingFixture(t)
@@ -195,7 +208,7 @@ func TestSilentGapCountsOnlyGrowthBeforeTheRead(t *testing.T) {
 				if calls == scenario.growAt {
 					file, err := os.OpenFile(progress, os.O_APPEND|os.O_WRONLY, 0)
 					if err == nil {
-						file.WriteString("[26-09-26 01:00:01] appended line\n")
+						file.WriteString(scenario.appended)
 						file.Close()
 					}
 				}
@@ -292,5 +305,91 @@ func TestMissingWorktreeIsPendingOnlyAtStartup(t *testing.T) {
 				t.Fatalf("pending = %v with markers %+v, want %v", pending, unknown, scenario.wantPending)
 			}
 		})
+	}
+}
+
+func TestPendingFromReadsOnlyABoundedTail(t *testing.T) {
+	write := func(content string) (*os.File, int64) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "progress.txt")
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		return f, int64(len(content))
+	}
+	owed := "[26-09-26 01:00:00] owed\n"
+	for _, c := range []struct {
+		name, content string
+		want          int64
+	}{
+		{"a header after a line", owed + "\n--- codex iteration 2 ---\n\n", int64(len(owed))},
+		{"only the newest header is pending", owed + "--- a ---\n--- b ---\n", int64(len(owed) + len("--- a ---\n"))},
+		{"a file of blanks and one header", "\n--- a ---\n", 0},
+		{"a line owes itself", owed, int64(len(owed))},
+		{"a partial line", owed + "--- a ---", int64(len(owed + "--- a ---"))},
+		{"an empty file", "", 0},
+		// Past the window the start of the pending stretch is unknown: all is owed.
+		{"blanks beyond the window", owed + strings.Repeat("\n", 20<<10), int64(len(owed) + 20<<10)},
+	} {
+		f, size := write(c.content)
+		if got := pendingFrom(f, size); got != c.want {
+			t.Errorf("%s: pendingFrom = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestOnlyARunsFirstBatchMayStartAtEventZero(t *testing.T) {
+	f := newBindingFixture(t)
+	selected := providerSession(t, f)
+	s := &Service{store: newStore(t), resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return testTime }}
+	registration := jsonDigest(f.catalog.runs[f.run])
+	var ids []uint64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/sessions" {
+			json.NewEncoder(w).Encode([]session{selected})
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, id := range ids {
+			payload, _ := json.Marshal(ProviderEvent{Type: "output", Phase: "task", Timestamp: stamp(testTime), Text: "line " + strconv.FormatUint(id, 10)})
+			fmt.Fprintf(w, "id: %d\ndata: %s\n\n", id, payload)
+		}
+	}))
+	defer server.Close()
+	sc := testSidecar(server)
+	// A collector connected before ralphex published anything receives event 0 live.
+	ids = []uint64{0, 1, 2}
+	last := uint64(math.MaxUint64)
+	if err := s.collectBatch(f.scope, registration, sc, &last); err != nil || last != 2 {
+		t.Fatal("first batch", err, last)
+	}
+	events, _, _, _ := s.store.read(f.run, registration, 0, 100)
+	if len(events) != 3 || len(unknownEvents(t, s, f.run, registration)) != 0 {
+		t.Fatalf("event 0 of a run's first batch was not accepted: %+v", events)
+	}
+	// Once progress is proven, a restart from nothing must begin at 1 as before:
+	// a 0 there is a first sighting of a gap and is not recorded.
+	g := newBindingFixture(t)
+	other := providerSession(t, g)
+	selected = other
+	t2 := &Service{store: newStore(t), resolver: Resolver{g.root, g.catalog}, ctx: context.Background(), now: func() time.Time { return testTime }}
+	registration = jsonDigest(g.catalog.runs[g.run])
+	ids = []uint64{1, 2}
+	last = math.MaxUint64
+	if err := t2.collectBatch(g.scope, registration, sc, &last); err != nil || last != 2 {
+		t.Fatal("proven batch", err, last)
+	}
+	ids = []uint64{0, 1, 2, 3}
+	last = math.MaxUint64
+	if err := t2.collectBatch(g.scope, registration, sc, &last); err != nil {
+		t.Fatal(err)
+	}
+	if last != math.MaxUint64 || len(unknownEvents(t, t2, g.run, registration)) != 0 {
+		t.Fatal("a later batch starting at 0 was accepted", last)
 	}
 }
