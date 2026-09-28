@@ -104,10 +104,19 @@ func (s *Service) registration(run string) (string, error) {
 	}
 	return jsonDigest(reg), nil
 }
+
+// appendUnknown records a controller marker. A stopping service records none:
+// shutdown interrupts provider reads and git checks, which is not missing
+// detail, and the next process resumes from the durable provider proof.
 func (s *Service) appendUnknown(run, registration, key, title string) error {
+	if s.stopping() {
+		return context.Canceled
+	}
 	_, err := s.store.Append(run, registration, unknown(run, key, title, s.now()))
 	return err
 }
+
+func (s *Service) stopping() bool { return s.ctx != nil && s.ctx.Err() != nil }
 
 func (s *Service) refresh(ctx context.Context, run, registration string) (Scope, error) {
 	snapshot, err := s.snapshots.Snapshot(ctx, run)
@@ -150,6 +159,11 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 		}
 		if s.worktreePending(run, registration, snapshot, err) {
 			return Scope{}, nil
+		}
+		// A cancelled request or a stopping service interrupted the binding
+		// check; that is not an unresolved binding.
+		if ctx.Err() != nil || s.stopping() {
+			return Scope{}, context.Canceled
 		}
 		s.diagnose(run, "binding-unavailable", err)
 		if err = s.appendUnknown(run, registration, "binding-unavailable", "Implementation detail unavailable"); err != nil {
@@ -488,6 +502,9 @@ func (s *Service) collect(run, registration string, w *worker) {
 				shared, key = s.acquireSidecar(scope)
 			}
 			if shared.err != nil {
+				if s.stopping() {
+					return
+				}
 				s.diagnose(run, "sidecar-unavailable", shared.err)
 				if s.appendUnknown(run, registration, "sidecar-unavailable", "Implementation detail unavailable") != nil {
 					return
@@ -496,6 +513,10 @@ func (s *Service) collect(run, registration string, w *worker) {
 				shared = nil
 			} else {
 				err = s.collectBatch(scope, registration, shared.sc, &last)
+				if err != nil && s.stopping() {
+					// Shutdown stops the sidecar and cancels in-flight reads.
+					return
+				}
 				if errors.Is(err, errWorktreeMissing) {
 					// Refresh classifies an absent worktree on its next pass.
 				} else if errors.Is(err, ErrIntegrity) {

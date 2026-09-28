@@ -155,3 +155,37 @@ func TestCheckpointsRecordTheFinalHeadBeforeEviction(t *testing.T) {
 		t.Fatal("collecting checkpoints for eviction counted as use of the run")
 	}
 }
+
+func TestShutdownOrCancelledReadRecordsNoMarker(t *testing.T) {
+	f := newBindingFixture(t)
+	command(t, f.repo, "worktree", "remove", "--force", f.worktree)
+	now := testTime.Add(time.Hour)
+	s, registration := worktreeService(t, f, &now, domain.StateImplementing)
+	if refreshMarkers(t, s, f.run, registration) != 0 {
+		t.Fatal("first observation of an absent worktree was marked")
+	}
+	now = now.Add(worktreeTransitionWindow + time.Second)
+	// Past the window this absence is a real gap, but a cancelled request
+	// interrupted the check and must not record it.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.refresh(cancelled, f.run, registration); !errors.Is(err, context.Canceled) {
+		t.Fatal("cancelled refresh", err)
+	}
+	stopping, stop := context.WithCancel(context.Background())
+	s.ctx = stopping
+	stop()
+	if _, err := s.refresh(context.Background(), f.run, registration); !errors.Is(err, context.Canceled) {
+		t.Fatal("refresh while stopping", err)
+	}
+	if err := s.appendUnknown(f.run, registration, "provider-unavailable", "Implementation detail unavailable"); !errors.Is(err, context.Canceled) {
+		t.Fatal("a stopping service recorded a provider marker", err)
+	}
+	if unknown := unknownEvents(t, s, f.run, registration); len(unknown) != 0 {
+		t.Fatal("shutdown or cancellation recorded a marker", unknown)
+	}
+	s.ctx = context.Background()
+	if refreshMarkers(t, s, f.run, registration) != 1 {
+		t.Fatal("a real gap after the window was not marked")
+	}
+}

@@ -13,7 +13,7 @@ Operational role: this file projects roadmap progress and the next eligible plan
 | Phase 2 — Recovery and blocker control | COMPLETE | PR #5 merged |
 | Phase 3 — Cross-plan scheduler and integration | COMPLETE | PR #6 merge `94e14ca749d31ac214e979aab03fbde37502dd7f` |
 | Phase 4 — GitHub lifecycle | **COMPLETE** | CI Task 4 merged in PR #15; governance hardening PR #16; merge authorization Task 1/2/3 closed; exact convergence PR #17 merged as `ed74fad…`; durable post-merge acceptance/reconciliation PASS |
-| Phase 5 — Service/API and dashboard | **IN PROGRESS** | EP-006 service/API baseline retained (PR #21). Product-integration extensions merged through PR #49 (eviction idle counts only live streams) (see the post-rebaseline ledger below). The customer dashboard is owned by Repo C. |
+| Phase 5 — Service/API and dashboard | **IN PROGRESS** | EP-006 service/API baseline retained (PR #21). Product-integration extensions merged through PR #50 (no activity marker on shutdown) (see the post-rebaseline ledger below). The customer dashboard is owned by Repo C. |
 | Phase 6 — Production hardening | NOT STARTED | Roadmap only |
 
 ## Phase-4 completion ledger
@@ -85,7 +85,8 @@ After the 2026-09-19 EP-006 rebaseline (PR #21), Repo B work followed concrete R
 | #46 | `7ae1a5f` | Controller-owned worktree eviction: 24 h idle, 7 days max age, 5 GiB per repository. Checkpoints are pinned and the eviction record is sealed before removal, so preview and activity survive eviction | `docs/plans/completed/bp02-worktree-eviction.md` |
 | #47 | `bef3cd5` | A finished run with a retained worktree reads provider detail for 15 minutes only, so a restarted sidecar can no longer add a false `UNKNOWN` marker | `docs/plans/completed/bp01-bounded-trailing-detail.md` |
 | #48 | `880d9c6` | Eviction sweep summary: each sweep logs how many retained worktrees it kept, and why (unfinished run, streaming client or live preview) | `docs/plans/completed/bp02-worktree-eviction.md` |
-| #49 | this PR | The idle rule counts only live activity streams as use. Repo C's 10-second notification poller had kept every run's worktree until the maximum age | `docs/plans/completed/bp02-worktree-eviction.md` |
+| #49 | `b187536` | The idle rule counts only live activity streams as use. Repo C's 10-second notification poller had kept every run's worktree until the maximum age | `docs/plans/completed/bp02-worktree-eviction.md` |
+| #50 | this PR | A stopping controller or a cancelled read no longer records a false `UNKNOWN` marker. Before this, a restart during collection marked both proof runs | `docs/plans/completed/bp01-no-marker-on-shutdown.md` |
 
 Repo C closed its PX-07 integrated journey on live Repo B `0d99f7d` (Repo C P0052, DEC-0021). BP-01/BP-02 therefore carry the Repo C PDLC Experience foundation. PR #42 was then proven live on `a5383a6` by run `admission-2b69b2cd…`:
 
