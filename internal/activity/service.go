@@ -745,8 +745,12 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 	// A grown progress source with no resumable events does not prove
 	// continuity. Retry its available replay and make the uncertainty explicit.
 	// Only growth observed before this read counts: bytes appended after the
-	// bounded read ended are delivered by the next batch, not missing.
-	if len(fresh) == 0 && previous != nil && before.Size > previous.Size {
+	// bounded read ended are delivered by the next batch, not missing. Growth
+	// that is only blank lines and the newest section header is not owed yet:
+	// ralphex skips blank lines and publishes a section with the first line
+	// after it (a Claude Code build's review hand-off to Codex waits seconds
+	// for that line).
+	if len(fresh) == 0 && previous != nil && before.Size > previous.Size && !before.quietGrowth {
 		s.diagnose(scope.RunID, "provider-silent-gap", nil)
 		if err = s.appendUnknown(scope.RunID, registration, identity("silent-gap", proof.Generation, proof.PrefixDigest), "Implementation detail replay gap"); err != nil {
 			return err
@@ -763,6 +767,12 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 			// Preview Runtime. Preserve gap detection while honoring the provider's
 			// documented first-event identity.
 			expected = 1
+			// The replayer numbers from 0 but replays after "0", so event 0 reaches
+			// only a reader connected before it was published: a run's first batch,
+			// before any progress was proven, may start there.
+			if previous == nil && message.id == 0 {
+				expected = 0
+			}
 		}
 		if message.id != expected {
 			gapKey := identity("gap", proof.Generation, strconv.FormatUint(*last, 10), strconv.FormatUint(message.id, 10))

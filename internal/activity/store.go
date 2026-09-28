@@ -41,6 +41,11 @@ type providerProof struct {
 	FileIdentity string `json:"file_identity"`
 	Size         int64  `json:"size"`
 	PrefixDigest string `json:"prefix_digest"`
+	// quietGrowth (never persisted) is true when every byte appended since the
+	// previous proof lies in the file's trailing stretch that owes no provider
+	// event yet (pendingFrom in provider.go). False, the default, keeps the
+	// silent-gap check.
+	quietGrowth bool
 }
 
 // The separately committed anchor detects complete-record truncation as well
