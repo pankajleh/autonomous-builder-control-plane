@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/readmodel"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
@@ -230,6 +231,12 @@ func (s *Service) worktreePending(run, registration string, snapshot readmodel.S
 	if !errors.Is(err, errWorktreeMissing) {
 		return false
 	}
+	// A run that has not begun implementing has no governed worktree yet. It
+	// holds no repository execution lease while another run of the same
+	// repository builds, and may wait for as long as that build takes.
+	if !executionStarted(snapshot) {
+		return true
+	}
 	proof, proofErr := s.store.proof(run, registration)
 	if proofErr != nil {
 		return false
@@ -267,6 +274,19 @@ func (s *Service) worktreePresent(run string) {
 	s.mu.Lock()
 	delete(s.worktreeMissing, run)
 	s.mu.Unlock()
+}
+
+// executionStarted reports whether the run has reached implementation, the
+// first state in which its provider has created the governed worktree.
+func executionStarted(snapshot readmodel.Snapshot) bool {
+	for _, fact := range snapshot.Events {
+		switch fact.StateTo {
+		case "", domain.StateRunCreated, domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateCapacityWait:
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func implementationFinished(snapshot readmodel.Snapshot) bool {
