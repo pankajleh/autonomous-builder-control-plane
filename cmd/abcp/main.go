@@ -608,7 +608,7 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		actionJournal, err = actioncontrol.Open(*serviceRoot)
 		if err != nil {
-			fmt.Fprintln(stderr, "open service action journal safely")
+			fmt.Fprintf(stderr, "open service action journal safely: %v\n", err)
 			return 1
 		}
 		defer actionJournal.Close()
@@ -848,7 +848,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	}
 	journal, err := actioncontrol.Open(*serviceRoot)
 	if err != nil {
-		fmt.Fprintln(stderr, "open service action journal safely")
+		fmt.Fprintf(stderr, "open service action journal safely: %v\n", err)
 		return 1
 	}
 	defer journal.Close()

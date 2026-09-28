@@ -53,7 +53,8 @@ Operational role: this file indexes accepted, reviewed, merged, and durable evid
 | Confirmed replay gaps; running-build release refusal | #54 | `6d5c7304156a93f2d6f2834cbcbf0e26b0330eb9` | `109e15b45ae1f75316f3b3ba75b93e6ae6a6d128` | `docs/plans/completed/bp01-confirmed-replay-gaps.md` |
 | Task-closure live proof | #55 | `96a326205ce8f2e885bf84e42b6eb553a1b40e23` | `bd4008332162e4bf0e047598745df9226ff463e3` | `docs/CURRENT_STATE.md`; runs `admission-3ce5345c…` (`ALREADY_RELEASED`) and `admission-6f80645d…` (`RELEASED`) |
 | Queued run never marked | #56 | `190e7b39d5fe1ae7b2e15987c123511140b03936` | `2bd85f7c308f7a37546e68037c76855977b03a24` | `docs/plans/completed/bp01-queued-run-no-marker.md` |
-| Servable-app product acceptance; hour-long previews | #57 | this PR | this PR | `docs/plans/completed/bp02-product-acceptance-servable-app.md` |
+| Servable-app product acceptance; hour-long previews | #57 | `a778e803ee49c33a043e269171e104c300ec61a9` | `fff4c12cded86c10ee4396310a9a65bacb7addb3` | `docs/plans/completed/bp02-product-acceptance-servable-app.md` |
+| Request-index shard authority off the service root | #58 | this PR | this PR | `docs/plans/completed/bp01-journal-shard-authority-capacity.md` |
 
 EP-005 foundation merged earlier in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 
