@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "profile_id": "local-p02",
+      "repository_path": "/home/devagent/local-integration/repo-c-abcp/runtime/product-repo",
+      "repository_identity": "example/product",
+      "manifest_template_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/manifest-template.json",
+      "input_directory": ".abcp-input",
+      "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
+      "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
+      "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+    },
+    {
+      "profile_id": "repo-c-development-v1",
+      "repository_path": "/home/devagent/local-integration/repo-c-abcp/runtime/development-repo",
+      "repository_identity": "pankajleh/autonomous-development-platform",
+      "manifest_template_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/manifest-template-development.json",
+      "input_directory": ".abcp-input",
+      "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/development-ledger",
+      "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/development-evidence",
+      "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+    }
+  ]
+}

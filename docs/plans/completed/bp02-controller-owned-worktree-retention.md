@@ -67,5 +67,5 @@ New tests:
 ## Cutover
 
 1. Merge this change, then build and cut over `abcp` from the merge SHA with no executing run.
-2. In each manifest template, pin `ralphex-governance-v2` (binary path, SHA-256 and source SHA) and set `"worktree": {"enabled": true, "retain": true}`. The operator config versioning note covers where these templates are kept.
+2. In each manifest template, pin `ralphex-governance-v2` (binary path, SHA-256 and source SHA) and set `"worktree": {"enabled": true, "retain": true}`. The templates are versioned in `deploy/local-integration/abcp-config/`; `tools/operator/check_local_integration_config.py` checks the host copy for drift.
 3. Restart `abcp serve` so admission profiles reload, then run one governed run. The run should show three things: the worktree is retained after `BRANCH_ACCEPTED`, trailing provider detail is collected, and a preview can be created after acceptance.

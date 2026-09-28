@@ -1,6 +1,6 @@
 # Implementation Progress
 
-Updated: 2026-09-13
+Updated: 2026-09-28
 
 Operational role: this file projects roadmap progress and the next eligible planning boundary. Immutable controller, review, Git, and durable evidence remain authoritative.
 
@@ -13,7 +13,7 @@ Operational role: this file projects roadmap progress and the next eligible plan
 | Phase 2 — Recovery and blocker control | COMPLETE | PR #5 merged |
 | Phase 3 — Cross-plan scheduler and integration | COMPLETE | PR #6 merge `94e14ca749d31ac214e979aab03fbde37502dd7f` |
 | Phase 4 — GitHub lifecycle | **COMPLETE** | CI Task 4 merged in PR #15; governance hardening PR #16; merge authorization Task 1/2/3 closed; exact convergence PR #17 merged as `ed74fad…`; durable post-merge acceptance/reconciliation PASS |
-| Phase 5 — Service/API and dashboard | NOT STARTED | Next roadmap phase; design/authority required before implementation |
+| Phase 5 — Service/API and dashboard | **IN PROGRESS** | EP-006 service/API baseline retained (PR #21). Product-integration extensions merged through PR #43 and live at `a5383a6` (see the post-rebaseline ledger below). The customer dashboard is owned by Repo C. |
 | Phase 6 — Production hardening | NOT STARTED | Roadmap only |
 
 ## Phase-4 completion ledger
@@ -53,6 +53,47 @@ Durability identities: manifest `ba742fb2ed92eeb03094b34e7f128bb0c46881abbe9300f
 
 Supported production merge execution is the controller-authorized same-repository-head `merge` path bound to exact base/head authority and the frozen atomic base-update plus head-no-op-CAS provider contract. Squash/rebase and fork-head merge execution remain unsupported. CI evidence remains neutral/read-only; `STABLE` is not a merge-approval verdict.
 
+## Post-rebaseline product-integration ledger (Phase 5)
+
+After the 2026-09-19 EP-006 rebaseline (PR #21), Repo B work followed concrete Repo C product-integration needs. Exact head and merge identities are in `docs/AUDIT_INDEX.md`.
+
+| PR | Merge | Scope | Evidence |
+|---|---|---|---|
+| #22 | `3d6a841` | ABCP-RC-P01 product run admission | `docs/execution-packs/ABCP-RC-P01/` |
+| #23, #24 | `f39eeb7`, `ff22028` | P01 current-state and audit projections | this file's history |
+| #25 | `12e292a` | Controller-owned Ralphex execution profile (ABCP-RALPHEX-P01) | `docs/execution-packs/ABCP-RALPHEX-P01/evidence.md`, `docs/architecture/RALPHEX_ADAPTER_CONTRACT.md` |
+| #26 | `baf1b37` | G0 governed development-run admission | `docs/execution-packs/G0-DEVELOPMENT-TOOLING-CUTOVER/` |
+| #27 | `5ae6fa6` | Governed product defaults and bounded Ralphex validation | PR #27 |
+| #28 | `fd1a17b` | Runtime catalog run-authority xattr relocation | PR #28 |
+| #29 | — | closed without merge (branch-accepted terminal report) | — |
+| #30 | `fec0c08` | Reject acceptance commands that cannot fail | PR #30 |
+| #31 | `6fc11cd` | Human-decision pause and resume after a proceed decision | PR #31 |
+| #32 | `935114d` | Preserve full admission run identity (BP-01 prerequisite) | PR #32 |
+| #33 | `f21174d` | BP-01 provider-neutral activity capability | `docs/plans/completed/bp-01-provider-neutral-activity.md` |
+| #34 | `ad8d19a` | BP-02 governed preview runtime | `docs/plans/completed/bp-02-governed-preview-runtime.md` |
+| #35 | `5cd8ee5` | BP-02 Docker 29 bind propagation correction | `docs/plans/completed/bp-02-docker29-bind-propagation-correction.md` |
+| #36 | `d510f0c` | PX-07 prerequisite: bounded preview route resolution | `docs/plans/completed/px07-preview-route-resolution.md` |
+| #37 | `34dec9e` | BP-01 activity replay continuity | `docs/plans/completed/bp01-activity-replay-continuity-correction.md` |
+| #38 | `dfc3b93` | BP-01 provider replay semantics | `docs/plans/completed/bp01-provider-replay-semantic-correction.md` |
+| #39 | `fd39b1a` | BP-01 step-named marker diagnostics | `docs/plans/completed/bp01-activity-marker-diagnostics.md` |
+| #40 | `20f2319` | BP-01 sidecar resume overlap; startup worktree deferral | `docs/plans/completed/bp01-sidecar-resume-overlap.md` |
+| #41 | `0d99f7d` | BP-01 provider worktree cleanup transition | `docs/plans/completed/bp01-worktree-cleanup-transition.md` |
+| #42 | `a5383a6` | Controller-owned governed worktree retention (`worktree.retain`, Ralphex `--keep-worktree`) | `docs/plans/completed/bp02-controller-owned-worktree-retention.md` |
+| #43 | this PR | Ledger reconciliation; versioned local-integration operator configuration and drift check | `deploy/local-integration/README.md` |
+
+Repo C closed its PX-07 integrated journey on live Repo B `0d99f7d` (Repo C P0052, DEC-0021). BP-01/BP-02 therefore carry the Repo C PDLC Experience foundation. PR #42 was then proven live on `a5383a6` by run `admission-2b69b2cd…`:
+
+- the worktree was retained after acceptance;
+- 7 trailing provider events, including "Review completed", were collected after acceptance, with 0 `UNKNOWN` markers;
+- a preview created after acceptance served the exact checkpoint.
+
+Known issues (not regressions of this ledger's PRs):
+
+- `internal/mergelifecycle` has environment-dependent failures, identical back to PR #17;
+- `internal/actionapi` fails intermittently;
+- `internal/run/resume.go` is not `gofmt`-clean;
+- the Ralphex governance fork source exists only on the integration host.
+
 ## Next authorized action
 
-Begin **Phase 5 — Service/API and dashboard** at design/authority, not implementation-by-default. Phase-5 deliverables are the event-stream/run-actions API, read-model projections, run/task/attempt/session timeline, evidence links, blocker/decision UI, and current/historical run views without session overwrites. No EP-005 authority may be carried forward as Phase-5 implementation authority.
+Phase 5 continues only where Repo C needs a capability. The first candidate is persistent checkpoint state (pinned refs, a sealed binding and eligibility from sealed state), which enables controller-owned worktree pruning. It needs a frozen design before implementation. No EP-005 authority may be carried forward as Phase-5 implementation authority.

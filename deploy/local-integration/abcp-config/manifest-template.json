@@ -1,0 +1,56 @@
+{
+  "repository": {
+    "remotes": {
+      "origin": "https://example.test/example/product.git"
+    },
+    "default_branch": "main"
+  },
+  "ralphex": {
+    "binary_path": "/home/devagent/ralphex-behavior-lab/tools/ralphex/.bin/ralphex-governance-v2",
+    "binary_sha256": "54300a18cb9a5ae5dc295f0f2b7f2e9441165e6b0aa56b4be52b18c225de94bc",
+    "source_sha": "055dfbdb4d92120a8249ae58923d7608d583e82f",
+    "mode": "full",
+    "timeout": "6h",
+    "wait_on_limit": "0s",
+    "max_iterations": 12,
+    "session_timeout": "90m",
+    "idle_timeout": "30m",
+    "max_internal_review_passes": 2,
+    "long_running_subprocess_mode": "orchestrator",
+    "validation": [
+      {
+        "id": "product-sandbox-smoke",
+        "argv": [
+          "/usr/bin/bash",
+          "-lc",
+          "set -euo pipefail; git diff --check; echo 'PRODUCT_SANDBOX_SMOKE_OK'"
+        ],
+        "timeout": "10m",
+        "expected_duration": "1m",
+        "stall_timeout": "5m"
+      }
+    ]
+  },
+  "executor": {
+    "executor": "codex",
+    "task_effort": "xhigh",
+    "review_effort": "xhigh"
+  },
+  "worktree": {
+    "enabled": true,
+    "retain": true
+  },
+  "acceptance": [
+    {
+      "name": "product-verification",
+      "required": true,
+      "timeout": "20m",
+      "argv": [
+        "/usr/bin/bash",
+        "-lc",
+        "set -euo pipefail; base=\"${ABCP_REPOSITORY_BASE_SHA}\"; test -n \"$base\"; git rev-parse --verify \"$base^{commit}\" >/dev/null; test -n \"$(git diff --name-only \"$base\" HEAD --)\"; git diff --check \"$base\" HEAD --; marker='P1-CLOSURE-VERIFICATION-OK'; found=0; for f in $(git diff --name-only \"$base\" HEAD --); do   if [ -f \"$f\" ] && grep -qxF \"$marker\" \"$f\"; then found=1; fi; done; if [ \"$found\" -ne 1 ]; then   echo 'ACCEPTANCE_FAILED: no changed file contains the required marker line' >&2; exit 1; fi; echo 'ACCEPTANCE_OK: candidate changes at least one file and contains the marker'"
+      ]
+    }
+  ],
+  "policy_version": "abcp-product-default-v1"
+}

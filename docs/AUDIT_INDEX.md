@@ -19,6 +19,27 @@ Operational role: this file indexes accepted, reviewed, merged, and durable evid
 | EP-005 merge lifecycle convergence | #17 | `8dd860286590044888052f2f53e856c3c8c1f1cb` | `ed74fad66b9dd564ac09dcedc1274b8fefffb983` | deterministic acceptance PASS; independent convergence `CLOSURE_CLEAN`, 0C/0M; post-merge acceptance/reconciliation PASS |
 | EP-006 rebaseline after assurance removal | #21 | `4040744d9db924ce4e174f7281fdc9f58db7818f` | `821e0476600c9299652b88a016c24ba471bf8a6b` | retained EP-006 tree restored as current platform baseline; post-EP-006 assurance expansion removed |
 | Repo C product run admission (ABCP-RC-P01) | #22 | `f1ae22fc3132513bbe5c411058e506676d9fb069` | `3d6a841e722c9c67c83d835a52178b09ca16776d` | final tested executable `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7`; required focused/broad/race/vet/cross-platform gates PASS; exactly two Ralphex review passes; bounded product admission integrated |
+| P01 current-state and audit projection | #23 | `c2d235a07215a80b0fe5c8fd66acd55490b64728` | `f39eeb7d313a1deac630a0d51c2ebdd9c8415150` | documentation only |
+| P01 projection merge-stability follow-up | #24 | `055b54e72351ec31010884b5ab4b4df2767eae4d` | `ff2202884cad24ac1b4ced70c8100d0ebc392827` | documentation only |
+| Controller-owned Ralphex execution profile (ABCP-RALPHEX-P01) | #25 | `bfd18fcea5d58351abd15728dd98066bfc266813` | `12e292afb93fd201485cedc734397c006140c202` | `docs/execution-packs/ABCP-RALPHEX-P01/evidence.md` |
+| G0 governed development-run admission | #26 | `c023870bb02b5305352e884ebc339a84b3b3a895` | `baf1b37f565d1054c1c96fcc3d46ed386c5a0d5c` | `docs/execution-packs/G0-DEVELOPMENT-TOOLING-CUTOVER/` |
+| Product defaults and bounded Ralphex validation | #27 | `2e1a20a9ca157879c28849963252736876045f28` | `5ae6fa6c8d06431a998cd4be08b4939b6972e838` | PR #27 |
+| Runtime catalog run-authority xattr relocation | #28 | `59d538febf0c7ad1789974fc71087304539510de` | `fd1a17bb80a66a73fc373d31e5790112c07b39fc` | PR #28 |
+| Branch-accepted terminal report (F-1) | #29 | `4eab423f9bb051933511307e69ca64ec3586c2fb` | not merged | closed without merge |
+| Reject acceptance commands that cannot fail | #30 | `cd99895d037fcda9833e7fe33d20b66e6dab1a2c` | `fec0c088337553a74e5d7423db41a400e96b2a42` | PR #30 |
+| Human-decision pause and resume loop | #31 | `1f48b1a7df8ea492a22906c42f76cb0d673f7356` | `6fc11cd96959869802be37dc03724d2b7f747d13` | PR #31; `retry`/`resume`/`recovery` capability flags remain false |
+| Full admission run identity | #32 | `69b6261dbf7af7764a953fd63c94398eeab88ff8` | `935114d21cdd79cf444bdea89c6052e27309a5bf` | PR #32 |
+| BP-01 provider-neutral activity | #33 | `cf04357d842174a1db877230edc2873be0e72d42` | `f21174dbaf47f4e71185f58dff5a338d0befa861` | `docs/plans/completed/bp-01-provider-neutral-activity.md` |
+| BP-02 governed preview runtime | #34 | `1705eba52346760edb58f5ba380fcf94d483d7f6` | `ad8d19ad1fcefb775a9c4ae6457bab772ccc96a9` | `docs/plans/completed/bp-02-governed-preview-runtime.md` |
+| BP-02 Docker 29 bind propagation | #35 | `3c4cd6eaec6798fb60aa575dfe642fb2df275cf1` | `5cd8ee5d3cc60370f9e607e2fda267eec514eee2` | `docs/plans/completed/bp-02-docker29-bind-propagation-correction.md` |
+| PX-07 preview route resolution | #36 | `b2b57c565c68dbd85a522a2b273897e4fa427363` | `d510f0c743bed33cdf2a53ffe9b46604ac85c31a` | `docs/plans/completed/px07-preview-route-resolution.md` |
+| BP-01 activity replay continuity | #37 | `b8c3a13572260a62699087d0db65dfb85bae34de` | `34dec9ee8d725304c0c56aa7c53118113759711c` | `docs/plans/completed/bp01-activity-replay-continuity-correction.md` |
+| BP-01 provider replay semantics | #38 | `d573ab93430f48e403b5b0429d8e66fa057f147d` | `dfc3b93858b157c93cd074d5a1abf521e50c62cf` | `docs/plans/completed/bp01-provider-replay-semantic-correction.md` |
+| BP-01 marker diagnostics | #39 | `bf96b34d4a8c1ecf5e10e7720c395b8d99adfc85` | `fd39b1a32e0f741e35d48013cf7a337aa7628e17` | `docs/plans/completed/bp01-activity-marker-diagnostics.md` |
+| BP-01 sidecar resume overlap | #40 | `60efc66c7f704726a7ec527e5f4d6ad461eea901` | `20f2319d9291252e2c641971235faac1405d1bec` | `docs/plans/completed/bp01-sidecar-resume-overlap.md` |
+| BP-01 worktree cleanup transition | #41 | `512725720f6ffd400dc676c995a4406ce2097b8a` | `0d99f7d340cec40336728c6c59dcb66a41d2a77c` | `docs/plans/completed/bp01-worktree-cleanup-transition.md`; Repo C PX-07 closure ran on this merge |
+| Controller-owned worktree retention | #42 | `a5ee44ae30fc98a5676695347a6694fb8a82ba47` | `a5383a672f99b68413cb946a6d93f89116a2769b` | `docs/plans/completed/bp02-controller-owned-worktree-retention.md`; live proof run `admission-2b69b2cd…` |
+| Ledger reconciliation and versioned operator configuration | #43 | this PR | this PR | `deploy/local-integration/README.md` |
 
 EP-005 foundation merged earlier in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 
@@ -77,8 +98,10 @@ PR #22 published exact head `f1ae22fc3132513bbe5c411058e506676d9fb069` and merge
 
 ## Current cutoff and non-claims
 
-The current legally recordable source cutoff is Repo B `main@3d6a841e722c9c67c83d835a52178b09ca16776d`: retained EP-006 plus bounded product run admission.
+The current recordable source cutoff is Repo B `main@a5383a672f99b68413cb946a6d93f89116a2769b` (PR #42) plus the documentation and operator-configuration PR #43. It covers retained EP-006, bounded product and development admission, the Ralphex execution profile, human-decision pause/resume, BP-01 activity, BP-02 preview runtime and controller-owned worktree retention. That same executable is live on the local-integration host.
 
-This cutoff does not claim Repo C UI completion, general retry/resume/recovery, human-decision continuation, provider redesign, live deployment/AWS mutation, or restoration of the discarded post-EP-006 assurance framework.
+This cutoff does not claim general retry/recovery or the advertised `retry`/`resume`/`recovery` capabilities. Nor does it claim persistent checkpoint state independent of the worktree, provider redesign, live production/AWS deployment, or restoration of the discarded post-EP-006 assurance framework.
+
+Earlier entries (PRs #23–#41) were recorded retrospectively on 2026-09-28; they merged without updating these projections.
 
 Further Repo B work requires fresh bounded authority from a concrete product integration need; review/discovery alone is not authority to expand scope.

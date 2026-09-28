@@ -1,0 +1,61 @@
+{
+  "repository": {
+    "remotes": {
+      "origin": "https://github.com/pankajleh/autonomous-development-platform.git"
+    },
+    "default_branch": "main"
+  },
+  "ralphex": {
+    "binary_path": "/home/devagent/ralphex-behavior-lab/tools/ralphex/.bin/ralphex-governance-v2",
+    "binary_sha256": "54300a18cb9a5ae5dc295f0f2b7f2e9441165e6b0aa56b4be52b18c225de94bc",
+    "source_sha": "055dfbdb4d92120a8249ae58923d7608d583e82f",
+    "mode": "full",
+    "timeout": "180m",
+    "wait_on_limit": "0s",
+    "max_iterations": 8,
+    "session_timeout": "120m",
+    "idle_timeout": "15m",
+    "max_internal_review_passes": 2,
+    "long_running_subprocess_mode": "orchestrator",
+    "validation": [
+      {
+        "id": "repo-c-focused-validation",
+        "argv": [
+          "/usr/bin/bash",
+          "-lc",
+          "base=\"$1\"; class=$(bash tools/development/classify_abcp_candidate.sh \"$base\"); case \"$class\" in web-only|cross-stack) export COREPACK_HOME=/home/devagent/.cache/node/corepack; pnpm install --offline --frozen-lockfile --store-dir /home/devagent/.local/share/pnpm/store/v10 ;; esac; exec /usr/bin/bash tools/development/validate_abcp_candidate.sh \"$base\"",
+          "abcp-validation",
+          "{{repository_base_sha}}"
+        ],
+        "timeout": "30m",
+        "expected_duration": "10m",
+        "stall_timeout": "15m"
+      }
+    ]
+  },
+  "executor": {
+    "executor": "codex",
+    "task_effort": "xhigh",
+    "review_effort": "xhigh",
+    "task_model": "gpt-6-astra",
+    "review_model": "gpt-6-astra"
+  },
+  "worktree": {
+    "enabled": true,
+    "retain": true
+  },
+  "acceptance": [
+    {
+      "name": "repo-c-development-acceptance",
+      "class": "candidate-sensitive",
+      "required": true,
+      "timeout": "45m",
+      "argv": [
+        "/usr/bin/bash",
+        "-lc",
+        "class=$(bash tools/development/classify_abcp_candidate.sh \"$ABCP_REPOSITORY_BASE_SHA\"); case \"$class\" in web-only|cross-stack) export COREPACK_HOME=/home/devagent/.cache/node/corepack; pnpm install --offline --frozen-lockfile --store-dir /home/devagent/.local/share/pnpm/store/v10 ;; esac; exec /usr/bin/bash tools/development/accept_abcp_candidate.sh"
+      ]
+    }
+  ],
+  "policy_version": "repo-c-development-v5"
+}

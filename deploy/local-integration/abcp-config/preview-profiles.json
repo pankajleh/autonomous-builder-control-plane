@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "schema_version": 1,
+      "profile_id": "web-v1",
+      "repository_identity_digest": "e4ef69506c076297eb9be0d8422378f920348799cff727bfea8d884f30f3e983",
+      "services": [
+        {
+          "name": "web",
+          "image": "busybox@sha256:5cec3fc171c87218698e85a52af7087de727372aae264a787b8112901a5b0092",
+          "user": "65534:65534",
+          "prepare_argv": [],
+          "start_argv": [
+            "/bin/httpd",
+            "-f",
+            "-p",
+            "8080",
+            "-h",
+            "/source"
+          ],
+          "environment": {},
+          "mount_source": true,
+          "port": 8080,
+          "presented": true
+        }
+      ],
+      "health_path": "/README.md",
+      "health_timeout_seconds": 10,
+      "ttl_seconds": 300,
+      "cpu_quota": 10000,
+      "memory_bytes": 67108864,
+      "pids_limit": 32,
+      "tmpfs_bytes": 8388608,
+      "network_policy": "INTERNAL_ONLY"
+    },
+    {
+      "schema_version": 1,
+      "profile_id": "demo-v1",
+      "repository_identity_digest": "34d8e67447ebe75af01759c1e97e277b272d8b5a8a055fda3db531deca0e20ca",
+      "services": [
+        {
+          "name": "web",
+          "image": "busybox@sha256:5cec3fc171c87218698e85a52af7087de727372aae264a787b8112901a5b0092",
+          "user": "65534:65534",
+          "prepare_argv": [],
+          "start_argv": [
+            "/bin/httpd",
+            "-f",
+            "-p",
+            "8080",
+            "-h",
+            "/source"
+          ],
+          "environment": {},
+          "mount_source": true,
+          "port": 8080,
+          "presented": true
+        }
+      ],
+      "health_path": "/README.md",
+      "health_timeout_seconds": 10,
+      "ttl_seconds": 300,
+      "cpu_quota": 10000,
+      "memory_bytes": 67108864,
+      "pids_limit": 32,
+      "tmpfs_bytes": 8388608,
+      "network_policy": "INTERNAL_ONLY"
+    }
+  ]
+}

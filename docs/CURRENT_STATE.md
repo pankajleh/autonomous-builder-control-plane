@@ -1,16 +1,24 @@
 # Current Project State
 
-Date: 2026-09-20
+Date: 2026-09-28
 
 Operational role: current checkpoint and authority projection for Repo B / ABCP. Immutable execution-pack/evidence artifacts and Git/GitHub objects remain authoritative if this projection conflicts with them.
 
 ## Repository checkpoint
 
 - Repository: `pankajleh/autonomous-builder-control-plane`.
-- Executable/product baseline: PR #22 merge `3d6a841e722c9c67c83d835a52178b09ca16776d`. Later documentation-only projection commits may advance `main`; Git/GitHub are authoritative for the latest repository head.
-- Current retained platform boundary: **EP-006 service/API baseline plus the bounded Repo C product run-admission extension**.
-- Post-EP-006 A/B/C assurance expansion remains discarded and is not part of current runtime authority.
-- Repo C is the product/UX authority; ABCP owns execution admission, authoritative run lifecycle/projections/evidence/actions, and provider coordination after admission.
+- Executable baseline: PR #42 merge `a5383a672f99b68413cb946a6d93f89116a2769b`. Later documentation-only commits may advance `main`; Git/GitHub are authoritative for the latest head.
+- Live controller: `abcp serve` built from exactly `a5383a6` (binary SHA-256 `1aebdb08d4deec62020e62ef15ebe9cbc022215837f41864d78e35c1eab94096`) on the local-integration host, serving Repo C. See [live runtime](#live-runtime-2026-09-28).
+- Platform boundary: **the EP-006 service/API baseline, plus these extensions:**
+  - Repo C product run admission (P01);
+  - the controller-owned Ralphex execution profile;
+  - governed development-run admission (G0);
+  - human-decision pause/resume;
+  - BP-01 provider-neutral activity;
+  - BP-02 governed preview runtime;
+  - controller-owned worktree retention.
+- The post-EP-006 A/B/C assurance expansion remains discarded and is not part of current runtime authority.
+- Repo C is the product/UX authority. ABCP owns execution admission, the authoritative run lifecycle, projections, evidence and actions, provider coordination after admission, activity normalization and preview runtime.
 - Repo A / Dev-Agent and Ralphex remain execution/provider mechanisms beneath ABCP; Repo C does not call them directly.
 
 ## Rebaseline and P01 chain
@@ -23,36 +31,63 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
 | P01 final tested executable | `38eda0c3ce489dbe5e51ad297ac3374d98fadcd7` | product-facing admission + replay/reconciliation hardening; all required gates passed, PostgreSQL integration skipped only because the authorized DSN was unavailable |
 | P01 publication | PR #22 head `f1ae22fc3132513bbe5c411058e506676d9fb069`; merge `3d6a841e722c9c67c83d835a52178b09ca16776d` | product run admission is integrated on `main` |
 
+Everything after P01, PRs #23–#43, is indexed in `docs/AUDIT_INDEX.md` and summarized in `docs/PROGRESS.md`.
+
 ## Current product-facing service boundary
 
-ABCP now provides the retained EP-006 read/action surfaces plus bounded product run admission:
+ABCP provides the retained EP-006 read/action surfaces, bounded product run admission and the PDLC Experience extensions:
 
 - authenticated capability discovery;
-- run list/detail, events, timeline and evidence;
-- evidence download;
-- cancel;
-- human-decision recording;
-- action status;
-- `POST /v1/runs` when admission is configured.
+- run list/detail, events, timeline and evidence, and evidence download;
+- cancel, human-decision recording and action status;
+- `POST /v1/runs` when admission is configured;
+- `GET /v1/extensions/pdlc-experience` (`PdlcExperienceCapabilitiesV1`, with `activity_stream` and `preview_runtime`);
+- BP-01 provider-neutral activity: paged `ActivityPageV1` reads and an SSE stream. Ralphex progress is normalized into provider-neutral events, and ABCP state and checkpoint facts are included. Every unverifiable gap becomes an explicit controller `UNKNOWN` marker, and marker diagnostics name the failing step without provider text;
+- BP-02 governed preview runtime: create, list, detail, stop and route for an exact clean checkpoint of a product-admitted run. Operator-owned, digest-pinned preview profiles apply, the `preview.control` authority is required, and preview never changes run state.
 
-The admission contract accepts only the frozen schema-v1 product-safe request, resolves controller-owned private execution configuration, binds one stable request identity to one durable ABCP run identity, and fails closed on conflicting replay, repository-base mismatch or unresolved reconciliation.
+The admission contract accepts only the frozen schema-v1 product-safe request. It resolves controller-owned private execution configuration, binds one stable request identity to one durable ABCP run identity, and fails closed on conflicting replay, repository-base mismatch or unresolved reconciliation.
 
-`run_admission` is independent of `retry`, `resume` and `recovery`; those capabilities remain false unless separately designed and authorized.
+A run whose Ralphex failure classifies as a human decision pauses at `HUMAN_DECISION_REQUIRED`, and resumes after a recorded proceed decision (PR #31). The advertised `retry`, `resume` and `recovery` capability flags remain false. There is no general retry or recovery.
+
+## Governed worktree retention
+
+Manifest templates may set `worktree.retain`. ABCP then passes `--keep-worktree` to a pinned Ralphex whose capability probe proves `worktree_retention_v1`, so the governed worktree survives the run and its removal is controller-owned (PR #42). This keeps the activity binding resolvable after acceptance. Trailing provider detail, such as the final "Review completed" signal, is collected, and a checkpoint stays preview-eligible after `BRANCH_ACCEPTED`. Retention is currently indefinite, and disk is the only bound. The persistent-state design that would allow controller-owned pruning is in `docs/plans/completed/bp02-controller-owned-worktree-retention.md`.
+
+## Live runtime (2026-09-28)
+
+| Component | Identity |
+|---|---|
+| ABCP | `a5383a6`, binary SHA-256 `1aebdb08…4096`, listener `127.0.0.1:18888` |
+| Pinned Ralphex | `ralphex-governance-v2`, source `055dfbdb4d92120a8249ae58923d7608d583e82f`, SHA-256 `54300a18…de94bc` |
+| Manifest templates | both `worktree.retain: true`; versioned in `deploy/local-integration/abcp-config/` |
+| Preview profiles | `demo-v1` and `web-v1` (busybox `/bin/httpd`, health `/README.md`); versioned in the same directory |
+
+Retention proof run `admission-2b69b2cd89c1c0cba2ab77c840587345a2512dc6d7944f00762cb77cb2a15c57` showed the following:
+
+- the worktree was retained after `BRANCH_ACCEPTED`;
+- activity grew from 79 events at acceptance to 86, including "Review completed", with 0 `UNKNOWN` markers;
+- a preview created only after acceptance was `READY/HEALTHY` and served the marker file (`200`);
+- the run state was unchanged.
+
+Operator configuration drift is checked with `tools/operator/check_local_integration_config.py`.
 
 ## Deliberate limits
 
 Current `main` does **not** claim:
 
-- Repo C UI completion;
-- Repo C adapter/runtime deployment completion;
-- human-decision continuation/resume;
-- general retry/recovery;
+- general retry/recovery, or advertised `retry`/`resume`/`recovery` capabilities;
+- persistent checkpoint state independent of the governed worktree, or controller-owned worktree pruning;
 - provider-selection redesign;
 - live production/AWS deployment;
 - restored Assurance Capsule / post-EP-006 A-B-C methodology.
 
-The pre-merge evidence document for P01 intentionally records the human merge gate as not yet done at evidence freeze time. Git/GitHub merge records above are the authoritative post-publication result.
+## Known issues
+
+- `internal/mergelifecycle`: two recovery subtests of `TestTask3FinalClosureM02BudgetExhaustionDisposition` fail ("leased append cannot bypass an unresolved transition barrier"). So does `TestTask3FinalClosureM03PreTargetBudgetCrashRecovery`. The failures are identical at every merge back to PR #17 (`ed74fad`), whose post-merge acceptance passed at the time, so they depend on the environment rather than being a regression from any later PR.
+- `internal/actionapi` has an intermittent failure.
+- `internal/run/resume.go` is not `gofmt`-clean on `main`.
+- The pinned Ralphex governance fork (branches `abcp/governance-bundle-v1-20260922` and `abcp/governance-bundle-v2-20260928`) exists only in the integration host clone and has no remote.
 
 ## Next bounded integration boundary
 
-Repo C P02 consumes the merged P01 admission contract through its own adapter/correlation layer. Any further ABCP capability is added only when a concrete Repo C product workflow proves it is required and the corresponding design authority is explicitly frozen. Review/discovery alone does not create new scope.
+The next ABCP capability is the persistent checkpoint state: pinned checkpoint refs, a sealed binding, and eligibility from sealed state. It is added only when a concrete Repo C product workflow needs it and its design authority is frozen. Review/discovery alone does not create new scope.
