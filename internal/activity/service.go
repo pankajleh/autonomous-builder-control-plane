@@ -61,8 +61,15 @@ type sharedSidecar struct {
 
 const initialProviderUnavailableRetryBudget = 6
 
-func deferInitialProviderUnavailable(err error, previous *providerProof, misses int) bool {
-	return errors.Is(err, ErrUnavailable) && previous == nil && misses < initialProviderUnavailableRetryBudget
+// deferProviderUnavailable reports whether an unavailable provider read is
+// retried before it is marked. The provider session can briefly be missing
+// from a sidecar in two cases: a newly admitted run has no provider proof yet,
+// and a freshly started sidecar (after a controller restart or sidecar respawn)
+// has not yet listed an existing session. Both get the same bounded budget.
+// Otherwise, once a provider proof exists and this sidecar has served the run,
+// any loss remains immediately fail-closed.
+func deferProviderUnavailable(err error, previous *providerProof, freshSidecar bool, misses int) bool {
+	return errors.Is(err, ErrUnavailable) && (previous == nil || freshSidecar) && misses < initialProviderUnavailableRetryBudget
 }
 
 // A failed activity substrate disables only this extension. Existing run reads
@@ -477,6 +484,7 @@ func (s *Service) collect(run, registration string, w *worker) {
 	backoff := 250 * time.Millisecond
 	providerFailed := false
 	initialUnavailableMisses := 0
+	freshSidecar := false
 	for {
 		if s.ctx.Err() != nil {
 			return
@@ -500,6 +508,7 @@ func (s *Service) collect(run, registration string, w *worker) {
 		if err == nil && scope.RunID != "" && !providerFailed {
 			if shared == nil {
 				shared, key = s.acquireSidecar(scope)
+				freshSidecar, initialUnavailableMisses = true, 0
 			}
 			if shared.err != nil {
 				if s.stopping() {
@@ -530,11 +539,7 @@ func (s *Service) collect(run, registration string, w *worker) {
 					if proofErr != nil {
 						return
 					}
-					if deferInitialProviderUnavailable(err, previous, initialUnavailableMisses) {
-						// A newly admitted run can briefly precede the provider session's
-						// appearance in the sidecar. Retry a bounded number of times before
-						// declaring provider detail unavailable; after the first verified
-						// provider proof, any loss remains immediately fail-closed.
+					if deferProviderUnavailable(err, previous, freshSidecar, initialUnavailableMisses) {
 						initialUnavailableMisses++
 					} else {
 						s.diagnose(run, "provider-unavailable", err)
@@ -543,7 +548,7 @@ func (s *Service) collect(run, registration string, w *worker) {
 						}
 					}
 				} else {
-					initialUnavailableMisses = 0
+					initialUnavailableMisses, freshSidecar = 0, false
 					backoff = 250 * time.Millisecond
 				}
 				select {

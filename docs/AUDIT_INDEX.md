@@ -47,7 +47,8 @@ Operational role: this file indexes accepted, reviewed, merged, and durable evid
 | Eviction sweep summary | #48 | `64ea62bcf75f8ec49f2c2a7c1c691822b2598b8a` | `880d9c66c79c45f16822a66b90b0a6f6c9efa8f9` | `docs/plans/completed/bp02-worktree-eviction.md` |
 | Eviction idle counts only live streams | #49 | `ff78fbfed51aebd6961a85e60c6de03fb2ae3a48` | `b187536aa194ff667b17102efb54d1ecac7d94fe` | `docs/plans/completed/bp02-worktree-eviction.md` |
 | No activity marker on shutdown or cancelled reads | #50 | `ff860580991025b7a03adaf43a401c5f60a3c639` | `e8ab2c97285e8767d8b9e4ad80d3b47f6a7f4a1b` | `docs/plans/completed/bp01-no-marker-on-shutdown.md` |
-| Worktree eviction live proof | #51 | this PR | this PR | `docs/CURRENT_STATE.md`; run `admission-3ce5345c4792fc37113251cfb9ca1a1fb03291838ee41f0eaa5461c75f0d4280`: evicted `idle` 05:29:58Z, 3 pinned checkpoints, record `0600`, 83→96 events, 0 `UNKNOWN`; previews `aebb78eb…` and `5c747a06…` after eviction `READY/HEALTHY` from `e4eaacd…`, marker `200` |
+| Worktree eviction live proof | #51 | `f7d7c44f91739735feda4873b55afae47d332166` | `ab4a007d745b532a2d564d691c3fff3e9fd99fca` | `docs/CURRENT_STATE.md`; run `admission-3ce5345c4792fc37113251cfb9ca1a1fb03291838ee41f0eaa5461c75f0d4280`: evicted `idle` 05:29:58Z, 3 pinned checkpoints, record `0600`, 83→96 events, 0 `UNKNOWN`; previews `aebb78eb…` and `5c747a06…` after eviction `READY/HEALTHY` from `e4eaacd…`, marker `200` |
+| Fresh provider sidecar grace | #52 | this PR | this PR | `docs/plans/completed/bp01-fresh-sidecar-grace.md` |
 
 EP-005 foundation merged earlier in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 

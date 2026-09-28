@@ -130,17 +130,23 @@ func TestActivityServiceCursorAndResumeBoundaries(t *testing.T) {
 
 func TestInitialProviderUnavailableRetryBudgetIsBounded(t *testing.T) {
 	for misses := 0; misses < initialProviderUnavailableRetryBudget; misses++ {
-		if !deferInitialProviderUnavailable(ErrUnavailable, nil, misses) {
+		if !deferProviderUnavailable(ErrUnavailable, nil, false, misses) {
 			t.Fatalf("startup miss %d was not deferred", misses)
 		}
+		// A controller restart starts a fresh sidecar that has not yet listed
+		// the run's existing session: the same bounded grace applies.
+		if !deferProviderUnavailable(ErrUnavailable, &providerProof{}, true, misses) {
+			t.Fatalf("fresh-sidecar miss %d after a verified proof was not deferred", misses)
+		}
 	}
-	if deferInitialProviderUnavailable(ErrUnavailable, nil, initialProviderUnavailableRetryBudget) {
-		t.Fatal("startup unavailability remained suppressed past the retry budget")
+	if deferProviderUnavailable(ErrUnavailable, nil, false, initialProviderUnavailableRetryBudget) ||
+		deferProviderUnavailable(ErrUnavailable, &providerProof{}, true, initialProviderUnavailableRetryBudget) {
+		t.Fatal("unavailability remained suppressed past the retry budget")
 	}
-	if deferInitialProviderUnavailable(ErrUnavailable, &providerProof{}, 0) {
-		t.Fatal("provider loss after a verified proof was suppressed")
+	if deferProviderUnavailable(ErrUnavailable, &providerProof{}, false, 0) {
+		t.Fatal("provider loss on a sidecar that already served the run was suppressed")
 	}
-	if deferInitialProviderUnavailable(ErrIntegrity, nil, 0) {
+	if deferProviderUnavailable(ErrIntegrity, nil, true, 0) {
 		t.Fatal("integrity failure was treated as startup unavailability")
 	}
 }
