@@ -52,7 +52,8 @@ Operational role: this file indexes accepted, reviewed, merged, and durable evid
 | Worktree release API and eviction activity | #53 | `98d1f301371eb00b6e681673b7d0a99c0372becf` | `7ac0cffef3887ba8d46bd1390b39c2033d048940` | `docs/plans/completed/bp02-worktree-release.md` |
 | Confirmed replay gaps; running-build release refusal | #54 | `6d5c7304156a93f2d6f2834cbcbf0e26b0330eb9` | `109e15b45ae1f75316f3b3ba75b93e6ae6a6d128` | `docs/plans/completed/bp01-confirmed-replay-gaps.md` |
 | Task-closure live proof | #55 | `96a326205ce8f2e885bf84e42b6eb553a1b40e23` | `bd4008332162e4bf0e047598745df9226ff463e3` | `docs/CURRENT_STATE.md`; runs `admission-3ce5345c…` (`ALREADY_RELEASED`) and `admission-6f80645d…` (`RELEASED`) |
-| Queued run never marked | #56 | this PR | this PR | `docs/plans/completed/bp01-queued-run-no-marker.md` |
+| Queued run never marked | #56 | `190e7b39d5fe1ae7b2e15987c123511140b03936` | `2bd85f7c308f7a37546e68037c76855977b03a24` | `docs/plans/completed/bp01-queued-run-no-marker.md` |
+| Servable-app product acceptance; hour-long previews | #57 | this PR | this PR | `docs/plans/completed/bp02-product-acceptance-servable-app.md` |
 
 EP-005 foundation merged earlier in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 

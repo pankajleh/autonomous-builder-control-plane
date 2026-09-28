@@ -60,7 +60,7 @@
       ],
       "health_path": "/README.md",
       "health_timeout_seconds": 10,
-      "ttl_seconds": 300,
+      "ttl_seconds": 3600,
       "cpu_quota": 10000,
       "memory_bytes": 67108864,
       "pids_limit": 32,
