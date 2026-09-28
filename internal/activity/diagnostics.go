@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
@@ -83,4 +85,20 @@ func (s *Service) diagnose(run, marker string, err error) {
 	}
 	fmt.Fprintf(s.diagnostics, "abcp activity marker at=%s run=%s marker=%s step=%s class=%s\n",
 		stamp(s.now()), run, marker, step, diagnosticClass(err))
+}
+
+// noteGap logs a provider replay gap by source event number only; no provider
+// text is written. last is math.MaxUint64 before the first event.
+func (s *Service) noteGap(run string, last, got uint64, confirmed bool) {
+	if s.diagnostics == nil {
+		return
+	}
+	if !runtimecatalog.ValidIdentifier(run) {
+		run = "invalid"
+	}
+	after := "none"
+	if last != math.MaxUint64 {
+		after = strconv.FormatUint(last, 10)
+	}
+	fmt.Fprintf(s.diagnostics, "abcp activity replay gap at=%s run=%s after=%s got=%d confirmed=%t\n", stamp(s.now()), run, after, got, confirmed)
 }

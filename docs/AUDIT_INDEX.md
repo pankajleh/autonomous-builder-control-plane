@@ -49,7 +49,8 @@ Operational role: this file indexes accepted, reviewed, merged, and durable evid
 | No activity marker on shutdown or cancelled reads | #50 | `ff860580991025b7a03adaf43a401c5f60a3c639` | `e8ab2c97285e8767d8b9e4ad80d3b47f6a7f4a1b` | `docs/plans/completed/bp01-no-marker-on-shutdown.md` |
 | Worktree eviction live proof | #51 | `f7d7c44f91739735feda4873b55afae47d332166` | `ab4a007d745b532a2d564d691c3fff3e9fd99fca` | `docs/CURRENT_STATE.md`; run `admission-3ce5345c4792fc37113251cfb9ca1a1fb03291838ee41f0eaa5461c75f0d4280`: evicted `idle` 05:29:58Z, 3 pinned checkpoints, record `0600`, 83→96 events, 0 `UNKNOWN`; previews `aebb78eb…` and `5c747a06…` after eviction `READY/HEALTHY` from `e4eaacd…`, marker `200` |
 | Fresh provider sidecar grace | #52 | `0013073eccfd66b392f6fa27da6e8855260d961e` | `928f94acf48f197ff73a33e798bc27c4d20de1e7` | `docs/plans/completed/bp01-fresh-sidecar-grace.md` |
-| Worktree release API and eviction activity | #53 | this PR | this PR | `docs/plans/completed/bp02-worktree-release.md` |
+| Worktree release API and eviction activity | #53 | `98d1f301371eb00b6e681673b7d0a99c0372becf` | `7ac0cffef3887ba8d46bd1390b39c2033d048940` | `docs/plans/completed/bp02-worktree-release.md` |
+| Confirmed replay gaps; running-build release refusal | #54 | this PR | this PR | `docs/plans/completed/bp01-confirmed-replay-gaps.md` |
 
 EP-005 foundation merged earlier in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 

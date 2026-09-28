@@ -48,6 +48,8 @@ type Service struct {
 	evictions func(run string) (reason string, at time.Time, ok bool)
 	// evictionRecorded marks runs whose eviction event is already appended.
 	evictionRecorded map[string]bool
+	// gaps holds, per run, a provider replay gap seen once and not yet re-read.
+	gaps map[string]string
 }
 type worker struct {
 	touched       time.Time
@@ -334,6 +336,22 @@ func (s *Service) prepare(ctx context.Context, run string, subscribe bool) (stri
 	s.wg.Add(1)
 	go s.collect(run, registration, w)
 	return registration, w, nil
+}
+
+// confirmGap reports whether the run's provider replay gap was already seen
+// once at the same position. A first sighting is remembered, not confirmed.
+func (s *Service) confirmGap(run, key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.gaps == nil {
+		s.gaps = map[string]string{}
+	}
+	if s.gaps[run] == key {
+		delete(s.gaps, run)
+		return true
+	}
+	s.gaps[run] = key
+	return false
 }
 
 // SetEvictions installs the reader of sealed worktree evictions. It is set once
@@ -727,8 +745,17 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 			expected = 1
 		}
 		if message.id != expected {
-			s.diagnose(scope.RunID, "provider-replay-gap", nil)
 			gapKey := identity("gap", proof.Generation, strconv.FormatUint(*last, 10), strconv.FormatUint(message.id, 10))
+			if !s.confirmGap(scope.RunID, gapKey) {
+				// The live sidecar can deliver an event before an earlier one it is
+				// still persisting. Stop at the gap; the next batch resumes from the
+				// last contiguous event and re-reads the session. Only the same gap
+				// seen again is a real one.
+				s.noteGap(scope.RunID, *last, message.id, false)
+				return nil
+			}
+			s.noteGap(scope.RunID, *last, message.id, true)
+			s.diagnose(scope.RunID, "provider-replay-gap", nil)
 			if err = s.appendUnknown(scope.RunID, registration, gapKey, "Implementation detail replay gap"); err != nil {
 				return err
 			}
