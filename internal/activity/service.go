@@ -44,8 +44,10 @@ type Service struct {
 	// Paged reads do not count: background readers, such as Repo C's
 	// notification poller, page every run's activity every few seconds.
 	lastAccess map[string]time.Time
-	// evicted reports a controller-sealed worktree eviction (see SetEvicted).
-	evicted func(run string) bool
+	// evictions reports a controller-sealed worktree eviction (see SetEvictions).
+	evictions func(run string) (reason string, at time.Time, ok bool)
+	// evictionRecorded marks runs whose eviction event is already appended.
+	evictionRecorded map[string]bool
 }
 type worker struct {
 	touched       time.Time
@@ -139,6 +141,9 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 				return Scope{}, err
 			}
 		}
+	}
+	if err = s.recordEviction(run, registration); err != nil {
+		return Scope{}, err
 	}
 	scope, err := s.resolver.Resolve(ctx, run)
 	if err != nil {
@@ -331,19 +336,58 @@ func (s *Service) prepare(ctx context.Context, run string, subscribe bool) (stri
 	return registration, w, nil
 }
 
-// SetEvicted installs the check for controller-evicted worktrees. It is set
-// once before serving; an evicted run's missing worktree is expected cleanup.
-func (s *Service) SetEvicted(evicted func(run string) bool) {
+// SetEvictions installs the reader of sealed worktree evictions. It is set once
+// before serving. An evicted run's missing worktree is expected cleanup, and
+// the eviction itself is recorded as an ABCP state activity event.
+func (s *Service) SetEvictions(evictions func(run string) (reason string, at time.Time, ok bool)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.evicted = evicted
+	s.evictions = evictions
+}
+
+func (s *Service) eviction(run string) (string, time.Time, bool) {
+	s.mu.Lock()
+	evictions := s.evictions
+	s.mu.Unlock()
+	if evictions == nil {
+		return "", time.Time{}, false
+	}
+	return evictions(run)
 }
 
 func (s *Service) wasEvicted(run string) bool {
+	_, _, ok := s.eviction(run)
+	return ok
+}
+
+// recordEviction appends the run's eviction event once it is sealed. The
+// event is derived from the durable record, so an eviction interrupted before
+// any read, or sealed before this process started, is still reported.
+func (s *Service) recordEviction(run, registration string) error {
 	s.mu.Lock()
-	evicted := s.evicted
+	done := s.evictionRecorded[run]
 	s.mu.Unlock()
-	return evicted != nil && evicted(run)
+	if done {
+		return nil
+	}
+	reason, at, ok := s.eviction(run)
+	if !ok {
+		return nil
+	}
+	e, ok := evictionEvent(run, reason, at, s.now())
+	if !ok {
+		return nil
+	}
+	if _, err := s.store.Append(run, registration, e); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.evictionRecorded == nil {
+		s.evictionRecorded = map[string]bool{}
+	}
+	s.evictionRecorded[run] = true
+	s.mu.Unlock()
+	return nil
 }
 
 // Engagement reports whether a client is streaming the run's activity and when

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"syscall"
+	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/strictjson"
@@ -59,8 +60,10 @@ func (r RecordV1) Pinned(sha string) bool {
 func (r RecordV1) validate() error {
 	if r.Kind != "WorktreeEvictionV1" || r.SchemaVersion != 1 || !runtimecatalog.ValidIdentifier(r.RunID) || len(r.AuthorityDigest) != 64 ||
 		!filepath.IsAbs(r.Repository) || filepath.Clean(r.Repository) != r.Repository || r.Branch != "abcp/"+r.RunID || !gitSHA.MatchString(r.Base) ||
-		!filepath.IsAbs(r.Worktree) || filepath.Clean(r.Worktree) != r.Worktree || r.EvictedAt == "" || r.WorktreeBytes < 0 ||
-		(r.Reason != ReasonIdle && r.Reason != ReasonMaxAge && r.Reason != ReasonQuota) {
+		!filepath.IsAbs(r.Worktree) || filepath.Clean(r.Worktree) != r.Worktree || r.WorktreeBytes < 0 || !validReason(r.Reason) {
+		return ErrIntegrity
+	}
+	if _, err := time.Parse(time.RFC3339Nano, r.EvictedAt); err != nil {
 		return ErrIntegrity
 	}
 	for _, c := range r.Checkpoints {
@@ -122,11 +125,15 @@ func (s *Store) Read(run string) (RecordV1, bool, error) {
 	return record, true, nil
 }
 
-// Evicted reports whether a valid record seals the run's eviction. An unreadable
+// Fact returns the reason and time of the run's sealed eviction. An unreadable
 // or invalid record is not an eviction, so its absent worktree stays a fault.
-func (s *Store) Evicted(run string) bool {
-	_, ok, err := s.Read(run)
-	return err == nil && ok
+func (s *Store) Fact(run string) (reason string, at time.Time, ok bool) {
+	record, found, err := s.Read(run)
+	if err != nil || !found {
+		return "", time.Time{}, false
+	}
+	at, _ = time.Parse(time.RFC3339Nano, record.EvictedAt)
+	return record.Reason, at, true
 }
 
 // Write durably replaces the run's record (temp file, fsync, rename, dir fsync).

@@ -224,3 +224,25 @@ func unknown(run, key, title string, now time.Time) Event {
 	e.ActivityID = identity(run, "unknown", key)
 	return e
 }
+
+// evictionTitles are the fixed titles of a worktree eviction event, one per
+// eviction reason. Repo C maps each to fixed customer text.
+var evictionTitles = map[string]string{
+	"idle":           "Worktree evicted after inactivity",
+	"max-age":        "Worktree evicted at maximum age",
+	"quota":          "Worktree evicted to free repository space",
+	"task-closed":    "Worktree released: task closed",
+	"tenant-deleted": "Worktree released: tenant deleted",
+}
+
+// evictionEvent is the ABCP state fact that the run's governed worktree was
+// removed. A run has at most one: its identity does not depend on the reason.
+func evictionEvent(run, reason string, at, now time.Time) (Event, bool) {
+	title, ok := evictionTitles[reason]
+	if !ok || at.IsZero() {
+		return Event{}, false
+	}
+	return Event{SchemaVersion: "ActivityEventV1", ActivityID: identity(run, "worktree-eviction"), RunID: run,
+		OccurredAt: stamp(at), ObservedAt: stamp(now), AuthorityLevel: "ABCP_STATE", Category: "WORKSPACE", Phase: "abcp",
+		Status: "RELEASED", Title: title, SourceKind: "ABCP_WORKTREE_EVICTION", SourceDigest: identity(run, "worktree-eviction", reason, stamp(at))}, true
+}

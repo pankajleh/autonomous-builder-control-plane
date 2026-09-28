@@ -150,6 +150,7 @@ type PreviewController interface {
 
 type ServerConfig struct {
 	Preview                 PreviewController
+	Worktrees               WorktreeReleaser
 	Activity                ActivityReader
 	Authenticator           Authenticator
 	Authority               *AuthorityMatcher
@@ -359,6 +360,8 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.runs(writer, request, principal, requestID)
 	case "/v1/development-runs":
 		s.developmentRunAdmission(writer, request, principal, requestID)
+	case "/v1/worktrees/release":
+		s.repositoryWorktreeRelease(writer, request, principal, requestID)
 	default:
 		s.runRoute(writer, request, principal, requestID)
 	}
@@ -390,6 +393,8 @@ func (s *Server) runRoute(writer http.ResponseWriter, request *http.Request, pri
 	switch {
 	case len(parts) >= 2 && len(parts) <= 4 && parts[1] == "previews":
 		s.runPreviews(writer, request, principal, requestID, runID, parts[2:])
+	case len(parts) == 3 && parts[1] == "worktree" && parts[2] == "release":
+		s.runWorktreeRelease(writer, request, principal, requestID, runID)
 	case len(parts) == 2 && parts[1] == "activity":
 		s.runActivity(writer, request, requestID, runID)
 	case len(parts) == 3 && parts[1] == "activity" && parts[2] == "stream":
@@ -852,6 +857,8 @@ func (s *Server) writeDependencyError(writer http.ResponseWriter, requestID stri
 		status, apiError.Code, apiError.Message = http.StatusServiceUnavailable, "NOT_AVAILABLE", "preview runtime is not available"
 	case errors.Is(err, ErrPreviewIneligible):
 		status, apiError.Code, apiError.Message = http.StatusConflict, "preview_ineligible", "checkpoint is not eligible for preview"
+	case errors.Is(err, ErrRunNotFinished):
+		status, apiError.Code, apiError.Message = http.StatusConflict, "run_not_finished", "run is not finished"
 	case errors.Is(err, ErrPreviewProfile):
 		status, apiError.Code, apiError.Message = http.StatusNotFound, "unknown_preview_profile", "preview profile is not available"
 	case errors.Is(err, ErrActivityUnavailable):

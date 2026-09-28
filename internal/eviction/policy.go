@@ -46,7 +46,18 @@ const (
 	ReasonIdle   = "idle"
 	ReasonMaxAge = "max-age"
 	ReasonQuota  = "quota"
+	// Product-requested releases (see Sweeper.Release).
+	ReasonTaskClosed    = "task-closed"
+	ReasonTenantDeleted = "tenant-deleted"
 )
+
+func validReason(reason string) bool {
+	switch reason {
+	case ReasonIdle, ReasonMaxAge, ReasonQuota, ReasonTaskClosed, ReasonTenantDeleted:
+		return true
+	}
+	return false
+}
 
 type Decision struct {
 	Candidate
