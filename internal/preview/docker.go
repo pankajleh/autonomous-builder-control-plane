@@ -25,8 +25,30 @@ type presentation struct {
 	server                *http.Server
 	transport             *http.Transport
 	url, endpoint, handle string
+	appCookies            bool
 	closed                atomic.Bool
 }
+
+// gatewayCookie reports a cookie name the preview gateway keeps for itself; such cookies never reach or come from an app.
+func gatewayCookie(name string) bool {
+	return strings.HasPrefix(name, "__Host-preview") || strings.HasPrefix(name, "__Host-unlock")
+}
+
+// appCookieHeader is a Cookie header without the gateway's own cookies, or "" when nothing is left.
+func appCookieHeader(values []string) string {
+	kept := []string{}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ";") {
+			part = strings.TrimSpace(part)
+			name, _, ok := strings.Cut(part, "=")
+			if ok && name != "" && !gatewayCookie(strings.TrimSpace(name)) {
+				kept = append(kept, part)
+			}
+		}
+	}
+	return strings.Join(kept, "; ")
+}
+
 type dockerRuntime struct {
 	mu              sync.Mutex
 	root, namespace string
@@ -217,7 +239,7 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 	if !d.internalNetwork(ctx, id) {
 		return nil, ErrUnavailable
 	}
-	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"})}
+	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies}
 	for i, s := range p.Services {
 		if _, err := d.run(ctx, d.createArgs(id, path, p, s, i)...); err != nil {
 			return nil, err
@@ -286,12 +308,30 @@ func (g *presentation) present() error {
 		r.Host = g.endpoint
 		r.Header.Del("Authorization")
 		r.Header.Del("Proxy-Authorization")
+		cookies := r.Header.Values("Cookie")
 		r.Header.Del("Cookie")
+		if g.appCookies {
+			if kept := appCookieHeader(cookies); kept != "" {
+				r.Header.Set("Cookie", kept)
+			}
+		}
 		r.Header.Del("Forwarded")
 		r.Header.Del("X-Forwarded-Host")
 		r.Header.Del("X-Forwarded-For")
 	}
-	proxy.ModifyResponse = func(r *http.Response) error { r.Header.Del("Set-Cookie"); return nil }
+	proxy.ModifyResponse = func(r *http.Response) error {
+		set := r.Header.Values("Set-Cookie")
+		r.Header.Del("Set-Cookie")
+		if g.appCookies {
+			for _, value := range set {
+				name, _, ok := strings.Cut(value, "=")
+				if ok && strings.TrimSpace(name) != "" && !gatewayCookie(strings.TrimSpace(name)) {
+					r.Header.Add("Set-Cookie", value)
+				}
+			}
+		}
+		return nil
+	}
 	slots := make(chan struct{}, 8)
 	g.server = &http.Server{ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 16 << 10, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect || r.Header.Get("Upgrade") != "" {

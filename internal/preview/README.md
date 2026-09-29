@@ -104,6 +104,14 @@ probes exercise that same mount and verify source-file contents through each
 service's configured user. Host-loopback presentation binds an explicit 127.0.0.1 address
 and targets only the presented service; siblings remain internal.
 
+The presentation proxy removes `Authorization`, `Proxy-Authorization`, `Forwarded`,
+`X-Forwarded-Host` and `X-Forwarded-For` from requests. It also removes `Cookie` from
+requests and `Set-Cookie` from responses, unless the profile sets `"app_cookies": true`.
+Such a profile is for previews that each have their own web host, so an app's own
+sign-in cookies stay its own. Even then, a cookie whose name starts with `__Host-preview`
+or `__Host-unlock` (the preview gateway's own) never passes in either direction. The
+field is omitted when false, so profiles without it keep their digests.
+
 Missing profile configuration or an unsupported host/profile leaves
 `preview_runtime=false` at `GET /v1/extensions/pdlc-experience`. At least one
 profile must pass the full isolation, blocked-egress, mount and loopback-access
