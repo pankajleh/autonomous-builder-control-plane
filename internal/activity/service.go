@@ -346,6 +346,14 @@ func (s *Service) prepare(ctx context.Context, run string, subscribe bool) (stri
 		return registration, w, nil
 	}
 	if len(s.workers) >= MaxStreams {
+		// A paged read is served from the durable store, which the refresh above
+		// has just brought up to date; only a live stream needs a collector of
+		// its own. Background readers page many runs' activity within a
+		// collector's idle minute, and refusing them here would leave every run
+		// beyond the ceiling unreadable until collectors retire.
+		if !subscribe {
+			return registration, nil, nil
+		}
 		return "", nil, ErrExhausted
 	}
 	w := &worker{touched: s.now()}

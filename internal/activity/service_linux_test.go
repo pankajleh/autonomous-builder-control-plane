@@ -446,3 +446,42 @@ func TestOnlyLiveStreamsCountAsEvictionEngagement(t *testing.T) {
 		t.Fatal("closing the stream must end streaming and count as the last use", streaming, closed)
 	}
 }
+
+func TestPagedReadsAreServedAtTheCollectorCeiling(t *testing.T) {
+	s, facts := testService(t)
+	facts.events = []ledger.Event{{EventID: "accepted", StateTo: domain.StateBranchAccepted, Timestamp: testTime}}
+	s.mu.Lock()
+	for i := 0; i < MaxStreams; i++ {
+		s.workers["busy-"+strconv.Itoa(i)] = &worker{touched: s.now(), subscriptions: 1}
+	}
+	s.mu.Unlock()
+	data, err := s.ReadActivity(context.Background(), "run", serviceapi.PageRequestV1{PageSize: 100})
+	if err != nil {
+		t.Fatal("a paged read was refused at the collector ceiling", err)
+	}
+	var page Page
+	if err = json.Unmarshal(data, &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 1 || page.Events[0].Status != "ACCEPTED" {
+		t.Fatalf("the read did not serve the refreshed durable store: %s", data)
+	}
+	s.mu.Lock()
+	_, started := s.workers["run"]
+	workers := len(s.workers)
+	s.mu.Unlock()
+	if started || workers != MaxStreams {
+		t.Fatal("a paged read at the ceiling started a collector", started, workers)
+	}
+	if _, err = s.OpenActivityStream(context.Background(), "run", ""); !errors.Is(err, serviceapi.ErrActivityUnavailable) {
+		t.Fatal("a live stream beyond the ceiling must still be refused", err)
+	}
+	s.mu.Lock()
+	delete(s.workers, "busy-0")
+	s.mu.Unlock()
+	stream, err := s.OpenActivityStream(context.Background(), "run", "")
+	if err != nil {
+		t.Fatal("a live stream within the ceiling was refused", err)
+	}
+	stream.Close()
+}
