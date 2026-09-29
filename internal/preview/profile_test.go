@@ -61,3 +61,22 @@ func TestProfileRejectsUnboundedAndInjectedExecution(t *testing.T) {
 		t.Fatal("policy edit did not change digest")
 	}
 }
+
+// A profile opts in to app cookies with app_cookies; without it the JSON, and so the digest, is what it was before the
+// field existed, and a file naming it loads.
+func TestAppCookiesIsOptInAndLeavesOtherProfilesDigestsAlone(t *testing.T) {
+	p := testProfile()
+	b, _ := json.Marshal(p)
+	if strings.Contains(string(b), "app_cookies") {
+		t.Fatal("a profile without app cookies must not mention them", string(b))
+	}
+	before := p.Digest()
+	p.AppCookies = true
+	if p.Validate() != nil || p.Digest() == before {
+		t.Fatal("app_cookies is a valid, distinct profile")
+	}
+	var decoded PreviewProfileV1
+	if err := json.Unmarshal([]byte(strings.Replace(string(b), `"network_policy":"INTERNAL_ONLY"`, `"network_policy":"INTERNAL_ONLY","app_cookies":true`, 1)), &decoded); err != nil || !decoded.AppCookies {
+		t.Fatal("app_cookies decodes", err)
+	}
+}

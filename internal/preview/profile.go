@@ -41,6 +41,11 @@ type PreviewProfileV1 struct {
 	PidsLimit                int                `json:"pids_limit"`
 	TmpfsBytes               int64              `json:"tmpfs_bytes"`
 	NetworkPolicy            string             `json:"network_policy"`
+	// AppCookies lets the presented service's own cookies through the presentation proxy. It is for a profile whose
+	// previews each have their own host (Repo C's per-app hosts), so an app's cookies stay its own. Cookies named like the
+	// preview gateway's own (__Host-preview*, __Host-unlock*) never pass either way. Omitted when false, so profiles
+	// without it keep their digests.
+	AppCookies bool `json:"app_cookies,omitempty"`
 }
 type ServiceProfileV1 struct {
 	Name        string            `json:"name"`

@@ -193,6 +193,61 @@ func TestControllerProxyBindsLoopbackAndOnlyDialsPresentedService(t *testing.T) 
 		t.Fatal("proxy forwarded authority or destination", receivedHost, path)
 	}
 }
+
+// With app_cookies, an app's own cookies pass both ways; the preview gateway's own never do, and neither do credentials.
+func TestControllerProxyPassesOnlyAnAppsOwnCookiesWhenTheProfileOptsIn(t *testing.T) {
+	var mu sync.Mutex
+	var auth, cookie string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auth, cookie = r.Header.Get("Authorization"), strings.Join(r.Header.Values("Cookie"), " | ")
+		mu.Unlock()
+		w.Header().Add("Set-Cookie", "session=new; Path=/; HttpOnly")
+		w.Header().Add("Set-Cookie", "__Host-preview-session=forged; Path=/; Secure")
+		w.Header().Add("Set-Cookie", "__Host-unlock-abcdefgh23=forged; Path=/; Secure")
+		w.Header().Add("Set-Cookie", "theme=dark")
+		w.Write([]byte("candidate"))
+	}))
+	defer target.Close()
+	parsed, _ := url.Parse(target.URL)
+	for _, appCookies := range []bool{true, false} {
+		g := &presentation{endpoint: parsed.Host, appCookies: appCookies}
+		if err := g.present(); err != nil {
+			t.Fatal(err)
+		}
+		req, _ := http.NewRequest(http.MethodGet, g.url+"/", nil)
+		req.Header.Set("Authorization", "Bearer controller-secret")
+		req.Header.Add("Cookie", "session=abc; __Host-preview-session=gateway; theme=light")
+		req.Header.Add("Cookie", "__Host-unlock-abcdefgh23=x")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.ReadAll(response.Body)
+		response.Body.Close()
+		g.server.Close()
+		set := response.Header.Values("Set-Cookie")
+		mu.Lock()
+		gotAuth, gotCookie := auth, cookie
+		mu.Unlock()
+		if gotAuth != "" {
+			t.Fatal("credentials reached the app", appCookies)
+		}
+		if appCookies {
+			if gotCookie != "session=abc; theme=light" {
+				t.Fatalf("app cookies: got %q", gotCookie)
+			}
+			if len(set) != 2 || set[0] != "session=new; Path=/; HttpOnly" || set[1] != "theme=dark" {
+				t.Fatalf("app Set-Cookie: got %q", set)
+			}
+		} else if gotCookie != "" || len(set) != 0 {
+			t.Fatalf("without app_cookies nothing passes: %q %q", gotCookie, set)
+		}
+	}
+	if appCookieHeader([]string{"__Host-preview-session=a", " ; =x; bare"}) != "" {
+		t.Fatal("nothing but gateway cookies and junk leaves an empty header")
+	}
+}
 func TestDockerOrphanCleanupUsesBothOwnershipFilters(t *testing.T) {
 	d := newDocker("/private/previews")
 	id := strings.Repeat("c", 64)
