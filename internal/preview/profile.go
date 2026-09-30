@@ -49,7 +49,15 @@ type PreviewProfileV1 struct {
 	// Hosted marks a profile for hosted instances only (B9.2.1): no time limit, a named data volume and restarts by
 	// the controller. Preview requests refuse it; hosted requests refuse any other profile. Omitted when false.
 	Hosted bool `json:"hosted,omitempty"`
+	// Runtime runs every service under another OCI runtime registered with Docker. Only "runsc" (gVisor, Repo C design
+	// note A4 decision 4) is accepted: a second wall between an untrusted app and the host kernel. Empty is Docker's
+	// default runtime. Omitted when empty, so profiles without it keep their digests.
+	Runtime string `json:"runtime,omitempty"`
 }
+
+// RuntimeGVisor is gVisor's OCI runtime as Docker registers it (`runsc install`).
+const RuntimeGVisor = "runsc"
+
 type ServiceProfileV1 struct {
 	Name        string            `json:"name"`
 	Image       string            `json:"image"`
@@ -142,6 +150,9 @@ func (p PreviewProfileV1) Validate() error {
 		return ErrUnavailable
 	}
 	if p.TTLSeconds < 1 || p.TTLSeconds > 3600 || p.HealthTimeoutSeconds < 1 || p.HealthTimeoutSeconds > 30 || p.HealthTimeoutSeconds > p.TTLSeconds || p.CPUQuota < 1000 || p.CPUQuota > 200000 || p.MemoryBytes < 16<<20 || p.MemoryBytes > 2<<30 || p.PidsLimit < 1 || p.PidsLimit > 256 || p.TmpfsBytes < 1<<20 || p.TmpfsBytes > 256<<20 || p.TmpfsBytes > p.MemoryBytes/2 {
+		return ErrUnavailable
+	}
+	if p.Runtime != "" && p.Runtime != RuntimeGVisor {
 		return ErrUnavailable
 	}
 	if len(p.HealthPath) > 256 || !strings.HasPrefix(p.HealthPath, "/") || strings.HasPrefix(p.HealthPath, "//") || strings.ContainsAny(p.HealthPath, "\x00\r\n?#\\") {

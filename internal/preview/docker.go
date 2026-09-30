@@ -108,8 +108,17 @@ func scratchOptions(p PreviewProfileV1, s ServiceProfileV1) string {
 	uid, gid, _ := strings.Cut(s.User, ":")
 	return "rw,nosuid,nodev,noexec,size=" + strconv.FormatInt(p.TmpfsBytes, 10) + ",mode=700,uid=" + uid + ",gid=" + gid
 }
-func (d *dockerRuntime) createArgs(id, path string, p PreviewProfileV1, s ServiceProfileV1, i int, volume string) []string {
+
+// createArgs is one service's `docker create`. hosts are "name:ip" entries for the services started before it, given
+// only under gVisor (see startOrder).
+func (d *dockerRuntime) createArgs(id, path string, p PreviewProfileV1, s ServiceProfileV1, i int, volume string, hosts ...string) []string {
 	args := []string{"create", "--pull=never", "--name", d.container(id, i), "--label", d.label(), "--label", "abcp.preview.id=" + id, "--network", d.network(id), "--network-alias", s.Name, "--user", s.User, "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", "--cpu-period=100000", "--cpu-quota=" + strconv.Itoa(p.CPUQuota), "--memory=" + strconv.FormatInt(p.MemoryBytes, 10), "--memory-swap=" + strconv.FormatInt(p.MemoryBytes, 10), "--pids-limit=" + strconv.Itoa(p.PidsLimit), "--ulimit=nofile=1024:1024", "--restart=no", "--ipc=none", "--log-driver=none", "--no-healthcheck", "--workdir=/scratch", "--tmpfs", "/scratch:" + scratchOptions(p, s), "--entrypoint=/usr/bin/env"}
+	if p.Runtime != "" {
+		args = append(args, "--runtime="+p.Runtime)
+	}
+	for _, h := range hosts {
+		args = append(args, "--add-host", h)
+	}
 	if s.MountSource {
 		args = append(args, "--mount", "type=bind,src="+path+",dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate")
 	}
@@ -199,8 +208,8 @@ func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfil
 		}
 		HostConfig struct {
 			Privileged, ReadonlyRootfs                         bool
-			NetworkMode, IpcMode                               string
-			CapDrop, SecurityOpt, Binds                        []string
+			NetworkMode, IpcMode, Runtime                      string
+			CapDrop, SecurityOpt, Binds, ExtraHosts            []string
 			CpuPeriod, CpuQuota, Memory, MemorySwap, PidsLimit int64
 			Tmpfs                                              map[string]string
 			PortBindings                                       map[string]json.RawMessage
@@ -220,6 +229,9 @@ func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfil
 	v := values[0]
 	h := v.HostConfig
 	if h.CpuPeriod != 100000 || h.IpcMode != "none" || len(h.Tmpfs) != 1 || h.Tmpfs["/scratch"] != scratchOptions(p, s) {
+		return "", ErrUnavailable
+	}
+	if !runtimeMatches(p, h.Runtime) || !extraHostsAllowed(p, s, h.ExtraHosts) {
 		return "", ErrUnavailable
 	}
 	if !v.State.Running || v.Config.User != s.User || v.Config.Labels["abcp.preview.owner"] != d.namespace || v.Config.Labels["abcp.preview.id"] != id || h.Privileged || !h.ReadonlyRootfs || h.NetworkMode != d.network(id) || len(h.CapDrop) != 1 || h.CapDrop[0] != "ALL" || len(h.SecurityOpt) != 1 || (h.SecurityOpt[0] != "no-new-privileges" && h.SecurityOpt[0] != "no-new-privileges=true") || len(h.Binds) != 0 || h.CpuQuota != int64(p.CPUQuota) || h.Memory != p.MemoryBytes || h.MemorySwap != p.MemoryBytes || h.PidsLimit != int64(p.PidsLimit) || len(h.PortBindings) != 0 || len(v.NetworkSettings.Networks) != 1 {
@@ -255,6 +267,70 @@ func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfil
 	}
 	return net.JoinHostPort(ip.String(), strconv.Itoa(s.Port)), nil
 }
+
+// runtimeMatches: a profile without a runtime runs on Docker's default (reported as runc, or not at all by older
+// daemons); one with a runtime runs on exactly that one.
+func runtimeMatches(p PreviewProfileV1, runtime string) bool {
+	if p.Runtime == "" {
+		return runtime == "" || runtime == "runc"
+	}
+	return runtime == p.Runtime
+}
+
+// extraHostsAllowed: hosts entries exist only under gVisor, and each names another service of the profile at a
+// private IPv4 address, once.
+func extraHostsAllowed(p PreviewProfileV1, s ServiceProfileV1, hosts []string) bool {
+	if p.Runtime == "" {
+		return len(hosts) == 0
+	}
+	names := map[string]bool{}
+	for _, other := range p.Services {
+		if other.Name != s.Name {
+			names[other.Name] = true
+		}
+	}
+	seen := map[string]bool{}
+	for _, h := range hosts {
+		// Only the form this controller writes: "name:ip".
+		name, address, ok := strings.Cut(h, ":")
+		ip := net.ParseIP(address)
+		if !ok || !names[name] || seen[name] || ip == nil || ip.To4() == nil || !ip.IsPrivate() || ip.IsLoopback() {
+			return false
+		}
+		seen[name] = true
+	}
+	return true
+}
+
+// startOrder is the order the services start in. Under gVisor its own network stack does not reach Docker's embedded
+// DNS, so services find each other by hosts entries: the services that are not presented start first, and the
+// presented one last, with an entry for each.
+func startOrder(p PreviewProfileV1) []int {
+	order := []int{}
+	for i, s := range p.Services {
+		if p.Runtime == "" || !s.Presented {
+			order = append(order, i)
+		}
+	}
+	for i, s := range p.Services {
+		if p.Runtime != "" && s.Presented {
+			order = append(order, i)
+		}
+	}
+	return order
+}
+
+// runtimeAvailable reports whether Docker has the OCI runtime registered.
+func (d *dockerRuntime) runtimeAvailable(ctx context.Context, name string) bool {
+	raw, err := d.run(ctx, "info", "--format", "{{json .Runtimes}}")
+	var runtimes map[string]json.RawMessage
+	if err != nil || json.Unmarshal([]byte(raw), &runtimes) != nil {
+		return false
+	}
+	_, ok := runtimes[name]
+	return ok
+}
+
 func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume string) (*presentation, error) {
 	if !sha256Pattern.MatchString(id) || p.Validate() != nil || (p.dataService() >= 0) != (volume != "") {
 		return nil, ErrUnavailable
@@ -279,8 +355,10 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 		}
 	}
 	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, volume: volume}
-	for i, s := range p.Services {
-		if _, err := d.run(ctx, d.createArgs(id, path, p, s, i, volume)...); err != nil {
+	hosts := []string{}
+	for _, i := range startOrder(p) {
+		s := p.Services[i]
+		if _, err := d.run(ctx, d.createArgs(id, path, p, s, i, volume, hosts...)...); err != nil {
 			return nil, err
 		}
 		name := d.container(id, i)
@@ -309,6 +387,13 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 		}
 		if s.Presented {
 			g.endpoint = endpoint
+		}
+		if p.Runtime != "" {
+			host, _, err := net.SplitHostPort(endpoint)
+			if err != nil {
+				return nil, ErrUnavailable
+			}
+			hosts = append(hosts, s.Name+":"+host)
 		}
 	}
 	if g.endpoint == "" {
@@ -557,7 +642,7 @@ const probeSourceContents = "governed preview source probe"
 // the fixed offline probe tools. Missing tools, unusable container IPs, egress,
 // or an unreachable explicit loopback listener all leave capability false.
 func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved bool) {
-	if !d.hostSupported(ctx) {
+	if !d.hostSupported(ctx) || (p.Runtime != "" && !d.runtimeAvailable(ctx, p.Runtime)) {
 		return false
 	}
 	id := jsonDigest([]string{d.namespace, p.Digest(), "isolation-probe"})
