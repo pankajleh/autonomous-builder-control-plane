@@ -23,6 +23,7 @@ type hostedMemory struct {
 	startErr, healthErr error
 	started, stopped    []string
 	keys                []string
+	settings            []string // the settings file each start named, "" for none
 	dump                string
 	loaded              []string
 	removed             []string
@@ -33,7 +34,7 @@ func (r *hostedMemory) Available(PreviewProfileV1) bool {
 	defer r.mu.Unlock()
 	return r.available
 }
-func (r *hostedMemory) StartHosted(_ context.Context, id, _ string, p PreviewProfileV1, keyDigest string) (string, error) {
+func (r *hostedMemory) StartHosted(_ context.Context, id, _ string, p PreviewProfileV1, keyDigest, settings string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !p.Hosted {
@@ -41,6 +42,7 @@ func (r *hostedMemory) StartHosted(_ context.Context, id, _ string, p PreviewPro
 	}
 	r.started = append(r.started, id)
 	r.keys = append(r.keys, keyDigest)
+	r.settings = append(r.settings, settings)
 	return strings.Repeat("d", 64), r.startErr
 }
 func (r *hostedMemory) Healthy(context.Context, string, PreviewProfileV1) (bool, error) {

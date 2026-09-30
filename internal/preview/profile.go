@@ -53,10 +53,25 @@ type PreviewProfileV1 struct {
 	// note A4 decision 4) is accepted: a second wall between an untrusted app and the host kernel. Empty is Docker's
 	// default runtime. Omitted when empty, so profiles without it keep their digests.
 	Runtime string `json:"runtime,omitempty"`
+	// Egress names the only places a hosted profile's services may reach, through the filtering proxy ABCP serves on
+	// the group network's gateway (egress.go; Repo C design note A5 §8). v1 accepts exactly one entry,
+	// EgressShopifyStores, and only on a hosted profile. Omitted when empty, so profiles without it keep their digests.
+	Egress []string `json:"egress,omitempty"`
 }
 
 // RuntimeGVisor is gVisor's OCI runtime as Docker registers it (`runsc install`).
 const RuntimeGVisor = "runsc"
+
+// EgressShopifyStores is the one egress entry v1 accepts: HTTPS to any single-label name under myshopify.com.
+const EgressShopifyStores = "*.myshopify.com:443"
+
+// EgressPort is the port the egress proxy listens on, on the group network's gateway. The owner's host rule accepts new
+// connections from the preview range to this port only; every other host port stays dropped.
+const EgressPort = 3129
+
+// hostedSettings are the only settings a hosted start may carry, for the one service that names them (Repo C
+// SHOPIFY_APP_FORMAT.md §3). Their values reach that service's environment from a 0600 file, never an argument.
+var hostedSettings = map[string]bool{"SHOPIFY_API_KEY": true, "SHOPIFY_API_SECRET": true, "SHOPIFY_APP_URL": true, "SCOPES": true}
 
 type ServiceProfileV1 struct {
 	Name        string            `json:"name"`
@@ -74,6 +89,19 @@ type ServiceProfileV1 struct {
 	DataVolume  bool     `json:"data_volume,omitempty"`
 	BackupArgv  []string `json:"backup_argv,omitempty"`
 	RestoreArgv []string `json:"restore_argv,omitempty"`
+	// Settings names the values a hosted start must carry for this service (hosted profiles only, at most one
+	// service), each one of hostedSettings. Omitted when unset.
+	Settings []string `json:"settings,omitempty"`
+}
+
+// settingsService returns the index of the service that takes settings, or -1.
+func (p PreviewProfileV1) settingsService() int {
+	for i, s := range p.Services {
+		if len(s.Settings) > 0 {
+			return i
+		}
+	}
+	return -1
 }
 
 // DataPath is where a hosted service's data volume is mounted.
@@ -193,6 +221,29 @@ func (p PreviewProfileV1) Validate() error {
 		}
 	}
 	if volumes > 1 {
+		return ErrUnavailable
+	}
+	if len(p.Egress) > 0 && (!p.Hosted || len(p.Egress) != 1 || p.Egress[0] != EgressShopifyStores) {
+		return ErrUnavailable
+	}
+	takers := 0
+	for _, s := range p.Services {
+		if len(s.Settings) == 0 {
+			continue
+		}
+		takers++
+		named := map[string]bool{}
+		for _, name := range s.Settings {
+			if !hostedSettings[name] || named[name] {
+				return ErrUnavailable
+			}
+			named[name] = true
+		}
+		if !p.Hosted {
+			return ErrUnavailable
+		}
+	}
+	if takers > 1 {
 		return ErrUnavailable
 	}
 	return nil

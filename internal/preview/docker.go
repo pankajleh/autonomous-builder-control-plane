@@ -31,7 +31,9 @@ type presentation struct {
 	volume string
 	// gateway is the host's own address on the group's network, which no service may reach (see previewSubnets).
 	gateway netip.Addr
-	closed  atomic.Bool
+	// egress is the group's filtering proxy on the gateway, for a profile with Egress (egress.go), or nil.
+	egress *egressProxy
+	closed atomic.Bool
 }
 
 // Preview networks live only in previewSubnets. The host's own rule (the owner's abcp-preview-isolation unit, board #93,
@@ -131,6 +133,24 @@ func (d *dockerRuntime) volume(keyDigest string) string {
 func cleanEnv(s ServiceProfileV1) []string {
 	out := []string{"-i", "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/scratch", "TMPDIR=/scratch"}
 	return append(out, environmentValues(s.Environment)...)
+}
+
+// serviceStart is the `docker exec` that starts a service with argv. A group with an egress proxy tells every service
+// where it is. The service that takes settings gets them from their 0600 file with --env-file, never an argument; since
+// `env -i` would clear them, its start keeps the environment Docker gives the exec instead (the image's own settings,
+// which imageSafe allows only from a short list, and the file's), less HOSTNAME.
+func serviceStart(name string, s ServiceProfileV1, argv []string, egress netip.Addr, settings string) []string {
+	args := []string{"exec", "--detach"}
+	env := cleanEnv(s)
+	if settings != "" {
+		args = append(args, "--env-file", settings)
+		env = append([]string{"-u", "HOSTNAME"}, env[1:]...)
+	}
+	args = append(append(args, name, "/usr/bin/env"), env...)
+	if egress.IsValid() {
+		args = append(args, "HTTPS_PROXY=http://"+netip.AddrPortFrom(egress, EgressPort).String(), "NODE_USE_ENV_PROXY=1")
+	}
+	return append(args, argv...)
 }
 func scratchOptions(p PreviewProfileV1, s ServiceProfileV1) string {
 	uid, gid, _ := strings.Cut(s.User, ":")
@@ -392,8 +412,12 @@ func (d *dockerRuntime) runtimeAvailable(ctx context.Context, name string) bool 
 	return ok
 }
 
-func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume string) (*presentation, error) {
+func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume, settings string) (_ *presentation, err error) {
 	if !sha256Pattern.MatchString(id) || p.Validate() != nil || (p.dataService() >= 0) != (volume != "") {
+		return nil, ErrUnavailable
+	}
+	// A hosted start of a profile that takes settings names their file; a probe and every other start name none.
+	if (p.settingsService() >= 0 && !probe) != (settings != "") || settings != "" && !validSettingsFile(settings) {
 		return nil, ErrUnavailable
 	}
 	if path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n") {
@@ -423,6 +447,24 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 		}
 	}
 	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, volume: volume, gateway: gateway}
+	if len(p.Egress) > 0 {
+		listener, listenErr := d.listen("tcp4", netip.AddrPortFrom(gateway, EgressPort).String())
+		if listenErr != nil {
+			return nil, ErrUnavailable
+		}
+		g.egress = newEgressProxy(listener, p.Egress)
+		g.egress.start()
+		// Until the group is handed back, a failed start must end its proxy here: Stop sees only registered groups.
+		defer func() {
+			if err != nil {
+				g.egress.Close()
+			}
+		}()
+	}
+	var egress netip.Addr
+	if g.egress != nil {
+		egress = gateway
+	}
 	hosts := []string{}
 	for _, i := range startOrder(p) {
 		s := p.Services[i]
@@ -440,13 +482,13 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 				return nil, err
 			}
 		}
-		start := s.StartArgv
+		start, serviceSettings := s.StartArgv, ""
 		if probe {
 			start = []string{"/bin/busybox", "httpd", "-f", "-p", strconv.Itoa(s.Port), "-h", "/scratch"}
+		} else if len(s.Settings) > 0 {
+			serviceSettings = settings
 		}
-		args := append([]string{"exec", "--detach", name, "/usr/bin/env"}, cleanEnv(s)...)
-		args = append(args, start...)
-		if _, err := d.run(ctx, args...); err != nil {
+		if _, err := d.run(ctx, serviceStart(name, s, start, egress, serviceSettings)...); err != nil {
 			return nil, err
 		}
 		endpoint, err := d.endpoint(ctx, id, p, s, i, volume)
@@ -550,11 +592,12 @@ func (d *dockerRuntime) Start(ctx context.Context, id, path string, p PreviewPro
 	if p.Hosted {
 		return "", ErrUnavailable
 	}
-	return d.start(ctx, id, path, p, "")
+	return d.start(ctx, id, path, p, "", "")
 }
 
-// StartHosted starts a hosted instance with the hosting key's data volume (B9.2.1).
-func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest string) (string, error) {
+// StartHosted starts a hosted instance with the hosting key's data volume (B9.2.1) and, for a profile that takes
+// settings, the file that holds them (A5.2b).
+func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest, settings string) (string, error) {
 	if !p.Hosted || !sha256Pattern.MatchString(keyDigest) {
 		return "", ErrUnavailable
 	}
@@ -562,16 +605,25 @@ func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p Prev
 	if p.dataService() >= 0 {
 		volume = d.volume(keyDigest)
 	}
-	return d.start(ctx, id, path, p, volume)
+	return d.start(ctx, id, path, p, volume, settings)
 }
-func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume string) (string, error) {
+
+// validSettingsFile accepts an absolute, clean path to a regular file only its owner can read or write.
+func validSettingsFile(path string) bool {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsAny(path, ",\x00\r\n") {
+		return false
+	}
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0077 == 0
+}
+func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume, settings string) (string, error) {
 	if !sha256Pattern.MatchString(id) || path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n") {
 		return "", ErrUnavailable
 	}
 	if !d.Available(p) {
 		return "", ErrUnavailable
 	}
-	g, err := d.startGroup(ctx, id, path, p, false, volume)
+	g, err := d.startGroup(ctx, id, path, p, false, volume, settings)
 	if err != nil {
 		_ = d.Stop(context.Background(), id)
 		return "", err
@@ -652,6 +704,9 @@ func (d *dockerRuntime) Stop(ctx context.Context, id string) error {
 		g.closed.Store(true)
 		_ = g.server.Close()
 		g.transport.CloseIdleConnections()
+		if g.egress != nil {
+			_ = g.egress.Close()
+		}
 	}
 	return d.removeObjects(ctx, "abcp.preview.id="+id)
 }
@@ -758,7 +813,7 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 			break
 		}
 	}
-	g, err := d.startGroup(ctx, id, path, p, true, volume)
+	g, err := d.startGroup(ctx, id, path, p, true, volume, "")
 	if err != nil {
 		return false
 	}
@@ -818,11 +873,25 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 		if _, err = d.run(ctx, append(args, "wget", "-T", "2", "-O", "/dev/null", hostURL)...); err == nil || reached.Load() != 0 {
 			return false
 		}
+		if g.egress != nil {
+			// The one way out is open to the service, and refuses a name the profile does not allow: this needs the
+			// owner's rule for the egress port, without which the profile stays unavailable.
+			script := "/bin/busybox printf 'CONNECT example.com:443 HTTP/1.1\\r\\nHost: example.com:443\\r\\n\\r\\n' | /bin/busybox nc -w 3 " + g.gateway.String() + " " + strconv.Itoa(EgressPort)
+			answer, err := d.run(ctx, append(args, "sh", "-c", script)...)
+			if err != nil || !strings.HasPrefix(answer, "HTTP/1.1 403 ") {
+				return false
+			}
+		}
 		if s.DataVolume {
 			// The service's own user must be able to write its data volume, as the image's /data prepares it.
 			if _, err = d.run(ctx, append(args, "touch", DataPath+"/.abcp-probe")...); err != nil {
 				return false
 			}
+		}
+	}
+	if g.egress != nil {
+		if counts := g.egress.Counts(); counts.Opened != 0 || counts.Refused != int64(len(p.Services)) {
+			return false
 		}
 	}
 	reachable := false
