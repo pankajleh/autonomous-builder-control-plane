@@ -1100,6 +1100,72 @@ git commit -qm 'candidate implementation' || exit 44
 	}
 }
 
+func TestRunnerGivesTheEngineItsLaneInPlaceOfTheInheritedSettings(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "subscription-key")
+	t.Setenv("CODEX_HOME", "/home/devagent/.codex")
+	laneFile := filepath.Join(t.TempDir(), "codex-api.env")
+	laneContent := "CODEX_HOME=/home/devagent/.codex-api\nOPENAI_API_KEY=lane-key-never-recorded\n"
+	writeTestFile(t, laneFile, []byte(laneContent), 0o600)
+	script := `#!/bin/sh
+if [ "$OPENAI_API_KEY" != "lane-key-never-recorded" ]; then exit 42; fi
+if [ "$CODEX_HOME" != "/home/devagent/.codex-api" ]; then exit 43; fi
+printf 'candidate\n' > candidate.txt
+git add candidate.txt || exit 44
+git commit -qm 'candidate implementation' || exit 45
+`
+	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	manifest.Executor.Lane, manifest.Executor.LaneFile = "codex-api", laneFile
+	fixture.authority = fixture.admit(t, manifest)
+	result := fixture.execute(t)
+	if !result.Accepted() {
+		t.Fatalf("a run on its lane was not accepted: %#v", result)
+	}
+	ledgerData, err := os.ReadFile(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(laneContent))
+	for _, want := range []string{`"engine_lane":"codex-api"`, `"engine_lane_sha256":"` + hex.EncodeToString(sum[:]) + `"`, `"engine_lane_keys":["CODEX_HOME","OPENAI_API_KEY"]`} {
+		if !strings.Contains(string(ledgerData), want) {
+			t.Errorf("the run's start does not record %s", want)
+		}
+	}
+	for _, root := range []string{filepath.Dir(fixture.ledgerPath), fixture.evidence} {
+		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err == nil && info.Mode().IsRegular() {
+				if data, _ := os.ReadFile(path); strings.Contains(string(data), "lane-key-never-recorded") {
+					t.Errorf("%s records the lane's key", path)
+				}
+			}
+			return nil
+		})
+	}
+}
+
+func TestRunnerStopsBeforeTheEngineWhenItsLaneFileIsNotPrivate(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "engine-started")
+	laneFile := filepath.Join(t.TempDir(), "codex-api.env")
+	writeTestFile(t, laneFile, []byte("OPENAI_API_KEY=lane-key-never-recorded\n"), 0o600)
+	fixture := newRunFixtureWithScript(t, "#!/bin/sh\ntouch "+marker+"\nexit 0\n", authority.WorktreePolicy{}, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	manifest.Executor.Lane, manifest.Executor.LaneFile = "codex-api", laneFile
+	fixture.authority = fixture.admit(t, manifest)
+	if err := os.Chmod(laneFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := fixture.runner(t).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "mode 0600") || strings.Contains(err.Error(), "lane-key-never-recorded") {
+		t.Fatalf("expected the lane to be refused, got %v", err)
+	}
+	if result.State != domain.StateFailed {
+		t.Fatalf("state %s", result.State)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("the engine started")
+	}
+}
+
 func TestRunnerIgnoresAmbientGitRepositoryOverrides(t *testing.T) {
 	fixture := newRunFixture(t, 0, commandPath(t, "true"))
 	t.Setenv("GIT_DIR", filepath.Join(t.TempDir(), "attacker.git"))

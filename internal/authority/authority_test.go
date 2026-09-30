@@ -302,6 +302,42 @@ func TestNewValidatesAndCanonicalizesExecutorPolicy(t *testing.T) {
 	}
 }
 
+func TestAnEngineLaneIsNamedWithItsFileOrNotAtAll(t *testing.T) {
+	manifest := fixtureManifest(t)
+	laned := cloneManifest(manifest)
+	laned.Executor.Lane, laned.Executor.LaneFile = "codex-api", "/home/devagent/abcp-config/lanes/codex-api.env"
+	governed, err := New(laned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := governed.Executor(); got.Lane != "codex-api" || got.LaneFile != "/home/devagent/abcp-config/lanes/codex-api.env" {
+		t.Fatalf("lane %+v", got)
+	}
+	plain, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if governed.SHA256() == plain.SHA256() {
+		t.Fatal("the lane is not part of the authority")
+	}
+	if strings.Contains(string(plain.CanonicalJSON()), "lane") {
+		t.Fatal("a manifest without a lane changed its canonical form")
+	}
+	for name, edit := range map[string]func(*ExecutorPolicy){
+		"lane without file": func(p *ExecutorPolicy) { p.Lane, p.LaneFile = "codex-api", "" },
+		"file without lane": func(p *ExecutorPolicy) { p.Lane, p.LaneFile = "", "/home/devagent/lanes/codex-api.env" },
+		"bad name":          func(p *ExecutorPolicy) { p.Lane, p.LaneFile = "Codex API", "/home/devagent/lanes/codex-api.env" },
+		"relative file":     func(p *ExecutorPolicy) { p.Lane, p.LaneFile = "codex-api", "lanes/codex-api.env" },
+		"not a .env file":   func(p *ExecutorPolicy) { p.Lane, p.LaneFile = "codex-api", "/home/devagent/lanes/codex-api.json" },
+	} {
+		invalid := cloneManifest(manifest)
+		edit(&invalid.Executor)
+		if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "executor.lane") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestAuthorityDoesNotExposeMutableState(t *testing.T) {
 	manifest := fixtureManifest(t)
 	authority, err := New(manifest)
