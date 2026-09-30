@@ -90,7 +90,7 @@ and proxy settings are ignored. Every image must contain `/usr/bin/env`,
 fixed offline isolation probe, as well as its configured application executables.
 The configured non-root user must be able to run these tools.
 
-Each group uses a dedicated internal bridge with no published container ports,
+Each group uses a dedicated internal bridge in `10.213.0.0/16` (one /28 each), with no published container ports,
 a read-only root, dropped capabilities and no-new-privileges. `/scratch` is its
 bounded, non-executable write area. Source, when requested, is mounted at
 `/source` using `readonly,bind-recursive=readonly,bind-propagation=rprivate`.
@@ -104,7 +104,10 @@ Detached checkout directories and files are made readable for the
 configured non-root users regardless of the controller's umask, preserving
 executable files and symlinks while their host parent remains private. Startup
 probes exercise that same mount and verify source-file contents through each
-service's configured user. Host-loopback presentation binds an explicit 127.0.0.1 address
+service's configured user. The host itself must be out of reach too: the host's rule
+(`abcp-preview-isolation`) drops new connections from `10.213.0.0/16`, and the probe
+proves it with a listener on the network's gateway that no service may reach.
+Host-loopback presentation binds an explicit 127.0.0.1 address
 and targets only the presented service; siblings remain internal.
 
 The presentation proxy removes `Authorization`, `Proxy-Authorization`, `Forwarded`,

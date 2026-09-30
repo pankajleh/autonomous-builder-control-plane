@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -14,12 +16,23 @@ import (
 	"time"
 )
 
+// networkInspection is `docker network inspect` for a group's network as the controller creates it: internal, its own,
+// in the /28 of the preview range it asks for first.
+func networkInspection(d *dockerRuntime, id string) string {
+	subnet := previewSubnet(id, 0)
+	gateway := subnet.Addr().As4()
+	gateway[3]++
+	raw, _ := json.Marshal([]any{map[string]any{"Internal": true, "Driver": "bridge", "Labels": map[string]string{"abcp.preview.owner": d.namespace},
+		"IPAM": map[string]any{"Config": []map[string]string{{"Subnet": subnet.String(), "Gateway": netip.AddrFrom4(gateway).String()}}}}})
+	return string(raw)
+}
+
 func dockerInspection(d *dockerRuntime, id string, p PreviewProfileV1, s ServiceProfileV1) map[string]any {
 	return map[string]any{
 		"State":           map[string]any{"Running": true},
 		"Config":          map[string]any{"User": s.User, "Labels": map[string]string{"abcp.preview.owner": d.namespace, "abcp.preview.id": id}},
 		"HostConfig":      map[string]any{"CpuPeriod": 100000, "IpcMode": "none", "Tmpfs": map[string]string{"/scratch": scratchOptions(p, s)}, "ReadonlyRootfs": true, "NetworkMode": d.network(id), "CapDrop": []string{"ALL"}, "SecurityOpt": []string{"no-new-privileges"}, "CpuQuota": p.CPUQuota, "Memory": p.MemoryBytes, "MemorySwap": p.MemoryBytes, "PidsLimit": p.PidsLimit},
-		"NetworkSettings": map[string]any{"Networks": map[string]any{d.network(id): map[string]string{"IPAddress": "10.88.0.2"}}, "Ports": map[string]any{"8080/tcp": nil}},
+		"NetworkSettings": map[string]any{"Networks": map[string]any{d.network(id): map[string]string{"IPAddress": "10.213.0.2"}}, "Ports": map[string]any{"8080/tcp": nil}},
 		"Mounts":          []map[string]any{{"Type": "bind", "Destination": "/source", "Source": filepath.Join(d.root, "sources", id), "RW": false}},
 	}
 }
@@ -309,8 +322,7 @@ func TestHostInternalNetworkWithoutReachableLoopbackRemainsUnavailable(t *testin
 			return string(b), nil
 		case "network":
 			if args[1] == "inspect" {
-				b, _ := json.Marshal([]any{map[string]any{"Internal": true, "Driver": "bridge", "Labels": map[string]string{"abcp.preview.owner": d.namespace}}})
-				return string(b), nil
+				return networkInspection(d, id), nil
 			}
 		case "inspect":
 			v := dockerInspection(d, id, p, p.Services[0])
@@ -326,9 +338,13 @@ func TestHostInternalNetworkWithoutReachableLoopbackRemainsUnavailable(t *testin
 				egressAttempted = true
 				return "", ErrUnavailable
 			}
+			if strings.Contains(joined, "wget -T 2 -O /dev/null http://127.0.0.1:") {
+				return "", ErrUnavailable
+			}
 		}
 		return "", nil
 	}
+	d.listen = func(network, _ string) (net.Listener, error) { return net.Listen(network, "127.0.0.1:0") }
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	if d.prove(ctx, p) || d.Available(p) || !egressAttempted {

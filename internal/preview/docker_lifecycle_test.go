@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -20,6 +22,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 type dockerFixture struct {
@@ -31,6 +34,8 @@ type dockerFixture struct {
 	created    map[string][]string // each container's create argv, which inspect reports back as Docker does
 	runtimes   string              // `docker info --format {{json .Runtimes}}`
 	network    bool
+	subnet     netip.Prefix // the /28 the controller asked for, reported back by network inspect as Docker does
+	reachHost  bool         // whether a service's request to the host's gateway listener gets through (no host rule)
 	reject     func(context.Context, []string) error
 	external   func()
 }
@@ -40,7 +45,18 @@ func newDockerFixture(t *testing.T, p PreviewProfileV1) *dockerFixture {
 	f := &dockerFixture{d: newDocker(t.TempDir()), p: p, id: strings.Repeat("c", 64), containers: map[string]string{}, created: map[string][]string{},
 		runtimes: `{"io.containerd.runc.v2":{},"runc":{}}`}
 	f.d.run = f.run
+	f.subnet = previewSubnet(f.id, 0)
+	// The gateway address exists only on a Docker host; the listener is loopback here, and the fixture's services
+	// reach it only when reachHost says so.
+	f.d.listen = func(network, _ string) (net.Listener, error) { return net.Listen(network, "127.0.0.1:0") }
 	return f
+}
+
+// ip is the fixture's address for service i: in the network's /28, after the gateway.
+func (f *dockerFixture) ip(i int) string {
+	a := f.subnet.Addr().As4()
+	a[3] += byte(i + 2)
+	return netip.AddrFrom4(a).String()
 }
 func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error) {
 	f.commands = append(f.commands, append([]string(nil), args...))
@@ -62,8 +78,16 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 		switch args[1] {
 		case "create":
 			f.network = true
+			for i, arg := range args {
+				if arg == "--subnet" && i+1 < len(args) {
+					f.subnet = netip.MustParsePrefix(args[i+1])
+				}
+			}
 		case "inspect":
-			return encoded([]any{map[string]any{"Internal": true, "Driver": "bridge", "Labels": map[string]string{"abcp.preview.owner": f.d.namespace}}})
+			gateway := f.subnet.Addr().As4()
+			gateway[3]++
+			return encoded([]any{map[string]any{"Internal": true, "Driver": "bridge", "Labels": map[string]string{"abcp.preview.owner": f.d.namespace},
+				"IPAM": map[string]any{"Config": []map[string]string{{"Subnet": f.subnet.String(), "Gateway": netip.AddrFrom4(gateway).String()}}}}})
 		case "ls":
 			if f.network {
 				return strings.Repeat("f", 64), nil
@@ -92,7 +116,7 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 		if !s.MountSource {
 			v["Mounts"] = []any{}
 		}
-		v["NetworkSettings"].(map[string]any)["Networks"].(map[string]any)[f.d.network(f.id)] = map[string]string{"IPAddress": "10.88.0." + strconv.Itoa(i+2)}
+		v["NetworkSettings"].(map[string]any)["Networks"].(map[string]any)[f.d.network(f.id)] = map[string]string{"IPAddress": f.ip(i)}
 		runtime, hosts := "runc", []string{}
 		created := f.created[args[1]]
 		for j, arg := range created {
@@ -140,6 +164,20 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 		if strings.Contains(joined, "http://1.1.1.1/") {
 			if f.external != nil {
 				f.external()
+			}
+			return "", ErrUnavailable
+		}
+		if strings.Contains(joined, "wget -T 2 -O /dev/null http://127.0.0.1:") {
+			// The probe's request to the host's listener: dropped by the host rule, unless the fixture says otherwise.
+			if !f.reachHost {
+				return "", ErrUnavailable
+			}
+			// As wget does: connect, then wait for the answer, which the probe's listener never gives; it closes.
+			c, err := net.Dial("tcp", strings.TrimSuffix(strings.TrimPrefix(args[len(args)-1], "http://"), "/"))
+			if err == nil {
+				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+				_, _ = io.Copy(io.Discard, c)
+				c.Close()
 			}
 			return "", ErrUnavailable
 		}
@@ -202,7 +240,7 @@ func TestDockerStartHealthIsolationAndCleanup(t *testing.T) {
 		t.Fatal("prepare/source mount missing")
 	}
 	g := f.d.groups[f.id]
-	if g.endpoint != "10.88.0.2:8080" {
+	if g.endpoint != f.ip(0)+":8080" {
 		t.Fatal("sibling presented", g.endpoint)
 	}
 	var healthy atomic.Bool
@@ -264,7 +302,7 @@ func TestDockerCanceledHealthDoesNotRevokeProfile(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			f := newDockerFixture(t, testProfile())
 			f.d.approved[f.p.Digest()] = true
-			f.d.groups[f.id] = &presentation{endpoint: "10.88.0.2:8080"}
+			f.d.groups[f.id] = &presentation{endpoint: "10.213.0.2:8080"}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			entered := make(chan struct{})

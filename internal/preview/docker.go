@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -28,7 +29,32 @@ type presentation struct {
 	appCookies            bool
 	// volume is the hosted data volume mounted at /data in the data service, or "" for a preview.
 	volume string
-	closed atomic.Bool
+	// gateway is the host's own address on the group's network, which no service may reach (see previewSubnets).
+	gateway netip.Addr
+	closed  atomic.Bool
+}
+
+// Preview networks live only in previewSubnets. The host's own rule (the owner's abcp-preview-isolation unit, board #93,
+// 2026-09-30) drops new connections from this range to the host, so a service reaches neither the internet (its network
+// is internal) nor the host through its network's gateway. The probe proves both before a profile is approved. Each
+// group network is one /28 of the range, 4096 of them.
+var previewSubnets = netip.MustParsePrefix("10.213.0.0/16")
+
+const previewSubnetBits = 28
+
+// previewSubnet is a group's attempt-th candidate /28, counting on from a place given by its id.
+func previewSubnet(id string, attempt int) netip.Prefix {
+	start, _ := strconv.ParseUint(id[:4], 16, 32)
+	index := (int(start) + attempt) % (1 << (previewSubnetBits - previewSubnets.Bits()))
+	base := previewSubnets.Addr().As4()
+	base[2], base[3] = byte(index>>4), byte(index&15)<<4
+	return netip.PrefixFrom(netip.AddrFrom4(base), previewSubnetBits)
+}
+
+// inPreviewSubnets reports an IPv4 address inside the preview range.
+func inPreviewSubnets(address string) bool {
+	ip, err := netip.ParseAddr(address)
+	return err == nil && ip.Is4() && previewSubnets.Contains(ip)
 }
 
 // gatewayCookie reports a cookie name the preview gateway keeps for itself; such cookies never reach or come from an app.
@@ -59,6 +85,8 @@ type dockerRuntime struct {
 	groups          map[string]*presentation
 	// stream runs one Docker command with the given standard input and output, for hosted backups and restores.
 	stream func(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error
+	// listen opens the probe's listener on a group network's gateway, to prove that no service reaches the host.
+	listen func(network, address string) (net.Listener, error)
 }
 
 // hostedSleepSeconds keeps a hosted instance's containers alive until they are stopped: ten years.
@@ -70,7 +98,7 @@ func dockerEnvironment(root string) ([]string, []string) {
 }
 
 func newDocker(root string) *dockerRuntime {
-	d := &dockerRuntime{root: root, namespace: digest([]byte(root)), approved: map[string]bool{}, groups: map[string]*presentation{}}
+	d := &dockerRuntime{root: root, namespace: digest([]byte(root)), approved: map[string]bool{}, groups: map[string]*presentation{}, listen: net.Listen}
 	d.run = func(ctx context.Context, args ...string) (string, error) {
 		// Ignore ambient Docker contexts, endpoints, registry credentials and proxy
 		// settings. The socket is controller-only; never a candidate mount.
@@ -192,17 +220,39 @@ func (d *dockerRuntime) imageSafe(ctx context.Context, s ServiceProfileV1) bool 
 	return true
 }
 func (d *dockerRuntime) internalNetwork(ctx context.Context, id string) bool {
+	_, ok := d.networkGateway(ctx, id)
+	return ok
+}
+
+// networkGateway checks a group's network (internal, IPv4 only, this controller's, one /28 of the preview range) and
+// returns the host's address on it.
+func (d *dockerRuntime) networkGateway(ctx context.Context, id string) (netip.Addr, bool) {
 	raw, err := d.run(ctx, "network", "inspect", d.network(id))
 	if err != nil {
-		return false
+		return netip.Addr{}, false
 	}
 	var values []struct {
 		Internal   bool
 		EnableIPv6 bool
 		Driver     string
 		Labels     map[string]string
+		IPAM       struct {
+			Config []struct{ Subnet, Gateway string }
+		}
 	}
-	return json.Unmarshal([]byte(raw), &values) == nil && len(values) == 1 && values[0].Internal && !values[0].EnableIPv6 && values[0].Driver == "bridge" && values[0].Labels["abcp.preview.owner"] == d.namespace
+	if json.Unmarshal([]byte(raw), &values) != nil || len(values) != 1 {
+		return netip.Addr{}, false
+	}
+	v := values[0]
+	if !v.Internal || v.EnableIPv6 || v.Driver != "bridge" || v.Labels["abcp.preview.owner"] != d.namespace || len(v.IPAM.Config) != 1 {
+		return netip.Addr{}, false
+	}
+	subnet, err := netip.ParsePrefix(v.IPAM.Config[0].Subnet)
+	gateway, gatewayErr := netip.ParseAddr(v.IPAM.Config[0].Gateway)
+	if err != nil || gatewayErr != nil || subnet.Bits() != previewSubnetBits || subnet.Masked() != subnet || !previewSubnets.Contains(subnet.Addr()) || !subnet.Contains(gateway) {
+		return netip.Addr{}, false
+	}
+	return gateway, true
 }
 
 // endpoint refuses host network, bridge attachment, published ports and any
@@ -274,7 +324,7 @@ func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfil
 	}
 	network, ok := v.NetworkSettings.Networks[d.network(id)]
 	ip := net.ParseIP(network.IPAddress)
-	if !ok || ip == nil || ip.To4() == nil || !ip.IsPrivate() || ip.IsLoopback() {
+	if !ok || ip == nil || !inPreviewSubnets(network.IPAddress) {
 		return "", ErrUnavailable
 	}
 	return net.JoinHostPort(ip.String(), strconv.Itoa(s.Port)), nil
@@ -303,10 +353,9 @@ func extraHostsAllowed(p PreviewProfileV1, s ServiceProfileV1, hosts []string) b
 	}
 	seen := map[string]bool{}
 	for _, h := range hosts {
-		// Only the form this controller writes: "name:ip".
+		// Only the form this controller writes: "name:ip", at an address in the preview range.
 		name, address, ok := strings.Cut(h, ":")
-		ip := net.ParseIP(address)
-		if !ok || !names[name] || seen[name] || ip == nil || ip.To4() == nil || !ip.IsPrivate() || ip.IsLoopback() {
+		if !ok || !names[name] || seen[name] || !inPreviewSubnets(address) {
 			return false
 		}
 		seen[name] = true
@@ -355,10 +404,17 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 			return nil, ErrUnavailable
 		}
 	}
-	if _, err := d.run(ctx, "network", "create", "--internal", "--driver=bridge", "--label", d.label(), "--label", "abcp.preview.id="+id, d.network(id)); err != nil {
-		return nil, err
+	// One free /28 of the preview range: Docker refuses a subnet that overlaps another network, so try the next.
+	created := false
+	for attempt := 0; attempt < 64 && !created && ctx.Err() == nil; attempt++ {
+		_, err := d.run(ctx, "network", "create", "--internal", "--driver=bridge", "--subnet", previewSubnet(id, attempt).String(), "--label", d.label(), "--label", "abcp.preview.id="+id, d.network(id))
+		created = err == nil
 	}
-	if !d.internalNetwork(ctx, id) {
+	if !created {
+		return nil, ErrUnavailable
+	}
+	gateway, ok := d.networkGateway(ctx, id)
+	if !ok {
 		return nil, ErrUnavailable
 	}
 	if volume != "" {
@@ -366,7 +422,7 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 			return nil, err
 		}
 	}
-	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, volume: volume}
+	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, volume: volume, gateway: gateway}
 	hosts := []string{}
 	for _, i := range startOrder(p) {
 		s := p.Services[i]
@@ -709,6 +765,25 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 	d.mu.Lock()
 	d.groups[id] = g
 	d.mu.Unlock()
+	// Nor may a service reach the host: a listener on the network's own gateway, where the host answers this network,
+	// must get no connection (the owner's host rule drops new connections from the preview range).
+	listener, err := d.listen("tcp4", netip.AddrPortFrom(g.gateway, 0).String())
+	if err != nil {
+		return false
+	}
+	defer listener.Close()
+	var reached atomic.Int32
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			reached.Add(1)
+			c.Close()
+		}
+	}()
+	hostURL := "http://" + listener.Addr().String() + "/"
 	for i, s := range p.Services {
 		// A functioning route reader and wget are prerequisites; a missing probe
 		// executable cannot masquerade as evidence of blocked external egress.
@@ -737,6 +812,10 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 		}
 		// A successful external HTTP request disproves isolation.
 		if _, err = d.run(ctx, append(args, "wget", "-T", "2", "-O", "/dev/null", "http://1.1.1.1/")...); err == nil {
+			return false
+		}
+		// So does reaching the host: any answer, or any connection the listener saw.
+		if _, err = d.run(ctx, append(args, "wget", "-T", "2", "-O", "/dev/null", hostURL)...); err == nil || reached.Load() != 0 {
 			return false
 		}
 		if s.DataVolume {

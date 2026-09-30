@@ -162,8 +162,7 @@ func TestHostedDockerBackupAndRestoreRunTheProfilesCommandsInTheDataService(t *t
 	d.run = func(_ context.Context, args ...string) (string, error) {
 		switch args[0] {
 		case "network":
-			raw, _ := json.Marshal([]any{map[string]any{"Internal": true, "Driver": "bridge", "Labels": map[string]string{"abcp.preview.owner": d.namespace}}})
-			return string(raw), nil
+			return networkInspection(d, id), nil
 		case "inspect":
 			return inspect(1), nil
 		}
@@ -202,8 +201,7 @@ func TestHostedDockerBackupAndRestoreRunTheProfilesCommandsInTheDataService(t *t
 			raw, _ := json.Marshal([]any{v})
 			return string(raw), nil
 		}
-		raw, _ := json.Marshal([]any{map[string]any{"Internal": true, "Driver": "bridge", "Labels": map[string]string{"abcp.preview.owner": d.namespace}}})
-		return string(raw), nil
+		return networkInspection(d, id), nil
 	}
 	streamed = nil
 	if err := d.Dump(context.Background(), id, p, &out); err == nil || len(streamed) != 0 {
@@ -259,7 +257,7 @@ func TestHostedProfileProbeWritesItsDataVolumeAndRemovesIt(t *testing.T) {
 				case args[0] == "inspect" && strings.HasSuffix(args[1], "-1"):
 					f.commands = append(f.commands, args)
 					v := hostedInspection(f.d, f.id, f.p, 1, volume)
-					v["NetworkSettings"].(map[string]any)["Networks"].(map[string]any)[f.d.network(f.id)] = map[string]string{"IPAddress": "10.88.0.3"}
+					v["NetworkSettings"].(map[string]any)["Networks"].(map[string]any)[f.d.network(f.id)] = map[string]string{"IPAddress": "10.213.0.3"}
 					raw, _ := json.Marshal([]any{v})
 					return string(raw), nil
 				case args[0] == "exec" && strings.Contains(strings.Join(args, " "), "touch /data/.abcp-probe"):
