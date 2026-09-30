@@ -52,7 +52,7 @@ func TestGVisorProfileStartsTheDatabaseFirstAndGivesTheAppItsAddress(t *testing.
 		}
 	}
 	// Docker's embedded DNS does not answer inside gVisor: the app finds the database by a hosts entry.
-	if !strings.Contains(appArgs, "--add-host db:10.88.0.3") || strings.Contains(dbArgs, "--add-host") {
+	if !strings.Contains(appArgs, "--add-host db:"+f.ip(1)) || strings.Contains(dbArgs, "--add-host") {
 		t.Fatal("hosts entries", appArgs, dbArgs)
 	}
 	if ok, err := f.d.Healthy(context.Background(), f.id, p); err != nil {
@@ -87,15 +87,15 @@ func TestGVisorInspectionRejectsTheWrongRuntimeAndForeignHostsEntries(t *testing
 		hosts   []string
 		gvisor  bool
 	}{
-		"gvisor-profile-on-runc":     {runtime: "runc", hosts: []string{"db:10.88.0.3"}, gvisor: true},
+		"gvisor-profile-on-runc":     {runtime: "runc", hosts: []string{"db:10.213.0.3"}, gvisor: true},
 		"gvisor-profile-no-runtime":  {runtime: "", hosts: nil, gvisor: true},
 		"entry-for-an-unknown-name":  {runtime: "runsc", hosts: []string{"metadata:10.0.0.9"}, gvisor: true},
-		"entry-for-itself":           {runtime: "runsc", hosts: []string{"web:10.88.0.2"}, gvisor: true},
+		"entry-for-itself":           {runtime: "runsc", hosts: []string{"web:10.213.0.2"}, gvisor: true},
 		"entry-to-loopback":          {runtime: "runsc", hosts: []string{"db:127.0.0.1"}, gvisor: true},
 		"entry-to-a-public-address":  {runtime: "runsc", hosts: []string{"db:1.1.1.1"}, gvisor: true},
-		"entry-twice":                {runtime: "runsc", hosts: []string{"db:10.88.0.3", "db:10.88.0.4"}, gvisor: true},
+		"entry-twice":                {runtime: "runsc", hosts: []string{"db:10.213.0.3", "db:10.213.0.4"}, gvisor: true},
 		"default-profile-on-runsc":   {runtime: "runsc", hosts: nil, gvisor: false},
-		"default-profile-with-entry": {runtime: "runc", hosts: []string{"db:10.88.0.3"}, gvisor: false},
+		"default-profile-with-entry": {runtime: "runc", hosts: []string{"db:10.213.0.3"}, gvisor: false},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -106,7 +106,7 @@ func TestGVisorInspectionRejectsTheWrongRuntimeAndForeignHostsEntries(t *testing
 			d := newDocker("/private/previews")
 			id := strings.Repeat("c", 64)
 			v := dockerInspection(d, id, p, p.Services[0])
-			good := map[string]any{"Runtime": "runsc", "ExtraHosts": []string{"db:10.88.0.3"}}
+			good := map[string]any{"Runtime": "runsc", "ExtraHosts": []string{"db:10.213.0.3"}}
 			if !c.gvisor {
 				good = map[string]any{"Runtime": "runc", "ExtraHosts": []string{}}
 			}
