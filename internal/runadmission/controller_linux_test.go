@@ -832,6 +832,60 @@ func TestAdmissionProfileRejectsRepositoryIdentityThatIsNotCanonicalOrigin(t *te
 	}
 }
 
+func TestAdmissionProfileOnAnEngineLaneLoadsOnlyWithTheOperatorsPrivateLaneFile(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mode    os.FileMode
+		content string
+		loads   bool
+	}{
+		{"private", 0o600, "OPENAI_API_KEY=lane-key-never-shown\nCODEX_HOME=/home/devagent/.codex-api\n", true},
+		{"readable by others", 0o644, "OPENAI_API_KEY=lane-key-never-shown\n", false},
+		{"a setting its engine does not take", 0o600, "AWS_SECRET_ACCESS_KEY=lane-key-never-shown\n", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, repository, head := makeRepository(t, true)
+			profilePath, catalog := writeAdmissionConfiguration(t, root, repository, head)
+			var profiles ProfileFileV1
+			data, err := os.ReadFile(profilePath)
+			if err != nil || json.Unmarshal(data, &profiles) != nil {
+				t.Fatalf("read profile: %v", err)
+			}
+			laneFile := filepath.Join(root, "codex-api.env")
+			if err := os.WriteFile(laneFile, []byte(test.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(laneFile, test.mode); err != nil {
+				t.Fatal(err)
+			}
+			var template authority.Manifest
+			data, err = os.ReadFile(profiles.Profiles[0].ManifestTemplatePath)
+			if err != nil || json.Unmarshal(data, &template) != nil {
+				t.Fatalf("read template: %v", err)
+			}
+			template.Executor.Lane, template.Executor.LaneFile = "codex-api", laneFile
+			writeProtectedJSON(t, profiles.Profiles[0].ManifestTemplatePath, template)
+			service := filepath.Join(root, "service")
+			if err := os.Mkdir(service, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			controller, err := NewController(Config{ProfileFile: profilePath, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog})
+			if err == nil {
+				controller.Close()
+			}
+			if test.loads && err != nil {
+				t.Fatalf("a private lane file was refused: %v", err)
+			}
+			if !test.loads && err == nil {
+				t.Fatal("the lane file was accepted")
+			}
+			if err != nil && strings.Contains(err.Error(), "lane-key-never-shown") {
+				t.Fatalf("the refusal names the lane's value: %v", err)
+			}
+		})
+	}
+}
+
 func TestAdmissionCreateOrVerifyRejectsMaterialDrift(t *testing.T) {
 	fixture := newAdmissionFixture(t, true)
 	response, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request)

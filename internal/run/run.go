@@ -25,6 +25,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/enginelane"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -561,9 +562,21 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("parse governed Ralphex timeout: %w", err), nil)
 	}
-	if err := r.transition(ctx, domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner", map[string]any{
-		"argv": argv, "timeout": r.governed.Ralphex().Timeout, "environment_policy": ralphexEnvironmentPolicy,
-	}, nil); err != nil {
+	// An engine lane (Repo C design note A6) replaces the inherited settings of
+	// its engine for this build only. It is read now, so a changed or removed
+	// file stops the build before the engine starts; only its name, SHA-256 and
+	// setting names are recorded, never a value.
+	environment := ralphexEnvironment(r.governed.Executor().Executor, r.capsule)
+	startEvidence := map[string]any{"argv": argv, "timeout": r.governed.Ralphex().Timeout, "environment_policy": ralphexEnvironmentPolicy}
+	if policy := r.governed.Executor(); policy.Lane != "" {
+		lane, err := enginelane.Load(policy.Lane, policy.LaneFile, policy.Executor)
+		if err != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
+		}
+		environment = lane.Environment(environment)
+		startEvidence["engine_lane"], startEvidence["engine_lane_sha256"], startEvidence["engine_lane_keys"] = lane.Name, lane.SHA256, lane.Keys()
+	}
+	if err := r.transition(ctx, domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner", startEvidence, nil); err != nil {
 		return result, err
 	}
 	result.State = domain.StateExecutionStarting
@@ -575,7 +588,7 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	command := supervisor.Command{
 		Argv:    argv,
 		Cwd:     r.governed.Repository().Path,
-		Env:     ralphexEnvironment(r.governed.Executor().Executor, r.capsule),
+		Env:     environment,
 		Timeout: ralphexTimeout,
 		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: r.ralphexArtifactName("ralphex-stdout.log"), Kind: "ralphex-stdout"},
 		Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: r.ralphexArtifactName("ralphex-stderr.log"), Kind: "ralphex-stderr"},

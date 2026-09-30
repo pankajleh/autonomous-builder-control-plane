@@ -20,6 +20,7 @@ import (
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/enginelane"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
@@ -283,6 +284,13 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 	governed, err := authority.New(validation)
 	if err != nil {
 		return loadedProfile{}, errors.New("invalid private admission policy")
+	}
+	// A profile on an engine lane is refused at load when its lane file is not
+	// the operator's private file or gives anything its engine does not accept.
+	if policy := governed.Executor(); policy.Lane != "" {
+		if _, err := enginelane.Load(policy.Lane, policy.LaneFile, policy.Executor); err != nil {
+			return loadedProfile{}, err
+		}
 	}
 	manifest = governed.Manifest()
 	manifest.RunID = ""

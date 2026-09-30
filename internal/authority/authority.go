@@ -16,6 +16,7 @@ import (
 	"time"
 
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/enginelane"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
@@ -124,6 +125,11 @@ type ExecutorPolicy struct {
 	TaskEffort   string `json:"task_effort,omitempty"`
 	ReviewModel  string `json:"review_model,omitempty"`
 	ReviewEffort string `json:"review_effort,omitempty"`
+	// Lane names an engine lane (Repo C design note A6): LaneFile holds the
+	// settings that replace the inherited ones for this build only. Both or
+	// neither; a template without a lane keeps the inherited environment.
+	Lane     string `json:"lane,omitempty"`
+	LaneFile string `json:"lane_file,omitempty"`
 }
 
 // WorktreePolicy records how Ralphex should isolate the governed run.
@@ -776,6 +782,12 @@ func canonicalizeExecutorPolicy(policy *ExecutorPolicy) error {
 	}
 	if policy.Executor != "claude" && policy.Executor != "codex" {
 		return fmt.Errorf("unsupported executor %q", policy.Executor)
+	}
+	if (policy.Lane == "") != (policy.LaneFile == "") {
+		return errors.New("executor.lane and executor.lane_file must be given together")
+	}
+	if policy.Lane != "" && (!enginelane.ValidName(policy.Lane) || !enginelane.ValidPath(policy.LaneFile)) {
+		return errors.New("executor.lane must be a short lower-case name and executor.lane_file an absolute, clean .env path")
 	}
 	for field, value := range map[string]string{
 		"executor.task_model":    policy.TaskModel,
