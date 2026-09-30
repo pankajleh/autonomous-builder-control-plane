@@ -45,6 +45,28 @@ func execute(ctx context.Context, binary string, env []string, args ...string) (
 	}
 	return strings.TrimSpace(out.String()), nil
 }
+
+// stream runs a bounded command with the given standard input and output, for data that does not fit the 1 MiB
+// output limit of execute: hosted backups and restores. It has 10 minutes.
+func stream(ctx context.Context, binary string, env []string, stdin io.Reader, stdout io.Writer, args ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, args...)
+	if configureProcess(cmd) != nil {
+		return ErrUnavailable
+	}
+	cmd.Cancel = func() error { return cancelProcess(cmd) }
+	cmd.WaitDelay = time.Second
+	defer cancelProcess(cmd)
+	cmd.Env = env
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
 func git(ctx context.Context, path string, args ...string) (string, error) {
 	return execute(ctx, "git", gitexec.Environment(), append([]string{"-C", path}, args...)...)
 }

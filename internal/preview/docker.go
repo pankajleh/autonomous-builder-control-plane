@@ -26,7 +26,9 @@ type presentation struct {
 	transport             *http.Transport
 	url, endpoint, handle string
 	appCookies            bool
-	closed                atomic.Bool
+	// volume is the hosted data volume mounted at /data in the data service, or "" for a preview.
+	volume string
+	closed atomic.Bool
 }
 
 // gatewayCookie reports a cookie name the preview gateway keeps for itself; such cookies never reach or come from an app.
@@ -55,6 +57,16 @@ type dockerRuntime struct {
 	run             dockerCommand
 	approved        map[string]bool
 	groups          map[string]*presentation
+	// stream runs one Docker command with the given standard input and output, for hosted backups and restores.
+	stream func(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error
+}
+
+// hostedSleepSeconds keeps a hosted instance's containers alive until they are stopped: ten years.
+const hostedSleepSeconds = 10 * 365 * 24 * 3600
+
+// dockerEnvironment ignores ambient Docker contexts, endpoints, registry credentials and proxy settings.
+func dockerEnvironment(root string) ([]string, []string) {
+	return []string{"PATH=/usr/bin:/bin", "LANG=C", "HOME=" + root}, []string{"--host=unix:///var/run/docker.sock", "--config=" + filepath.Join(root, "docker-config")}
 }
 
 func newDocker(root string) *dockerRuntime {
@@ -62,7 +74,12 @@ func newDocker(root string) *dockerRuntime {
 	d.run = func(ctx context.Context, args ...string) (string, error) {
 		// Ignore ambient Docker contexts, endpoints, registry credentials and proxy
 		// settings. The socket is controller-only; never a candidate mount.
-		return execute(ctx, "/usr/bin/docker", []string{"PATH=/usr/bin:/bin", "LANG=C", "HOME=" + root}, append([]string{"--host=unix:///var/run/docker.sock", "--config=" + filepath.Join(root, "docker-config")}, args...)...)
+		env, global := dockerEnvironment(root)
+		return execute(ctx, "/usr/bin/docker", env, append(global, args...)...)
+	}
+	d.stream = func(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
+		env, global := dockerEnvironment(root)
+		return stream(ctx, "/usr/bin/docker", env, stdin, stdout, append(global, args...)...)
 	}
 	return d
 }
@@ -78,6 +95,11 @@ func (d *dockerRuntime) network(id string) string {
 func (d *dockerRuntime) container(id string, i int) string {
 	return d.network(id) + "-" + strconv.Itoa(i)
 }
+
+// volume names a hosting key's data volume. Only a key digest reaches it, never the key.
+func (d *dockerRuntime) volume(keyDigest string) string {
+	return "abcp-hosted-" + d.namespace[:16] + "-" + keyDigest[:24]
+}
 func cleanEnv(s ServiceProfileV1) []string {
 	out := []string{"-i", "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/scratch", "TMPDIR=/scratch"}
 	return append(out, environmentValues(s.Environment)...)
@@ -86,14 +108,21 @@ func scratchOptions(p PreviewProfileV1, s ServiceProfileV1) string {
 	uid, gid, _ := strings.Cut(s.User, ":")
 	return "rw,nosuid,nodev,noexec,size=" + strconv.FormatInt(p.TmpfsBytes, 10) + ",mode=700,uid=" + uid + ",gid=" + gid
 }
-func (d *dockerRuntime) createArgs(id, path string, p PreviewProfileV1, s ServiceProfileV1, i int) []string {
+func (d *dockerRuntime) createArgs(id, path string, p PreviewProfileV1, s ServiceProfileV1, i int, volume string) []string {
 	args := []string{"create", "--pull=never", "--name", d.container(id, i), "--label", d.label(), "--label", "abcp.preview.id=" + id, "--network", d.network(id), "--network-alias", s.Name, "--user", s.User, "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", "--cpu-period=100000", "--cpu-quota=" + strconv.Itoa(p.CPUQuota), "--memory=" + strconv.FormatInt(p.MemoryBytes, 10), "--memory-swap=" + strconv.FormatInt(p.MemoryBytes, 10), "--pids-limit=" + strconv.Itoa(p.PidsLimit), "--ulimit=nofile=1024:1024", "--restart=no", "--ipc=none", "--log-driver=none", "--no-healthcheck", "--workdir=/scratch", "--tmpfs", "/scratch:" + scratchOptions(p, s), "--entrypoint=/usr/bin/env"}
 	if s.MountSource {
 		args = append(args, "--mount", "type=bind,src="+path+",dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate")
 	}
+	if s.DataVolume {
+		args = append(args, "--mount", "type=volume,src="+volume+",dst="+DataPath)
+	}
 	args = append(args, s.Image)
 	args = append(args, cleanEnv(s)...)
-	return append(args, "/bin/sleep", strconv.Itoa(p.TTLSeconds))
+	sleep := p.TTLSeconds
+	if p.Hosted {
+		sleep = hostedSleepSeconds
+	}
+	return append(args, "/bin/sleep", strconv.Itoa(sleep))
 }
 func (d *dockerRuntime) imageSafe(ctx context.Context, s ServiceProfileV1) bool {
 	raw, err := d.run(ctx, "image", "inspect", s.Image)
@@ -157,7 +186,7 @@ func (d *dockerRuntime) internalNetwork(ctx context.Context, id string) bool {
 
 // endpoint refuses host network, bridge attachment, published ports and any
 // second network. Only the configured presented service IP/port is returned.
-func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfileV1, s ServiceProfileV1, i int) (string, error) {
+func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfileV1, s ServiceProfileV1, i int, volume string) (string, error) {
 	raw, err := d.run(ctx, "inspect", d.container(id, i))
 	if err != nil {
 		return "", ErrUnavailable
@@ -181,8 +210,8 @@ func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfil
 			Ports    map[string]json.RawMessage
 		}
 		Mounts []struct {
-			Type, Source, Destination string
-			RW                        bool
+			Type, Name, Source, Destination string
+			RW                              bool
 		}
 	}
 	if json.Unmarshal([]byte(raw), &values) != nil || len(values) != 1 {
@@ -201,9 +230,14 @@ func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfil
 			return "", ErrUnavailable
 		}
 	}
-	sourceFound := false
+	sourceFound, volumeFound := false, false
 	for _, m := range v.Mounts {
 		if m.Type == "tmpfs" && m.Destination == "/scratch" {
+			continue
+		}
+		// The one writable mount besides /scratch: this hosting key's own data volume, at /data, in the data service.
+		if m.Type == "volume" && m.Destination == DataPath && m.RW && s.DataVolume && volume != "" && m.Name == volume && !volumeFound {
+			volumeFound = true
 			continue
 		}
 		if m.Type != "bind" || m.Destination != "/source" || m.RW || !s.MountSource || m.Source != filepath.Join(d.root, "sources", id) || sourceFound {
@@ -211,7 +245,7 @@ func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfil
 		}
 		sourceFound = true
 	}
-	if s.MountSource != sourceFound {
+	if s.MountSource != sourceFound || s.DataVolume != volumeFound {
 		return "", ErrUnavailable
 	}
 	network, ok := v.NetworkSettings.Networks[d.network(id)]
@@ -221,8 +255,8 @@ func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfil
 	}
 	return net.JoinHostPort(ip.String(), strconv.Itoa(s.Port)), nil
 }
-func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool) (*presentation, error) {
-	if !sha256Pattern.MatchString(id) || p.Validate() != nil {
+func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume string) (*presentation, error) {
+	if !sha256Pattern.MatchString(id) || p.Validate() != nil || (p.dataService() >= 0) != (volume != "") {
 		return nil, ErrUnavailable
 	}
 	if path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n") {
@@ -239,9 +273,14 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 	if !d.internalNetwork(ctx, id) {
 		return nil, ErrUnavailable
 	}
-	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies}
+	if volume != "" {
+		if err := d.ensureVolume(ctx, volume); err != nil {
+			return nil, err
+		}
+	}
+	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, volume: volume}
 	for i, s := range p.Services {
-		if _, err := d.run(ctx, d.createArgs(id, path, p, s, i)...); err != nil {
+		if _, err := d.run(ctx, d.createArgs(id, path, p, s, i, volume)...); err != nil {
 			return nil, err
 		}
 		name := d.container(id, i)
@@ -264,7 +303,7 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 		if _, err := d.run(ctx, args...); err != nil {
 			return nil, err
 		}
-		endpoint, err := d.endpoint(ctx, id, p, s, i)
+		endpoint, err := d.endpoint(ctx, id, p, s, i, volume)
 		if err != nil {
 			return nil, err
 		}
@@ -355,13 +394,31 @@ func (g *presentation) present() error {
 	return nil
 }
 func (d *dockerRuntime) Start(ctx context.Context, id, path string, p PreviewProfileV1) (string, error) {
+	if p.Hosted {
+		return "", ErrUnavailable
+	}
+	return d.start(ctx, id, path, p, "")
+}
+
+// StartHosted starts a hosted instance with the hosting key's data volume (B9.2.1).
+func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest string) (string, error) {
+	if !p.Hosted || !sha256Pattern.MatchString(keyDigest) {
+		return "", ErrUnavailable
+	}
+	volume := ""
+	if p.dataService() >= 0 {
+		volume = d.volume(keyDigest)
+	}
+	return d.start(ctx, id, path, p, volume)
+}
+func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume string) (string, error) {
 	if !sha256Pattern.MatchString(id) || path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n") {
 		return "", ErrUnavailable
 	}
 	if !d.Available(p) {
 		return "", ErrUnavailable
 	}
-	g, err := d.startGroup(ctx, id, path, p, false)
+	g, err := d.startGroup(ctx, id, path, p, false, volume)
 	if err != nil {
 		_ = d.Stop(context.Background(), id)
 		return "", err
@@ -408,7 +465,7 @@ func (d *dockerRuntime) Healthy(ctx context.Context, id string, p PreviewProfile
 		return unsafe()
 	}
 	for i, s := range p.Services {
-		endpoint, err := d.endpoint(ctx, id, p, s, i)
+		endpoint, err := d.endpoint(ctx, id, p, s, i, g.volume)
 		if err != nil || s.Presented && endpoint != g.endpoint {
 			return unsafe()
 		}
@@ -507,10 +564,18 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 	checkout := Checkout{Root: filepath.Join(d.root, "sources")}
 	path := filepath.Join(checkout.Root, id)
 	sourceCreated := false
+	// A hosted profile's probe mounts a throwaway data volume of its own, removed afterwards.
+	volume := ""
+	if p.dataService() >= 0 {
+		volume = d.volume(jsonDigest([]string{d.namespace, p.Digest(), "isolation-probe-volume"}))
+	}
 	defer func() {
 		err := d.Stop(context.Background(), id)
 		if err == nil && sourceCreated {
 			err = checkout.Remove(id)
+		}
+		if err == nil && volume != "" {
+			err = d.removeVolume(context.Background(), volume)
 		}
 		proved = proved && err == nil
 		d.mu.Lock()
@@ -540,7 +605,7 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 			break
 		}
 	}
-	g, err := d.startGroup(ctx, id, path, p, true)
+	g, err := d.startGroup(ctx, id, path, p, true, volume)
 	if err != nil {
 		return false
 	}
@@ -576,6 +641,12 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 		// A successful external HTTP request disproves isolation.
 		if _, err = d.run(ctx, append(args, "wget", "-T", "2", "-O", "/dev/null", "http://1.1.1.1/")...); err == nil {
 			return false
+		}
+		if s.DataVolume {
+			// The service's own user must be able to write its data volume, as the image's /data prepares it.
+			if _, err = d.run(ctx, append(args, "touch", DataPath+"/.abcp-probe")...); err != nil {
+				return false
+			}
 		}
 	}
 	reachable := false
@@ -623,4 +694,107 @@ func (d *dockerRuntime) hostSupported(ctx context.Context) bool {
 		}
 	}
 	return false
+}
+
+// ensureVolume creates a hosting key's data volume, or finds the one this controller made before. A volume of that name
+// with another owner, another driver or any driver options (a bind to a host path, for example) is refused.
+func (d *dockerRuntime) ensureVolume(ctx context.Context, volume string) error {
+	if _, err := d.run(ctx, "volume", "create", "--driver", "local", "--label", d.label(), "--label", "abcp.hosted.volume="+volume, volume); err != nil {
+		return ErrUnavailable
+	}
+	return d.ownVolume(ctx, volume)
+}
+func (d *dockerRuntime) ownVolume(ctx context.Context, volume string) error {
+	raw, err := d.run(ctx, "volume", "inspect", volume)
+	if err != nil {
+		return ErrUnavailable
+	}
+	var values []struct {
+		Name, Driver string
+		Labels       map[string]string
+		Options      map[string]string
+	}
+	if json.Unmarshal([]byte(raw), &values) != nil || len(values) != 1 {
+		return ErrUnavailable
+	}
+	v := values[0]
+	if v.Name != volume || v.Driver != "local" || len(v.Options) != 0 || v.Labels["abcp.preview.owner"] != d.namespace || v.Labels["abcp.hosted.volume"] != volume {
+		return ErrIntegrity
+	}
+	return nil
+}
+func (d *dockerRuntime) removeVolume(ctx context.Context, volume string) error {
+	raw, err := d.run(ctx, "volume", "ls", "-q", "--filter", "name=^"+volume+"$")
+	if err != nil {
+		return ErrUnavailable
+	}
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	if err = d.ownVolume(ctx, volume); err != nil {
+		return err
+	}
+	if _, err = d.run(ctx, "volume", "rm", volume); err != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+// RemoveVolume removes a hosting key's data volume. Docker refuses while a container still uses it.
+func (d *dockerRuntime) RemoveVolume(ctx context.Context, keyDigest string) error {
+	if !sha256Pattern.MatchString(keyDigest) {
+		return ErrIntegrity
+	}
+	return d.removeVolume(ctx, d.volume(keyDigest))
+}
+
+// dataExec checks the running hosted instance exactly as a health read does, then returns the docker exec arguments
+// that run argv in its data service.
+func (d *dockerRuntime) dataExec(ctx context.Context, id string, p PreviewProfileV1, argv []string, stdin bool) ([]string, error) {
+	i := p.dataService()
+	if !p.Hosted || i < 0 || len(argv) == 0 {
+		return nil, ErrUnavailable
+	}
+	d.mu.Lock()
+	g := d.groups[id]
+	d.mu.Unlock()
+	if g == nil || g.volume == "" || !d.internalNetwork(ctx, id) {
+		return nil, ErrUnavailable
+	}
+	if _, err := d.endpoint(ctx, id, p, p.Services[i], i, g.volume); err != nil {
+		return nil, ErrUnavailable
+	}
+	args := []string{"exec"}
+	if stdin {
+		args = append(args, "-i")
+	}
+	args = append(args, d.container(id, i), "/usr/bin/env")
+	args = append(args, cleanEnv(p.Services[i])...)
+	return append(args, argv...), nil
+}
+
+// Dump writes a backup of a hosted instance's data to w with the profile's backup command.
+func (d *dockerRuntime) Dump(ctx context.Context, id string, p PreviewProfileV1, w io.Writer) error {
+	i := p.dataService()
+	if i < 0 {
+		return ErrUnavailable
+	}
+	args, err := d.dataExec(ctx, id, p, p.Services[i].BackupArgv, false)
+	if err != nil {
+		return err
+	}
+	return d.stream(ctx, nil, w, args...)
+}
+
+// Load restores a backup read from r into a hosted instance with the profile's restore command.
+func (d *dockerRuntime) Load(ctx context.Context, id string, p PreviewProfileV1, r io.Reader) error {
+	i := p.dataService()
+	if i < 0 {
+		return ErrUnavailable
+	}
+	args, err := d.dataExec(ctx, id, p, p.Services[i].RestoreArgv, true)
+	if err != nil {
+		return err
+	}
+	return d.stream(ctx, r, io.Discard, args...)
 }

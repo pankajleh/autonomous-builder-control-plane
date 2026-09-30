@@ -27,7 +27,7 @@ func TestDockerStructuredIsolationAndInjectionBoundary(t *testing.T) {
 	d := newDocker("/private/previews")
 	p := testProfile()
 	id := strings.Repeat("c", 64)
-	args := d.createArgs(id, filepath.Join(d.root, "sources", id), p, p.Services[0], 0)
+	args := d.createArgs(id, filepath.Join(d.root, "sources", id), p, p.Services[0], 0, "")
 	joined := strings.Join(args, " ")
 	for _, required := range []string{"--pull=never", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", "--cpu-quota=10000", "--memory=67108864", "--memory-swap=67108864", "--pids-limit=32", "--restart=no", "--log-driver=none", "--ipc=none", "--entrypoint=/usr/bin/env", "1000:1000", "dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate", "noexec,size=8388608", "/bin/sleep 60"} {
 		if !strings.Contains(joined, required) {
@@ -65,7 +65,7 @@ func TestDockerSourceBindMountOptions(t *testing.T) {
 			s.MountSource = mountSource
 			id := strings.Repeat("c", 64)
 			path := filepath.Join(d.root, "sources", id)
-			args := d.createArgs(id, path, p, s, 0)
+			args := d.createArgs(id, path, p, s, 0, "")
 			mounts := 0
 			for i, arg := range args {
 				if arg != "--mount" {
@@ -114,13 +114,13 @@ func TestDockerRejectsIsolationDrift(t *testing.T) {
 			v := dockerInspection(d, id, p, p.Services[0])
 			good, _ := json.Marshal([]any{v})
 			d.run = func(context.Context, ...string) (string, error) { return string(good), nil }
-			if _, err := d.endpoint(context.Background(), id, p, p.Services[0], 0); err != nil {
+			if _, err := d.endpoint(context.Background(), id, p, p.Services[0], 0, ""); err != nil {
 				t.Fatal("baseline isolation rejected", err)
 			}
 			mutate(v)
 			raw, _ := json.Marshal([]any{v})
 			d.run = func(context.Context, ...string) (string, error) { return string(raw), nil }
-			if _, err := d.endpoint(context.Background(), id, p, p.Services[0], 0); err == nil {
+			if _, err := d.endpoint(context.Background(), id, p, p.Services[0], 0, ""); err == nil {
 				t.Fatal("isolation drift accepted")
 			}
 		})

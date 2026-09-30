@@ -137,7 +137,7 @@ func (s *Service) CreatePreview(ctx context.Context, p serviceapi.Principal, aut
 		return v, err
 	}
 	profile, ok := s.profiles[c.ProfileID]
-	if !ok {
+	if !ok || profile.Hosted {
 		s.mu.Unlock()
 		return empty, serviceapi.ErrPreviewProfile
 	}

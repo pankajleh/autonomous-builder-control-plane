@@ -888,6 +888,15 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer previewService.Close()
+	// Hosted instances (B9.2.1) run on the preview runtime after its restart cleanup, and stop before it closes.
+	// Without them the rest of the service still runs, and the hosted API answers that the capability is missing.
+	var hosting serviceapi.HostingController
+	if h, err := preview.NewHosting(ctx, previewService); err != nil {
+		fmt.Fprintln(stderr, "hosted instances unavailable")
+	} else {
+		defer h.Close()
+		hosting = h
+	}
 	// The sweeper also serves product-requested releases, so it exists even when
 	// periodic eviction is disabled.
 	sweeper := &eviction.Sweeper{
@@ -903,6 +912,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Activity:      activityService,
 		Preview:       previewService,
 		Worktrees:     eviction.API{Sweeper: sweeper},
+		Hosting:       hosting,
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
 		RunAdmission: admissions, DevelopmentRunAdmission: admissions,

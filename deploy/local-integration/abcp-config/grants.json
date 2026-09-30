@@ -4,7 +4,8 @@
       "principal_id": "repo-c-service",
       "required_authorities": [
         "preview.control",
-        "worktree.release"
+        "worktree.release",
+        "hosting.control"
       ],
       "may_assert_delegated_actor": true
     }
