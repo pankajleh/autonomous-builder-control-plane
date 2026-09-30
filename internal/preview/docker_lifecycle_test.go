@@ -72,6 +72,10 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 			f.network = false
 		}
 	case "create":
+		// As Docker does: gVisor refuses recursive read-only binds.
+		if slices.Contains(args, "--runtime=runsc") && slices.ContainsFunc(args, func(a string) bool { return strings.Contains(a, "bind-recursive=readonly") }) {
+			return "", errors.New(`rro is not supported by runtime "runsc"`)
+		}
 		for i, arg := range args {
 			if arg == "--name" {
 				f.containers[args[i+1]] = strings.Repeat(strconv.Itoa(len(f.containers)+1), 64)

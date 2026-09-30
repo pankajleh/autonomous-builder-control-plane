@@ -95,8 +95,11 @@ a read-only root, dropped capabilities and no-new-privileges. `/scratch` is its
 bounded, non-executable write area. Source, when requested, is mounted at
 `/source` using `readonly,bind-recursive=readonly,bind-propagation=rprivate`.
 Docker 29 requires explicit `bind-propagation=rprivate` with recursive read-only
-binds; the daemon/kernel must support these options. A rejected mount leaves
-preview unavailable without retrying with weaker mount options.
+binds; the daemon/kernel must support these options. A profile with
+`runtime: "runsc"` uses `readonly,bind-propagation=rprivate` instead, since gVisor
+refuses recursive read-only binds and serves the whole checkout through the one
+read-only mount. A rejected mount leaves preview unavailable without retrying
+with weaker mount options.
 Detached checkout directories and files are made readable for the
 configured non-root users regardless of the controller's umask, preserving
 executable files and symlinks while their host parent remains private. Startup

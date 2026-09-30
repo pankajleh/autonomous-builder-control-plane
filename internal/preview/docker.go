@@ -109,6 +109,18 @@ func scratchOptions(p PreviewProfileV1, s ServiceProfileV1) string {
 	return "rw,nosuid,nodev,noexec,size=" + strconv.FormatInt(p.TmpfsBytes, 10) + ",mode=700,uid=" + uid + ",gid=" + gid
 }
 
+// sourceMount is the read-only bind of the checkout at /source. Under Docker's default runtime it is recursively
+// read-only, which Docker 29 accepts only with explicit rprivate propagation. gVisor refuses recursive read-only binds
+// ("rro is not supported by runtime runsc"), so a gVisor profile gets the plain read-only bind: gVisor's own kernel
+// serves the whole checkout through that one read-only mount, and the checkout, a directory this controller made, has
+// no mounts inside it either way.
+func sourceMount(p PreviewProfileV1, path string) string {
+	if p.Runtime == RuntimeGVisor {
+		return "type=bind,src=" + path + ",dst=/source,readonly,bind-propagation=rprivate"
+	}
+	return "type=bind,src=" + path + ",dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate"
+}
+
 // createArgs is one service's `docker create`. hosts are "name:ip" entries for the services started before it, given
 // only under gVisor (see startOrder).
 func (d *dockerRuntime) createArgs(id, path string, p PreviewProfileV1, s ServiceProfileV1, i int, volume string, hosts ...string) []string {
@@ -120,7 +132,7 @@ func (d *dockerRuntime) createArgs(id, path string, p PreviewProfileV1, s Servic
 		args = append(args, "--add-host", h)
 	}
 	if s.MountSource {
-		args = append(args, "--mount", "type=bind,src="+path+",dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate")
+		args = append(args, "--mount", sourceMount(p, path))
 	}
 	if s.DataVolume {
 		args = append(args, "--mount", "type=volume,src="+volume+",dst="+DataPath)
