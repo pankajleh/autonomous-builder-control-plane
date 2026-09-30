@@ -46,6 +46,9 @@ type PreviewProfileV1 struct {
 	// preview gateway's own (__Host-preview*, __Host-unlock*) never pass either way. Omitted when false, so profiles
 	// without it keep their digests.
 	AppCookies bool `json:"app_cookies,omitempty"`
+	// Hosted marks a profile for hosted instances only (B9.2.1): no time limit, a named data volume and restarts by
+	// the controller. Preview requests refuse it; hosted requests refuse any other profile. Omitted when false.
+	Hosted bool `json:"hosted,omitempty"`
 }
 type ServiceProfileV1 struct {
 	Name        string            `json:"name"`
@@ -57,7 +60,27 @@ type ServiceProfileV1 struct {
 	MountSource bool              `json:"mount_source"`
 	Port        int               `json:"port"`
 	Presented   bool              `json:"presented"`
+	// DataVolume mounts the hosting key's own named volume at /data, read-write (hosted profiles only, at most one
+	// service). BackupArgv writes a dump of that data to standard output and RestoreArgv reads one from standard
+	// input; only the data service may have them, both or neither. All are omitted when unset.
+	DataVolume  bool     `json:"data_volume,omitempty"`
+	BackupArgv  []string `json:"backup_argv,omitempty"`
+	RestoreArgv []string `json:"restore_argv,omitempty"`
 }
+
+// DataPath is where a hosted service's data volume is mounted.
+const DataPath = "/data"
+
+// dataService returns the index of the service with the data volume, or -1.
+func (p PreviewProfileV1) dataService() int {
+	for i, s := range p.Services {
+		if s.DataVolume {
+			return i
+		}
+	}
+	return -1
+}
+
 type ProfileFileV1 struct {
 	SchemaVersion int                `json:"schema_version"`
 	Profiles      []PreviewProfileV1 `json:"profiles"`
@@ -140,6 +163,25 @@ func (p PreviewProfileV1) Validate() error {
 		}
 	}
 	if presented != 1 {
+		return ErrUnavailable
+	}
+	volumes := 0
+	for _, s := range p.Services {
+		backup := len(s.BackupArgv) > 0
+		if (s.DataVolume || backup || len(s.RestoreArgv) > 0) && !p.Hosted {
+			return ErrUnavailable
+		}
+		if backup != (len(s.RestoreArgv) > 0) || backup && !s.DataVolume {
+			return ErrUnavailable
+		}
+		if backup && (!validArgv(s.BackupArgv, false) || !validArgv(s.RestoreArgv, false) || filepath.Base(s.BackupArgv[0]) == "busybox" || filepath.Base(s.RestoreArgv[0]) == "busybox") {
+			return ErrUnavailable
+		}
+		if s.DataVolume {
+			volumes++
+		}
+	}
+	if volumes > 1 {
 		return ErrUnavailable
 	}
 	return nil

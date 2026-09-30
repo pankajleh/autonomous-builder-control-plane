@@ -151,6 +151,7 @@ type PreviewController interface {
 type ServerConfig struct {
 	Preview                 PreviewController
 	Worktrees               WorktreeReleaser
+	Hosting                 HostingController
 	Activity                ActivityReader
 	Authenticator           Authenticator
 	Authority               *AuthorityMatcher
@@ -363,6 +364,10 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	case "/v1/worktrees/release":
 		s.repositoryWorktreeRelease(writer, request, principal, requestID)
 	default:
+		if strings.HasPrefix(request.URL.Path, "/v1/hosted/") {
+			s.hostedRoute(writer, request, principal, requestID)
+			return
+		}
 		s.runRoute(writer, request, principal, requestID)
 	}
 }
@@ -857,6 +862,10 @@ func (s *Server) writeDependencyError(writer http.ResponseWriter, requestID stri
 		status, apiError.Code, apiError.Message = http.StatusServiceUnavailable, "NOT_AVAILABLE", "preview runtime is not available"
 	case errors.Is(err, ErrPreviewIneligible):
 		status, apiError.Code, apiError.Message = http.StatusConflict, "preview_ineligible", "checkpoint is not eligible for preview"
+	case errors.Is(err, ErrHostedConflict):
+		status, apiError.Code, apiError.Message = http.StatusConflict, "hosted_state_conflict", "hosted instance is not in a state for this command"
+	case errors.Is(err, ErrHostedCapacity):
+		status, apiError.Code, apiError.Message = http.StatusConflict, "hosted_capacity", "the limit of running hosted instances is reached"
 	case errors.Is(err, ErrRunNotFinished):
 		status, apiError.Code, apiError.Message = http.StatusConflict, "run_not_finished", "run is not finished"
 	case errors.Is(err, ErrPreviewProfile):

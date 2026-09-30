@@ -21,7 +21,7 @@ python3 tools/operator/check_local_integration_config.py [--live <dir>]
 | `manifest-template.json` | Demo-product governed manifest template; pins the Ralphex binary, executor policy, worktree retention and acceptance |
 | `manifest-template-development.json` | Repo C development manifest template |
 | `preview-profiles.json` | BP-02 preview profiles: `demo-v1` (demo product) and `web-v1` (Repo C) |
-| `grants.json` | Authority grants for the `repo-c-service` principal: `preview.control`, and `worktree.release` for product-requested worktree release (#53) |
+| `grants.json` | Authority grants for the `repo-c-service` principal: `preview.control`, `worktree.release` for product-requested worktree release (#53), and `hosting.control` for hosted instances (#63, B9.2.1) |
 
 Both preview profiles are static busybox `httpd` servers. `/bin/httpd` is the busybox path (`/usr/sbin/httpd` is the Alpine path and exits 127). The health path is `/README.md` because busybox `httpd` has no directory index. `web-v1` serves Repo C sources as static files only; a real web/API preview of Repo C needs an approved offline image and its own profile.
 
