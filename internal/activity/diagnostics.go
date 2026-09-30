@@ -87,6 +87,18 @@ func (s *Service) diagnose(run, marker string, err error) {
 		stamp(s.now()), run, marker, step, diagnosticClass(err))
 }
 
+// note writes one operator line for a controller observation that records no
+// marker. what is a controller-owned token.
+func (s *Service) note(run, what string) {
+	if s.diagnostics == nil {
+		return
+	}
+	if !runtimecatalog.ValidIdentifier(run) {
+		run = "invalid"
+	}
+	fmt.Fprintf(s.diagnostics, "abcp activity note at=%s run=%s what=%s\n", stamp(s.now()), run, what)
+}
+
 // noteGap logs a provider replay gap by source event number only; no provider
 // text is written. last is math.MaxUint64 before the first event.
 func (s *Service) noteGap(run string, last, got uint64, confirmed bool) {

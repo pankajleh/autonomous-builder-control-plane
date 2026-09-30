@@ -169,6 +169,58 @@ func WorktreePath(ctx context.Context, scope Scope) (string, error) {
 	return path, err
 }
 
+// worktreeOffBranch reports whether path, the worktree ABCP last bound for the
+// run, is still listed by Git at the same path while no worktree holds the
+// run's branch, and the branch ref still exists: for example a detached HEAD
+// during a rebase. Any other absence, or a Git failure, is not off-branch and
+// keeps the missing-worktree rule.
+func worktreeOffBranch(ctx context.Context, scope Scope, path string) bool {
+	if path == "" {
+		return false
+	}
+	text, err := git(ctx, scope.Repository, "worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return false
+	}
+	listed := false
+	for _, field := range strings.Split(text, "\x00") {
+		if field == "worktree "+path {
+			listed = true
+		}
+		if field == "branch refs/heads/"+scope.Branch {
+			return false
+		}
+	}
+	if !listed {
+		return false
+	}
+	_, err = git(ctx, scope.Repository, "rev-parse", "--verify", "--quiet", "refs/heads/"+scope.Branch+"^{commit}")
+	return err == nil
+}
+
+// historyKept reports whether every checkpoint already recorded for the run is
+// an ancestor of the run's branch head. A checkpoint that is not, or that Git
+// cannot show to be, means the history was rewritten. An interrupted check
+// returns an error so the caller tries again without deciding.
+func historyKept(ctx context.Context, scope Scope, checkpoints []string) (bool, error) {
+	for _, sha := range checkpoints {
+		check, cancel := context.WithTimeout(ctx, 5*time.Second)
+		cmd := exec.CommandContext(check, "git", "-C", scope.Repository, "merge-base", "--is-ancestor", sha, "refs/heads/"+scope.Branch)
+		cmd.Env = gitexec.Environment()
+		cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+		err := cmd.Run()
+		interrupted := check.Err() != nil
+		cancel()
+		if interrupted {
+			return false, atStep("history-check", ErrUnavailable)
+		}
+		if err != nil {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // Git subprocesses are bounded and inherit the repository's existing sanitized
 // Git environment, including protection from GIT_DIR/worktree overrides.
 func git(ctx context.Context, path string, args ...string) (string, error) {

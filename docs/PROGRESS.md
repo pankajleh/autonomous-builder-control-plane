@@ -1,6 +1,6 @@
 # Implementation Progress
 
-Updated: 2026-09-29
+Updated: 2026-09-30
 
 Operational role: this file projects roadmap progress and the next eligible planning boundary. Immutable controller, review, Git, and durable evidence remain authoritative.
 
@@ -13,7 +13,7 @@ Operational role: this file projects roadmap progress and the next eligible plan
 | Phase 2 — Recovery and blocker control | COMPLETE | PR #5 merged |
 | Phase 3 — Cross-plan scheduler and integration | COMPLETE | PR #6 merge `94e14ca749d31ac214e979aab03fbde37502dd7f` |
 | Phase 4 — GitHub lifecycle | **COMPLETE** | CI Task 4 merged in PR #15; governance hardening PR #16; merge authorization Task 1/2/3 closed; exact convergence PR #17 merged as `ed74fad…`; durable post-merge acceptance/reconciliation PASS |
-| Phase 5 — Service/API and dashboard | **IN PROGRESS** | EP-006 service/API baseline retained (PR #21). Product-integration extensions merged through PR #61; live controller `7f76c66` with worktree eviction and release (PRs #51 and #55 record the live proofs) (see the post-rebaseline ledger below). The customer dashboard is owned by Repo C. |
+| Phase 5 — Service/API and dashboard | **IN PROGRESS** | EP-006 service/API baseline retained (PR #21). Product-integration extensions merged through PR #62; live controller `7f76c66` with worktree eviction and release (PRs #51 and #55 record the live proofs) (see the post-rebaseline ledger below). The customer dashboard is owned by Repo C. |
 | Phase 6 — Production hardening | NOT STARTED | Roadmap only |
 
 ## Phase-4 completion ledger
@@ -97,7 +97,8 @@ After the 2026-09-19 EP-006 rebaseline (PR #21), Repo B work followed concrete R
 | #58 | `7f76c66` | Request-index shards keep their generation authority on their own directory, with a registry on the request-index directory. On ext4 the service root had room for only two or three shard records, and a third shard's half-written record stopped the live controller from starting | `docs/plans/completed/bp01-journal-shard-authority-capacity.md` |
 | #59 | `feda373` | Provider gap markers that were not gaps. A section header that ralphex still holds back (blank lines and the newest header owe no event yet) is no longer a silent gap, and a run's first batch may start at event 0, which ralphex sends only live. Found in Repo C's Claude Code engine trial: at each Claude-to-Codex review handoff the markers made every checkpoint of a correct build ineligible for preview | `docs/plans/completed/bp01-provider-gap-false-positives.md` |
 | #60 | `d01b64c` | Preview profiles may pass an app's own cookies. A profile with `app_cookies` (only Repo C's `node-pg-v1`, for web apps with accounts) lets the presented service's own `Cookie` and `Set-Cookie` through the presentation proxy; cookies named like the preview gateway's own (`__Host-preview*`, `__Host-unlock*`) never pass, and credentials and forwarding headers are still removed. The field is omitted when false, so other profiles keep their digests. Requested by Repo C's approved A4.4 note: with per-app hosts each preview has its own host, so an app's cookies stay its own | `docs/plans/completed/bp01-preview-app-cookies.md` |
-| #61 | this PR | Paged activity reads are served at the collector ceiling. With 16 collectors alive, a read of any other run's activity had answered `503`: Repo C pages every build of an app, so its versions list and previews failed on 8 of 12 live apps. A paged read at the ceiling now answers from the refreshed durable store without a collector; a live stream beyond it is still refused | `docs/plans/completed/bp01-paged-reads-at-collector-ceiling.md` |
+| #61 | `11f4636` | Paged activity reads are served at the collector ceiling. With 16 collectors alive, a read of any other run's activity had answered `503`: Repo C pages every build of an app, so its versions list and previews failed on 8 of 12 live apps. A paged read at the ceiling now answers from the refreshed durable store without a collector; a live stream beyond it is still refused | `docs/plans/completed/bp01-paged-reads-at-collector-ceiling.md` |
+| #62 | this PR | A run's worktree briefly off its branch (a detached `HEAD` during a rebase, or another branch) is no longer marked for 10 minutes, and nothing is observed meanwhile. When it is back, every recorded checkpoint must be an ancestor of the branch head, or one `history-rewritten` integrity marker is recorded. A worktree that is gone, or a deleted branch, keeps the 30-second rule. Team Kudos had 142 `binding-unavailable` markers for a 4.5-minute rebase, and none of its versions could be previewed. Owner-approved (Repo C P0142, P0166) | `docs/plans/completed/bp01-worktree-off-branch-window.md` |
 
 Repo C closed its PX-07 integrated journey on live Repo B `0d99f7d` (Repo C P0052, DEC-0021). BP-01/BP-02 therefore carry the Repo C PDLC Experience foundation. PR #42 was then proven live on `a5383a6` by run `admission-2b69b2cd…`:
 

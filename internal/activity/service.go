@@ -40,6 +40,14 @@ type Service struct {
 	// worktreeMissing records when a run's governed worktree was first seen
 	// missing after a provider proof, bounding the finish transition grace.
 	worktreeMissing map[string]time.Time
+	// worktreeBound records, per run, the worktree path ABCP last bound, so a
+	// worktree still listed there but off the run's branch can be told apart
+	// from one that is gone.
+	worktreeBound map[string]string
+	// offBranch records when a run's bound worktree was first seen off its
+	// branch. It stays until the worktree is back on the branch and the
+	// recorded checkpoints are checked against it.
+	offBranch map[string]time.Time
 	// lastAccess records, per run, when a client last opened or closed a live
 	// activity stream since this process started (worktree eviction idle).
 	// Paged reads do not count: background readers, such as Repo C's
@@ -172,8 +180,13 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 		if errors.Is(err, errWorktreeMissing) && s.wasEvicted(run) {
 			return Scope{}, nil
 		}
-		if s.worktreePending(run, registration, snapshot, err) {
+		switch s.worktreeOffBranchFor(ctx, run, err) {
+		case offBranchWaiting:
 			return Scope{}, nil
+		case notOffBranch:
+			if s.worktreePending(run, registration, snapshot, err) {
+				return Scope{}, nil
+			}
 		}
 		// A cancelled request or a stopping service interrupted the binding
 		// check; that is not an unresolved binding.
@@ -185,6 +198,9 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 			return Scope{}, err
 		}
 		return Scope{}, nil
+	}
+	if proceed, err := s.worktreeReturned(ctx, run, registration, scope); err != nil || !proceed {
+		return Scope{}, err
 	}
 	s.worktreePresent(run)
 	if e, ok := checkpoint(ctx, scope, s.now()); ok {
@@ -274,6 +290,100 @@ func (s *Service) worktreePresent(run string) {
 	s.mu.Lock()
 	delete(s.worktreeMissing, run)
 	s.mu.Unlock()
+}
+
+// worktreeOffBranchWindow bounds how long a run's worktree may stay off its
+// branch, for example on a detached HEAD during a rebase, before the
+// controller records the binding-unavailable marker. Nothing is observed
+// meanwhile, so no checkpoint can come from off the branch.
+const worktreeOffBranchWindow = 10 * time.Minute
+
+type offBranchState int
+
+const (
+	notOffBranch offBranchState = iota
+	offBranchWaiting
+	offBranchExpired
+)
+
+// worktreeOffBranchFor classifies a missing worktree: still listed at the path
+// last bound but off the run's branch, within or past the window, or anything
+// else, which keeps the missing-worktree rule. The first observation writes
+// one diagnostic line.
+func (s *Service) worktreeOffBranchFor(ctx context.Context, run string, err error) offBranchState {
+	if !errors.Is(err, errWorktreeMissing) {
+		return notOffBranch
+	}
+	s.mu.Lock()
+	path := s.worktreeBound[run]
+	s.mu.Unlock()
+	if path == "" {
+		return notOffBranch
+	}
+	scope, bindErr := s.resolver.ResolveBinding(ctx, run)
+	if bindErr != nil || !worktreeOffBranch(ctx, scope, path) {
+		return notOffBranch
+	}
+	now := s.now()
+	s.mu.Lock()
+	if s.offBranch == nil {
+		s.offBranch = map[string]time.Time{}
+	}
+	first, seen := s.offBranch[run]
+	if !seen {
+		first = now
+		s.offBranch[run] = now
+	}
+	s.mu.Unlock()
+	if !seen {
+		s.note(run, "worktree-off-branch")
+	}
+	if now.Sub(first) < worktreeOffBranchWindow {
+		return offBranchWaiting
+	}
+	return offBranchExpired
+}
+
+// worktreeReturned records the worktree bound for the run. When that worktree
+// was seen off its branch, it first checks that the branch still holds every
+// checkpoint already recorded. A rewritten history records one integrity
+// marker, which makes the run's checkpoints ineligible exactly as any marker
+// does. An interrupted check neither decides nor observes: the next refresh
+// tries again.
+func (s *Service) worktreeReturned(ctx context.Context, run, registration string, scope Scope) (bool, error) {
+	s.mu.Lock()
+	if s.worktreeBound == nil {
+		s.worktreeBound = map[string]string{}
+	}
+	s.worktreeBound[run] = scope.Worktree
+	_, wasOff := s.offBranch[run]
+	s.mu.Unlock()
+	if !wasOff {
+		return true, nil
+	}
+	checkpoints, err := s.recordedCheckpoints(run, registration)
+	if err != nil {
+		return false, err
+	}
+	kept, err := historyKept(ctx, scope, checkpoints)
+	if err != nil {
+		if ctx.Err() != nil || s.stopping() {
+			return false, context.Canceled
+		}
+		return false, nil
+	}
+	if kept {
+		s.note(run, "worktree-back-on-branch")
+	} else {
+		s.diagnose(run, "history-rewritten", atStep("history-rewritten", ErrIntegrity))
+		if err = s.appendUnknown(run, registration, "history-rewritten", "Implementation history rewritten"); err != nil {
+			return false, err
+		}
+	}
+	s.mu.Lock()
+	delete(s.offBranch, run)
+	s.mu.Unlock()
+	return true, nil
 }
 
 // executionStarted reports whether the run has reached implementation, the
@@ -463,6 +573,12 @@ func (s *Service) Checkpoints(ctx context.Context, run string) ([]string, error)
 	if _, err = s.refresh(ctx, run, registration); err != nil {
 		return nil, err
 	}
+	return s.recordedCheckpoints(run, registration)
+}
+
+// recordedCheckpoints returns the distinct clean checkpoint commits recorded
+// for the run, oldest first.
+func (s *Service) recordedCheckpoints(run, registration string) ([]string, error) {
 	var shas []string
 	seen := map[string]bool{}
 	after := uint64(0)
