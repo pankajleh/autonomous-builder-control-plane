@@ -28,6 +28,8 @@ type dockerFixture struct {
 	id         string
 	commands   [][]string
 	containers map[string]string
+	created    map[string][]string // each container's create argv, which inspect reports back as Docker does
+	runtimes   string              // `docker info --format {{json .Runtimes}}`
 	network    bool
 	reject     func(context.Context, []string) error
 	external   func()
@@ -35,7 +37,8 @@ type dockerFixture struct {
 
 func newDockerFixture(t *testing.T, p PreviewProfileV1) *dockerFixture {
 	t.Helper()
-	f := &dockerFixture{d: newDocker(t.TempDir()), p: p, id: strings.Repeat("c", 64), containers: map[string]string{}}
+	f := &dockerFixture{d: newDocker(t.TempDir()), p: p, id: strings.Repeat("c", 64), containers: map[string]string{}, created: map[string][]string{},
+		runtimes: `{"io.containerd.runc.v2":{},"runc":{}}`}
 	f.d.run = f.run
 	return f
 }
@@ -49,6 +52,9 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 	encoded := func(v any) (string, error) { b, e := json.Marshal(v); return string(b), e }
 	switch args[0] {
 	case "info":
+		if len(args) > 2 && strings.Contains(args[2], ".Runtimes") {
+			return f.runtimes, nil
+		}
 		return `{"OSType":"linux","MemoryLimit":true,"SwapLimit":true,"CpuCfsQuota":true,"PidsLimit":true,"SecurityOptions":["name=seccomp,profile=builtin"]}`, nil
 	case "image":
 		return encoded([]any{map[string]any{"RepoDigests": []string{args[2]}, "Config": map[string]any{}}})
@@ -69,6 +75,7 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 		for i, arg := range args {
 			if arg == "--name" {
 				f.containers[args[i+1]] = strings.Repeat(strconv.Itoa(len(f.containers)+1), 64)
+				f.created[args[i+1]] = append([]string(nil), args...)
 			}
 		}
 	case "inspect":
@@ -82,6 +89,18 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 			v["Mounts"] = []any{}
 		}
 		v["NetworkSettings"].(map[string]any)["Networks"].(map[string]any)[f.d.network(f.id)] = map[string]string{"IPAddress": "10.88.0." + strconv.Itoa(i+2)}
+		runtime, hosts := "runc", []string{}
+		created := f.created[args[1]]
+		for j, arg := range created {
+			if strings.HasPrefix(arg, "--runtime=") {
+				runtime = strings.TrimPrefix(arg, "--runtime=")
+			}
+			if arg == "--add-host" && j+1 < len(created) {
+				hosts = append(hosts, created[j+1])
+			}
+		}
+		v["HostConfig"].(map[string]any)["Runtime"] = runtime
+		v["HostConfig"].(map[string]any)["ExtraHosts"] = hosts
 		return encoded([]any{v})
 	case "ps":
 		ids := []string{}
