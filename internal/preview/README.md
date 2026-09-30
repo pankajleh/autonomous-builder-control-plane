@@ -107,6 +107,24 @@ probes exercise that same mount and verify source-file contents through each
 service's configured user. The host itself must be out of reach too: the host's rule
 (`abcp-preview-isolation`) drops new connections from `10.213.0.0/16`, and the probe
 proves it with a listener on the network's gateway that no service may reach.
+
+A hosted profile may name one way out: `"egress": ["*.myshopify.com:443"]`, the only
+entry v1 accepts (Repo C design note A5 §8). Its group then gets an HTTP `CONNECT`
+proxy on the gateway, port 3129, and every service is started with
+`HTTPS_PROXY=http://<gateway>:3129` and `NODE_USE_ENV_PROXY=1`. The proxy tunnels
+only to a single-label name under `myshopify.com` on port 443; it resolves the name
+itself and connects only to a public address, never one the app gives; it refuses
+anything else (403, 405, 400 or 502), holds at most 32 tunnels, ends each after 30
+minutes and counts what it opened and refused, never content. The owner's rule must
+accept new connections from `10.213.0.0/16` to port 3129 above the drop; the probe
+sends each service's `CONNECT example.com:443` there and proves a 403, so without the
+rule the profile stays unavailable. One service of a hosted profile may also name
+`"settings"` from `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, `SHOPIFY_APP_URL` and
+`SCOPES`. A hosted start must then carry exactly those values. They are kept in the
+key's private `settings.env` (0600, replaced by each start, removed by a purge),
+reach that service by `docker exec --env-file` with its environment kept rather than
+cleared (less `HOSTNAME`), and never appear in a receipt, a state file, a view or an
+argument. Both fields are omitted when unset, so other profiles keep their digests.
 Host-loopback presentation binds an explicit 127.0.0.1 address
 and targets only the presented service; siblings remain internal.
 

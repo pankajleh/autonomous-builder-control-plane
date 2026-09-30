@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,7 +45,7 @@ var (
 // HostedRuntime is the part of the governed runtime a hosted instance uses. The Docker runtime provides it.
 type HostedRuntime interface {
 	Available(PreviewProfileV1) bool
-	StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest string) (string, error)
+	StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest, settings string) (string, error)
 	Healthy(ctx context.Context, id string, p PreviewProfileV1) (bool, error)
 	ResolveRoute(ctx context.Context, id, handle string) (string, error)
 	Stop(ctx context.Context, id string) error
@@ -344,7 +345,7 @@ func (h *Hosting) StartHosted(ctx context.Context, p serviceapi.Principal, autho
 	k.op.Lock()
 	defer k.op.Unlock()
 	defer h.forget(k)
-	cmd := newHostedCommand(p, authorityDigest, key, "start", c.RequestID, c.DelegatedActor, c)
+	cmd := newHostedCommand(p, authorityDigest, key, "start", c.RequestID, c.DelegatedActor, hostedStartBody(c))
 	h.mu.Lock()
 	st := k.state
 	var result serviceapi.HostedV1
@@ -356,6 +357,10 @@ func (h *Hosting) StartHosted(ctx context.Context, p serviceapi.Principal, autho
 	if !ok || !profile.Hosted {
 		h.mu.Unlock()
 		return empty, serviceapi.ErrPreviewProfile
+	}
+	if !settingsMatch(profile, c.Settings) {
+		h.mu.Unlock()
+		return empty, serviceapi.ErrPreviewIneligible
 	}
 	if h.unavailable || !h.runtime.Available(profile) {
 		h.mu.Unlock()
@@ -397,11 +402,91 @@ func (h *Hosting) StartHosted(ctx context.Context, p serviceapi.Principal, autho
 		ValidationID: source.ValidationID, RepositoryIdentityDigest: source.RepositoryIdentityDigest}
 	st.Data, st.UpdatedAt = "PRESENT", now
 	result = view(st)
+	// The settings are written before the state that starts the instance, and replaced by every start.
+	if err = h.writeSettings(k.digest, c.Settings); err != nil {
+		return empty, err
+	}
 	if err = h.save(k, withReceipt(st, cmd, result)); err != nil {
 		return empty, err
 	}
 	h.launch(k)
 	return result, nil
+}
+
+// hostedStartBody is what a start's receipt digests: the request with its settings' names but never their values.
+func hostedStartBody(c serviceapi.HostedStartRequestV1) serviceapi.HostedStartRequestV1 {
+	if len(c.Settings) > 0 {
+		names := make(map[string]string, len(c.Settings))
+		for name := range c.Settings {
+			names[name] = ""
+		}
+		c.Settings = names
+	}
+	return c
+}
+
+// settingsMatch reports whether a start carries exactly the settings the profile's settings service names.
+func settingsMatch(p PreviewProfileV1, settings map[string]string) bool {
+	i := p.settingsService()
+	if i < 0 {
+		return len(settings) == 0
+	}
+	if len(settings) != len(p.Services[i].Settings) {
+		return false
+	}
+	for _, name := range p.Services[i].Settings {
+		if _, ok := settings[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Hosting) settingsPath(keyDigest string) string {
+	return filepath.Join(h.root, keyDigest, "settings.env")
+}
+
+// writeSettings keeps a key's settings in a 0600 file in its private directory, one NAME=VALUE line each, written whole
+// like its state; with none, any earlier file is removed.
+func (h *Hosting) writeSettings(keyDigest string, settings map[string]string) error {
+	path := h.settingsPath(keyDigest)
+	if len(settings) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			h.unavailable = true
+			return ErrUnavailable
+		}
+		return nil
+	}
+	names := make([]string, 0, len(settings))
+	for name := range settings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var data strings.Builder
+	for _, name := range names {
+		data.WriteString(name + "=" + settings[name] + "\n")
+	}
+	dir := filepath.Join(h.root, keyDigest)
+	d, err := privateDirectory(dir, true)
+	if err != nil {
+		h.unavailable = true
+		return ErrUnavailable
+	}
+	defer d.Close()
+	tmp := filepath.Join(dir, "settings.next")
+	f, err := openRegular(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, true)
+	if err != nil {
+		h.unavailable = true
+		return ErrUnavailable
+	}
+	_, err = f.WriteString(data.String())
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if err != nil || syncErr != nil || closeErr != nil || os.Rename(tmp, path) != nil || d.Sync() != nil {
+		h.unavailable = true
+		return ErrUnavailable
+	}
+	return nil
 }
 
 func (h *Hosting) StopHosted(_ context.Context, p serviceapi.Principal, authorityDigest, key string, c serviceapi.HostedCommandRequestV1) (serviceapi.HostedV1, error) {
@@ -427,6 +512,10 @@ func (h *Hosting) PurgeHosted(ctx context.Context, p serviceapi.Principal, autho
 			return st, serviceapi.ErrPreviewUnavailable
 		}
 		if os.RemoveAll(filepath.Join(h.root, k.digest, "backups")) != nil {
+			return st, serviceapi.ErrPreviewUnavailable
+		}
+		// A purged key keeps no settings either; the next start brings them again.
+		if err := os.Remove(h.settingsPath(k.digest)); err != nil && !os.IsNotExist(err) {
 			return st, serviceapi.ErrPreviewUnavailable
 		}
 		st.Data, st.Backups, st.LastNightly = "PURGED", nil, ""
@@ -766,7 +855,11 @@ func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedStat
 	if err != nil {
 		return
 	}
-	route, err := h.runtime.StartHosted(ctx, id, path, profile, k.digest)
+	settings := ""
+	if profile.settingsService() >= 0 {
+		settings = h.settingsPath(k.digest)
+	}
+	route, err := h.runtime.StartHosted(ctx, id, path, profile, k.digest, settings)
 	if err != nil || !sha256Pattern.MatchString(route) {
 		return
 	}

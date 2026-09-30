@@ -5,8 +5,11 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 )
@@ -39,6 +42,9 @@ type HostedStartRequestV1 struct {
 	CheckpointActivityID string           `json:"checkpoint_activity_id"`
 	ProfileID            string           `json:"profile_id"`
 	DelegatedActor       DelegatedActorV1 `json:"delegated_actor"`
+	// Settings are the values the profile's settings service takes (Repo C design note A5 §8): exactly the names it
+	// lists, no more. They are kept in a 0600 file for the key and never returned, logged or digested.
+	Settings map[string]string `json:"settings,omitempty"`
 }
 
 // HostedCommandRequestV1 is the body of stop and purge.
@@ -121,7 +127,31 @@ func ValidateHostedStartRequestV1(c HostedStartRequestV1) error {
 	if c.SchemaVersion != 1 || ValidatePrincipalID(c.RequestID) != nil || runtimecatalog.ValidateIdentifier(c.RunID) != nil || !isLowerSHA256(c.CheckpointActivityID) || ValidatePrincipalID(c.ProfileID) != nil || !validPreviewActor(c.DelegatedActor) {
 		return errors.New("invalid hosted start command")
 	}
+	if len(c.Settings) > 8 {
+		return errors.New("invalid hosted start command")
+	}
+	for name, value := range c.Settings {
+		if !settingName.MatchString(name) || !validSettingValue(value) {
+			return errors.New("invalid hosted start command")
+		}
+	}
 	return nil
+}
+
+var settingName = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
+
+// validSettingValue is one line of printable UTF-8, up to 1024 bytes, not starting with a space: what Docker's
+// --env-file reads back unchanged.
+func validSettingValue(value string) bool {
+	if value == "" || len(value) > 1024 || !utf8.ValidString(value) || unicode.IsSpace(rune(value[0])) {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 func ValidateHostedCommandRequestV1(c HostedCommandRequestV1) error {
 	if c.SchemaVersion != 1 || ValidatePrincipalID(c.RequestID) != nil || !validPreviewActor(c.DelegatedActor) {

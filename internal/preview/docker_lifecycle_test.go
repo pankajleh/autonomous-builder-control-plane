@@ -36,6 +36,7 @@ type dockerFixture struct {
 	network    bool
 	subnet     netip.Prefix // the /28 the controller asked for, reported back by network inspect as Docker does
 	reachHost  bool         // whether a service's request to the host's gateway listener gets through (no host rule)
+	egressRule bool         // whether the owner's rule lets a service reach the egress port on the gateway
 	reject     func(context.Context, []string) error
 	external   func()
 }
@@ -166,6 +167,25 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 				f.external()
 			}
 			return "", ErrUnavailable
+		}
+		if strings.Contains(joined, "| /bin/busybox nc -w 3 ") {
+			// The probe's CONNECT to the egress proxy: dropped without the owner's rule for its port; otherwise sent, as
+			// busybox would, to the proxy the group runs (on loopback here), and its answer returned.
+			f.d.mu.Lock()
+			g := f.d.groups[f.id]
+			f.d.mu.Unlock()
+			if !f.egressRule || g == nil || g.egress == nil || !strings.HasSuffix(joined, " "+strconv.Itoa(EgressPort)) {
+				return "", ErrUnavailable
+			}
+			c, err := net.Dial("tcp", g.egress.listener.Addr().String())
+			if err != nil {
+				return "", ErrUnavailable
+			}
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+			_, _ = io.WriteString(c, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+			answer, _ := io.ReadAll(c)
+			return string(answer), nil
 		}
 		if strings.Contains(joined, "wget -T 2 -O /dev/null http://127.0.0.1:") {
 			// The probe's request to the host's listener: dropped by the host rule, unless the fixture says otherwise.
