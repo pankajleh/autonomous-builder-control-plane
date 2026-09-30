@@ -169,3 +169,25 @@ func TestProfileRuntimeIsGVisorOrNothingAndKeepsOldDigests(t *testing.T) {
 		t.Fatal("gVisor profile invalid, or its digest does not differ")
 	}
 }
+
+func TestGVisorSourceMountIsReadOnlyWithoutTheRecursiveOptionGVisorRefuses(t *testing.T) {
+	d := newDocker("/private/previews")
+	id := strings.Repeat("c", 64)
+	path := filepath.Join(d.root, "sources", id)
+	mount := func(p PreviewProfileV1) string {
+		args := d.createArgs(id, path, p, p.Services[0], 0, "")
+		i := slices.Index(args, "--mount")
+		if i < 0 || i+1 >= len(args) {
+			t.Fatal("no source mount", args)
+		}
+		return args[i+1]
+	}
+	if got := mount(gvisorProfile()); got != "type=bind,src="+path+",dst=/source,readonly,bind-propagation=rprivate" {
+		t.Fatal("gVisor source mount", got)
+	}
+	p := gvisorProfile()
+	p.Runtime = ""
+	if got := mount(p); got != "type=bind,src="+path+",dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate" {
+		t.Fatal("a profile without a runtime lost its recursive read-only source mount", got)
+	}
+}
