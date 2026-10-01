@@ -261,6 +261,48 @@ func TestControllerProxyPassesOnlyAnAppsOwnCookiesWhenTheProfileOptsIn(t *testin
 		t.Fatal("nothing but gateway cookies and junk leaves an empty header")
 	}
 }
+
+// With app_authorization (a hosted Shopify app), the visitor's bearer token reaches the app; Proxy-Authorization never does.
+func TestControllerProxyPassesTheVisitorsAuthorizationOnlyWhenTheProfileOptsIn(t *testing.T) {
+	var mu sync.Mutex
+	var auth, proxyAuth string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auth, proxyAuth = r.Header.Get("Authorization"), r.Header.Get("Proxy-Authorization")
+		mu.Unlock()
+		w.Write([]byte("candidate"))
+	}))
+	defer target.Close()
+	parsed, _ := url.Parse(target.URL)
+	for _, appAuthorization := range []bool{true, false} {
+		g := &presentation{endpoint: parsed.Host, appAuthorization: appAuthorization}
+		if err := g.present(); err != nil {
+			t.Fatal(err)
+		}
+		req, _ := http.NewRequest(http.MethodPost, g.url+"/app/note.data", strings.NewReader("note=x"))
+		req.Header.Set("Authorization", "Bearer session.token.here")
+		req.Header.Set("Proxy-Authorization", "Basic c2VjcmV0")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.ReadAll(response.Body)
+		response.Body.Close()
+		g.server.Close()
+		mu.Lock()
+		gotAuth, gotProxyAuth := auth, proxyAuth
+		mu.Unlock()
+		if gotProxyAuth != "" {
+			t.Fatal("Proxy-Authorization reached the app", appAuthorization)
+		}
+		if appAuthorization && gotAuth != "Bearer session.token.here" {
+			t.Fatalf("with app_authorization the session token is lost: %q", gotAuth)
+		}
+		if !appAuthorization && gotAuth != "" {
+			t.Fatal("without app_authorization credentials reached the app")
+		}
+	}
+}
 func TestDockerOrphanCleanupUsesBothOwnershipFilters(t *testing.T) {
 	d := newDocker("/private/previews")
 	id := strings.Repeat("c", 64)
