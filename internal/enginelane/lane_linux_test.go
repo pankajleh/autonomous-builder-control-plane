@@ -67,6 +67,21 @@ func TestAClaudeLaneTakesBedrocksSettings(t *testing.T) {
 	}
 }
 
+func TestAClaudeLaneTakesAnthropicsAPIKey(t *testing.T) {
+	path := write(t, "CLAUDE_CONFIG_DIR=/home/devagent/.claude-api\nANTHROPIC_API_KEY="+secret+"\nANTHROPIC_MODEL=claude-sonnet-5-5\n"+
+		"ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5\n", 0o600)
+	lane, err := Load("claude-api", path, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lane.Settings) != 4 || lane.Settings["ANTHROPIC_API_KEY"] != secret {
+		t.Fatalf("settings %v", lane.Keys())
+	}
+	if _, err := Load("claude-api", path, "codex"); err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("a Claude lane given to Codex, or its key named: %v", err)
+	}
+}
+
 func TestALaneFileThatIsNotTheOperatorsPrivateFileOrGivesAnythingElseIsRefused(t *testing.T) {
 	good := "OPENAI_API_KEY=" + secret + "\n"
 	for name, content := range map[string]string{

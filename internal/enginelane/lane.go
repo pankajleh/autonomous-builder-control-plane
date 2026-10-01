@@ -32,7 +32,8 @@ var keyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 // else in a lane file refuses it.
 var allowed = map[string]map[string]bool{
 	"codex": set("CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID"),
-	"claude": set("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+	// Claude Code on Anthropic's API (ANTHROPIC_API_KEY, the owner's choice for the Claude lane) or on Amazon Bedrock.
+	"claude": set("CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
 		"AWS_SESSION_TOKEN", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
 }
 
