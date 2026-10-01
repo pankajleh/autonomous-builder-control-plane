@@ -43,6 +43,22 @@ func TestInvocationArgv(t *testing.T) {
 	}
 }
 
+func TestInvocationKeepsTheAnthropicKeyOnlyForClaude(t *testing.T) {
+	inv := Invocation{BinaryPath: "/opt/ralphex", PlanPath: "plan.md", ConfigDir: "/etc/abcp/ralphex", Mode: ModeFull, PreserveAnthropicAPIKey: true}
+	got, err := inv.Argv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/opt/ralphex", "--config-dir", "/etc/abcp/ralphex", "--preserve-anthropic-api-key", "plan.md"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv mismatch\nwant: %#v\n got: %#v", want, got)
+	}
+	inv.Codex = true
+	if _, err := inv.Argv(); err == nil {
+		t.Fatal("a Codex invocation kept the Anthropic key")
+	}
+}
+
 func TestV3InvocationEmitsEveryStructuralBound(t *testing.T) {
 	bounds := testBounds()
 	capability := testCapability(ModeTasksOnly)
