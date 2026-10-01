@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -888,6 +889,16 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer previewService.Close()
+	// One line per preview profile, so a profile whose startup probe failed shows in the log, not only as refused previews.
+	availability := previewService.ProfileAvailability()
+	profileIDs := make([]string, 0, len(availability))
+	for id := range availability {
+		profileIDs = append(profileIDs, id)
+	}
+	sort.Strings(profileIDs)
+	for _, id := range profileIDs {
+		fmt.Fprintf(stderr, "abcp preview profile id=%s available=%t\n", id, availability[id])
+	}
 	// Hosted instances (B9.2.1) run on the preview runtime after its restart cleanup, and stop before it closes.
 	// Without them the rest of the service still runs, and the hosted API answers that the capability is missing.
 	var hosting serviceapi.HostingController

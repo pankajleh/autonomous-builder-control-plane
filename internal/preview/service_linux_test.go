@@ -635,3 +635,30 @@ func TestDamagedJournalStillReconcilesExclusivelyOwnedObjects(t *testing.T) {
 		})
 	}
 }
+
+func TestProfileAvailabilityReportsEachProfileAsTheRuntimeProvedIt(t *testing.T) {
+	rt := &memoryRuntime{available: true, healthy: true}
+	s, _ := fixtureService(t, rt)
+	if got := s.ProfileAvailability(); len(got) != 1 || !got["web-v1"] {
+		t.Fatalf("proved profile: %v", got)
+	}
+	rt.mu.Lock()
+	rt.available = false
+	rt.mu.Unlock()
+	if got := s.ProfileAvailability(); len(got) != 1 || got["web-v1"] {
+		t.Fatalf("unproved profile: %v", got)
+	}
+	rt.mu.Lock()
+	rt.available = true
+	rt.mu.Unlock()
+	s.mu.Lock()
+	s.unavailable = true
+	s.mu.Unlock()
+	if got := s.ProfileAvailability(); len(got) != 1 || got["web-v1"] {
+		t.Fatalf("an unavailable service offers no profile: %v", got)
+	}
+	var none *Service
+	if got := none.ProfileAvailability(); len(got) != 0 {
+		t.Fatalf("nil service: %v", got)
+	}
+}

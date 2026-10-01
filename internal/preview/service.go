@@ -111,6 +111,24 @@ func (s *Service) Available() bool {
 	}
 	return false
 }
+
+// ProfileAvailability tells, for each loaded preview profile, whether previews (or hosted instances) can start on it now.
+// The runtime approves a profile once, at startup, by proving it from its pinned images, so a profile it could not prove
+// (one of its images pruned from the host, say) stays unavailable until a restart. All are false while the service
+// itself is unavailable.
+func (s *Service) ProfileAvailability() map[string]bool {
+	out := map[string]bool{}
+	if s == nil {
+		return out
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	down := s.closed || s.unavailable || s.store.broken || s.ctx.Err() != nil
+	for id, p := range s.profiles {
+		out[id] = !down && s.runtime.Available(p)
+	}
+	return out
+}
 func (s *Service) replay(key, d string) (serviceapi.PreviewV1, bool, error) {
 	if r, ok := s.store.receipts[key]; ok {
 		if r.Digest != d {
