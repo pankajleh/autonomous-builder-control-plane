@@ -27,6 +27,7 @@ type presentation struct {
 	transport             *http.Transport
 	url, endpoint, handle string
 	appCookies            bool
+	appAuthorization      bool
 	// volume is the hosted data volume mounted at /data in the data service, or "" for a preview.
 	volume string
 	// gateway is the host's own address on the group's network, which no service may reach (see previewSubnets).
@@ -446,7 +447,7 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 			return nil, err
 		}
 	}
-	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, volume: volume, gateway: gateway}
+	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, appAuthorization: p.AppAuthorization, volume: volume, gateway: gateway}
 	if len(p.Egress) > 0 {
 		listener, listenErr := d.listen("tcp4", netip.AddrPortFrom(gateway, EgressPort).String())
 		if listenErr != nil {
@@ -540,7 +541,9 @@ func (g *presentation) present() error {
 	proxy.Director = func(r *http.Request) {
 		original(r)
 		r.Host = g.endpoint
-		r.Header.Del("Authorization")
+		if !g.appAuthorization {
+			r.Header.Del("Authorization")
+		}
 		r.Header.Del("Proxy-Authorization")
 		cookies := r.Header.Values("Cookie")
 		r.Header.Del("Cookie")

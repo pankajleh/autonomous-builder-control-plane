@@ -46,6 +46,12 @@ type PreviewProfileV1 struct {
 	// preview gateway's own (__Host-preview*, __Host-unlock*) never pass either way. Omitted when false, so profiles
 	// without it keep their digests.
 	AppCookies bool `json:"app_cookies,omitempty"`
+	// AppAuthorization lets the visitor's Authorization header through the presentation proxy (hosted profiles only).
+	// An embedded Shopify app needs it: App Bridge sends the merchant's session token as a bearer token on the app's
+	// own requests, and without it every save is answered as a sign-in. Repo C's gateway passes the header only to a
+	// hosted app's own host and never adds one of its own; Proxy-Authorization never passes. Omitted when false, so
+	// profiles without it keep their digests.
+	AppAuthorization bool `json:"app_authorization,omitempty"`
 	// Hosted marks a profile for hosted instances only (B9.2.1): no time limit, a named data volume and restarts by
 	// the controller. Preview requests refuse it; hosted requests refuse any other profile. Omitted when false.
 	Hosted bool `json:"hosted,omitempty"`
@@ -224,6 +230,9 @@ func (p PreviewProfileV1) Validate() error {
 		return ErrUnavailable
 	}
 	if len(p.Egress) > 0 && (!p.Hosted || len(p.Egress) != 1 || p.Egress[0] != EgressShopifyStores) {
+		return ErrUnavailable
+	}
+	if p.AppAuthorization && !p.Hosted {
 		return ErrUnavailable
 	}
 	takers := 0

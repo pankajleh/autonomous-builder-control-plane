@@ -35,6 +35,11 @@ func TestProfilesTakeEgressAndSettingsOnlyWhenHostedAndOnlyFromTheirLists(t *tes
 	if err := shopifyProfile().Validate(); err != nil {
 		t.Fatal("the Shopify profile was refused:", err)
 	}
+	withAuthorization := shopifyProfile()
+	withAuthorization.AppAuthorization = true
+	if err := withAuthorization.Validate(); err != nil {
+		t.Fatal("the Shopify profile with app_authorization was refused:", err)
+	}
 	cases := map[string]func(*PreviewProfileV1){
 		"egress-on-a-preview":   func(p *PreviewProfileV1) { p.Hosted = false; p.Services[0].Settings = nil },
 		"settings-on-a-preview": func(p *PreviewProfileV1) { p.Hosted = false; p.Egress = nil },
@@ -45,6 +50,9 @@ func TestProfilesTakeEgressAndSettingsOnlyWhenHostedAndOnlyFromTheirLists(t *tes
 		"an-unknown-setting":    func(p *PreviewProfileV1) { p.Services[0].Settings = append(p.Services[0].Settings, "DATABASE_URL") },
 		"a-runtime-setting":     func(p *PreviewProfileV1) { p.Services[0].Settings = []string{"LD_PRELOAD"} },
 		"a-setting-twice":       func(p *PreviewProfileV1) { p.Services[0].Settings = []string{"SCOPES", "SCOPES"} },
+		"authorization-on-a-preview": func(p *PreviewProfileV1) {
+			p.Hosted, p.Egress, p.Services[0].Settings, p.AppAuthorization = false, nil, nil, true
+		},
 		"two-services-with-settings": func(p *PreviewProfileV1) {
 			db := p.Services[0]
 			db.Name, db.Presented, db.Settings = "db", false, []string{"SCOPES"}
@@ -60,8 +68,8 @@ func TestProfilesTakeEgressAndSettingsOnlyWhenHostedAndOnlyFromTheirLists(t *tes
 	}
 	// Profiles without them keep their digests: neither field appears in their JSON.
 	raw, _ := json.Marshal(hostedProfile())
-	if strings.Contains(string(raw), "egress") || strings.Contains(string(raw), "settings") {
-		t.Fatal("a profile without egress or settings changed its JSON:", string(raw))
+	if strings.Contains(string(raw), "egress") || strings.Contains(string(raw), "settings") || strings.Contains(string(raw), "authorization") {
+		t.Fatal("a profile without egress, settings or app_authorization changed its JSON:", string(raw))
 	}
 }
 
