@@ -58,6 +58,9 @@ type Invocation struct {
 	Capability                *CapabilityV1
 	BinarySHA256              string
 	SourceSHA                 string
+	// PreserveAnthropicAPIKey keeps ANTHROPIC_API_KEY in Claude Code's environment, which Ralphex otherwise removes:
+	// a Claude engine lane that pays through Anthropic's API needs it (Repo C design note A6).
+	PreserveAnthropicAPIKey bool
 }
 
 // HandoffMode identifies the controller-visible review->lease->fix boundary.
@@ -166,6 +169,12 @@ func (i Invocation) Argv() ([]string, error) {
 	}
 	if i.Codex {
 		argv = append(argv, "--codex")
+	}
+	if i.PreserveAnthropicAPIKey {
+		if i.Codex {
+			return nil, fmt.Errorf("the Anthropic API key is kept only for Claude Code")
+		}
+		argv = append(argv, "--preserve-anthropic-api-key")
 	}
 	if i.WaitOnLimit != "" {
 		argv = append(argv, "--wait", i.WaitOnLimit)

@@ -1143,6 +1143,46 @@ git commit -qm 'candidate implementation' || exit 45
 	}
 }
 
+func TestRunnerKeepsAClaudeLanesAnthropicKeyForClaudeCode(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "inherited-key")
+	laneFile := filepath.Join(t.TempDir(), "claude-api.env")
+	writeTestFile(t, laneFile, []byte("ANTHROPIC_API_KEY=lane-key-never-recorded\nANTHROPIC_MODEL=claude-test\n"), 0o600)
+	script := `#!/bin/sh
+case " $* " in *" --preserve-anthropic-api-key "*) ;; *) exit 41 ;; esac
+if [ "$ANTHROPIC_API_KEY" != "lane-key-never-recorded" ]; then exit 42; fi
+printf 'candidate\n' > candidate.txt
+git add candidate.txt || exit 44
+git commit -qm 'candidate implementation' || exit 45
+`
+	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	manifest.Executor.Executor = "claude"
+	manifest.Executor.Lane, manifest.Executor.LaneFile = "claude-api", laneFile
+	fixture.authority = fixture.admit(t, manifest)
+	if result := fixture.execute(t); !result.Accepted() {
+		t.Fatalf("a run on a Claude lane with Anthropic's key was not accepted: %#v", result)
+	}
+}
+
+func TestRunnerLeavesTheAnthropicKeyFlagOffWithoutALaneKey(t *testing.T) {
+	laneFile := filepath.Join(t.TempDir(), "claude-bedrock.env")
+	writeTestFile(t, laneFile, []byte("CLAUDE_CODE_USE_BEDROCK=1\nAWS_REGION=ap-south-1\n"), 0o600)
+	script := `#!/bin/sh
+case " $* " in *" --preserve-anthropic-api-key "*) exit 41 ;; esac
+printf 'candidate\n' > candidate.txt
+git add candidate.txt || exit 44
+git commit -qm 'candidate implementation' || exit 45
+`
+	fixture := newRunFixtureWithScript(t, script, authority.WorktreePolicy{}, commandPath(t, "true"))
+	manifest := fixture.authority.Manifest()
+	manifest.Executor.Executor = "claude"
+	manifest.Executor.Lane, manifest.Executor.LaneFile = "claude-bedrock", laneFile
+	fixture.authority = fixture.admit(t, manifest)
+	if result := fixture.execute(t); !result.Accepted() {
+		t.Fatalf("a run on a Claude lane without Anthropic's key was not accepted: %#v", result)
+	}
+}
+
 func TestRunnerStopsBeforeTheEngineWhenItsLaneFileIsNotPrivate(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "engine-started")
 	laneFile := filepath.Join(t.TempDir(), "codex-api.env")

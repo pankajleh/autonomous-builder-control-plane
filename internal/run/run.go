@@ -554,6 +554,20 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
+	// An engine lane (Repo C design note A6) replaces the inherited settings of
+	// its engine for this build only. It is read now, so a changed or removed
+	// file stops the build before the engine starts; only its name, SHA-256 and
+	// setting names are recorded, never a value.
+	var lane *enginelane.Lane
+	if policy := r.governed.Executor(); policy.Lane != "" {
+		loaded, err := enginelane.Load(policy.Lane, policy.LaneFile, policy.Executor)
+		if err != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
+		}
+		lane = &loaded
+		// Ralphex removes ANTHROPIC_API_KEY from Claude Code's environment unless asked to keep it.
+		_, invocation.PreserveAnthropicAPIKey = loaded.Settings["ANTHROPIC_API_KEY"]
+	}
 	argv, err := invocation.Argv()
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
@@ -562,17 +576,9 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("parse governed Ralphex timeout: %w", err), nil)
 	}
-	// An engine lane (Repo C design note A6) replaces the inherited settings of
-	// its engine for this build only. It is read now, so a changed or removed
-	// file stops the build before the engine starts; only its name, SHA-256 and
-	// setting names are recorded, never a value.
 	environment := ralphexEnvironment(r.governed.Executor().Executor, r.capsule)
 	startEvidence := map[string]any{"argv": argv, "timeout": r.governed.Ralphex().Timeout, "environment_policy": ralphexEnvironmentPolicy}
-	if policy := r.governed.Executor(); policy.Lane != "" {
-		lane, err := enginelane.Load(policy.Lane, policy.LaneFile, policy.Executor)
-		if err != nil {
-			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
-		}
+	if lane != nil {
 		environment = lane.Environment(environment)
 		startEvidence["engine_lane"], startEvidence["engine_lane_sha256"], startEvidence["engine_lane_keys"] = lane.Name, lane.SHA256, lane.Keys()
 	}
