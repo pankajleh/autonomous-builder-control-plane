@@ -58,7 +58,7 @@ Manifest templates may set `worktree.retain`. ABCP then passes `--keep-worktree`
 | Component | Identity |
 |---|---|
 | ABCP | `109e15b` since 07:36Z, binary SHA-256 `403d104a…8b78`, listener `127.0.0.1:18888`; worktree eviction on the default policy (24 h without a live stream, 7 days, 5 GiB per repository); worktree release enabled by the `worktree.release` grant |
-| Pinned Ralphex | `ralphex-v1.7.0-abcp`: upstream release `v1.7.0` plus the ABCP patch series, source `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `2275e23adba99bb22c23679ae3e8152c0323aba1`, SHA-256 `fe5a7c46…4058` |
+| Pinned Ralphex | `ralphex-v1.7.0-abcp2` since 2026-10-02 19:34Z: upstream release `v1.7.0` plus the ABCP patch series, source `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `c66debcd8353802851ee97f48b7bbd011eba7088`, SHA-256 `4b62e1d6…26fe`, in all 16 host manifest templates. A review pass that commits a fix and says `REVIEW_DONE` is handled as a fix (ralphex-governance #4) |
 | Manifest templates | both `worktree.retain: true`; versioned in `deploy/local-integration/abcp-config/` |
 | Preview profiles | `demo-v1` and `web-v1` (busybox `/bin/httpd`, health `/README.md`); versioned in the same directory |
 

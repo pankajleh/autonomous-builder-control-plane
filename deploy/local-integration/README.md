@@ -35,11 +35,12 @@ Source: the private repository [`pankajleh/ralphex-governance`](https://github.c
 
 | Binary | Upstream base | Source | SHA-256 |
 |---|---|---|---|
-| `ralphex-v1.7.0-abcp` (current) | release `v1.7.0` (`24c19b1`) | `abcp/v1.7.0` @ `2275e23adba99bb22c23679ae3e8152c0323aba1` | `fe5a7c4651aa73af755f0aed10a82d9652a763a000f72b0646eaba6ae4894058` |
-| `ralphex-governance-v2` (previous) | master `319e306` (v1.6.1+34) | `abcp/governance-bundle-v2-20260928` @ `055dfbdb4d92120a8249ae58923d7608d583e82f` | `54300a18cb9a5ae5dc295f0f2b7f2e9441165e6b0aa56b4be52b18c225de94bc` |
+| `ralphex-v1.7.0-abcp2` (current) | release `v1.7.0` (`24c19b1`) | `abcp/v1.7.0` @ `c66debcd8353802851ee97f48b7bbd011eba7088` | `4b62e1d6b74f8ea6d5331f165b335185e33598e98eedc90503d89ed3750d26fe` |
+| `ralphex-v1.7.0-abcp` (previous) | release `v1.7.0` (`24c19b1`) | `abcp/v1.7.0` @ `2275e23adba99bb22c23679ae3e8152c0323aba1` | `fe5a7c4651aa73af755f0aed10a82d9652a763a000f72b0646eaba6ae4894058` |
+| `ralphex-governance-v2` (older) | master `319e306` (v1.6.1+34) | `abcp/governance-bundle-v2-20260928` @ `055dfbdb4d92120a8249ae58923d7608d583e82f` | `54300a18cb9a5ae5dc295f0f2b7f2e9441165e6b0aa56b4be52b18c225de94bc` |
 | `ralphex-governance-v1` (earlier) | master `319e306` | `abcp/governance-bundle-v1-20260922` @ `66e8868173ffc982dbeab903663839d2276372c4` | `9698c1621fddf76038c38dec19c424c815b334d392d2211c74b556c1a8b48bcd` |
 
-The patch series has two commits:
+The patch series has four commits:
 
 1. **ABCP governed execution budgets** (26 files, about +1,350/−220). It adds:
    - bounded iterations, session and idle timeouts, and internal review passes;
@@ -48,14 +49,16 @@ The patch series has two commits:
    - the orchestrator subprocess wait;
    - the `--abcp-governance-capability-v1` probe.
 2. **`--keep-worktree`** (2 files, +55/−7). The finished run leaves its worktree for ABCP to remove, and the probe advertises `worktree_retention_v1`.
+3. **Lint clean-up** (ralphex-governance #5; 4 files, no behaviour change). golangci-lint v2.13.0 passes on the branch, so CI is green.
+4. **A review pass that commits a fix and says `REVIEW_DONE` is a fix, not a failed run** (ralphex-governance #4; 2 files). In bounded internal review, such a pass is validated like any fix and the runner's budget decides the next pass: with ABCP's budget of 2, a first-pass fix is reviewed by the final pass, and no review 3+ is launched (`docs/plans/review-pass-fixes.md`).
 
 ## Upgrading Ralphex
 
-1. In the host clone `~/ralphex-behavior-lab/tools/ralphex`, run `git fetch origin --tags`. Create `abcp/<new-tag>` from the new release tag, then `git cherry-pick -x` the two commits of the current branch.
+1. In the host clone `~/ralphex-behavior-lab/tools/ralphex`, run `git fetch origin --tags`. Create `abcp/<new-tag>` from the new release tag, then `git cherry-pick -x` the commits of the current branch, oldest first.
 2. Resolve any conflicts. Then run `gofmt -l cmd pkg` (expect no output), `go vet ./...` and `go test ./...`.
-3. Build with `cd cmd/ralphex && go build -trimpath -ldflags "-X main.revision=<commit> -s -w" -o ../../.bin/ralphex-<new-tag>-abcp .`, and check `--abcp-governance-capability-v1`.
+3. Build with `cd cmd/ralphex && go build -trimpath -ldflags "-X main.revision=<commit> -s -w" -o ../../.bin/ralphex-<new-tag>-abcp .`, and check `--abcp-governance-capability-v1`. From a `git worktree` outside the clone, add `-buildvcs=false`: the revision comes from `-ldflags`.
 4. Push the branch to `pankajleh/ralphex-governance` and make it the default branch.
-5. Update the binary path, SHA-256 and source in both templates here and on the host (`runtime/pin-ralphex.py`). Restart `abcp serve` (`runtime/start-abcp.sh`) with no run executing, run one governed proof run, and record it.
+5. Update the binary path, SHA-256 and source in both templates here, and in **every** `manifest-template*.json` on the host (`runtime/pin-ralphex.py`). Besides the two versioned here, the host holds one template per engine lane and kind of app (14 on 2026-10-02), and ABCP reads them all when it starts. Restart `abcp serve` (`runtime/start-abcp.sh`) with no run executing, run one governed proof run, and record it.
 
 If `--keep-worktree` is accepted upstream, adjust the patch series once, at the first upgrade to a release that contains it:
 
