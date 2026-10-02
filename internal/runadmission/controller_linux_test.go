@@ -1531,3 +1531,28 @@ func git(t *testing.T, directory string, args ...string) string {
 	}
 	return strings.TrimSpace(string(output))
 }
+
+// Parallel builds (design note docs/plans/parallel-builds.md): a service that
+// lets runs of a repository execute at once tells each launched run how many.
+func TestAdmissionTellsLaunchedRunsHowManyMayRunAtOnce(t *testing.T) {
+	fixture := newAdmissionFixture(t, true)
+	defer fixture.closeLocks()
+	fixture.controller.parallelRuns = 3
+	if _, err := fixture.controller.AdmitRun(context.Background(), fixture.principal, fixture.request); err != nil {
+		t.Fatal(err)
+	}
+	fixture.mu.Lock()
+	starts := append([][]string(nil), fixture.starts...)
+	fixture.mu.Unlock()
+	if len(starts) != 1 {
+		t.Fatalf("launches = %d", len(starts))
+	}
+	argv := starts[0]
+	if len(argv) < 2 || argv[len(argv)-2] != "--parallel-runs" || argv[len(argv)-1] != "3" {
+		t.Fatalf("launch argv = %#v, want --parallel-runs 3 at the end", argv)
+	}
+	one := &Controller{parallelRuns: 1}
+	if args := one.runArgs([]string{"run"}); !reflect.DeepEqual(args, []string{"run"}) {
+		t.Fatalf("one run at a time adds %#v", args)
+	}
+}

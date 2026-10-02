@@ -23,6 +23,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/enginelane"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
+	runctl "github.com/pankajleh/autonomous-builder-control-plane/internal/run"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/workflowauthoritypg"
@@ -99,6 +100,9 @@ func NewController(config Config) (*Controller, error) {
 	if config.Clock == nil {
 		config.Clock = time.Now
 	}
+	if config.ParallelRuns < 0 || config.ParallelRuns > runctl.MaxParallelRuns {
+		return nil, serviceapi.ErrAdmissionUnavailable
+	}
 	executable := config.Executable
 	if executable == "" {
 		var err error
@@ -151,6 +155,7 @@ func NewController(config Config) (*Controller, error) {
 	controller := &Controller{
 		serviceRoot: config.ServiceRoot, executable: executable, catalog: config.Catalog,
 		clock: config.Clock, profiles: profiles, admissionsFD: admissionsFD, launchesFD: launchesFD,
+		parallelRuns: config.ParallelRuns,
 	}
 	controller.start = startProcess
 	return controller, nil
@@ -442,12 +447,12 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 	if err := c.createAdmissionLaunchIntent(binding); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	}
-	args := []string{
+	args := c.runArgs([]string{
 		"run", "--manifest", binding.ManifestPath, "--ledger", binding.CanonicalLedgerPath,
 		"--evidence-root", binding.EvidenceRoot, "--cgroup-root", binding.CgroupRoot,
 		"--service-root", c.serviceRoot,
 		"--workflow-authority-config-file", binding.WorkflowAuthorityConfigPath,
-	}
+	})
 	if err := c.start(c.executable, args, lock); err != nil {
 		if clearErr := c.clearAdmissionLaunchIntent(binding); clearErr != nil {
 			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrReconciliationRequired

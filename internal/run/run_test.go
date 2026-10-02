@@ -351,8 +351,27 @@ func TestRunnerRejectsTamperedInterruptedExecutionPlan(t *testing.T) {
 	if err := recoverExecutionPlanHandoffs(lease); err != nil {
 		t.Fatal(err)
 	}
-	stalePath, _, err := fixture.runner(t).prepareExecutionPlan(context.Background(), lease)
+	// An interrupted run: its handoff and ownership record stay, and its handoff lock was released when its process
+	// ended (parallel builds, docs/plans/parallel-builds.md).
+	plan := fixture.authority.Manifest().Plan
+	contents, err := os.ReadFile(plan.Path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	runDigest := sha256.Sum256([]byte(fixture.authority.RunID()))
+	relative := ralphex.ExecutionPlanHandoffPrefixV1 + hex.EncodeToString(runDigest[:]) + "/plan.md"
+	stalePath := filepath.Join(fixture.authority.Repository().Path, filepath.FromSlash(relative))
+	if err := os.Mkdir(filepath.Dir(stalePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, stalePath, contents, 0o600)
+	_, handoffLock, err := writeExecutionPlanHandoffOwner(lease, executionPlanHandoffOwnerV1{
+		Kind: executionPlanOwnerKind, SchemaVersion: 1, RunID: fixture.authority.RunID(), RelativePath: relative, SHA256: plan.SHA256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handoffLock.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(stalePath, []byte("tampered\n"), 0o600); err != nil {

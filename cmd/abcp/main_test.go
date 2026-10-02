@@ -707,3 +707,20 @@ func TestServeRejectsUnsafePreviewProfileConfiguration(t *testing.T) {
 		t.Fatalf("unsafe profile startup: %d %s", code, stderr.String())
 	}
 }
+
+// Parallel builds (design note docs/plans/parallel-builds.md): the number of
+// runs at once is 1 to 8, refused otherwise before anything is opened.
+func TestParallelRunsMustBeOneToEight(t *testing.T) {
+	for _, value := range []string{"0", "9", "-1"} {
+		var stdout, stderr bytes.Buffer
+		if code := runCommand([]string{"--manifest", "m", "--ledger", "l", "--evidence-root", "e", "--parallel-runs", value}, &stdout, &stderr); code != 2 ||
+			!strings.Contains(stderr.String(), "parallel runs must be between 1 and 8") {
+			t.Fatalf("run --parallel-runs %s = %d, %q", value, code, stderr.String())
+		}
+		stderr.Reset()
+		if code := serveCommand([]string{"--service-root", "s", "--token-file", "t", "--principal-id", "p", "--cursor-key-file", "c", "--authority-grants-file", "g",
+			"--parallel-runs", value}, &stderr); code != 2 || !strings.Contains(stderr.String(), "parallel runs must be between 1 and 8") {
+			t.Fatalf("serve --parallel-runs %s = %d, %q", value, code, stderr.String())
+		}
+	}
+}
