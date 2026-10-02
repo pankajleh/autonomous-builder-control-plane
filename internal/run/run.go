@@ -42,9 +42,17 @@ const (
 	executionPlanOwnerKind     = "ExecutionPlanHandoffOwnerV1"
 	executionPlanOwnerRoot     = "abcp-ralphex-plan-handoffs"
 	executionPlanLockName      = "abcp-ralphex-execution.lock"
+	executionSlotDirectoryName = "abcp-ralphex-slots"
 	maxExecutionPlanOwners     = 1024
 	maxExecutionPlanOwnerBytes = 4096
+	// MaxParallelRuns bounds how many runs of one repository may execute at
+	// once (design note docs/plans/parallel-builds.md).
+	MaxParallelRuns = 8
 )
+
+// worktreeSetupTimeout bounds how long a worktree run keeps the repository
+// execution lease while Ralphex creates its worktree.
+var worktreeSetupTimeout = 3 * time.Minute
 
 const apiCancelEventDomain = "ep006-api-cancel-request-v1"
 
@@ -297,6 +305,7 @@ type Runner struct {
 	resumeOrdinal int
 	finalization  FinalizationHook
 	snapshots     SnapshotCoordinator
+	parallelRuns  int
 }
 
 // New constructs an EP-002 runner from validated authority and explicit
@@ -402,6 +411,23 @@ func (r *Runner) SetSnapshotCoordinator(coordinator SnapshotCoordinator) error {
 	return nil
 }
 
+// SetParallelRuns sets how many runs of the repository may execute at once
+// (design note docs/plans/parallel-builds.md); every run of a repository must
+// use the same number. The default is one. It must be configured before Run
+// starts.
+func (r *Runner) SetParallelRuns(runs int) error {
+	if r == nil || runs < 1 || runs > MaxParallelRuns {
+		return fmt.Errorf("parallel runs must be between 1 and %d", MaxParallelRuns)
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.started {
+		return errors.New("runner has already started")
+	}
+	r.parallelRuns = runs
+	return nil
+}
+
 func autonomousDevelopmentCapsule(capsule contextcapsule.Capsule) bool {
 	if capsule.PolicyVersion == contextcapsule.PolicyVersionV3 {
 		return true
@@ -453,11 +479,24 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		}
 	}()
 
+	// A run executes under its run slots (one, or every slot for a run in the
+	// shared checkout) and sets up under the repository execution lease, which a
+	// worktree run releases once Ralphex has created its worktree.
 	var repositoryLease *repositoryExecutionLease
+	var slots *executionSlots
 	acquireLease := func() error {
 		if !repositoryExecutionLeasingSupported() {
 			return nil
 		}
+		parallel := r.parallelRuns
+		if parallel == 0 {
+			parallel = 1
+		}
+		acquired, err := acquireExecutionSlots(ctx, r.governed.Repository().Path, parallel, !r.governed.Worktree().Enabled)
+		if err != nil {
+			return fmt.Errorf("acquire run slot: %w", err)
+		}
+		slots = acquired
 		lease, err := acquireRepositoryExecutionLease(ctx, r.governed.Repository().Path)
 		if err != nil {
 			return fmt.Errorf("acquire repository execution lease: %w", err)
@@ -471,6 +510,9 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	defer func() {
 		if repositoryLease != nil {
 			runErr = errors.Join(runErr, repositoryLease.Close())
+		}
+		if slots != nil {
+			runErr = errors.Join(runErr, slots.Close())
 		}
 	}()
 
@@ -610,6 +652,11 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	var process supervisor.Result
 	var processErr error
 	var containment *ContainmentEvidenceV1
+	stopSetupWatch := func() {}
+	if repositoryLease != nil && r.governed.Worktree().Enabled {
+		stopSetupWatch = r.releaseLeaseAfterWorktreeSetup(ctx, repositoryLease)
+		defer stopSetupWatch()
+	}
 	if invocation.Bounds != nil {
 		contained, ok := r.processes.(ContainedCommandRunner)
 		if !ok {
@@ -627,6 +674,7 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	} else {
 		process, processErr = r.processes.Run(ctx, command)
 	}
+	stopSetupWatch()
 	if cleanupExecutionPlan != nil {
 		processErr = errors.Join(processErr, cleanupExecutionPlan())
 		cleanupExecutionPlan = nil
@@ -634,6 +682,10 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if repositoryLease != nil {
 		processErr = errors.Join(processErr, repositoryLease.Close())
 		repositoryLease = nil
+	}
+	if slots != nil {
+		processErr = errors.Join(processErr, slots.Close())
+		slots = nil
 	}
 	if invocation.Bounds != nil {
 		if finishErr := r.controller.FinishRalphexInvocationV1(reservation); finishErr != nil {
@@ -939,18 +991,29 @@ func (r *Runner) prepareExecutionPlan(ctx context.Context, lease *repositoryExec
 		Kind: executionPlanOwnerKind, SchemaVersion: 1, RunID: r.governed.RunID(),
 		RelativePath: relativePath, SHA256: plan.SHA256,
 	}
-	ownerPath, err := writeExecutionPlanHandoffOwner(lease, owner)
+	ownerPath, handoffLock, err := writeExecutionPlanHandoffOwner(lease, owner)
 	if err != nil {
 		return "", nil, fmt.Errorf("record Ralphex execution plan ownership: %w", err)
 	}
+	// The handoff is removed under the repository execution lease; a worktree
+	// run has released it by then, so it is taken again for that moment.
+	cleanup := func() error {
+		active := lease
+		if !lease.held() {
+			retaken, err := acquireRepositoryExecutionLease(context.WithoutCancel(ctx), repository.Path)
+			if err != nil {
+				return errors.Join(fmt.Errorf("retake repository execution lease to remove Ralphex execution plan: %w", err), handoffLock.Close())
+			}
+			defer retaken.Close()
+			active = retaken
+		}
+		return errors.Join(removeExecutionPlanHandoff(active, ownerPath), handoffLock.Close())
+	}
 	if err := os.Mkdir(directory, 0o700); err != nil {
-		_ = removeExecutionPlanHandoff(lease, ownerPath)
+		_ = cleanup()
 		return "", nil, fmt.Errorf("create Ralphex execution plan directory: %w", err)
 	}
 	path := filepath.Join(directory, "plan.md")
-	cleanup := func() error {
-		return removeExecutionPlanHandoff(lease, ownerPath)
-	}
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		_ = cleanup()
@@ -985,9 +1048,53 @@ func (r *Runner) prepareExecutionPlan(ctx context.Context, lease *repositoryExec
 }
 
 type repositoryExecutionLease struct {
+	mu         sync.Mutex
 	file       *os.File
 	repository string
 	ownersDir  string
+}
+
+// executionSlots are the run slots a run holds while Ralphex executes.
+type executionSlots struct {
+	mu    sync.Mutex
+	files []*os.File
+}
+
+// releaseLeaseAfterWorktreeSetup releases the repository execution lease once
+// the run's branch carries a commit past the start commit (Ralphex has created
+// the worktree and committed the plan copy on the branch), or after
+// worktreeSetupTimeout, so another run can set up while this one executes. The
+// returned stop ends the watcher and waits for it; it may be called repeatedly.
+func (r *Runner) releaseLeaseAfterWorktreeSetup(ctx context.Context, lease *repositoryExecutionLease) func() {
+	repository := r.governed.Repository()
+	branch := "refs/heads/" + r.governed.Worktree().Branch + "^{commit}"
+	done, finished := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(finished)
+		deadline := time.NewTimer(worktreeSetupTimeout)
+		defer deadline.Stop()
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-deadline.C:
+				_ = lease.Close()
+				return
+			case <-ticker.C:
+				head, err := gitOutput(context.WithoutCancel(ctx), repository.Path, "rev-parse", "--verify", "--quiet", branch)
+				if err == nil && head != "" && head != repository.StartSHA {
+					_ = lease.Close()
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done); <-finished }) }
 }
 
 type executionPlanHandoffOwnerV1 struct {
@@ -999,7 +1106,7 @@ type executionPlanHandoffOwnerV1 struct {
 }
 
 func recoverExecutionPlanHandoffs(lease *repositoryExecutionLease) error {
-	if lease == nil || lease.file == nil {
+	if !lease.held() {
 		return errors.New("repository execution lease is required")
 	}
 	if err := ensureProtectedRunDirectory(filepath.Dir(lease.ownersDir)); err != nil {
@@ -1017,6 +1124,27 @@ func recoverExecutionPlanHandoffs(lease *repositoryExecutionLease) error {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
+		if strings.HasSuffix(name, ".lock") && validLowerDigest(strings.TrimSuffix(name, ".lock")) {
+			// A lock with its record is handled with the record. One without a
+			// record whose owner is gone is left over from a removal or a write
+			// that was interrupted.
+			if _, err := os.Lstat(filepath.Join(lease.ownersDir, strings.TrimSuffix(name, ".lock")+".json")); err == nil {
+				continue
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			path := filepath.Join(lease.ownersDir, name)
+			live, err := executionPlanHandoffLive(path)
+			if err != nil {
+				return err
+			}
+			if !live {
+				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+			}
+			continue
+		}
 		if strings.HasSuffix(name, ".json.tmp") && validLowerDigest(strings.TrimSuffix(name, ".json.tmp")) {
 			info, infoErr := entry.Info()
 			if infoErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
@@ -1030,6 +1158,14 @@ func recoverExecutionPlanHandoffs(lease *repositoryExecutionLease) error {
 		if !strings.HasSuffix(name, ".json") || !validLowerDigest(strings.TrimSuffix(name, ".json")) {
 			return errors.New("invalid Ralphex execution plan ownership record name")
 		}
+		// A live run holds the lock beside its record: its handoff stays.
+		live, err := executionPlanHandoffLive(filepath.Join(lease.ownersDir, strings.TrimSuffix(name, ".json")+".lock"))
+		if err != nil {
+			return err
+		}
+		if live {
+			continue
+		}
 		if err := removeExecutionPlanHandoff(lease, filepath.Join(lease.ownersDir, name)); err != nil {
 			return err
 		}
@@ -1037,30 +1173,43 @@ func recoverExecutionPlanHandoffs(lease *repositoryExecutionLease) error {
 	return syncRunDirectory(lease.ownersDir)
 }
 
-func writeExecutionPlanHandoffOwner(lease *repositoryExecutionLease, owner executionPlanHandoffOwnerV1) (string, error) {
-	if lease == nil || lease.file == nil {
-		return "", errors.New("repository execution lease is required")
+// writeExecutionPlanHandoffOwner records the run's handoff ownership and
+// returns the run's lock beside the record, which the run holds until its
+// handoff is removed.
+func writeExecutionPlanHandoffOwner(lease *repositoryExecutionLease, owner executionPlanHandoffOwnerV1) (string, *os.File, error) {
+	if !lease.held() {
+		return "", nil, errors.New("repository execution lease is required")
 	}
 	if err := ensureProtectedRunDirectory(filepath.Dir(lease.ownersDir)); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := ensureProtectedRunDirectory(lease.ownersDir); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	digest := sha256.Sum256([]byte(owner.RunID))
 	name := hex.EncodeToString(digest[:]) + ".json"
 	if err := validateExecutionPlanHandoffOwner(owner, name); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	data, err := json.Marshal(owner)
 	if err != nil {
-		return "", err
+		return "", nil, err
+	}
+	lockPath := filepath.Join(lease.ownersDir, strings.TrimSuffix(name, ".json")+".lock")
+	handoffLock, err := lockExecutionPlanHandoff(lockPath)
+	if err != nil {
+		return "", nil, err
+	}
+	abandon := func() {
+		_ = os.Remove(lockPath)
+		_ = handoffLock.Close()
 	}
 	path := filepath.Join(lease.ownersDir, name)
 	temporary := path + ".tmp"
 	file, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return "", err
+		abandon()
+		return "", nil, err
 	}
 	written, writeErr := file.Write(data)
 	if writeErr == nil && written != len(data) {
@@ -1069,21 +1218,25 @@ func writeExecutionPlanHandoffOwner(lease *repositoryExecutionLease, owner execu
 	closeErr := errors.Join(file.Sync(), file.Close())
 	if writeErr != nil || closeErr != nil {
 		_ = os.Remove(temporary)
-		return "", errors.Join(writeErr, closeErr)
+		abandon()
+		return "", nil, errors.Join(writeErr, closeErr)
 	}
 	if err := os.Link(temporary, path); err != nil {
 		_ = os.Remove(temporary)
-		return "", err
+		abandon()
+		return "", nil, err
 	}
 	if err := os.Remove(temporary); err != nil {
 		_ = os.Remove(path)
-		return "", err
+		abandon()
+		return "", nil, err
 	}
 	if err := syncRunDirectory(lease.ownersDir); err != nil {
 		_ = os.Remove(path)
-		return "", err
+		abandon()
+		return "", nil, err
 	}
-	return path, nil
+	return path, handoffLock, nil
 }
 
 func removeExecutionPlanHandoff(lease *repositoryExecutionLease, ownerPath string) error {
@@ -1122,6 +1275,9 @@ func removeExecutionPlanHandoff(lease *repositoryExecutionLease, ownerPath strin
 		return statErr
 	}
 	if err := os.Remove(ownerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(strings.TrimSuffix(ownerPath, ".json") + ".lock"); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return syncRunDirectory(lease.ownersDir)
@@ -1176,6 +1332,48 @@ func ensureProtectedRunDirectory(path string) error {
 		return errors.Join(errors.New("Ralphex execution plan ownership directory is not protected"), err)
 	}
 	return nil
+}
+
+// withoutLiveExecutionPlanHandoffs leaves out of a porcelain status the plan
+// copies of runs still executing beside this one (design note
+// docs/plans/parallel-builds.md): an untracked
+// abcp-ralphex-plan-<run digest>/plan.md whose owner holds the lock beside its
+// ownership record. Anything else, an abandoned handoff included, still counts.
+func withoutLiveExecutionPlanHandoffs(ctx context.Context, repository, status string) (string, error) {
+	if status == "" || !repositoryExecutionLeasingSupported() {
+		return status, nil
+	}
+	ownersDir := ""
+	kept := make([]string, 0)
+	for _, line := range strings.Split(status, "\n") {
+		path, untracked := strings.CutPrefix(line, "?? ")
+		digest, isHandoff := strings.CutPrefix(path, ralphex.ExecutionPlanHandoffPrefixV1)
+		digest, isHandoff = strings.CutSuffix(digest, "/plan.md")
+		if !untracked || !isHandoff || !validLowerDigest(digest) {
+			kept = append(kept, line)
+			continue
+		}
+		if ownersDir == "" {
+			common, err := gitCommonDirectory(ctx, repository)
+			if err != nil {
+				return "", err
+			}
+			ownersDir = executionPlanOwnersDirectory(common, repository)
+		}
+		owner, err := readExecutionPlanHandoffOwner(filepath.Join(ownersDir, digest+".json"))
+		if err != nil || validateExecutionPlanHandoffOwner(owner, digest+".json") != nil {
+			kept = append(kept, line)
+			continue
+		}
+		live, err := executionPlanHandoffLive(filepath.Join(ownersDir, digest+".lock"))
+		if err != nil {
+			return "", err
+		}
+		if !live {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n"), nil
 }
 
 func executionPlanOwnersDirectory(common, repository string) string {
@@ -1493,6 +1691,10 @@ func validatePinnedIdentity(ctx context.Context, governed authority.Authority) (
 		}
 	}
 	status, err := gitOutput(ctx, repository.Path, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil {
+		return validation, fmt.Errorf("inspect repository working tree: %w", err)
+	}
+	status, err = withoutLiveExecutionPlanHandoffs(ctx, repository.Path, status)
 	if err != nil {
 		return validation, fmt.Errorf("inspect repository working tree: %w", err)
 	}

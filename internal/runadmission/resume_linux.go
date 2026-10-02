@@ -89,12 +89,12 @@ func (c *Controller) ResumeRun(ctx context.Context, runID string) error {
 		lock.Close()
 		return nil
 	}
-	args := []string{
+	args := c.runArgs([]string{
 		"run", "--resume", "--manifest", binding.ManifestPath, "--ledger", binding.CanonicalLedgerPath,
 		"--evidence-root", binding.EvidenceRoot, "--cgroup-root", binding.CgroupRoot,
 		"--service-root", c.serviceRoot,
 		"--workflow-authority-config-file", binding.WorkflowAuthorityConfigPath,
-	}
+	})
 	if err := c.start(c.executable, args, lock); err != nil {
 		lock.Close()
 		return serviceapi.ErrAdmissionUnavailable

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
@@ -42,6 +43,9 @@ type Config struct {
 	Executable  string
 	Catalog     CatalogReader
 	Clock       func() time.Time
+	// ParallelRuns is how many runs of a repository may execute at once (design note docs/plans/parallel-builds.md).
+	// Zero or one keeps them one at a time; launched runs are told the number with --parallel-runs.
+	ParallelRuns int
 }
 
 type ProfileFileV1 struct {
@@ -137,6 +141,15 @@ type Controller struct {
 	admissionsFD int
 	launchesFD   int
 	start        func(string, []string, *os.File) error
+	parallelRuns int
+}
+
+// runArgs is the argv of a launched run, with the parallel run count when runs may execute at once.
+func (c *Controller) runArgs(args []string) []string {
+	if c.parallelRuns > 1 {
+		args = append(args, "--parallel-runs", strconv.Itoa(c.parallelRuns))
+	}
+	return args
 }
 
 func RequestDigest(request serviceapi.RunAdmissionRequestV1) string {

@@ -517,7 +517,12 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	serviceRoot := flags.String("service-root", "", "optional EP-006 service root for runtime registration")
 	workflowAuthorityConfigFile := flags.String("workflow-authority-config-file", "", "optional protected PostgreSQL workflow-authority config file")
 	resume := flags.Bool("resume", false, "re-enter a run paused at HUMAN_DECISION_REQUIRED from its recorded human decision")
+	parallelRuns := flags.Int("parallel-runs", 1, "how many runs of the repository may execute at once (1 to 8)")
 	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if *parallelRuns < 1 || *parallelRuns > runctl.MaxParallelRuns {
+		fmt.Fprintf(stderr, "parallel runs must be between 1 and %d\n", runctl.MaxParallelRuns)
 		return 2
 	}
 	if flags.NArg() != 0 || *manifestPath == "" || *ledgerPath == "" || *evidenceRoot == "" {
@@ -580,6 +585,10 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
+	}
+	if err := runner.SetParallelRuns(*parallelRuns); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
 	}
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
@@ -784,7 +793,12 @@ func serveCommand(args []string, stderr io.Writer) int {
 	evictionIdle := flags.Duration("worktree-eviction-idle", eviction.DefaultIdle, "evict a finished run's worktree after this long without a live activity stream (0 disables the rule)")
 	evictionMaxAge := flags.Duration("worktree-eviction-max-age", eviction.DefaultMaxAge, "evict a finished run's worktree this long after it finished (0 disables the rule)")
 	evictionQuota := flags.Int64("worktree-eviction-quota-bytes", eviction.DefaultQuotaBytes, "per-repository retained worktree quota; least recently used evicted first (0 disables the rule)")
+	parallelRuns := flags.Int("parallel-runs", 1, "how many admitted runs of a repository may execute at once (1 to 8)")
 	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if *parallelRuns < 1 || *parallelRuns > runctl.MaxParallelRuns {
+		fmt.Fprintf(stderr, "parallel runs must be between 1 and %d\n", runctl.MaxParallelRuns)
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
@@ -823,7 +837,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	var admissions *runadmission.Controller
 	if *admissionProfileFile != "" {
 		admissions, err = runadmission.NewController(runadmission.Config{
-			ProfileFile: *admissionProfileFile, ServiceRoot: *serviceRoot, Catalog: catalog,
+			ProfileFile: *admissionProfileFile, ServiceRoot: *serviceRoot, Catalog: catalog, ParallelRuns: *parallelRuns,
 		})
 		if err != nil {
 			fmt.Fprintln(stderr, "load run admission configuration")
