@@ -6,9 +6,9 @@
     "default_branch": "main"
   },
   "ralphex": {
-    "binary_path": "/home/devagent/ralphex-behavior-lab/tools/ralphex/.bin/ralphex-v1.7.0-abcp",
-    "binary_sha256": "fe5a7c4651aa73af755f0aed10a82d9652a763a000f72b0646eaba6ae4894058",
-    "source_sha": "2275e23adba99bb22c23679ae3e8152c0323aba1",
+    "binary_path": "/home/devagent/ralphex-behavior-lab/tools/ralphex/.bin/ralphex-v1.7.0-abcp2",
+    "binary_sha256": "4b62e1d6b74f8ea6d5331f165b335185e33598e98eedc90503d89ed3750d26fe",
+    "source_sha": "c66debcd8353802851ee97f48b7bbd011eba7088",
     "mode": "full",
     "timeout": "180m",
     "wait_on_limit": "0s",

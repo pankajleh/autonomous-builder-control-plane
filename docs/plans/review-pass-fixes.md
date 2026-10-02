@@ -1,6 +1,6 @@
 # A review pass that fixes something should be reviewed again, not fail the run
 
-Date: 2026-10-02 · Status: proposal (no code in this repository changes)
+Date: 2026-10-02 · Status: implemented in `ralphex-v1.7.0-abcp2` (ralphex-governance #4), pinned on 2026-10-02 (#75)
 
 ## What happened
 
@@ -43,3 +43,33 @@ Build the patched release, re-pin it (`deploy/local-integration/README.md`, upgr
 build whose first review pass commits a fix.
 
 The governance repository is not reachable from the session that wrote this note, so the patch waits for it.
+
+## As built (2026-10-02)
+
+The governance repository was reachable later the same day, and the change differs from the proposal in one respect.
+Reading `runInternalReview` showed that bounded review already reviews a first-pass fix: with ABCP's budget of 2, a first
+pass that fixes something is followed by the final pass. So the proposal's "up to two extra passes" was not needed, and
+adding them would have broken the runner's rule that no review 3+ is launched.
+
+**What changed** (`pkg/processor/phase/review.go`, `runBoundedPass`): a pass that changed HEAD and said `REVIEW_DONE` is
+handled exactly like a pass that commits a fix without a signal:
+
+- governed validation runs, with its one repair turn;
+- the pass reports confirmed findings with fixes applied;
+- the runner's budget decides what comes next. A first-pass fix gets the final review pass. A final-pass fix is validated
+  and ends the internal review, as a final fix without a signal always has.
+
+**Unchanged:** a pass that leaves HEAD alone and says `REVIEW_DONE`; legacy mode (budget 0); timeouts; `FAILED`;
+acceptance; merge rules.
+
+**Tests** (`pkg/processor/phase/review_test.go`):
+
+- first pass, final pass and a budget of 1, each committing and saying done;
+- no change plus done;
+- legacy mode;
+- validation passing, repaired once, or still failing.
+
+The runner's path from a first-pass fix to one final pass is covered by `TestInternalReviewPolicyFirstFixesRunOneFinal`.
+
+**Pin:** `ralphex-v1.7.0-abcp2`, built from `c66debc` (SHA-256 `4b62e1d6…26fe`; the capability probe reports `c66debc`). It
+is pinned in all 16 host templates, and ABCP restarted at 19:34Z on 2026-10-02 (announced on Repo C #93).
