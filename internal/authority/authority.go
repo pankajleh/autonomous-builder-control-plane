@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -90,7 +91,9 @@ type RalphexValidationCommand struct {
 	StallTimeout     string   `json:"stall_timeout,omitempty"`
 }
 
-// RalphexManifest pins the executable, source, budgets and deterministic validation policy.
+// RalphexManifest pins the executable, source, budgets and deterministic validation policy. ExternalReviewTool overrides
+// Ralphex's outside review ("codex" or "none"; empty keeps Ralphex's own choice), and ReviewAgents limits the first
+// internal review to those built-in agents (empty keeps all five).
 type RalphexManifest struct {
 	BinaryPath                string                     `json:"binary_path"`
 	BinarySHA256              string                     `json:"binary_sha256"`
@@ -102,6 +105,8 @@ type RalphexManifest struct {
 	SessionTimeout            string                     `json:"session_timeout,omitempty"`
 	IdleTimeout               string                     `json:"idle_timeout,omitempty"`
 	MaxInternalReviewPasses   int                        `json:"max_internal_review_passes,omitempty"`
+	ExternalReviewTool        string                     `json:"external_review_tool,omitempty"`
+	ReviewAgents              []string                   `json:"review_agents,omitempty"`
 	LongRunningSubprocessMode string                     `json:"long_running_subprocess_mode,omitempty"`
 	Validation                []RalphexValidationCommand `json:"validation,omitempty"`
 	Capability                *ralphex.CapabilityV1      `json:"capability,omitempty"`
@@ -628,6 +633,22 @@ func validateRequired(manifest Manifest) error {
 	if manifest.Ralphex.MaxIterations < 0 || manifest.Ralphex.MaxInternalReviewPasses < 0 || manifest.Ralphex.MaxInternalReviewPasses > 2 {
 		return errors.New("invalid Ralphex iteration/review budget")
 	}
+	if tool := manifest.Ralphex.ExternalReviewTool; tool != "" {
+		if !slices.Contains(ralphex.ExternalReviewTools, tool) {
+			return fmt.Errorf("ralphex.external_review_tool must be one of %s", strings.Join(ralphex.ExternalReviewTools, ", "))
+		}
+		if manifest.Executor.Executor == "codex" && tool != "none" {
+			return errors.New("ralphex.external_review_tool: the Codex executor runs no external review")
+		}
+	}
+	if len(manifest.Ralphex.ReviewAgents) > 0 {
+		if manifest.Ralphex.SourceSHA != ralphex.ReviewPromptSourceSHA {
+			return fmt.Errorf("ralphex.review_agents needs Ralphex source %s, the one its review prompt is written for", ralphex.ReviewPromptSourceSHA)
+		}
+		if err := ralphex.ValidateReviewAgents(manifest.Ralphex.ReviewAgents); err != nil {
+			return err
+		}
+	}
 	if manifest.Ralphex.LongRunningSubprocessMode != "" && manifest.Ralphex.LongRunningSubprocessMode != "legacy-agent" && manifest.Ralphex.LongRunningSubprocessMode != "orchestrator" {
 		return errors.New("invalid Ralphex long-running subprocess mode")
 	}
@@ -953,6 +974,9 @@ func cloneManifest(input Manifest) Manifest {
 	if input.Ralphex.ExecutionState != nil {
 		state := *input.Ralphex.ExecutionState
 		clone.Ralphex.ExecutionState = &state
+	}
+	if input.Ralphex.ReviewAgents != nil {
+		clone.Ralphex.ReviewAgents = append([]string(nil), input.Ralphex.ReviewAgents...)
 	}
 	clone.Acceptance = cloneAcceptance(input.Acceptance)
 	return clone

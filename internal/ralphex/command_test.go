@@ -190,3 +190,28 @@ func TestInvocationRejectsReviewWorktree(t *testing.T) {
 		t.Fatal("expected review + worktree to be rejected")
 	}
 }
+
+func TestInvocationPassesTheExternalReviewTool(t *testing.T) {
+	inv := Invocation{BinaryPath: "/opt/ralphex", PlanPath: "plan.md", ConfigDir: "/etc/abcp/ralphex", Mode: ModeFull, ExternalReviewTool: "none"}
+	got, err := inv.Argv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/opt/ralphex", "--config-dir", "/etc/abcp/ralphex", "--external-review-tool", "none", "plan.md"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv mismatch\nwant: %#v\n got: %#v", want, got)
+	}
+	inv.Codex = true
+	if _, err := inv.Argv(); err != nil {
+		t.Fatalf("a Codex invocation refused no external review: %v", err)
+	}
+	inv.ExternalReviewTool = "codex"
+	if _, err := inv.Argv(); err == nil {
+		t.Fatal("a Codex invocation asked for an external review")
+	}
+	inv.Codex = false
+	inv.ExternalReviewTool = "custom"
+	if _, err := inv.Argv(); err == nil {
+		t.Fatal("an ungoverned custom review script was accepted")
+	}
+}

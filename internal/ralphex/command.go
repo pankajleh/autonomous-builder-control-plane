@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +52,7 @@ type Invocation struct {
 	SessionTimeout            string
 	IdleTimeout               string
 	MaxInternalReviewPasses   int
+	ExternalReviewTool        string
 	LongRunningSubprocessMode string
 	ValidationSpecPath        string
 	BaseRef                   string
@@ -190,6 +192,15 @@ func (i Invocation) Argv() ([]string, error) {
 	}
 	if i.MaxInternalReviewPasses > 0 {
 		argv = append(argv, "--max-internal-review-passes", strconv.Itoa(i.MaxInternalReviewPasses))
+	}
+	if i.ExternalReviewTool != "" {
+		if !slices.Contains(ExternalReviewTools, i.ExternalReviewTool) {
+			return nil, fmt.Errorf("unsupported external review tool %q", i.ExternalReviewTool)
+		}
+		if i.Codex && i.ExternalReviewTool != "none" {
+			return nil, fmt.Errorf("the Codex executor runs no external review")
+		}
+		argv = append(argv, "--external-review-tool", i.ExternalReviewTool)
 	}
 	if i.LongRunningSubprocessMode != "" {
 		argv = append(argv, "--long-running-subprocess-mode", i.LongRunningSubprocessMode)
