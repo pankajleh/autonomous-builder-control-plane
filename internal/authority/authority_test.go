@@ -338,6 +338,46 @@ func TestAnEngineLaneIsNamedWithItsFileOrNotAtAll(t *testing.T) {
 	}
 }
 
+func TestNewValidatesTheReviewSettings(t *testing.T) {
+	manifest := fixtureManifest(t)
+	manifest.Ralphex.SourceSHA = ralphex.ReviewPromptSourceSHA
+	manifest.Ralphex.ExternalReviewTool = "none"
+	manifest.Ralphex.ReviewAgents = []string{"quality", "implementation"}
+	governed, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := governed.Ralphex(); got.ExternalReviewTool != "none" || strings.Join(got.ReviewAgents, ",") != "quality,implementation" {
+		t.Fatalf("review settings %+v", got)
+	}
+	plain, err := New(fixtureManifest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain.CanonicalJSON()), "review_agents") || strings.Contains(string(plain.CanonicalJSON()), "external_review_tool") {
+		t.Fatal("a manifest without review settings changed its canonical form")
+	}
+	claude := cloneManifest(manifest)
+	claude.Executor = ExecutorPolicy{Executor: "claude"}
+	claude.Ralphex.ExternalReviewTool = "codex"
+	if _, err := New(claude); err != nil {
+		t.Fatalf("Claude with an outside Codex review: %v", err)
+	}
+	for name, edit := range map[string]func(*RalphexManifest){
+		"custom tool":         func(r *RalphexManifest) { r.ExternalReviewTool = "custom" },
+		"Codex reviews Codex": func(r *RalphexManifest) { r.ExternalReviewTool = "codex" },
+		"another source":      func(r *RalphexManifest) { r.SourceSHA = "abcdef0123456789" },
+		"one agent":           func(r *RalphexManifest) { r.ReviewAgents = []string{"quality"} },
+		"unknown agent":       func(r *RalphexManifest) { r.ReviewAgents = []string{"quality", "security"} },
+	} {
+		invalid := cloneManifest(manifest)
+		edit(&invalid.Ralphex)
+		if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "ralphex.") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestAuthorityDoesNotExposeMutableState(t *testing.T) {
 	manifest := fixtureManifest(t)
 	authority, err := New(manifest)

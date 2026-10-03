@@ -2114,6 +2114,12 @@ git commit -qm 'candidate implementation' || exit 91
 
 func newRunFixtureWithScript(t *testing.T, script string, worktree authority.WorktreePolicy, acceptanceArgv ...string) runFixture {
 	t.Helper()
+	return newRunFixtureEdited(t, script, worktree, nil, acceptanceArgv...)
+}
+
+// newRunFixtureEdited is newRunFixtureWithScript with a last change to the manifest before it is admitted.
+func newRunFixtureEdited(t *testing.T, script string, worktree authority.WorktreePolicy, edit func(*authority.Manifest), acceptanceArgv ...string) runFixture {
+	t.Helper()
 	// Callers that pass the `true` binary use it only as a placeholder for "the
 	// default acceptance command". Acceptance must be a command that could fail,
 	// because manifest validation rejects no-op commands such as /usr/bin/true:
@@ -2168,6 +2174,9 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 		}},
 		PolicyVersion: "branch-test-v1",
 	}
+	if edit != nil {
+		edit(&manifest)
+	}
 	bindOperationCapsule(t, &manifest, contextcapsule.OperationImplementation)
 	controller := newRunTestController(t, repository, repositoryIdentity)
 	governed, err := authority.NewWithGovernanceController(manifest, controller)
@@ -2180,6 +2189,35 @@ func newRunFixtureWithScript(t *testing.T, script string, worktree authority.Wor
 		controller: controller,
 		ledgerPath: filepath.Join(root, "events", "run.jsonl"),
 		evidence:   filepath.Join(root, "evidence"),
+	}
+}
+
+func TestRunnerGivesRalphexTheGovernedReviewSettings(t *testing.T) {
+	seen := filepath.Join(t.TempDir(), "review_first.txt")
+	script := fmt.Sprintf(`#!/bin/sh
+cp "$2/prompts/review_first.txt" %q || exit 92
+printf 'candidate\n' > candidate.txt
+git add candidate.txt || exit 90
+git commit -qm 'candidate implementation' || exit 91
+`, seen)
+	fixture := newRunFixtureEdited(t, script, authority.WorktreePolicy{}, func(manifest *authority.Manifest) {
+		manifest.Ralphex.SourceSHA = ralphex.ReviewPromptSourceSHA
+		manifest.Ralphex.ExternalReviewTool = "none"
+		manifest.Ralphex.ReviewAgents = []string{"implementation", "quality"}
+	}, commandPath(t, "true"))
+	result := fixture.execute(t)
+	if !result.Accepted() {
+		t.Fatalf("expected accepted result, got state %s, reason %q", result.State, result.FailureReason)
+	}
+	if !strings.Contains(strings.Join(result.Ralphex.Argv, " "), " --external-review-tool none ") {
+		t.Fatalf("Ralphex argv lacks the external review tool: %#v", result.Ralphex.Argv)
+	}
+	prompt, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatalf("Ralphex did not find the review prompt in its settings folder: %v", err)
+	}
+	if !strings.Contains(string(prompt), "{{agent:quality}}\n{{agent:implementation}}\n") || strings.Contains(string(prompt), "{{agent:testing}}") {
+		t.Fatalf("review prompt does not launch exactly the governed agents:\n%s", prompt)
 	}
 }
 

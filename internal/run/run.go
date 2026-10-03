@@ -580,6 +580,11 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
+	if agents := r.governed.Ralphex().ReviewAgents; len(agents) > 0 {
+		if err := ralphex.WriteReviewPrompt(configDir, agents); err != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
+		}
+	}
 	executionPlanPath, cleanupExecutionPlan, err := r.prepareExecutionPlan(ctx, repositoryLease)
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
@@ -882,6 +887,7 @@ func (r *Runner) invocation(configDir, executionPlanPath string) (ralphex.Invoca
 		SessionTimeout:            r.governed.Ralphex().SessionTimeout,
 		IdleTimeout:               r.governed.Ralphex().IdleTimeout,
 		MaxInternalReviewPasses:   r.governed.Ralphex().MaxInternalReviewPasses,
+		ExternalReviewTool:        r.governed.Ralphex().ExternalReviewTool,
 		LongRunningSubprocessMode: r.governed.Ralphex().LongRunningSubprocessMode,
 	}
 	data, err := os.ReadFile(r.capsule.Path)
