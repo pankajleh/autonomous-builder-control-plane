@@ -56,7 +56,24 @@ Operational role: this file indexes accepted, reviewed, merged, and durable evid
 | Servable-app product acceptance; hour-long previews | #57 | `a778e803ee49c33a043e269171e104c300ec61a9` | `fff4c12cded86c10ee4396310a9a65bacb7addb3` | `docs/plans/completed/bp02-product-acceptance-servable-app.md` |
 | Request-index shard authority off the service root | #58 | `55c6bbbcaaf5a9cf561e68d139ab361dbe0c08d7` | `7f76c6615d1d29179229cffde7e0e45a0681a7b0` | `docs/plans/completed/bp01-journal-shard-authority-capacity.md` |
 | Provider gap markers that were not gaps (Claude Code builds) | #59 | `31df5782bbd29b12b77d2cbe4cb17ce224baf0de` | `feda373ade2a285c645a2e9d21bdad58ceefdff8` | `docs/plans/completed/bp01-provider-gap-false-positives.md` |
-| Preview profiles may pass an app's own cookies (Repo C A4.4) | #60 | this PR | this PR | `docs/plans/completed/bp01-preview-app-cookies.md` |
+| Preview profiles may pass an app's own cookies (Repo C A4.4) | #60 | `f6861d44cacb0f7e594ffd328a26229bbbd3a361` | `d01b64c45184b741979fd72de17f32b3ea0b0fb1` | `docs/plans/completed/bp01-preview-app-cookies.md` |
+| Paged activity reads served at the collector ceiling | #61 | `b8503a0f4134f38b0d0ddcc8e78a2f7f0cb82bac` | `11f4636893775ce4d6468e1f1c1922070e091c96` | `docs/PROGRESS.md` #61 |
+| A run's worktree briefly off its branch is not marked | #62 | `ad31fdc9b9f8514eb4dfde0554a8144ea5c96eac` | `fa8e02ad9109e703659a1f3c8067f5d5b09d32fb` | `docs/PROGRESS.md` #62 |
+| Hosted instances (Repo C B9.2.1) | #63 | `d8a1a154424a2b079c1243afb3eeade886423e07` | `fc550be8f784fa6007009202023158242286a129` | `docs/PROGRESS.md` #63 |
+| Preview profiles may run under gVisor | #64 | `a694a817e0e4d207e0e85c53458d5d4d2e894ae6` | `e3c079bd458fec1ea223fed33acc23861a515ac4` | `docs/PROGRESS.md` #64 |
+| gVisor profiles mount the source plain read-only | #65 | squash merge | `2848ad9d21912f1c7da6123bc3474ae09a9a964d` | `docs/PROGRESS.md` #65 |
+| Preview networks cannot reach the host | #66 | squash merge | `75f9180eaa948b781958328269a5b019ad9fd70b` | `docs/PROGRESS.md` #66 |
+| A hosted Shopify app's one way out, and its settings | #67 | `2d3eebc72ab3676351aeb93cd16b69f23d843824` | `3242cbaadc6380382966ddee5be07815d790bf6e` | `docs/PROGRESS.md` #67 |
+| Engine lanes (Repo C A6.1) | #68 | `9c875e76f85a17a663e5c3d3dd5d7dfbdb59134c` | `af9bd0bff0da222b8d2ba22f34ba499fdfe74e77` | `docs/PROGRESS.md` #68 |
+| A hosted Shopify app gets the merchant's session token | #69 | `aa43cbe60390c04dd4cb8cbd9873fb162583111c` | `0be7efb7b8cc27b97df7bfde6c6f2c4bb48d6fab` | `docs/PROGRESS.md` #69 |
+| A Claude lane may pay through Anthropic's API | #70 | `1ef89eb7de6efa13ecbb1a8c4d58dd3da4b39e97` | `8a2bb4ec0e7725f8c42e6292acc1ac69448f7896` | `docs/PROGRESS.md` #70 |
+| Preview profile availability logged at startup | #71 | `56dfc2c8cd6e63db9730261aef37b406d270a323` | `90454b650ef488a2068b0a0888e2b041e1b5bc42` | `docs/PROGRESS.md` #71 |
+| A Claude API lane reaches Claude Code with its key | #72 | `4495ad6993065d76c489610fa1170bae138ff524` | `71b1995d177cf9df92b0bc458f219038c71094f6` | `docs/PROGRESS.md` #72 |
+| Parallel builds | #73 | `1529874f9d007877c94223fe36696377ef47f6c6` | `c55d76baedbb8dd64960f4fd0a1de1d3517c7752` | `docs/PROGRESS.md` #73 |
+| Proposal: a review pass that fixes something is reviewed again | #74 | `4c0595cefda2a326674760c667b3b4e56a30a713` | `a35f471dbcdd4f3cff510d9ed54a18a885cfe927` | `docs/PROGRESS.md` #74 |
+| Pin `ralphex-v1.7.0-abcp2` | #75 | squash merge | `2e1c2732f255fe7bcaecbcd43462846fc316d9e5` | `docs/PROGRESS.md` #75 |
+| Review settings that cut a build's cost | #76 | squash merge | `813561f4ec7b2ccc759289d2bcd0c291d3de7f27` | `docs/PROGRESS.md` #76 |
+| Documents brought up to date | #77 | this PR | this PR | `docs/CURRENT_STATE.md` |
 
 EP-005 foundation merged earlier in PR #7 at `bf5f923f1743b541fac8ad75fa173557fe68ba0f`.
 
@@ -115,9 +132,9 @@ PR #22 published exact head `f1ae22fc3132513bbe5c411058e506676d9fb069` and merge
 
 ## Current cutoff and non-claims
 
-The current recordable source cutoff is Repo B `main@e8ab2c97285e8767d8b9e4ad80d3b47f6a7f4a1b` (PR #50) plus this documentation PR #51. It covers retained EP-006, bounded product and development admission, the Ralphex execution profile, human-decision pause/resume, BP-01 activity, BP-02 preview runtime, and controller-owned worktree retention and eviction (PRs #42, #46–#50). That same executable is live on the local-integration host, proven by the eviction proof run above.
+The current recordable source cutoff is Repo B `main@813561f4ec7b2ccc759289d2bcd0c291d3de7f27` (PR #76) plus this documentation PR #77. (Until 2026-10-04 it read `e8ab2c9`, PR #50, plus PR #51.) It covers retained EP-006, bounded product and development admission, the Ralphex execution profile, human-decision pause/resume, BP-01 activity, BP-02 preview runtime, and controller-owned worktree retention and eviction (PRs #42, #46–#50). That same executable is live on the local-integration host, proven by the eviction proof run above.
 
-This cutoff does not claim general retry/recovery or the advertised `retry`/`resume`/`recovery` capabilities. Nor does it claim a customer-visible eviction entry, eviction on task closure or tenant deletion, provider redesign, live production/AWS deployment, or restoration of the discarded post-EP-006 assurance framework.
+This cutoff does not claim general retry/recovery or the advertised `retry`/`resume`/`recovery` capabilities. Nor does it claim provider redesign, live production/AWS deployment, or restoration of the discarded post-EP-006 assurance framework.
 
 Earlier entries (PRs #23–#41) were recorded retrospectively on 2026-09-28; they merged without updating these projections.
 
