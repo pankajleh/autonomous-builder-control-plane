@@ -1,14 +1,14 @@
 # Current Project State
 
-Date: 2026-09-28
+Date: 2026-10-04 (the live runtime, limits and next work; earlier sections keep their checkpoints)
 
 Operational role: current checkpoint and authority projection for Repo B / ABCP. Immutable execution-pack/evidence artifacts and Git/GitHub objects remain authoritative if this projection conflicts with them.
 
 ## Repository checkpoint
 
 - Repository: `pankajleh/autonomous-builder-control-plane`.
-- Executable baseline: PR #54 merge `109e15b45ae1f75316f3b3ba75b93e6ae6a6d128`. It carries worktree eviction, product-requested worktree release, and their corrections (PRs #46–#54). Later documentation-only commits may advance `main`; Git/GitHub are authoritative for the latest head.
-- Live controller: `abcp serve` built from exactly `109e15b` (binary SHA-256 `403d104aa741fbfc93f4716ef6defdc916434940c7b1a96bcc78a7cc58b78b78`) on the local-integration host, serving Repo C. See [live runtime](#live-runtime-2026-09-28).
+- Executable baseline: PR #76 merge `813561f` (review settings that cut a build's cost). Since the 2026-09-28 baseline `109e15b` (PR #54), `main` added hosted instances, gVisor previews, host isolation, the Shopify app egress proxy, engine lanes, parallel builds and the review settings (PRs #55–#76, `docs/PROGRESS.md`).
+- Live controller: `abcp serve` built from exactly `813561f`, running with `--parallel-runs 3` since 2026-10-03 19:31Z on the local-integration host, serving Repo C. See [live runtime](#live-runtime-2026-10-04).
 - Platform boundary: **the EP-006 service/API baseline, plus these extensions:**
   - Repo C product run admission (P01);
   - the controller-owned Ralphex execution profile;
@@ -16,7 +16,12 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
   - human-decision pause/resume;
   - BP-01 provider-neutral activity;
   - BP-02 governed preview runtime;
-  - controller-owned worktree retention and eviction.
+  - controller-owned worktree retention and eviction, and product-requested worktree release (#53);
+  - hosted instances (#63), previews under gVisor (#64, #65) that cannot reach the host (#66);
+  - a Shopify app's egress proxy and settings (#67, #69);
+  - engine lanes (#68, #70, #72);
+  - parallel builds, three at once on the live host (#73);
+  - review settings: an outside review tool and the review helpers (#76).
 - The post-EP-006 A/B/C assurance expansion remains discarded and is not part of current runtime authority.
 - Repo C is the product/UX authority. ABCP owns execution admission, the authoritative run lifecycle, projections, evidence and actions, provider coordination after admission, activity normalization and preview runtime.
 - Repo A / Dev-Agent and Ralphex remain execution/provider mechanisms beneath ABCP; Repo C does not call them directly.
@@ -53,14 +58,16 @@ A run whose Ralphex failure classifies as a human decision pauses at `HUMAN_DECI
 
 Manifest templates may set `worktree.retain`. ABCP then passes `--keep-worktree` to a pinned Ralphex whose capability probe proves `worktree_retention_v1`, so the governed worktree survives the run and its removal is controller-owned (PR #42). This keeps the activity binding resolvable after acceptance. Trailing provider detail, such as the final "Review completed" signal, is collected for 15 minutes after the run finishes (PR #47), and a checkpoint stays preview-eligible after `BRANCH_ACCEPTED`. Retention is bounded by controller-owned eviction (PR #46). A finished run's worktree is evicted after 24 hours without a live activity stream (paged reads do not count) or 7 days after the run finished, and least-recently-used worktrees go first when a repository exceeds 5 GiB. Unfinished runs, live previews and streaming clients protect a worktree. Before removal, ABCP pins every clean checkpoint at `refs/abcp/checkpoints/<run>/<sha>` and seals a `WorktreeEvictionV1` record. A preview of an evicted run then resolves from the sealed record and the pinned ref, even if the branch is deleted, and activity reads stay free of markers. The design, flags and tests are in `docs/plans/completed/bp02-worktree-eviction.md`.
 
-## Live runtime (2026-09-28)
+## Live runtime (2026-10-04)
 
 | Component | Identity |
 |---|---|
-| ABCP | `109e15b` since 07:36Z, binary SHA-256 `403d104a…8b78`, listener `127.0.0.1:18888`; worktree eviction on the default policy (24 h without a live stream, 7 days, 5 GiB per repository); worktree release enabled by the `worktree.release` grant |
-| Pinned Ralphex | `ralphex-v1.7.0-abcp2` since 2026-10-02 19:34Z: upstream release `v1.7.0` plus the ABCP patch series, source `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `c66debcd8353802851ee97f48b7bbd011eba7088`, SHA-256 `4b62e1d6…26fe`, in all 16 host manifest templates. A review pass that commits a fix and says `REVIEW_DONE` is handled as a fix (ralphex-governance #4) |
-| Manifest templates | both `worktree.retain: true`; versioned in `deploy/local-integration/abcp-config/` |
-| Preview profiles | `demo-v1` and `web-v1` (busybox `/bin/httpd`, health `/README.md`); versioned in the same directory |
+| ABCP | `813561f` since 2026-10-03 19:31Z, `--parallel-runs 3`, listener `127.0.0.1:18888`; worktree eviction on the default policy (24 h without a live stream, 7 days, 5 GiB per repository); worktree release enabled by the `worktree.release` grant |
+| Pinned Ralphex | `ralphex-v1.7.0-abcp2` since 2026-10-02 19:34Z: upstream release `v1.7.0` plus the ABCP patch series, source `pankajleh/ralphex-governance` `abcp/v1.7.0` @ `c66debcd8353802851ee97f48b7bbd011eba7088`, SHA-256 `4b62e1d6…26fe`, in every host manifest template. A review pass that commits a fix and says `REVIEW_DONE` is handled as a fix (ralphex-governance #4) |
+| Manifest templates | 17 on the host (`runtime/abcp-config/manifest-template-*.json`, one per app kind and engine), all with `worktree.retain: true`. The live engine is Codex on the server's own subscription (Repo C owner decision, 2026-10-03); the Claude API templates carry Repo C's cost rounds 1 and 2 but are unused. The examples in `deploy/local-integration/abcp-config/` are the starting point, not the live set |
+| Preview profiles | 8 on the host: `web-v1`, `demo-v1`, `node-pg-v1`, `node-pg-hosted-v1`, `woo-v1`, `expo-v1`, `shopify-app-hosted-v1` and `desktop-v1`; `abcp serve` logs each one's availability at startup (#71) |
+
+The proofs below are from 2026-09-28.
 
 Retention proof run `admission-2b69b2cd89c1c0cba2ab77c840587345a2512dc6d7944f00762cb77cb2a15c57` showed the following:
 
@@ -109,7 +116,6 @@ Operator configuration drift is checked with `tools/operator/check_local_integra
 Current `main` does **not** claim:
 
 - general retry/recovery, or advertised `retry`/`resume`/`recovery` capabilities;
-- a customer-visible "worktree evicted" activity entry (needs a Repo B and Repo C contract change), or eviction on task closure or tenant deletion;
 - provider-selection redesign;
 - live production/AWS deployment;
 - restored Assurance Capsule / post-EP-006 A-B-C methodology.
@@ -118,9 +124,18 @@ Current `main` does **not** claim:
 
 - `internal/mergelifecycle`: two recovery subtests of `TestTask3FinalClosureM02BudgetExhaustionDisposition` fail ("leased append cannot bypass an unresolved transition barrier"). So does `TestTask3FinalClosureM03PreTargetBudgetCrashRecovery`. The failures are identical at every merge back to PR #17 (`ed74fad`), whose post-merge acceptance passed at the time, so they depend on the environment rather than being a regression from any later PR.
 - `internal/actionapi` has an intermittent failure.
+- `internal/run`: `TestRunnerRecoversOwnedExecutionPlanAfterInterruptedCleanup` fails on unchanged `main` in the development environment.
 - `internal/run/resume.go` is not `gofmt`-clean on `main`.
 - The pinned Ralphex governance patch series is maintained in the private `pankajleh/ralphex-governance` repository, on upstream release tags. The upgrade procedure is in `deploy/local-integration/README.md`.
 
 ## Next bounded integration boundary
 
-Persistent checkpoint state and eviction are in place (PR #46). Candidate follow-ups are a customer-visible eviction entry and eviction on task closure or tenant deletion. Each is added only when a concrete Repo C product workflow needs it. Review/discovery alone does not create new scope.
+From Repo C's queue (`docs/CURRENT_STATE.md` there):
+- **Request IDs, phase 1e:** one log line per request with its `X-Request-Id` (the admission's line names the run it
+  created), and an ID check of its own (`^[A-Za-z0-9_:.-]{6,100}$`) instead of `principalPattern`, which replaces IDs
+  with `:` or a leading `-`, `_` or `.`. Repo C design note `REQUEST_IDS.md`.
+- **H6:** the settings a Node app needs for its first-admin link (Repo C P0277, P0278).
+- **A build stopped because an engine has no credit** should move to another engine instead of failing (Repo C
+  `COST_PER_BUILD.md`).
+
+Each is added only when its Repo C workflow needs it.
