@@ -934,6 +934,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		go sweeper.Run(ctx, *evictionInterval)
 	}
 	server, err := serviceapi.NewServer(serviceapi.ServerConfig{
+		RequestLog:    stderr,
 		Activity:      activityService,
 		Preview:       previewService,
 		Worktrees:     eviction.API{Sweeper: sweeper},
