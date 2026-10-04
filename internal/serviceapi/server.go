@@ -3,8 +3,6 @@ package serviceapi
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -165,6 +163,8 @@ type ServerConfig struct {
 	Actions                 ActionController
 	RunAdmission            RunAdmissionController
 	DevelopmentRunAdmission DevelopmentRunAdmissionController
+	// RequestLog, when set, gets one line per request with its X-Request-ID (Repo C design note REQUEST_IDS.md).
+	RequestLog io.Writer
 }
 
 type Server struct {
@@ -310,6 +310,12 @@ type ErrorResponseV1 struct {
 
 func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	requestID := safeRequestID(request.Header.Get("X-Request-ID"))
+	if s.reserved.RequestLog != nil {
+		started := s.now()
+		record := &requestRecord{ResponseWriter: writer}
+		writer = record
+		defer func() { logRequest(s.reserved.RequestLog, started, requestID, request, record, s.now().Sub(started)) }()
+	}
 	writer.Header().Set("X-Request-ID", requestID)
 	// Bound every stream request before authentication, body reads, or catalog
 	// access. Its dedicated slot covers both preprocessing and stream lifetime.
@@ -717,6 +723,7 @@ func (s *Server) runAdmission(writer http.ResponseWriter, request *http.Request,
 		s.writeDependencyError(writer, requestID, ErrInternalDurableSubstrate)
 		return
 	}
+	noteRun(writer, response.RunID)
 	s.writeJSON(writer, http.StatusAccepted, response)
 }
 
@@ -757,6 +764,7 @@ func (s *Server) developmentRunAdmission(writer http.ResponseWriter, request *ht
 		s.writeDependencyError(writer, requestID, ErrInternalDurableSubstrate)
 		return
 	}
+	noteRun(writer, response.RunID)
 	s.writeJSON(writer, http.StatusAccepted, response)
 }
 
@@ -937,17 +945,6 @@ func requestBodyEmpty(request *http.Request) bool {
 func parseRunsQuery(query url.Values) (int, string, error) {
 	page, err := parsePageQuery(query, DefaultRunsPageSize, MaxRunsPageSize)
 	return page.PageSize, page.Cursor, err
-}
-
-func safeRequestID(presented string) string {
-	if ValidatePrincipalID(presented) == nil {
-		return presented
-	}
-	var value [16]byte
-	if _, err := rand.Read(value[:]); err == nil {
-		return hex.EncodeToString(value[:])
-	}
-	return "request-id-unavailable"
 }
 
 func (s *Server) writeError(writer http.ResponseWriter, status int, apiError ErrorV1) {
