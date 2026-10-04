@@ -123,6 +123,11 @@ var diagnosticRules = []diagnosticRule{
 		"insufficient_quota", "quota exceeded", "quota has been exceeded",
 		"usage limit reached", "usage limit exceeded", "monthly limit reached",
 		"hard limit reached", "credit balance exhausted", "out of credits",
+		// The providers' own words for an empty prepaid balance: Anthropic's API
+		// and Claude Code ("Credit balance is too low"), OpenAI's API ("You
+		// exceeded your current quota"), and pay-as-you-go APIs such as DeepSeek
+		// ("Insufficient Balance").
+		"credit balance is too low", "exceeded your current quota", "insufficient balance",
 	}},
 	{ClassAuthentication, "diagnostic:authentication-authorization", []string{
 		"authentication failed", "authentication required", "invalid api key",

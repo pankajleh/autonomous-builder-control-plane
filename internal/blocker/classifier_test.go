@@ -42,6 +42,27 @@ func TestClassifyFailureTaxonomy(t *testing.T) {
 			action: ActionRequestUsageDecision, retryability: RetryRequiresAuthority,
 		},
 		{
+			name: "hard quota: Anthropic credit balance",
+			input: FailureInput{Phase: PhaseExecution, Outcome: supervisor.OutcomeExited, ExitCode: 1,
+				Diagnostics: "Credit balance is too low"},
+			class: ClassHardQuotaExhausted, state: domain.StateHumanDecisionRequired,
+			action: ActionRequestUsageDecision, retryability: RetryRequiresAuthority,
+		},
+		{
+			name: "hard quota: OpenAI current quota",
+			input: FailureInput{Phase: PhaseExecution, Outcome: supervisor.OutcomeExited, ExitCode: 1,
+				Diagnostics: "You exceeded your current quota, please check your plan and billing details."},
+			class: ClassHardQuotaExhausted, state: domain.StateHumanDecisionRequired,
+			action: ActionRequestUsageDecision, retryability: RetryRequiresAuthority,
+		},
+		{
+			name: "hard quota: insufficient balance",
+			input: FailureInput{Phase: PhaseExecution, Outcome: supervisor.OutcomeExited, ExitCode: 1,
+				Diagnostics: "error: Insufficient Balance"},
+			class: ClassHardQuotaExhausted, state: domain.StateHumanDecisionRequired,
+			action: ActionRequestUsageDecision, retryability: RetryRequiresAuthority,
+		},
+		{
 			name: "authentication",
 			input: FailureInput{Phase: PhaseExecution, Outcome: supervisor.OutcomeExited, ExitCode: 1,
 				Diagnostics: "authentication failed: invalid api key"},
