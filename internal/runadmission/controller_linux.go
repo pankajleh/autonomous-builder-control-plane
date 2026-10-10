@@ -48,6 +48,8 @@ type admissionAuthority struct {
 	plan                   func(serviceapi.Principal, string, string) []byte
 	legacyPlan             func(serviceapi.Principal, string, string) []byte
 	capsuleSpec            func(string, string) contextcapsule.Spec
+	// template is the library template a product build starts from, if any.
+	template *serviceapi.RunTemplateV1
 }
 
 func productAdmissionAuthority(request serviceapi.RunAdmissionRequestV1) admissionAuthority {
@@ -63,6 +65,7 @@ func productAdmissionAuthority(request serviceapi.RunAdmissionRequestV1) admissi
 		capsuleSpec: func(repositoryIdentity, planRelative string) contextcapsule.Spec {
 			return admissionCapsuleSpecForIdentity(repositoryIdentity, request, planRelative)
 		},
+		template: request.Template,
 	}
 }
 
@@ -197,6 +200,14 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 			return loadedProfile{}, errors.New("profile paths must be canonical absolute paths")
 		}
 	}
+	if configuration.TemplateMirrorPath != "" {
+		if !canonicalAbsolute(configuration.TemplateMirrorPath) {
+			return loadedProfile{}, errors.New("profile paths must be canonical absolute paths")
+		}
+		if bare, err := gitMirrorOutput(configuration.TemplateMirrorPath, "rev-parse", "--is-bare-repository"); err != nil || bare != "true" {
+			return loadedProfile{}, errors.New("template mirror is not a bare Git repository")
+		}
+	}
 	repositoryFD, err := openAbsoluteDirectory(configuration.RepositoryPath, false)
 	if err != nil {
 		return loadedProfile{}, err
@@ -267,7 +278,7 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 	if err := strictJSON(templateData, &manifest); err != nil {
 		return loadedProfile{}, errors.New("invalid admission manifest template")
 	}
-	if !manifest.Worktree.Enabled || manifest.Governance != nil || manifest.Ralphex.ExecutionState != nil {
+	if !manifest.Worktree.Enabled || manifest.Governance != nil || manifest.Ralphex.ExecutionState != nil || manifest.TemplateCopy != nil {
 		return loadedProfile{}, errors.New("manifest template is not a bounded V2 implementation template")
 	}
 	manifest.Repository.Path = configuration.RepositoryPath
@@ -419,6 +430,11 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 		}
 		if head != admission.repositoryBaseSHA {
 			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrRepositoryBaseMismatch
+		}
+		if admission.template != nil {
+			if err := requireMirroredTemplate(profile.configuration.TemplateMirrorPath, *admission.template); err != nil {
+				return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrTemplateNotAccepted
+			}
 		}
 		manifestPath, materialized, materializeErr := materialize(profile, principal, admission, runID)
 		if materializeErr != nil {
@@ -892,7 +908,7 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, admissio
 		return "", runBinding{}, err
 	}
 	capsulePath := filepath.Join(runDirectory, "context-capsule.json")
-	manifestData, err := derivedManifestData(profile, admission.repositoryBaseSHA, runID, planPath, capsulePath, plan, capsuleData)
+	manifestData, err := derivedManifestData(profile, admission.repositoryBaseSHA, runID, planPath, capsulePath, plan, capsuleData, admission.template)
 	if err != nil || len(manifestData) > MaxManifestTemplateBytes {
 		return "", runBinding{}, errors.New("derived manifest exceeds bounds")
 	}
@@ -1090,7 +1106,7 @@ func developmentAdmissionCapsuleSpecForIdentity(repositoryIdentity string, reque
 	}
 }
 
-func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPath, capsulePath string, plan, capsuleData []byte) ([]byte, error) {
+func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPath, capsulePath string, plan, capsuleData []byte, template *serviceapi.RunTemplateV1) ([]byte, error) {
 	manifest, err := cloneManifest(profile.template)
 	if err != nil {
 		return nil, err
@@ -1100,7 +1116,44 @@ func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPa
 	manifest.Plan = authority.PlanManifest{Path: planPath, SHA256: digest(plan)}
 	manifest.ContextCapsule = &authority.ContextCapsuleManifest{Path: capsulePath, SHA256: digest(capsuleData)}
 	manifest.Worktree.Branch = "abcp/" + runID
+	if template != nil {
+		if profile.configuration.TemplateMirrorPath == "" {
+			return nil, errors.New("profile does not accept a template")
+		}
+		manifest.TemplateCopy = &authority.TemplateCopyManifest{
+			MirrorPath: profile.configuration.TemplateMirrorPath, TemplateID: template.TemplateID, Version: template.Version,
+			CommitSHA: template.CommitSHA, TreeSHA: template.TreeSHA,
+		}
+	}
 	return json.Marshal(manifest)
+}
+
+// requireMirroredTemplate checks, before a build is admitted, that the
+// profile's read-only mirror holds the template: its commit, and the tree of
+// dist/<template_id> at that commit. It only reads the mirror.
+func requireMirroredTemplate(mirror string, template serviceapi.RunTemplateV1) error {
+	if mirror == "" {
+		return errors.New("profile does not accept a template")
+	}
+	if _, err := gitMirrorOutput(mirror, "cat-file", "-e", template.CommitSHA+"^{commit}"); err != nil {
+		return errors.New("template commit is not in the mirror")
+	}
+	tree, err := gitMirrorOutput(mirror, "rev-parse", "--verify", template.CommitSHA+":dist/"+template.TemplateID)
+	if err != nil || tree != template.TreeSHA {
+		return errors.New("template tree does not match the mirror")
+	}
+	return nil
+}
+
+// gitMirrorOutput runs a read-only Git command against a bare mirror.
+func gitMirrorOutput(mirror string, arguments ...string) (string, error) {
+	command := exec.Command("git", append([]string{"--git-dir=" + mirror}, arguments...)...)
+	command.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+	output, err := command.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 func bindingFor(profile loadedProfile, runID string, manifestData []byte) runBinding {

@@ -143,3 +143,33 @@ func TestPreviewCommandsCannotSupplyRuntimeAuthority(t *testing.T) {
 		}
 	}
 }
+
+func TestRunAdmissionTemplateIsOptionalAndExact(t *testing.T) {
+	valid := RunAdmissionRequestV1{
+		SchemaVersion: 1, RequestID: "request-1", ProfileID: "default",
+		ProductAuthorizationID: "authorization-1", ProductTaskID: "task-1", ProductVersionID: "version-1",
+		ProductManifestSHA256: strings.Repeat("a", 64), RepositoryBaseSHA: strings.Repeat("b", 40),
+		TaskMarkdown: "# Build\n", DelegatedActor: DelegatedActorV1{SubjectID: "user-1", SubjectType: PrincipalUser},
+	}
+	data, err := json.Marshal(valid)
+	if err != nil || strings.Contains(string(data), "template") {
+		t.Fatalf("a request without a template keeps its shape and digest: %s %v", data, err)
+	}
+	valid.Template = &RunTemplateV1{TemplateID: "booking", Version: "1.0.10", CommitSHA: strings.Repeat("c", 40), TreeSHA: strings.Repeat("d", 64)}
+	if err := ValidateRunAdmissionRequestV1(valid); err != nil {
+		t.Fatalf("a template named by id, version, commit and tree is accepted: %v", err)
+	}
+	for name, template := range map[string]RunTemplateV1{
+		"no id":        {Version: "1.0.0", CommitSHA: strings.Repeat("c", 40), TreeSHA: strings.Repeat("d", 40)},
+		"path id":      {TemplateID: "../booking", Version: "1.0.0", CommitSHA: strings.Repeat("c", 40), TreeSHA: strings.Repeat("d", 40)},
+		"bad version":  {TemplateID: "booking", Version: "v1", CommitSHA: strings.Repeat("c", 40), TreeSHA: strings.Repeat("d", 40)},
+		"short commit": {TemplateID: "booking", Version: "1.0.0", CommitSHA: "c0ffee", TreeSHA: strings.Repeat("d", 40)},
+		"no tree":      {TemplateID: "booking", Version: "1.0.0", CommitSHA: strings.Repeat("c", 40)},
+	} {
+		invalid := valid
+		invalid.Template = &template
+		if err := ValidateRunAdmissionRequestV1(invalid); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

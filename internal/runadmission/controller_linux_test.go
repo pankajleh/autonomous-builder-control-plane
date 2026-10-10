@@ -1277,8 +1277,30 @@ func TestAdmissionManifestTemplateRequiresStrictJSON(t *testing.T) {
 
 func newAdmissionFixture(t *testing.T, ignored bool) *admissionFixture {
 	t.Helper()
+	return newEditedAdmissionFixture(t, ignored, nil)
+}
+
+// newEditedAdmissionFixture lets a test change the profiles before the
+// controller loads them.
+func newEditedAdmissionFixture(t *testing.T, ignored bool, edit func(root string, profiles *ProfileFileV1)) *admissionFixture {
+	t.Helper()
 	root, repository, head := makeRepository(t, ignored)
 	config, catalog := writeAdmissionConfiguration(t, root, repository, head)
+	if edit != nil {
+		data, err := os.ReadFile(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var profiles ProfileFileV1
+		if err := json.Unmarshal(data, &profiles); err != nil {
+			t.Fatal(err)
+		}
+		edit(root, &profiles)
+		if err := os.Remove(config); err != nil {
+			t.Fatal(err)
+		}
+		writeProtectedJSON(t, config, profiles)
+	}
 	service := filepath.Join(root, "service")
 	if err := os.Mkdir(service, 0o700); err != nil {
 		t.Fatal(err)

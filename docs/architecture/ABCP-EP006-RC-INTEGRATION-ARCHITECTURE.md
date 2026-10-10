@@ -77,7 +77,10 @@ P01 freezes the request at schema version 1 with these product-visible fields:
 - `product_manifest_sha256`;
 - `repository_base_sha`;
 - bounded UTF-8 `task_markdown`, deterministically representing the authorized product snapshot for execution handoff;
-- required `delegated_actor { subject_id, subject_type }`, with subject type `user` or `operator`.
+- required `delegated_actor { subject_id, subject_type }`, with subject type `user` or `operator`;
+- optional `template { template_id, version, commit_sha, tree_sha }` (2026-10-10, `docs/plans/template-copy.md`): a
+  library template by identity only, never a path. The controller-owned profile names the read-only mirror ABCP checks
+  it against.
 
 No caller-supplied filesystem path, private authority manifest, Ralphex argv/config, worktree path, evidence path, PID/process identity, workflow-authority store, merge authority or provider-private configuration is permitted in the public admission request.
 ## 6. Trust and actor model

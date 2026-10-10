@@ -70,6 +70,36 @@ type RunAdmissionRequestV1 struct {
 	RepositoryBaseSHA      string           `json:"repository_base_sha"`
 	TaskMarkdown           string           `json:"task_markdown"`
 	DelegatedActor         DelegatedActorV1 `json:"delegated_actor"`
+	// Template names the one exact library template the build starts from
+	// (Repo C design note DECORATION.md, phase 2). Omitted when the build
+	// starts fresh, so every request without it keeps its digest.
+	Template *RunTemplateV1 `json:"template,omitempty"`
+}
+
+// RunTemplateV1 names a template of the library by its version tag's commit and
+// the tree of its assembled app (dist/<template_id>). The builder copies those
+// files first; ABCP checks the copy against the profile's read-only mirror
+// before acceptance. The task markdown carries how to copy them.
+type RunTemplateV1 struct {
+	TemplateID string `json:"template_id"`
+	Version    string `json:"version"`
+	CommitSHA  string `json:"commit_sha"`
+	TreeSHA    string `json:"tree_sha"`
+}
+
+var (
+	runTemplateIDPattern      = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	runTemplateVersionPattern = regexp.MustCompile(`^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$`)
+)
+
+// ValidateRunTemplateV1 accepts a template id, a dotted version and two
+// lowercase Git object IDs.
+func ValidateRunTemplateV1(template RunTemplateV1) error {
+	if !runTemplateIDPattern.MatchString(template.TemplateID) || !runTemplateVersionPattern.MatchString(template.Version) ||
+		!isLowerGitObjectID(template.CommitSHA) || !isLowerGitObjectID(template.TreeSHA) {
+		return errors.New("invalid run template")
+	}
+	return nil
 }
 
 // DevelopmentRunAdmissionRequestV1 is the complete development-only run
@@ -110,6 +140,11 @@ func ValidateRunAdmissionRequestV1(request RunAdmissionRequestV1) error {
 	if ValidatePrincipalID(request.DelegatedActor.SubjectID) != nil ||
 		(request.DelegatedActor.SubjectType != PrincipalUser && request.DelegatedActor.SubjectType != PrincipalOperator) {
 		return errors.New("invalid delegated actor")
+	}
+	if request.Template != nil {
+		if err := ValidateRunTemplateV1(*request.Template); err != nil {
+			return err
+		}
 	}
 	return nil
 }

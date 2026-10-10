@@ -20,6 +20,10 @@ The authenticated request is strict JSON with exactly:
 - `repository_base_sha`
 - bounded UTF-8 `task_markdown`
 - required `delegated_actor` (`user` or `operator`)
+- optional `template { template_id, version, commit_sha, tree_sha }`: the one exact library template the build starts
+  from (design note `docs/plans/template-copy.md`). Omitted when the build starts fresh, so requests without it keep
+  their digests. Only a profile with a `template_mirror_path` admits it, and only when that read-only mirror holds the
+  commit and the tree of `dist/<template_id>` at that commit; otherwise `422 template_not_accepted`.
 
 A successful first admission or exact replay returns `202 Accepted` with `run_id` and `run_url`.
 

@@ -21,7 +21,8 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
   - a Shopify app's egress proxy and settings (#67, #69);
   - engine lanes (#68, #70, #72);
   - parallel builds, three at once on the live host (#73);
-  - review settings: an outside review tool and the review helpers (#76).
+  - review settings: an outside review tool and the review helpers (#76);
+  - a build that starts from a template copy: the request names the template, ABCP checks the copy before acceptance (#80, not deployed).
 - The post-EP-006 A/B/C assurance expansion remains discarded and is not part of current runtime authority.
 - Repo C is the product/UX authority. ABCP owns execution admission, the authoritative run lifecycle, projections, evidence and actions, provider coordination after admission, activity normalization and preview runtime.
 - Repo A / Dev-Agent and Ralphex remain execution/provider mechanisms beneath ABCP; Repo C does not call them directly.
@@ -137,5 +138,8 @@ From Repo C's queue (`docs/CURRENT_STATE.md` there):
 - **H6:** the settings a Node app needs for its first-admin link (Repo C P0277, P0278).
 - **A build stopped because an engine has no credit** should move to another engine instead of failing (Repo C
   `COST_PER_BUILD.md`).
+
+- **Template copies (#80):** deploy with no build running; then set up the library's bare mirror on the host and add
+  `template_mirror_path` to the node-app and web-app profiles (`docs/plans/template-copy.md`, rollout).
 
 Each is added only when its Repo C workflow needs it.
