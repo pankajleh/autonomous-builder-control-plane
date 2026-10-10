@@ -2110,6 +2110,9 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 		if r.governed.Ralphex().Mode != ralphex.ModeReview && headSHA == repository.StartSHA {
 			return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q did not advance beyond governed start SHA", currentBranch)
 		}
+		if err := r.requireGovernedTemplateCopy(ctx, headSHA); err != nil {
+			return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q: %w", currentBranch, err)
+		}
 		branch = currentBranch
 		return materializeAcceptanceTarget(ctx, repository.Path, branch, headSHA)
 	}
@@ -2124,8 +2127,23 @@ func (r *Runner) prepareAcceptanceTarget(ctx context.Context) (acceptance.Target
 	if r.governed.Ralphex().Mode != ralphex.ModeReview && headSHA == repository.StartSHA {
 		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q did not advance beyond governed start SHA", branch)
 	}
+	if err := r.requireGovernedTemplateCopy(ctx, headSHA); err != nil {
+		return acceptance.Target{}, func() error { return nil }, fmt.Errorf("candidate branch %q: %w", branch, err)
+	}
 
 	return materializeAcceptanceTarget(ctx, repository.Path, branch, headSHA)
+}
+
+// requireGovernedTemplateCopy refuses a run whose authority names a template
+// when none of its first commits holds the template's files unchanged; a run
+// that starts fresh, or a read-only review, is not checked.
+func (r *Runner) requireGovernedTemplateCopy(ctx context.Context, headSHA string) error {
+	template, ok := r.governed.TemplateCopy()
+	if !ok || r.governed.Ralphex().Mode == ralphex.ModeReview {
+		return nil
+	}
+	_, err := requireTemplateCopy(ctx, r.governed.Repository().Path, r.governed.Repository().StartSHA, headSHA, template)
+	return err
 }
 
 func materializeAcceptanceTarget(ctx context.Context, repository, branch, headSHA string) (acceptance.Target, func() error, error) {

@@ -378,6 +378,53 @@ func TestNewValidatesTheReviewSettings(t *testing.T) {
 	}
 }
 
+func TestNewValidatesTheTemplateCopy(t *testing.T) {
+	plain, err := New(fixtureManifest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain.CanonicalJSON()), "template_copy") {
+		t.Fatal("a run that starts fresh keeps its canonical form")
+	}
+	if _, ok := plain.TemplateCopy(); ok {
+		t.Fatal("a run that starts fresh names no template")
+	}
+	mirror := t.TempDir()
+	manifest := fixtureManifest(t)
+	manifest.TemplateCopy = &TemplateCopyManifest{MirrorPath: mirror, TemplateID: "booking", Version: "1.0.10",
+		CommitSHA: strings.Repeat("c", 40), TreeSHA: strings.Repeat("d", 40)}
+	governed, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copied, ok := governed.TemplateCopy()
+	if !ok || copied.TemplateID != "booking" || copied.Version != "1.0.10" || copied.TreeSHA != strings.Repeat("d", 40) {
+		t.Fatalf("template copy %+v", copied)
+	}
+	manifest.TemplateCopy.TemplateID = "changed"
+	if again, _ := governed.TemplateCopy(); again.TemplateID != "booking" {
+		t.Fatal("the authority keeps its own copy of the template")
+	}
+	for name, edit := range map[string]func(*TemplateCopyManifest){
+		"capital id":     func(c *TemplateCopyManifest) { c.TemplateID = "Booking" },
+		"phone tag":      func(c *TemplateCopyManifest) { c.TemplateID = "booking-phone" },
+		"two-part ver":   func(c *TemplateCopyManifest) { c.Version = "1.0" },
+		"short commit":   func(c *TemplateCopyManifest) { c.CommitSHA = "abc123" },
+		"upper tree":     func(c *TemplateCopyManifest) { c.TreeSHA = strings.Repeat("D", 40) },
+		"missing mirror": func(c *TemplateCopyManifest) { c.MirrorPath = filepath.Join(mirror, "missing") },
+		"relative":       func(c *TemplateCopyManifest) { c.MirrorPath = "mirror.git" },
+	} {
+		invalid := fixtureManifest(t)
+		template := TemplateCopyManifest{MirrorPath: mirror, TemplateID: "booking", Version: "1.0.10",
+			CommitSHA: strings.Repeat("c", 40), TreeSHA: strings.Repeat("d", 40)}
+		edit(&template)
+		invalid.TemplateCopy = &template
+		if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "template copy") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestAuthorityDoesNotExposeMutableState(t *testing.T) {
 	manifest := fixtureManifest(t)
 	authority, err := New(manifest)

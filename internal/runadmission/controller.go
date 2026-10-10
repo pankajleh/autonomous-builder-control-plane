@@ -63,6 +63,11 @@ type ProfileV1 struct {
 	EvidenceRoot                string `json:"evidence_root"`
 	CgroupRoot                  string `json:"cgroup_root"`
 	WorkflowAuthorityConfigPath string `json:"workflow_authority_config_path"`
+	// TemplateMirrorPath is a bare mirror of the template library that ABCP
+	// only reads (Repo C design note DECORATION.md, phase 2). A profile
+	// without it admits no request that names a template; omitted, so every
+	// existing profile keeps its binding digest.
+	TemplateMirrorPath string `json:"template_mirror_path,omitempty"`
 }
 
 type AdmissionReceiptV1 struct {

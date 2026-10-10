@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -33,6 +34,7 @@ type Manifest struct {
 	Repository     RepositoryManifest      `json:"repository"`
 	Plan           PlanManifest            `json:"plan"`
 	ContextCapsule *ContextCapsuleManifest `json:"context_capsule,omitempty"`
+	TemplateCopy   *TemplateCopyManifest   `json:"template_copy,omitempty"`
 	MergeReview    *ReviewPolicy           `json:"merge_review,omitempty"`
 	Governance     *GovernanceManifest     `json:"governance,omitempty"`
 	Ralphex        RalphexManifest         `json:"ralphex"`
@@ -79,6 +81,33 @@ type PlanManifest struct {
 type ContextCapsuleManifest struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
+}
+
+// TemplateCopyManifest binds a run to one exact template of the library (Repo C
+// design note DECORATION.md, phase 2): one of the run's first commits must hold
+// every file of the tree, unchanged, before acceptance. The mirror is a bare
+// repository of the library that ABCP only reads. It is omitted for every run
+// that starts fresh and for every manifest created before template copies.
+type TemplateCopyManifest struct {
+	MirrorPath string `json:"mirror_path"`
+	TemplateID string `json:"template_id"`
+	Version    string `json:"version"`
+	CommitSHA  string `json:"commit_sha"`
+	TreeSHA    string `json:"tree_sha"`
+}
+
+var (
+	templateCopyIDPattern      = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	templateCopyVersionPattern = regexp.MustCompile(`^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$`)
+	templateCopyObjectPattern  = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
+)
+
+func validateTemplateCopy(template TemplateCopyManifest) error {
+	if !templateCopyIDPattern.MatchString(template.TemplateID) || !templateCopyVersionPattern.MatchString(template.Version) ||
+		!templateCopyObjectPattern.MatchString(template.CommitSHA) || !templateCopyObjectPattern.MatchString(template.TreeSHA) {
+		return errors.New("template copy: invalid template identity")
+	}
+	return nil
 }
 
 // RalphexManifest pins the executable, its source metadata, and invocation mode.
@@ -232,6 +261,17 @@ func newAuthority(input Manifest, controller *governancev3.ControllerV1) (Author
 		}
 	}
 
+	if manifest.TemplateCopy != nil {
+		if err := validateTemplateCopy(*manifest.TemplateCopy); err != nil {
+			return Authority{}, err
+		}
+		mirrorPath, err := canonicalDirectory(manifest.TemplateCopy.MirrorPath)
+		if err != nil {
+			return Authority{}, fmt.Errorf("template copy mirror path: %w", err)
+		}
+		manifest.TemplateCopy.MirrorPath = mirrorPath
+	}
+
 	binaryPath, err := canonicalFile(manifest.Ralphex.BinaryPath)
 	if err != nil {
 		return Authority{}, fmt.Errorf("ralphex binary path: %w", err)
@@ -373,6 +413,14 @@ func (a Authority) Executor() ExecutorPolicy {
 }
 
 // Worktree returns the configured worktree policy.
+// TemplateCopy returns the template the run must start from, if it names one.
+func (a Authority) TemplateCopy() (TemplateCopyManifest, bool) {
+	if a.manifest.TemplateCopy == nil {
+		return TemplateCopyManifest{}, false
+	}
+	return *a.manifest.TemplateCopy, true
+}
+
 func (a Authority) Worktree() WorktreePolicy {
 	return a.manifest.Worktree
 }
@@ -953,6 +1001,10 @@ func cloneManifest(input Manifest) Manifest {
 	if input.ContextCapsule != nil {
 		binding := *input.ContextCapsule
 		clone.ContextCapsule = &binding
+	}
+	if input.TemplateCopy != nil {
+		template := *input.TemplateCopy
+		clone.TemplateCopy = &template
 	}
 	if input.MergeReview != nil {
 		policy := cloneReviewPolicy(*input.MergeReview)

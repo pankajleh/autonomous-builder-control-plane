@@ -139,3 +139,5 @@ This cutoff does not claim general retry/recovery or the advertised `retry`/`res
 Earlier entries (PRs #23–#41) were recorded retrospectively on 2026-09-28; they merged without updating these projections.
 
 Further Repo B work requires fresh bounded authority from a concrete product integration need; review/discovery alone is not authority to expand scope.
+
+PR #80 (2026-10-10) adds an optional `template` to the product admission request and checks the template's copy before acceptance (`docs/plans/template-copy.md`). Its authority is the owner's 2026-10-10 decision recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md` (decoration phase 2, "Copy like change builds").
