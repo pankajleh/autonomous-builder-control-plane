@@ -143,3 +143,5 @@ Further Repo B work requires fresh bounded authority from a concrete product int
 PR #80 (2026-10-10) adds an optional `template` to the product admission request and checks the template's copy before acceptance (`docs/plans/template-copy.md`). Its authority is the owner's 2026-10-10 decision recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md` (decoration phase 2, "Copy like change builds").
 
 PR #81 (2026-10-11) lets a preview profile, never a hosted one, name a sample `BOOTSTRAP_TOKEN` (Repo C design note `TRYING_APPS.md`). Its authority is the owner's 2026-10-11 request recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md` (a sample token while trying an app).
+
+PR #82 (2026-10-11) lets Preview Runtime resolve a checkpoint past ABCP's provider replay-gap marker, which says nothing about checkpoints; every other marker still makes a run ineligible. Its authority is the owner's 2026-10-11 report that apps could not be opened (Repo C `docs/operator/OWNER_INPUTS_LEDGER.md`).

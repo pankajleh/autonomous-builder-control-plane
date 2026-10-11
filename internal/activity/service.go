@@ -876,7 +876,7 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 	// for that line).
 	if len(fresh) == 0 && previous != nil && before.Size > previous.Size && !before.quietGrowth {
 		s.diagnose(scope.RunID, "provider-silent-gap", nil)
-		if err = s.appendUnknown(scope.RunID, registration, identity("silent-gap", proof.Generation, proof.PrefixDigest), "Implementation detail replay gap"); err != nil {
+		if err = s.appendUnknown(scope.RunID, registration, identity("silent-gap", proof.Generation, proof.PrefixDigest), ProviderGapTitle); err != nil {
 			return err
 		}
 		*last = math.MaxUint64
@@ -910,7 +910,7 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 			}
 			s.noteGap(scope.RunID, *last, message.id, true)
 			s.diagnose(scope.RunID, "provider-replay-gap", nil)
-			if err = s.appendUnknown(scope.RunID, registration, gapKey, "Implementation detail replay gap"); err != nil {
+			if err = s.appendUnknown(scope.RunID, registration, gapKey, ProviderGapTitle); err != nil {
 				return err
 			}
 		}

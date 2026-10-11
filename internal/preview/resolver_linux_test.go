@@ -403,7 +403,7 @@ func (p *pagedActivity) ReadActivity(_ context.Context, _ string, request servic
 	return json.Marshal(page)
 }
 func TestResolverTraversesPagesAndDistinguishesProviderWarnings(t *testing.T) {
-	for _, scenario := range []string{"warning-before", "warning-after", "integrity-after", "repeated-cursor", "nonprogressing-ordinal", "empty-page"} {
+	for _, scenario := range []string{"warning-before", "warning-after", "integrity-after", "gap-marker-after", "other-marker-after", "repeated-cursor", "nonprogressing-ordinal", "empty-page"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newBindingFixture(t)
 			checkpoint := f.events.page.Events[0]
@@ -419,6 +419,11 @@ func TestResolverTraversesPagesAndDistinguishesProviderWarnings(t *testing.T) {
 				first.Events, second.Events = []activity.Event{warning}, []activity.Event{checkpoint}
 			case "integrity-after":
 				second.Events[0].SourceSessionID, second.Events[0].SourceEventID = "", ""
+			case "gap-marker-after":
+				// ABCP's own replay-gap marker, as activity writes it: no source IDs, the gap title.
+				second.Events[0].SourceSessionID, second.Events[0].SourceEventID, second.Events[0].Title = "", "", activity.ProviderGapTitle
+			case "other-marker-after":
+				second.Events[0].SourceSessionID, second.Events[0].SourceEventID, second.Events[0].Title = "", "", "Implementation detail integrity failure"
 			case "repeated-cursor":
 				second.NextCursor = "page-2"
 			case "nonprogressing-ordinal":
@@ -430,7 +435,7 @@ func TestResolverTraversesPagesAndDistinguishesProviderWarnings(t *testing.T) {
 			resolver := f.resolver()
 			resolver.Activity = reader
 			_, err := resolver.Resolve(context.Background(), f.run, checkpoint.ActivityID)
-			valid := scenario == "warning-before" || scenario == "warning-after"
+			valid := scenario == "warning-before" || scenario == "warning-after" || scenario == "gap-marker-after"
 			if (err == nil) != valid {
 				t.Fatalf("eligibility: %v", err)
 			}
