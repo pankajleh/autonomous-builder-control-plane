@@ -157,7 +157,7 @@ func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, 
 			return fail()
 		}
 		for _, event := range page.Events {
-			if event.RunID != run || event.Ordinal <= last || event.Category == "UNKNOWN" || event.Status == "UNKNOWN" && !providerWarning(event) {
+			if event.RunID != run || event.Ordinal <= last || event.Category == "UNKNOWN" || event.Status == "UNKNOWN" && !providerWarning(event) && !providerGap(event) {
 				return fail()
 			}
 			last = event.Ordinal
@@ -208,6 +208,16 @@ func providerWarning(e activity.Event) bool {
 	return e.SchemaVersion == "ActivityEventV1" && e.AuthorityLevel == "PROVIDER_DETAIL" && e.SourceKind == "RALPHEX_PROGRESS" && e.Category == "WARNING" &&
 		strings.HasPrefix(e.SourceSessionID, "sha256-") && sha256Pattern.MatchString(strings.TrimPrefix(e.SourceSessionID, "sha256-")) &&
 		strings.HasPrefix(e.SourceEventID, "sha256-") && sha256Pattern.MatchString(strings.TrimPrefix(e.SourceEventID, "sha256-"))
+}
+
+// providerGap is ABCP's own marker that some provider narration was not observed (activity.ProviderGapTitle). It says
+// nothing about checkpoints, which ABCP observes itself (ABCP_STATE) and git verifies here, so it does not make a run
+// ineligible. A builder that restarts its progress numbering mid-run leaves one, and every such run had become impossible
+// to preview (Repo C design note TRYING_APPS.md, 2026-10-11). Every other marker (integrity failure, detail unavailable)
+// still does.
+func providerGap(e activity.Event) bool {
+	return e.SchemaVersion == "ActivityEventV1" && e.AuthorityLevel == "PROVIDER_DETAIL" && e.SourceKind == "RALPHEX_PROGRESS" &&
+		e.Category == "WARNING" && e.Status == "UNKNOWN" && e.Title == activity.ProviderGapTitle
 }
 
 func repositoryIdentity(ctx context.Context, path, identity string) bool {

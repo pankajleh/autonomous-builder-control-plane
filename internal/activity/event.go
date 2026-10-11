@@ -217,6 +217,11 @@ func normalizeLedger(f ledger.Event, now time.Time) (Event, bool) {
 	return e, true
 }
 
+// ProviderGapTitle is the title of ABCP's marker that some of the provider's narration (Ralphex progress lines) was not
+// observed: a replay gap, or progress that grew without a resumable event. It is about implementation detail only; Preview
+// Runtime still resolves a checkpoint past it (preview.providerGap).
+const ProviderGapTitle = "Implementation detail replay gap"
+
 func unknown(run, key, title string, now time.Time) Event {
 	e := baseEvent(run, now)
 	e.Category, e.Status, e.Title = "WARNING", "UNKNOWN", title
