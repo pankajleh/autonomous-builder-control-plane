@@ -132,9 +132,16 @@ func digest(data []byte) string           { sum := sha256.Sum256(data); return h
 func jsonDigest(v any) string             { b, _ := json.Marshal(v); return digest(b) }
 func (p PreviewProfileV1) Digest() string { return jsonDigest(p) }
 
+// sampleSetupToken is the shape of the one app value a preview may carry (Repo C design note TRYING_APPS.md): the
+// sample first-administrator token that the product shows the person trying the app, so a fresh app with accounts can
+// be set up at all. It is no secret: a preview is reached only through its own single-use link, and its data goes when
+// it stops. A hosted profile never takes one, so a live app's first administrator stays its owner's.
+var sampleSetupToken = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{7,39}$`)
+
 // This small semantic allowlist deliberately excludes arbitrary values, URLs,
 // credentials, runtime injection variables and inherited image environments.
-func validEnvironment(env map[string]string) bool {
+// Only a preview (not hosted) profile may name BOOTSTRAP_TOKEN, and only with a sample token's shape.
+func validEnvironment(env map[string]string, hosted bool) bool {
 	if len(env) > 4 {
 		return false
 	}
@@ -150,6 +157,10 @@ func validEnvironment(env map[string]string) bool {
 			}
 		case "TZ":
 			if v != "UTC" {
+				return false
+			}
+		case "BOOTSTRAP_TOKEN":
+			if hosted || !sampleSetupToken.MatchString(v) {
 				return false
 			}
 		default:
@@ -195,7 +206,7 @@ func (p PreviewProfileV1) Validate() error {
 	seen := map[string]bool{}
 	presented := 0
 	for _, s := range p.Services {
-		if !serviceName.MatchString(s.Name) || seen[s.Name] || !imagePattern.MatchString(s.Image) || !userPattern.MatchString(s.User) || !validArgv(s.PrepareArgv, true) || !validArgv(s.StartArgv, false) || !validEnvironment(s.Environment) || s.Port < 1024 || s.Port > 65535 {
+		if !serviceName.MatchString(s.Name) || seen[s.Name] || !imagePattern.MatchString(s.Image) || !userPattern.MatchString(s.User) || !validArgv(s.PrepareArgv, true) || !validArgv(s.StartArgv, false) || !validEnvironment(s.Environment, p.Hosted) || s.Port < 1024 || s.Port > 65535 {
 			return ErrUnavailable
 		}
 		// busybox applets can otherwise smuggle a shell as argv[1].

@@ -80,3 +80,39 @@ func TestAppCookiesIsOptInAndLeavesOtherProfilesDigestsAlone(t *testing.T) {
 		t.Fatal("app_cookies decodes", err)
 	}
 }
+
+// A preview may hand the app a sample first-administrator token (Repo C design note TRYING_APPS.md); a hosted profile may
+// not, and the value must look like a sample token, never anything that could carry a secret, a URL or an argument.
+func TestOnlyAPreviewTakesASampleSetupToken(t *testing.T) {
+	p := testProfile()
+	p.Services[0].Environment["BOOTSTRAP_TOKEN"] = "try-autobuild"
+	if p.Validate() != nil {
+		t.Fatal("a preview's sample setup token rejected")
+	}
+	before := testProfile().Digest()
+	if p.Digest() == before {
+		t.Fatal("the token is part of the profile's digest")
+	}
+	hosted := testProfile()
+	hosted.Hosted = true
+	if hosted.Validate() != nil {
+		t.Fatal("the hosted test profile is valid without a token")
+	}
+	hosted.Services[0].Environment["BOOTSTRAP_TOKEN"] = "try-autobuild"
+	if hosted.Validate() == nil {
+		t.Fatal("a hosted profile took a setup token")
+	}
+	for _, value := range []string{"", "short", "Try-Autobuild", "-leading-dash", "with space", "a=b&c=d", "https://x.example", strings.Repeat("a", 41)} {
+		bad := testProfile()
+		bad.Services[0].Environment["BOOTSTRAP_TOKEN"] = value
+		if bad.Validate() == nil {
+			t.Fatalf("setup token %q accepted", value)
+		}
+	}
+	if !validEnvironment(map[string]string{"BOOTSTRAP_TOKEN": strings.Repeat("a", 40)}, false) || validEnvironment(map[string]string{"BOOTSTRAP_TOKEN": "try-autobuild"}, true) {
+		t.Fatal("40 characters is the longest token; an image's own environment never takes one")
+	}
+	if got := strings.Join(cleanEnv(p.Services[0]), " "); got != "-i PATH=/usr/local/bin:/usr/bin:/bin HOME=/scratch TMPDIR=/scratch BOOTSTRAP_TOKEN=try-autobuild NODE_ENV=development" {
+		t.Fatal("the token reaches the service's environment", got)
+	}
+}

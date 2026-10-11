@@ -141,3 +141,5 @@ Earlier entries (PRs #23–#41) were recorded retrospectively on 2026-09-28; the
 Further Repo B work requires fresh bounded authority from a concrete product integration need; review/discovery alone is not authority to expand scope.
 
 PR #80 (2026-10-10) adds an optional `template` to the product admission request and checks the template's copy before acceptance (`docs/plans/template-copy.md`). Its authority is the owner's 2026-10-10 decision recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md` (decoration phase 2, "Copy like change builds").
+
+PR #81 (2026-10-11) lets a preview profile, never a hosted one, name a sample `BOOTSTRAP_TOKEN` (Repo C design note `TRYING_APPS.md`). Its authority is the owner's 2026-10-11 request recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md` (a sample token while trying an app).
