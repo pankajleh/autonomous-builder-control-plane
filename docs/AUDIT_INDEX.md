@@ -145,3 +145,5 @@ PR #80 (2026-10-10) adds an optional `template` to the product admission request
 PR #81 (2026-10-11) lets a preview profile, never a hosted one, name a sample `BOOTSTRAP_TOKEN` (Repo C design note `TRYING_APPS.md`). Its authority is the owner's 2026-10-11 request recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md` (a sample token while trying an app).
 
 PR #82 (2026-10-11) lets Preview Runtime resolve a checkpoint past ABCP's provider replay-gap marker, which says nothing about checkpoints; every other marker still makes a run ineligible. Its authority is the owner's 2026-10-11 report that apps could not be opened (Repo C `docs/operator/OWNER_INPUTS_LEDGER.md`).
+
+PR #83 (2026-10-11) versions the live admission profiles and gives the web-app and node-app ones the template library's bare mirror (`docs/plans/template-copy.md` rollout step 2). Its authority is the owner's 2026-10-11 go to turn templates on for administrators, recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md`. Builds that name no template are unchanged.

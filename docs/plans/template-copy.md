@@ -66,4 +66,9 @@ copying, must not pass as a build from the template.
    nothing changes for any build.
 2. Set up the library's bare mirror on the host, and add `template_mirror_path` to the node-app and web-app profiles.
    Restart ABCP with no build running, and run the drift check.
+   - The mirror is `/home/devagent/autobuild-vendor/templates-mirror.git`, refreshed from the factory library every ten
+     minutes (Repo C `DECORATION.md`).
+   - #83 versions all 32 live admission profiles, the first time since the host got ahead of this repository. The 7
+     web-app and 4 node-app ones name the mirror; the rest are byte for byte as the host had them.
+   - It is live once the file is copied and ABCP restarted with no build running.
 3. Repo C sends `template` only when its decoration is on for the person and the version's decoration chose a template.

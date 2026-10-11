@@ -17,7 +17,7 @@ python3 tools/operator/check_local_integration_config.py [--live <dir>]
 
 | File | Purpose |
 |---|---|
-| `profiles.json` | Admission profiles: `local-p02` (demo product `example/product`) and `repo-c-development-v1` (Repo C) |
+| `profiles.json` | Admission profiles, all 32 the live host reads: `repo-c-development-v1` (Repo C) and the product builds' `local-p02*`, one per platform and engine. The web-app and node-app ones (`local-p02`, `-claude`, `-codex-api`, `-claude-api`, `-lean`, `-codex-api-lean`, `-claude-api-lean`, `-node`, `-node-claude-api`, `-node-lean`, `-node-claude-api-lean`) name the template library's bare mirror, `template_mirror_path` (`docs/plans/template-copy.md`) |
 | `manifest-template.json` | Demo-product governed manifest template; pins the Ralphex binary, executor policy, worktree retention and acceptance |
 | `manifest-template-development.json` | Repo C development manifest template |
 | `preview-profiles.json` | BP-02 preview profiles: `demo-v1` (demo product) and `web-v1` (Repo C) |
