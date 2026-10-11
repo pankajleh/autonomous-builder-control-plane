@@ -22,7 +22,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
   - engine lanes (#68, #70, #72);
   - parallel builds, three at once on the live host (#73);
   - review settings: an outside review tool and the review helpers (#76);
-  - a build that starts from a template copy: the request names the template, ABCP checks the copy before acceptance (#80, live since 2026-10-11 03:30 UTC);
+  - a build that starts from a template copy: the request names the template, ABCP checks the copy before acceptance (#80, live since 2026-10-11 03:30 UTC); the web-app and node-app profiles name the library's mirror (#83);
   - a preview's sample setup token: a preview profile may name `BOOTSTRAP_TOKEN` with a sample value, a hosted one never (#81, live since 2026-10-11 03:30 UTC);
   - a provider replay gap no longer makes a run impossible to preview (#82).
 - The post-EP-006 A/B/C assurance expansion remains discarded and is not part of current runtime authority.
