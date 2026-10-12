@@ -153,3 +153,5 @@ PR #84 (2026-10-12) adds the read-only `GET /v1/engines` (`docs/plans/engines-re
 PR #85 (2026-10-12) records #84 live: ABCP on `34b31b7` since 19:59 UTC, `GET /v1/engines` answering all 32 profiles ready.
 
 PR #86 (2026-10-12) lets a product admission carry an optional model and reasoning level for the build's task, admitted only from its profile's `executor_choices` and pinned in the run's manifest (`docs/plans/executor-choices.md`), and gives each profile's choices in `GET /v1/engines`. Its authority is the owner's 2026-10-12 question "does it let choose model and reasoning?", recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md` and design note `AI_KEYS_AND_MODELS.md` §9.5 (step 4b). Requests and profiles without them are unchanged.
+
+PR #87 (2026-10-12) records #86 live: ABCP on `813bdfe` since 20:47:45 UTC with the versioned profiles, `GET /v1/engines` answering 31 profiles with choices.
