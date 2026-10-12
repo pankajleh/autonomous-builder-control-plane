@@ -1,6 +1,6 @@
 # The engines, read by Repo C
 
-Status: **built in #84, live once ABCP restarts on it** (an announced restart, with no build running). Repo C design note
+Status: **live since 2026-10-12 19:59 UTC** (#84, `34b31b7`; ABCP restarted with no build running, recorded in #85). Repo C design note
 `AI_KEYS_AND_MODELS.md` §9.5, step 4a.
 
 ## Why
@@ -52,3 +52,14 @@ the controller except a lane's model name.
 - Repo C's page shows each engine's model, reasoning and readiness, and refuses to choose an engine that is not ready.
 - 4b: model and reasoning per build, from an allowlist, recorded in the pinned manifest.
 - 4c: personal sign-ins as lanes of their own.
+
+## Live check (2026-10-12)
+
+- **The restart:** ABCP started on `34b31b7` at 19:58:51 UTC, with no build running, and listens with its 8 preview
+  profiles available.
+- **The engines:** `GET /v1/engines` answers the 32 profiles, and every one is ready.
+  - The Codex sign-in profiles run `gpt-6-astra` at `xhigh`, for the task and the review.
+  - The Claude sign-in profiles run `xhigh`, with no model named.
+  - The `claude-api` lane names `claude-sonnet-5-5`, with reviews on `haiku`.
+  - The `codex-api` lane names no model, so Codex's own default applies.
+- **The rest:** `/v1/capabilities` answers as before.
