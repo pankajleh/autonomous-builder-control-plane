@@ -74,6 +74,50 @@ type RunAdmissionRequestV1 struct {
 	// (Repo C design note DECORATION.md, phase 2). Omitted when the build
 	// starts fresh, so every request without it keeps its digest.
 	Template *RunTemplateV1 `json:"template,omitempty"`
+	// Executor picks the model and reasoning level of the build's task from
+	// the profile's allowlist (Repo C design note AI_KEYS_AND_MODELS.md, step
+	// 4b). Omitted, the profile's own apply, so every request without it keeps
+	// its digest.
+	Executor *RunExecutorV1 `json:"executor,omitempty"`
+}
+
+// RunExecutorV1 names a model, a reasoning level, or both, for the build's
+// task. The review keeps the profile's. ABCP admits only what the profile's
+// executor_choices list and records it in the run's pinned manifest.
+type RunExecutorV1 struct {
+	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
+}
+
+// RunExecutorEfforts are the reasoning levels a request or a profile may name.
+var RunExecutorEfforts = []string{"low", "medium", "high", "xhigh", "max"}
+
+var runExecutorModelPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+// ValidRunExecutorModel accepts a lower-case model name: letters, digits,
+// dots, dashes and underscores, at most 64 bytes.
+func ValidRunExecutorModel(model string) bool { return runExecutorModelPattern.MatchString(model) }
+
+// ValidRunExecutorEffort accepts one of RunExecutorEfforts.
+func ValidRunExecutorEffort(effort string) bool {
+	for _, known := range RunExecutorEfforts {
+		if effort == known {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateRunExecutorV1 accepts a model, a reasoning level, or both; never
+// neither.
+func ValidateRunExecutorV1(executor RunExecutorV1) error {
+	if executor.Model == "" && executor.Effort == "" {
+		return errors.New("invalid run executor")
+	}
+	if (executor.Model != "" && !ValidRunExecutorModel(executor.Model)) || (executor.Effort != "" && !ValidRunExecutorEffort(executor.Effort)) {
+		return errors.New("invalid run executor")
+	}
+	return nil
 }
 
 // RunTemplateV1 names a template of the library by its version tag's commit and
@@ -143,6 +187,11 @@ func ValidateRunAdmissionRequestV1(request RunAdmissionRequestV1) error {
 	}
 	if request.Template != nil {
 		if err := ValidateRunTemplateV1(*request.Template); err != nil {
+			return err
+		}
+	}
+	if request.Executor != nil {
+		if err := ValidateRunExecutorV1(*request.Executor); err != nil {
 			return err
 		}
 	}

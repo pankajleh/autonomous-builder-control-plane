@@ -11,7 +11,16 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-claude",
@@ -23,7 +32,18 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "repo-c-development-v1",
@@ -45,7 +65,16 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-node",
@@ -57,7 +86,16 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-woo",
@@ -68,7 +106,16 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-expo",
@@ -79,7 +126,16 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-codex-api",
@@ -91,7 +147,16 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-shopify-app",
@@ -102,7 +167,16 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-claude-api",
@@ -114,7 +188,18 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-node-claude-api",
@@ -126,7 +211,18 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-woo-claude-api",
@@ -137,7 +233,18 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-expo-claude-api",
@@ -148,7 +255,18 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-shopify-claude-api",
@@ -159,7 +277,18 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-shopify-app-claude-api",
@@ -170,7 +299,18 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-desktop",
@@ -181,7 +321,16 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-desktop-claude-api",
@@ -192,7 +341,18 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-lean",
@@ -204,7 +364,16 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-shopify-lean",
@@ -215,7 +384,16 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-node-lean",
@@ -227,7 +405,16 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-woo-lean",
@@ -238,7 +425,16 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-expo-lean",
@@ -249,7 +445,16 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-codex-api-lean",
@@ -261,7 +466,16 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-shopify-app-lean",
@@ -272,7 +486,16 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-claude-api-lean",
@@ -284,7 +507,18 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-node-claude-api-lean",
@@ -296,7 +530,18 @@
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
       "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
-      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git"
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-woo-claude-api-lean",
@@ -307,7 +552,18 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-expo-claude-api-lean",
@@ -318,7 +574,18 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-shopify-claude-api-lean",
@@ -329,7 +596,18 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-shopify-app-claude-api-lean",
@@ -340,7 +618,18 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-desktop-lean",
@@ -351,7 +640,16 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
     },
     {
       "profile_id": "local-p02-desktop-claude-api-lean",
@@ -362,7 +660,18 @@
       "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
       "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
       "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
-      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json"
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     }
   ]
 }

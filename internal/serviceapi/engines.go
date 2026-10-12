@@ -29,6 +29,15 @@ type EngineV1 struct {
 	Access string `json:"access"`
 	Ready  bool   `json:"ready"`
 	Reason string `json:"reason,omitempty"`
+	// Choices are the models and reasoning levels a run admission may pick for
+	// this profile's task (step 4b); omitted when it offers none.
+	Choices *EngineChoicesV1 `json:"choices,omitempty"`
+}
+
+// EngineChoicesV1 is a profile's allowlist, as its configuration lists it.
+type EngineChoicesV1 struct {
+	Models  []string `json:"models,omitempty"`
+	Efforts []string `json:"efforts,omitempty"`
 }
 
 // EnginesV1 lists every admission profile's engine, in profile order.

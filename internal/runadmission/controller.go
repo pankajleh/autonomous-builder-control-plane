@@ -68,7 +68,22 @@ type ProfileV1 struct {
 	// without it admits no request that names a template; omitted, so every
 	// existing profile keeps its binding digest.
 	TemplateMirrorPath string `json:"template_mirror_path,omitempty"`
+	// ExecutorChoices lists the models and reasoning levels a request may pick
+	// for the build's task (Repo C design note AI_KEYS_AND_MODELS.md, step
+	// 4b). A profile without it admits no request that names one; omitted, so
+	// every existing profile keeps its binding digest.
+	ExecutorChoices *ExecutorChoicesV1 `json:"executor_choices,omitempty"`
 }
+
+// ExecutorChoicesV1 is a profile's allowlist. Either list may be empty, never
+// both. A Codex profile may list only xhigh, the one level Codex runs at.
+type ExecutorChoicesV1 struct {
+	Models  []string `json:"models,omitempty"`
+	Efforts []string `json:"efforts,omitempty"`
+}
+
+// MaxExecutorChoices bounds each list of a profile's executor choices.
+const MaxExecutorChoices = 16
 
 type AdmissionReceiptV1 struct {
 	Kind                   string               `json:"kind"`

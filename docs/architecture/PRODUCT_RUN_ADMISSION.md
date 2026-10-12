@@ -24,6 +24,11 @@ The authenticated request is strict JSON with exactly:
   from (design note `docs/plans/template-copy.md`). Omitted when the build starts fresh, so requests without it keep
   their digests. Only a profile with a `template_mirror_path` admits it, and only when that read-only mirror holds the
   commit and the tree of `dist/<template_id>` at that commit; otherwise `422 template_not_accepted`.
+- optional `executor { model, effort }`: a model, a reasoning level, or both, for the build's task (design note
+  `docs/plans/executor-choices.md`). Omitted, the profile's own apply, so requests without it keep their digests. Only
+  a profile whose `executor_choices` list each named part admits it; otherwise `422 executor_choice_not_accepted`. The
+  choice is written into the run's pinned manifest (`executor.task_model`, `executor.task_effort`); the review keeps
+  the profile's.
 
 A successful first admission or exact replay returns `202 Accepted` with `run_id` and `run_url`.
 

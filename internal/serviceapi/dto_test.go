@@ -173,3 +173,39 @@ func TestRunAdmissionTemplateIsOptionalAndExact(t *testing.T) {
 		}
 	}
 }
+
+func TestRunAdmissionExecutorIsOptionalAndFromKnownValues(t *testing.T) {
+	valid := RunAdmissionRequestV1{
+		SchemaVersion: 1, RequestID: "request-1", ProfileID: "default",
+		ProductAuthorizationID: "authorization-1", ProductTaskID: "task-1", ProductVersionID: "version-1",
+		ProductManifestSHA256: strings.Repeat("a", 64), RepositoryBaseSHA: strings.Repeat("b", 40),
+		TaskMarkdown: "# Build\n", DelegatedActor: DelegatedActorV1{SubjectID: "user-1", SubjectType: PrincipalUser},
+	}
+	data, err := json.Marshal(valid)
+	if err != nil || strings.Contains(string(data), "executor") {
+		t.Fatalf("a request without an executor keeps its shape and digest: %s %v", data, err)
+	}
+	for _, executor := range []RunExecutorV1{{Model: "gpt-6-astra"}, {Effort: "xhigh"}, {Model: "claude-opus-5-5", Effort: "max"}, {Model: "gpt-5.6-sol", Effort: "low"}} {
+		chosen := valid
+		chosen.Executor = &executor
+		if err := ValidateRunAdmissionRequestV1(chosen); err != nil {
+			t.Errorf("%+v refused: %v", executor, err)
+		}
+	}
+	for name, executor := range map[string]RunExecutorV1{
+		"neither":     {},
+		"upper case":  {Model: "Claude-Opus"},
+		"spaces":      {Model: "gpt 6"},
+		"model:level": {Model: "gpt-6-astra:xhigh"},
+		"path":        {Model: "../models"},
+		"too long":    {Model: strings.Repeat("m", 65)},
+		"level":       {Effort: "extreme"},
+		"level case":  {Effort: "XHIGH"},
+	} {
+		chosen := valid
+		chosen.Executor = &executor
+		if err := ValidateRunAdmissionRequestV1(chosen); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
