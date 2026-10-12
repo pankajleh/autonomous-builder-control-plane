@@ -147,3 +147,5 @@ PR #81 (2026-10-11) lets a preview profile, never a hosted one, name a sample `B
 PR #82 (2026-10-11) lets Preview Runtime resolve a checkpoint past ABCP's provider replay-gap marker, which says nothing about checkpoints; every other marker still makes a run ineligible. Its authority is the owner's 2026-10-11 report that apps could not be opened (Repo C `docs/operator/OWNER_INPUTS_LEDGER.md`).
 
 PR #83 (2026-10-11) versions the live admission profiles and gives the web-app and node-app ones the template library's bare mirror (`docs/plans/template-copy.md` rollout step 2). Its authority is the owner's 2026-10-11 go to turn templates on for administrators, recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md`. Builds that name no template are unchanged.
+
+PR #84 (2026-10-12) adds the read-only `GET /v1/engines` (`docs/plans/engines-read.md`), so Repo C's AI and API keys page can show what each engine runs and whether its key or sign-in is in place. Its authority is the owner's 2026-10-12 questions, recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md` and design note `AI_KEYS_AND_MODELS.md` §9.

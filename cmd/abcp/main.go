@@ -933,6 +933,11 @@ func serveCommand(args []string, stderr io.Writer) int {
 	if *evictionInterval > 0 {
 		go sweeper.Run(ctx, *evictionInterval)
 	}
+	// Only a controller with its profiles answers GET /v1/engines; without one the route says it is unsupported.
+	var engines serviceapi.EngineCatalog
+	if admissions != nil {
+		engines = admissions
+	}
 	server, err := serviceapi.NewServer(serviceapi.ServerConfig{
 		RequestLog:    stderr,
 		Activity:      activityService,
@@ -941,7 +946,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Hosting:       hosting,
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
-		RunAdmission: admissions, DevelopmentRunAdmission: admissions,
+		RunAdmission: admissions, DevelopmentRunAdmission: admissions, Engines: engines,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "construct service API")

@@ -164,6 +164,8 @@ type ServerConfig struct {
 	Actions                 ActionController
 	RunAdmission            RunAdmissionController
 	DevelopmentRunAdmission DevelopmentRunAdmissionController
+	// Engines, when set, answers GET /v1/engines (Repo C design note AI_KEYS_AND_MODELS §9.5).
+	Engines EngineCatalog
 	// RequestLog, when set, gets one line per request with its X-Request-ID (Repo C design note REQUEST_IDS.md).
 	RequestLog io.Writer
 }
@@ -364,6 +366,8 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.experienceCapabilities(writer, request, principal, requestID)
 	case "/v1/capabilities":
 		s.capabilities(writer, request, requestID)
+	case "/v1/engines":
+		s.engines(writer, request, requestID)
 	case "/v1/runs":
 		s.runs(writer, request, principal, requestID)
 	case "/v1/development-runs":
