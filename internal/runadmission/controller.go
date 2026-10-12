@@ -147,6 +147,8 @@ type Controller struct {
 	launchesFD   int
 	start        func(string, []string, *os.File) error
 	parallelRuns int
+	// getenv reads the controller's environment for Engines; nil is os.Getenv.
+	getenv func(string) string
 }
 
 // runArgs is the argv of a launched run, with the parallel run count when runs may execute at once.

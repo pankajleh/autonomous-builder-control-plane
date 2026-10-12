@@ -255,7 +255,7 @@ func TestEveryV1RouteAuthenticatesAndCapabilitiesAreDeterministic(t *testing.T) 
 	for _, path := range []string{
 		"/v1", "/v1/capabilities", "/v1/runs", "/v1/development-runs", "/v1/runs/run", "/v1/runs/run/events",
 		"/v1/runs/run/timeline", "/v1/runs/run/evidence", "/v1/runs/run/evidence/item",
-		"/v1/runs/run/actions/cancel", "/v1/runs/run/actions/operation", "/v1/unknown",
+		"/v1/runs/run/actions/cancel", "/v1/runs/run/actions/operation", "/v1/engines", "/v1/unknown",
 	} {
 		response := httptest.NewRecorder()
 		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
