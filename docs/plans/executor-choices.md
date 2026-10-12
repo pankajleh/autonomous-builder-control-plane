@@ -1,6 +1,6 @@
 # Model and reasoning per build
 
-Status: **built, not yet live** (this PR). Repo C design note `AI_KEYS_AND_MODELS.md` §9.5, step 4b.
+Status: **live since 2026-10-12 20:47 UTC** (#86, `813bdfe`; ABCP restarted with no build running and the versioned profiles copied, recorded in #87). Repo C design note `AI_KEYS_AND_MODELS.md` §9.5, step 4b.
 
 ## Why
 
@@ -69,3 +69,12 @@ on in the run's pinned manifest.
 
 - Repo C: the page's choice, stored per engine, sent with each build.
 - 4c: personal Codex and Claude sign-ins as lanes of their own.
+
+## Live check (2026-10-12)
+
+- **The restart:** ABCP started on `813bdfe` at 20:47:45 UTC, with no build running, and listens with its 8 preview
+  profiles available. The versioned `profiles.json` was copied in the same restart; the host's previous file, equal to
+  `a17fdee`'s, is kept beside it. The drift check says OK for it.
+- **The engines:** `GET /v1/engines` answers the 32 profiles, all ready. 31 give `choices`: the 16 Codex ones
+  `gpt-6-astra` and `gpt-5.6-sol` at `xhigh`, the 15 Claude ones `claude-sonnet-5-5` and `claude-opus-5-5` at
+  `medium`, `high` or `xhigh`. The development profile gives none.
