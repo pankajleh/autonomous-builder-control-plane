@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
@@ -38,7 +39,11 @@ func (c *Controller) Engines(context.Context) (serviceapi.EnginesV1, error) {
 	}
 	out := serviceapi.EnginesV1{SchemaVersion: EnginesSchemaV1, Engines: make([]serviceapi.EngineV1, 0, len(ids))}
 	for _, id := range ids {
-		out.Engines = append(out.Engines, engineOf(id, c.profiles[id].template.Executor, getenv))
+		engine := engineOf(id, c.profiles[id].template.Executor, getenv)
+		if choices := c.profiles[id].configuration.ExecutorChoices; choices != nil {
+			engine.Choices = &serviceapi.EngineChoicesV1{Models: slices.Clone(choices.Models), Efforts: slices.Clone(choices.Efforts)}
+		}
+		out.Engines = append(out.Engines, engine)
 	}
 	return out, nil
 }

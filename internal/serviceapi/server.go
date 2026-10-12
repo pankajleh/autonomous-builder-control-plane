@@ -65,6 +65,7 @@ var (
 	ErrAdmissionUnavailable            = errors.New("run admission unavailable")
 	ErrUnsafeAdmissionMaterialization  = errors.New("unsafe admission materialization")
 	ErrTemplateNotAccepted             = errors.New("template not accepted")
+	ErrExecutorChoiceNotAccepted       = errors.New("executor choice not accepted")
 	ErrInternalDurableSubstrateFailure = errors.New("internal durable substrate failure")
 	ErrInternalDurableSubstrate        = ErrInternalDurableSubstrateFailure
 	errRequestBodyTooLarge             = errors.New("request body exceeds limit")
@@ -905,6 +906,8 @@ func (s *Server) writeDependencyError(writer http.ResponseWriter, requestID stri
 		status, apiError.Code, apiError.Message = http.StatusConflict, "request_id_conflict", "request identifier conflicts with an existing operation"
 	case errors.Is(err, ErrTemplateNotAccepted):
 		status, apiError.Code, apiError.Message = http.StatusUnprocessableEntity, "template_not_accepted", "the admission profile does not accept this template"
+	case errors.Is(err, ErrExecutorChoiceNotAccepted):
+		status, apiError.Code, apiError.Message = http.StatusUnprocessableEntity, "executor_choice_not_accepted", "the admission profile does not accept this model or reasoning level"
 	case errors.Is(err, ErrUnknownAdmissionProfile):
 		status, apiError.Code, apiError.Message = http.StatusNotFound, "unknown_profile", "admission profile is not available"
 	case errors.Is(err, ErrRepositoryBaseMismatch):

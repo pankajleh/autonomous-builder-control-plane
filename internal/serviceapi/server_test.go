@@ -316,6 +316,10 @@ func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
 		"duplicate field":   strings.Replace(valid, `"profile_id":"default"`, `"profile_id":"default","profile_id":"other"`, 1),
 		"partial SHA":       strings.Replace(valid, strings.Repeat("b", 40), strings.Repeat("b", 12), 1),
 		"missing actor":     strings.Replace(valid, `,"delegated_actor":{"subject_id":"human-1","subject_type":"user"}`, "", 1),
+		"empty executor":    strings.TrimSuffix(valid, "}") + `,"executor":{}}`,
+		"executor field":    strings.TrimSuffix(valid, "}") + `,"executor":{"model":"gpt-6-astra","review_model":"haiku"}}`,
+		"executor level":    strings.TrimSuffix(valid, "}") + `,"executor":{"effort":"extreme"}}`,
+		"executor model":    strings.TrimSuffix(valid, "}") + `,"executor":{"model":"GPT 6"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			response := httptest.NewRecorder()
@@ -348,6 +352,7 @@ func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
 		{ErrReconciliationRequired, http.StatusConflict, "reconciliation_required"},
 		{ErrAdmissionUnavailable, http.StatusServiceUnavailable, "admission_unavailable"},
 		{ErrUnsafeAdmissionMaterialization, http.StatusInternalServerError, "unsafe_admission_materialization"},
+		{ErrExecutorChoiceNotAccepted, http.StatusUnprocessableEntity, "executor_choice_not_accepted"},
 	} {
 		controller.err = test.err
 		response := httptest.NewRecorder()
@@ -355,6 +360,22 @@ func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
 		if response.Code != test.status || !strings.Contains(response.Body.String(), `"code":"`+test.code+`"`) || strings.Contains(response.Body.String(), "/private") {
 			t.Fatalf("mapped admission error %v = %d %q", test.err, response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestRunAdmissionCarriesTheExecutorChoice(t *testing.T) {
+	controller := &testRunAdmissionController{response: RunAdmissionResponseV1{RunID: "admission-run-1", RunURL: "/v1/runs/admission-run-1"}}
+	server := newTestServer(t, &testCatalog{}, time.Now().UTC())
+	server.reserved.RunAdmission = controller
+	grantRunAdmission(server)
+	body := strings.TrimSuffix(validRunAdmissionJSON("request-1", "task"), "}") + `,"executor":{"model":"claude-opus-5-5","effort":"high"}}`
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, authenticatedRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(body))))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("admission with an executor choice = %d %q", response.Code, response.Body.String())
+	}
+	if controller.request.Executor == nil || *controller.request.Executor != (RunExecutorV1{Model: "claude-opus-5-5", Effort: "high"}) {
+		t.Fatalf("the executor choice reaches admission: %+v", controller.request.Executor)
 	}
 }
 

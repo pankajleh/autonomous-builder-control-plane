@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -50,6 +51,8 @@ type admissionAuthority struct {
 	capsuleSpec            func(string, string) contextcapsule.Spec
 	// template is the library template a product build starts from, if any.
 	template *serviceapi.RunTemplateV1
+	// executor is the model and reasoning level a product build asked for, if any.
+	executor *serviceapi.RunExecutorV1
 }
 
 func productAdmissionAuthority(request serviceapi.RunAdmissionRequestV1) admissionAuthority {
@@ -66,6 +69,7 @@ func productAdmissionAuthority(request serviceapi.RunAdmissionRequestV1) admissi
 			return admissionCapsuleSpecForIdentity(repositoryIdentity, request, planRelative)
 		},
 		template: request.Template,
+		executor: request.Executor,
 	}
 }
 
@@ -308,6 +312,9 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 			return loadedProfile{}, err
 		}
 	}
+	if err := validateExecutorChoices(configuration.ExecutorChoices, governed.Executor().Executor); err != nil {
+		return loadedProfile{}, err
+	}
 	manifest = governed.Manifest()
 	manifest.RunID = ""
 	manifest.Repository.StartSHA = ""
@@ -435,6 +442,9 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 			if err := requireMirroredTemplate(profile.configuration.TemplateMirrorPath, *admission.template); err != nil {
 				return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrTemplateNotAccepted
 			}
+		}
+		if admission.executor != nil && !acceptsExecutor(profile.configuration.ExecutorChoices, *admission.executor) {
+			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrExecutorChoiceNotAccepted
 		}
 		manifestPath, materialized, materializeErr := materialize(profile, principal, admission, runID)
 		if materializeErr != nil {
@@ -757,6 +767,10 @@ func validateAdmissionBindingMaterial(binding AdmissionBindingV1, principal serv
 		manifest.ContextCapsule.Path != binding.ContextCapsulePath || manifest.ContextCapsule.SHA256 != digest(capsuleData) {
 		return errors.New("admission manifest content is invalid")
 	}
+	if admission.executor != nil && ((admission.executor.Model != "" && manifest.Executor.TaskModel != admission.executor.Model) ||
+		(admission.executor.Effort != "" && manifest.Executor.TaskEffort != admission.executor.Effort)) {
+		return errors.New("admission manifest executor differs from the request")
+	}
 	workflowConfiguration, err := readProtectedFile(binding.WorkflowAuthorityConfigPath, workflowauthoritypg.MaxConfigBytes)
 	if err != nil || digest(workflowConfiguration) != binding.WorkflowAuthorityConfigSHA256 ||
 		workflowauthoritypg.ValidateConfigFile(binding.WorkflowAuthorityConfigPath) != nil {
@@ -908,7 +922,7 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, admissio
 		return "", runBinding{}, err
 	}
 	capsulePath := filepath.Join(runDirectory, "context-capsule.json")
-	manifestData, err := derivedManifestData(profile, admission.repositoryBaseSHA, runID, planPath, capsulePath, plan, capsuleData, admission.template)
+	manifestData, err := derivedManifestData(profile, admission.repositoryBaseSHA, runID, planPath, capsulePath, plan, capsuleData, admission.template, admission.executor)
 	if err != nil || len(manifestData) > MaxManifestTemplateBytes {
 		return "", runBinding{}, errors.New("derived manifest exceeds bounds")
 	}
@@ -1106,7 +1120,7 @@ func developmentAdmissionCapsuleSpecForIdentity(repositoryIdentity string, reque
 	}
 }
 
-func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPath, capsulePath string, plan, capsuleData []byte, template *serviceapi.RunTemplateV1) ([]byte, error) {
+func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPath, capsulePath string, plan, capsuleData []byte, template *serviceapi.RunTemplateV1, executor *serviceapi.RunExecutorV1) ([]byte, error) {
 	manifest, err := cloneManifest(profile.template)
 	if err != nil {
 		return nil, err
@@ -1125,7 +1139,58 @@ func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPa
 			CommitSHA: template.CommitSHA, TreeSHA: template.TreeSHA,
 		}
 	}
+	if executor != nil {
+		if !acceptsExecutor(profile.configuration.ExecutorChoices, *executor) {
+			return nil, errors.New("profile does not accept this executor choice")
+		}
+		if executor.Model != "" {
+			manifest.Executor.TaskModel = executor.Model
+		}
+		if executor.Effort != "" {
+			manifest.Executor.TaskEffort = executor.Effort
+		}
+	}
 	return json.Marshal(manifest)
+}
+
+// validateExecutorChoices checks a profile's allowlist at load: known
+// reasoning levels and lower-case model names, each once, at most
+// MaxExecutorChoices of each, and only xhigh for Codex, whose runs refuse any
+// other level.
+func validateExecutorChoices(choices *ExecutorChoicesV1, executor string) error {
+	if choices == nil {
+		return nil
+	}
+	if (len(choices.Models) == 0 && len(choices.Efforts) == 0) || len(choices.Models) > MaxExecutorChoices || len(choices.Efforts) > MaxExecutorChoices {
+		return errors.New("invalid executor choices")
+	}
+	seen := map[string]bool{}
+	for _, model := range choices.Models {
+		if !serviceapi.ValidRunExecutorModel(model) || seen["model:"+model] {
+			return errors.New("invalid executor choices")
+		}
+		seen["model:"+model] = true
+	}
+	for _, effort := range choices.Efforts {
+		if !serviceapi.ValidRunExecutorEffort(effort) || seen["effort:"+effort] {
+			return errors.New("invalid executor choices")
+		}
+		if executor == "codex" && effort != "xhigh" {
+			return errors.New("a Codex profile may offer only the xhigh reasoning level")
+		}
+		seen["effort:"+effort] = true
+	}
+	return nil
+}
+
+// acceptsExecutor reports whether a profile's allowlist holds each part a
+// request names.
+func acceptsExecutor(choices *ExecutorChoicesV1, executor serviceapi.RunExecutorV1) bool {
+	if choices == nil || serviceapi.ValidateRunExecutorV1(executor) != nil {
+		return false
+	}
+	return (executor.Model == "" || slices.Contains(choices.Models, executor.Model)) &&
+		(executor.Effort == "" || slices.Contains(choices.Efforts, executor.Effort))
 }
 
 // requireMirroredTemplate checks, before a build is admitted, that the
