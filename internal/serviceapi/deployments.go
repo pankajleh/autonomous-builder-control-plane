@@ -16,8 +16,11 @@ import (
 // plan sealed by a hash, Repo C applies the plan an administrator approved,
 // and ABCP carries it out on the target over its pinned SSH key as an
 // operation. On the server ABCP keeps releases, a link per site and one
-// rootless front door; nothing outside the deploy login's ~/autobuild is
-// touched.
+// rootless front door; nothing outside the deploy login's ~/autobuild, and the
+// autobuild-* containers, networks and volumes, is touched. A Node release
+// (BF-14.2b) also gets the shared Postgres, a database and login of its own,
+// and an app container on a network of its own, with a backup before every
+// update.
 
 // ReleaseV1 describes a release ABCP keeps.
 type ReleaseV1 struct {
@@ -54,9 +57,19 @@ type PlanV1 struct {
 	Site          PlanSiteV1 `json:"site"`
 	// Replaces is the release the site serves now, if any.
 	Replaces string `json:"replaces,omitempty"`
-	// Steps, in order: send_files (or reuse_files), write_site,
-	// start_frontdoor (or reload_frontdoor), switch_site, check.
-	Steps     []string `json:"steps"`
+	// Steps, in order. A static site: send_files (or reuse_files),
+	// switch_site, write_site, start_frontdoor (or reload_frontdoor), check.
+	// A Node app (BF-14.2b): send_files (or reuse_files), get_images,
+	// start_database, make_database, back_up (when it replaces a release),
+	// switch_site, start_app, wait_health, write_site, start_frontdoor (or
+	// reload_frontdoor), check.
+	Steps []string `json:"steps"`
+	// Images are what a Node app runs, by digest; Database is its database and
+	// login, made on the server the first time; Sandbox is "gvisor" or
+	// "standard". All three are empty for a static site.
+	Images    []string `json:"images,omitempty"`
+	Database  string   `json:"database,omitempty"`
+	Sandbox   string   `json:"sandbox,omitempty"`
 	CreatedAt string   `json:"created_at"`
 	ExpiresAt string   `json:"expires_at"`
 	Hash      string   `json:"hash"`
@@ -111,8 +124,13 @@ type SiteCheckV1 struct {
 // SiteV1 is a site ABCP put on a target. State is "deploying", "live",
 // "failed", "removing" or "unknown".
 type SiteV1 struct {
-	Name      string       `json:"name"`
-	Host      string       `json:"host"`
+	Name string `json:"name"`
+	Host string `json:"host"`
+	// Kind is "node" for a Node app and empty for a static site; a Node app
+	// also names its database and sandbox.
+	Kind      string       `json:"kind,omitempty"`
+	Database  string       `json:"database,omitempty"`
+	Sandbox   string       `json:"sandbox,omitempty"`
 	Release   string       `json:"release"`
 	State     string       `json:"state"`
 	UpdatedAt string       `json:"updated_at"`
@@ -127,7 +145,34 @@ type SitesV1 struct {
 	Sites         []SiteV1 `json:"sites"`
 }
 
+// BackupV1 is one backup of a Node app's database, kept on its server.
+// Reason is "before_update", "nightly" or "manual".
+type BackupV1 struct {
+	BackupID string `json:"backup_id"`
+	Reason   string `json:"reason"`
+	TakenAt  string `json:"taken_at"`
+	Bytes    int64  `json:"bytes"`
+	Release  string `json:"release,omitempty"`
+}
+
+// BackupsV1 lists a Node app's backups, newest last. They are kept after the
+// app is removed, with its database.
+type BackupsV1 struct {
+	SchemaVersion string     `json:"schema_version"`
+	Target        string     `json:"target"`
+	Site          string     `json:"site"`
+	Database      string     `json:"database"`
+	Backups       []BackupV1 `json:"backups"`
+}
+
+// BackupCreateV1 takes a backup now. RequestID makes a repeated request
+// answer the same operation.
+type BackupCreateV1 struct {
+	RequestID string `json:"request_id"`
+}
+
 const (
+	BackupsSchemaV1   = "BackupsV1"
 	ReleaseSchemaV1   = "ReleaseV1"
 	PlanSchemaV1      = "PlanV1"
 	OperationSchemaV1 = "OperationV1"
@@ -147,6 +192,8 @@ type DeploymentController interface {
 	Operation(ctx context.Context, target, operationID string) (OperationV1, error)
 	Sites(ctx context.Context, target string) (SitesV1, error)
 	RemoveSite(ctx context.Context, target, site string, remove SiteRemoveV1) (OperationV1, error)
+	Backups(ctx context.Context, target, site string) (BackupsV1, error)
+	BackUp(ctx context.Context, target, site string, create BackupCreateV1) (OperationV1, error)
 }
 
 var (
@@ -222,7 +269,7 @@ func (s *Server) releases(w http.ResponseWriter, r *http.Request, principal Prin
 	}
 }
 
-// /v1/targets/{key}/plans, /apply, /operations/{id}, /sites and /sites/{name}/remove
+// /v1/targets/{key}/plans, /apply, /operations/{id}, /sites, /sites/{name}/remove and /sites/{name}/backups
 func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id string, parts []string, body func(any) bool) {
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid deployment request", RequestID: id})
@@ -285,6 +332,25 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 			return
 		}
 		op, err := s.reserved.Deployments.RemoveSite(r.Context(), key, parts[2], remove)
+		operation(op, err, http.StatusAccepted)
+	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "backups" && r.Method == http.MethodGet:
+		if !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		backups, err := s.reserved.Deployments.Backups(r.Context(), key, parts[2])
+		if err != nil {
+			s.writeDeploymentError(w, id, err)
+			return
+		}
+		s.writeJSON(w, http.StatusOK, backups)
+	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "backups" && r.Method == http.MethodPost:
+		var create BackupCreateV1
+		if !body(&create) {
+			bad()
+			return
+		}
+		op, err := s.reserved.Deployments.BackUp(r.Context(), key, parts[2], create)
 		operation(op, err, http.StatusAccepted)
 	default:
 		bad()

@@ -98,6 +98,8 @@ type record struct {
 	// Sites ABCP put on the target, and the releases whose files are there (BF-14.2a).
 	Sites    []siteRecord `json:"sites,omitempty"`
 	Releases []string     `json:"releases,omitempty"`
+	// Node apps' databases, kept after an app is removed (BF-14.2b).
+	Databases []databaseRecord `json:"databases,omitempty"`
 }
 
 // Manager keeps the targets in one private folder.
@@ -114,9 +116,10 @@ type Manager struct {
 	busy       map[string]bool
 	wg         sync.WaitGroup
 	remote     func(context.Context, record) (remote, string)
-	fetch      func(context.Context, net.IP, string) (string, error)
+	fetch      func(context.Context, net.IP, string, string) (string, error)
 	checkEvery time.Duration
 	checkFor   time.Duration
+	healthWait int
 }
 
 // New keeps targets in dir, a folder open to the controller's user alone.
@@ -135,7 +138,7 @@ func New(dir string, clock func() time.Time) (*Manager, error) {
 		},
 		allow: PublicAddress,
 		dial:  dialer.DialContext,
-		busy:  map[string]bool{}, fetch: httpsFetch, checkEvery: defaultCheckEvery, checkFor: checkWindow,
+		busy:  map[string]bool{}, fetch: httpsFetch, checkEvery: defaultCheckEvery, checkFor: checkWindow, healthWait: defaultHealthWait,
 	}
 	m.interrupted()
 	return m, nil

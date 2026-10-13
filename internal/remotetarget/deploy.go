@@ -77,8 +77,12 @@ var (
 
 // siteRecord is a site as ABCP keeps it in its target's record.
 type siteRecord struct {
-	Name      string                  `json:"name"`
-	Host      string                  `json:"host"`
+	Name string `json:"name"`
+	Host string `json:"host"`
+	// Kind is "node" for a Node app (BF-14.2b), empty for a static site.
+	Kind      string                  `json:"kind,omitempty"`
+	Database  string                  `json:"database,omitempty"`
+	Sandbox   string                  `json:"sandbox,omitempty"`
 	Release   string                  `json:"release"`
 	State     string                  `json:"state"`
 	UpdatedAt string                  `json:"updated_at"`
@@ -87,8 +91,8 @@ type siteRecord struct {
 }
 
 func (s siteRecord) view() serviceapi.SiteV1 {
-	return serviceapi.SiteV1{Name: s.Name, Host: s.Host, Release: s.Release, State: s.State, UpdatedAt: s.UpdatedAt,
-		LastCheck: s.LastCheck, Operation: s.Operation}
+	return serviceapi.SiteV1{Name: s.Name, Host: s.Host, Kind: s.Kind, Database: s.Database, Sandbox: s.Sandbox, Release: s.Release,
+		State: s.State, UpdatedAt: s.UpdatedAt, LastCheck: s.LastCheck, Operation: s.Operation}
 }
 
 type planRecord struct {
@@ -102,6 +106,10 @@ type operationRecord struct {
 	Operation     serviceapi.OperationV1 `json:"operation"`
 	Host          string                 `json:"host,omitempty"`
 	Release       string                 `json:"release,omitempty"`
+	// Replaces and Sandbox are a Node app's (BF-14.2b): the release a failed
+	// update switches back to, and the runtime its app runs on.
+	Replaces string `json:"replaces,omitempty"`
+	Sandbox  string `json:"sandbox,omitempty"`
 }
 
 // remote runs scripts on a target.
@@ -166,6 +174,11 @@ func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.Pl
 			return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
 		}
 		if s.Name == name {
+			// A site keeps its kind: a static site becomes a Node app, or back,
+			// only by removing it first.
+			if s.Release != "" && siteKind(s) != release.Release.Kind {
+				return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
+			}
 			replaces = s.Release
 		}
 		running = running || s.State == siteLive
@@ -183,15 +196,22 @@ func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.Pl
 	if running {
 		frontdoor = "reload_frontdoor"
 	}
-	steps = append(steps, "switch_site", "write_site", frontdoor, "check")
+	if replaces == release.Release.Digest {
+		replaces = ""
+	}
+	if release.Release.Kind == kindNode {
+		steps = nodeSteps(steps[0], frontdoor, replaces != "")
+	} else {
+		steps = append(steps, "switch_site", "write_site", frontdoor, "check")
+	}
 	now := m.now().UTC()
 	plan := serviceapi.PlanV1{
 		SchemaVersion: serviceapi.PlanSchemaV1, PlanID: newID("pln-"), Target: key, Release: release.Release,
 		Site: serviceapi.PlanSiteV1{Name: name, Host: host}, Replaces: replaces, Steps: steps,
 		CreatedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(planLifetime).Format(time.RFC3339),
 	}
-	if replaces == release.Release.Digest {
-		plan.Replaces = ""
+	if release.Release.Kind == kindNode {
+		plan.Images, plan.Database, plan.Sandbox = []string{NodeRuntimeImage, NodePostgresImage}, databaseName(name), sandbox(r)
 	}
 	plan.Hash = planHash(plan)
 	if err := m.writeJSON(filepath.Join(m.dir, "plans"), plan.PlanID, planRecord{SchemaVersion: planSchema, Plan: plan}); err != nil {
@@ -251,7 +271,8 @@ func (m *Manager) Apply(_ context.Context, key string, apply serviceapi.ApplyV1)
 	for _, step := range plan.Steps {
 		op.Steps = append(op.Steps, serviceapi.OperationStepV1{Name: step, State: "pending"})
 	}
-	rec := operationRecord{SchemaVersion: operationSchema, Operation: op, Host: plan.Site.Host, Release: plan.Release.Digest}
+	rec := operationRecord{SchemaVersion: operationSchema, Operation: op, Host: plan.Site.Host, Release: plan.Release.Digest,
+		Replaces: plan.Replaces, Sandbox: plan.Sandbox}
 	if err := m.writeJSON(filepath.Join(m.dir, "operations"), op.OperationID, rec); err != nil {
 		return serviceapi.OperationV1{}, err
 	}
@@ -262,6 +283,9 @@ func (m *Manager) Apply(_ context.Context, key string, apply serviceapi.ApplyV1)
 	// The site keeps the release it serves until its link is switched.
 	site, _ := findSite(r, plan.Site.Name)
 	site.Name, site.Host, site.State, site.UpdatedAt, site.Operation = plan.Site.Name, plan.Site.Host, siteDeploying, m.stamp(), op.OperationID
+	if plan.Release.Kind == kindNode {
+		site.Kind, site.Database, site.Sandbox = kindNode, plan.Database, plan.Sandbox
+	}
 	m.setSite(&r, site)
 	if err := m.write(r); err != nil {
 		return serviceapi.OperationV1{}, err
@@ -305,6 +329,10 @@ func (m *Manager) RemoveSite(_ context.Context, key, name string, remove service
 		RequestID: remove.RequestID, State: opQueued, StartedAt: m.stamp(),
 		Steps: []serviceapi.OperationStepV1{{Name: "unlink_site", State: "pending"}, {Name: "write_site", State: "pending"},
 			{Name: "reload_frontdoor", State: "pending"}, {Name: "remove_files", State: "pending"}},
+	}
+	if siteKind(site) == kindNode {
+		// A Node app stops first; its database and backups are kept.
+		op.Steps = append([]serviceapi.OperationStepV1{{Name: "stop_app", State: "pending"}}, op.Steps...)
 	}
 	rec := operationRecord{SchemaVersion: operationSchema, Operation: op, Host: site.Host, Release: site.Release}
 	if err := m.writeJSON(filepath.Join(m.dir, "operations"), op.OperationID, rec); err != nil {
@@ -409,9 +437,12 @@ func (m *Manager) run(rec operationRecord) {
 		return
 	}
 	defer session.Close()
-	if op.Kind == "remove" {
+	switch op.Kind {
+	case "remove":
 		failed = m.runRemove(ctx, &rec, r, session)
-	} else {
+	case "backup":
+		failed = m.runBackup(ctx, &rec, r, session)
+	default:
 		failed = m.runApply(ctx, &rec, r, session)
 	}
 }
@@ -492,9 +523,45 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 				return run(ctx, session, writeSiteScript, strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
 			})
 		case "start_frontdoor", "reload_frontdoor":
-			err = m.step(rec, s.Name, func() (string, error) { return run(ctx, session, frontDoorScript, nil) })
+			err = m.step(rec, s.Name, func() (string, error) {
+				return run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
+			})
 		case "check":
 			err = m.step(rec, s.Name, func() (string, error) { return m.checkSite(ctx, r, rec.Host, release) })
+		case "get_images":
+			err = m.step(rec, s.Name, func() (string, error) { return run(ctx, session, getImagesScript, nil) })
+		case "start_database":
+			err = m.step(rec, s.Name, func() (string, error) { return run(ctx, session, startDatabaseScript, nil) })
+		case "make_database":
+			err = m.step(rec, s.Name, func() (string, error) {
+				return run(ctx, session, fill(makeDatabaseScript, "N", site, "DB", databaseName(site)), nil)
+			})
+			if err == nil {
+				m.mu.Lock()
+				if cur, readErr := m.read(r.Key); readErr == nil {
+					if _, ok := findDatabase(cur, site); !ok {
+						setDatabase(&cur, databaseRecord{Site: site, Name: databaseName(site), CreatedAt: m.stamp()})
+						_ = m.write(cur)
+					}
+				}
+				m.mu.Unlock()
+			}
+		case "back_up":
+			err = m.step(rec, s.Name, func() (string, error) {
+				return m.backUp(ctx, session, r.Key, site, reasonBeforeUpdate, rec.Replaces)
+			})
+		case "start_app":
+			err = m.step(rec, s.Name, func() (string, error) {
+				return run(ctx, session, fill(startAppScript, "N", site, "RUNTIME", runtimeFlag(rec.Sandbox)), nil)
+			})
+		case "wait_health":
+			err = m.step(rec, s.Name, func() (string, error) {
+				out, err := run(ctx, session, fill(waitHealthScript, "N", site, "WAIT", fmt.Sprint(m.healthWait)), nil)
+				if err != nil {
+					return "", errStep(stepDetail(err) + "; " + m.rollBack(ctx, rec, r.Key, session))
+				}
+				return out, nil
+			})
 		}
 		if err != nil {
 			return stepDetail(err)
@@ -510,6 +577,7 @@ func (m *Manager) runRemove(ctx context.Context, rec *operationRecord, r record,
 		name string
 		work func() (string, error)
 	}{
+		{"stop_app", func() (string, error) { return run(ctx, session, fill(stopAppScript, "N", site), nil) }},
 		{"unlink_site", func() (string, error) { return run(ctx, session, fill(unlinkScript, "N", site), nil) }},
 		{"write_site", func() (string, error) {
 			return run(ctx, session, writeSiteScript, strings.NewReader(m.caddyfile(r.Key, site, "")))
@@ -518,11 +586,18 @@ func (m *Manager) runRemove(ctx context.Context, rec *operationRecord, r record,
 			if m.liveSitesExcept(r.Key, site) == 0 {
 				return run(ctx, session, stopFrontDoorScript, nil)
 			}
-			return run(ctx, session, frontDoorScript, nil)
+			return run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
 		}},
 		{"remove_files", func() (string, error) { return m.pruneReleases(ctx, session, r.Key, site), nil }},
 	}
+	node := false
+	for _, s := range rec.Operation.Steps {
+		node = node || s.Name == "stop_app"
+	}
 	for _, s := range steps {
+		if s.name == "stop_app" && !node {
+			continue
+		}
 		if err := m.step(rec, s.name, s.work); err != nil {
 			return stepDetail(err)
 		}
@@ -563,7 +638,12 @@ func (m *Manager) checkSite(ctx context.Context, r record, host string, release 
 	if err != nil {
 		return "", errStep("refused_address")
 	}
-	want := ""
+	// A static site must answer / with its index.html; a Node app must answer
+	// /health (any answer with status 200).
+	path, want, node := "/", "", release.Release.Kind == kindNode
+	if node {
+		path = "/health"
+	}
 	for _, f := range release.Files {
 		if f.Path == "index.html" {
 			want = f.SHA256
@@ -581,8 +661,11 @@ func (m *Manager) checkSite(ctx context.Context, r record, host string, release 
 	deadline := time.Now().Add(m.checkFor)
 	last := "unreachable"
 	for {
-		got, err := m.fetch(ctx, ips[0], host)
+		got, err := m.fetch(ctx, ips[0], host, path)
 		switch {
+		case err == nil && node:
+			m.recordCheck(r.Key, host, true, "")
+			return "answers /health", nil
 		case err == nil && got == want:
 			m.recordCheck(r.Key, host, true, "")
 			return "answers with this release", nil
@@ -618,9 +701,9 @@ func (m *Manager) recordCheck(key, host string, ok bool, detail string) {
 	_ = m.write(r)
 }
 
-// httpsFetch reads https://host/ from ip, checking the certificate for host,
-// and answers the SHA-256 of what came back.
-func httpsFetch(ctx context.Context, ip net.IP, host string) (string, error) {
+// httpsFetch reads https://host<path> from ip, checking the certificate for
+// host, and answers the SHA-256 of what came back.
+func httpsFetch(ctx context.Context, ip net.IP, host, path string) (string, error) {
 	dialer := &net.Dialer{Timeout: dialTimeout}
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -633,7 +716,7 @@ func httpsFetch(ctx context.Context, ip net.IP, host string) (string, error) {
 	}
 	client := &http.Client{Transport: transport, Timeout: 30 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+"/", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+path, nil)
 	if err != nil {
 		return "", errStep("failed")
 	}
@@ -666,8 +749,9 @@ func (m *Manager) caddyfile(key, site, host string) string {
 	m.mu.Lock()
 	r, _ := m.read(key)
 	m.mu.Unlock()
-	hosts := map[string]string{}
+	hosts, kinds := map[string]string{}, map[string]string{}
 	for _, s := range r.Sites {
+		kinds[s.Name] = siteKind(s)
 		if served(s) {
 			hosts[s.Name] = s.Host
 		}
@@ -682,9 +766,13 @@ func (m *Manager) caddyfile(key, site, host string) string {
 	}
 	sort.Strings(names)
 	var b strings.Builder
-	b.WriteString("# Written by ABCP (BF-14.2a). Each site serves the release its link points to.\n")
+	b.WriteString("# Written by ABCP (BF-14.2a, BF-14.2b). A static site serves the release its link points to; a Node app is its container.\n")
 	for _, name := range names {
-		fmt.Fprintf(&b, "\n%s {\n\troot * /srv/sites/%s\n\tfile_server\n\tencode zstd gzip\n\theader {\n\t\tX-Content-Type-Options nosniff\n\t\tReferrer-Policy strict-origin-when-cross-origin\n\t\t-Server\n\t}\n}\n", hosts[name], name)
+		serve := "\troot * /srv/sites/" + name + "\n\tfile_server\n"
+		if kinds[name] == kindNode {
+			serve = "\treverse_proxy autobuild-app-" + name + ":8080\n"
+		}
+		fmt.Fprintf(&b, "\n%s {\n%s\tencode zstd gzip\n\theader {\n\t\tX-Content-Type-Options nosniff\n\t\tReferrer-Policy strict-origin-when-cross-origin\n\t\t-Server\n\t}\n}\n", hosts[name], serve)
 	}
 	return b.String()
 }
@@ -993,8 +1081,9 @@ func (m *Manager) readJSON(dir, name string, v any) error {
 }
 
 // The scripts. Each value in them (@D@ a release digest, @N@ a site name,
-// @COUNT@ a number, @LIST@ digests) is checked by ABCP against a narrow
-// pattern before it is put in; nothing else from a request reaches a server.
+// @COUNT@ a number, @LIST@ digests, @NETS@ site names) is checked by ABCP
+// against a narrow pattern before it is put in; nothing else from a request
+// reaches a server.
 const (
 	dockerHost = `[ -S "/run/user/$(id -u)/docker.sock" ] && export DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"`
 
@@ -1037,9 +1126,9 @@ mv "$C/Caddyfile.next" "$C/Caddyfile"
 	frontDoorScript = `set -eu
 ` + dockerHost + `
 A="$HOME/autobuild"
+state=started
 if [ "$(docker inspect -f '{{.State.Running}}' autobuild-frontdoor 2>/dev/null || true)" = "true" ]; then
-  docker exec autobuild-frontdoor caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
-  echo reloaded
+  state=reloaded
 else
   docker rm -f autobuild-frontdoor >/dev/null 2>&1 || true
   docker pull -q ` + FrontDoorImage + ` >/dev/null
@@ -1048,8 +1137,16 @@ else
     -v "$A/frontdoor/config:/etc/caddy:ro" -v "$A/frontdoor/data:/data" -v "$A/frontdoor/state:/config" \
     -v "$A/sites:/srv/sites:ro" -v "$A/releases:/srv/releases:ro" \
     ` + FrontDoorImage + ` caddy run --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
-  echo started
 fi
+# The front door joins each Node app's network, @NETS@ being their sites.
+for n in @NETS@; do
+  docker inspect -f '{{json .NetworkSettings.Networks}}' autobuild-frontdoor | grep -q "\"autobuild-net-$n\"" ||
+    docker network connect "autobuild-net-$n" autobuild-frontdoor
+done
+if [ "$state" = reloaded ]; then
+  docker exec autobuild-frontdoor caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+fi
+echo "$state"
 `
 	stopFrontDoorScript = `set -eu
 ` + dockerHost + `

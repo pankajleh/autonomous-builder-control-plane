@@ -83,12 +83,66 @@ type localRemote struct {
 func newLocalRemote(t *testing.T) *localRemote {
 	t.Helper()
 	l := &localRemote{home: t.TempDir(), bin: t.TempDir()}
+	// The fake keeps containers, networks, volumes and images as files under
+	// $HOME/.docker, and the shared Postgres's roles and databases too, so a
+	// script sees what earlier scripts did. A Node app answers /health unless
+	// $HOME/app.fails-once was there when it started.
 	fake := `#!/bin/sh
 echo "$@" >> "$HOME/docker.log"
+S="$HOME/.docker"
+mkdir -p "$S/nets"
+last() { for a; do l=$a; done; echo "$l"; }
 case "$1" in
-  inspect) if [ -f "$HOME/docker.running" ]; then echo true; else echo false; fi ;;
-  run) touch "$HOME/docker.running" ;;
-  rm) rm -f "$HOME/docker.running" ;;
+  inspect)
+    n=$(last "$@")
+    case "$*" in
+      *NetworkSettings*)
+        [ -f "$S/c-$n" ] || exit 1
+        printf '{'; for f in "$S/nets/$n"/*; do [ -e "$f" ] && printf '"%s":{},' "${f##*/}"; done; echo '}' ;;
+      *) if [ -f "$S/c-$n" ]; then echo true; else echo false; fi ;;
+    esac ;;
+  run)
+    n=""; net=""; prev=""
+    for a; do [ "$prev" = "--name" ] && n=$a; [ "$prev" = "--network" ] && net=$a; prev=$a; done
+    touch "$S/c-$n"; mkdir -p "$S/nets/$n"
+    if [ -n "$net" ]; then touch "$S/nets/$n/$net"; fi
+    case "$n" in autobuild-app-*) if [ -f "$HOME/app.fails-once" ]; then touch "$S/c-$n.unhealthy"; rm -f "$HOME/app.fails-once"; fi ;; esac ;;
+  rm) n=$(last "$@"); rm -rf "$S/c-$n" "$S/c-$n.unhealthy" "$S/nets/$n" ;;
+  exec)
+    shift; if [ "$1" = "-i" ]; then shift; fi
+    n=$1; shift
+    [ -f "$S/c-$n" ] || exit 1
+    case "$*" in
+      *pg_isready*) exit 0 ;;
+      *pg_dump*) printf 'PGDMP fake dump of %s\n' "$(last "$@")" ;;
+      *"FROM pg_roles"*) r=$(echo "$*" | sed -n "s/.*rolname = '\([a-z0-9_]*\)'.*/\1/p"); if [ -f "$S/role-$r" ]; then echo 1; fi ;;
+      *"FROM pg_database"*) d=$(echo "$*" | sed -n "s/.*datname = '\([a-z0-9_]*\)'.*/\1/p"); if [ -f "$S/db-$d" ]; then echo 1; fi ;;
+      *"CREATE DATABASE"*) d=$(echo "$*" | sed -n 's/.*CREATE DATABASE \([a-z0-9_]*\) .*/\1/p'); touch "$S/db-$d" ;;
+      *psql*)
+        sql=$(cat); echo "$sql" >> "$S/psql.stdin"
+        r=$(echo "$sql" | sed -n 's/^\(CREATE\|ALTER\) ROLE \([a-z0-9_]*\) .*/\2/p'); if [ -n "$r" ]; then touch "$S/role-$r"; fi ;;
+      *wget*) if [ -f "$S/c-$n.unhealthy" ]; then exit 1; fi ;;
+    esac ;;
+  network)
+    case "$2" in
+      inspect) if [ -f "$S/net-$3" ]; then exit 0; else exit 1; fi ;;
+      create) n=$(last "$@"); touch "$S/net-$n"; case "$*" in *autobuild.site=*) touch "$S/site-net-$n" ;; esac ;;
+      connect|disconnect)
+        verb=$2; shift 2; while [ $# -gt 2 ]; do shift; done
+        net=$1; c=$2
+        if [ "$verb" = disconnect ]; then rm -f "$S/nets/$c/$net"; exit 0; fi
+        [ -f "$S/net-$net" ] && [ -f "$S/c-$c" ] || exit 1
+        touch "$S/nets/$c/$net" ;;
+      rm) rm -f "$S/net-$3" "$S/site-net-$3" ;;
+      ls) for f in "$S"/site-net-*; do [ -e "$f" ] && echo "${f##*/site-net-}"; done ;;
+    esac ;;
+  volume)
+    case "$2" in
+      inspect) if [ -f "$S/vol-$3" ]; then exit 0; else exit 1; fi ;;
+      create) touch "$S/vol-$(last "$@")" ;;
+    esac ;;
+  image) if [ -f "$S/img-$(echo "$3" | cksum | cut -d' ' -f1)" ]; then exit 0; else exit 1; fi ;;
+  pull) touch "$S/img-$(last "$@" | cksum | cut -d' ' -f1)" ;;
 esac
 exit 0
 `
@@ -125,8 +179,9 @@ func (l *localRemote) docker() string {
 }
 
 // serve answers like the front door: the Caddyfile's block for the host names
-// the site whose link it serves index.html from.
-func (l *localRemote) serve(host string) (string, error) {
+// the site whose link it serves index.html from, or the Node app it proxies,
+// which answers when it runs, is healthy and the front door is on its network.
+func (l *localRemote) serve(host, path string) (string, error) {
 	data, err := os.ReadFile(filepath.Join(l.home, "autobuild/frontdoor/config/Caddyfile"))
 	if err != nil {
 		return "", errStep("unreachable")
@@ -134,6 +189,17 @@ func (l *localRemote) serve(host string) (string, error) {
 	lines := strings.Split(string(data), "\n")
 	for i, line := range lines {
 		if line == host+" {" && i+1 < len(lines) {
+			if app, ok := strings.CutPrefix(strings.TrimSpace(lines[i+1]), "reverse_proxy autobuild-app-"); ok {
+				app = strings.TrimSuffix(app, ":8080")
+				state := filepath.Join(l.home, ".docker")
+				_, running := os.Stat(filepath.Join(state, "c-autobuild-app-"+app))
+				_, unhealthy := os.Stat(filepath.Join(state, "c-autobuild-app-"+app+".unhealthy"))
+				_, joined := os.Stat(filepath.Join(state, "nets/autobuild-frontdoor/autobuild-net-"+app))
+				if path != "/health" || running != nil || unhealthy == nil || joined != nil {
+					return "", errStep("status")
+				}
+				return "healthy", nil
+			}
 			site := strings.TrimPrefix(strings.TrimSpace(lines[i+1]), "root * /srv/sites/")
 			body, err := os.ReadFile(filepath.Join(l.home, "autobuild/sites", site, "index.html"))
 			if err != nil {
@@ -172,13 +238,13 @@ func newDeployFixture(t *testing.T) *deployFixture {
 		return []net.IP{net.ParseIP("13.232.9.9")}, nil
 	}
 	m.remote = func(context.Context, record) (remote, string) { return f.remote, "" }
-	m.fetch = func(_ context.Context, ip net.IP, host string) (string, error) {
+	m.fetch = func(_ context.Context, ip net.IP, host, path string) (string, error) {
 		if !ip.Equal(net.ParseIP("13.232.1.2")) {
 			return "", errStep("unreachable")
 		}
-		return f.remote.serve(host)
+		return f.remote.serve(host, path)
 	}
-	m.checkEvery, m.checkFor = time.Millisecond, 50*time.Millisecond
+	m.checkEvery, m.checkFor, m.healthWait = time.Millisecond, 50*time.Millisecond, 2
 	f.m = m
 	if _, err := m.CreateTarget(context.Background(), f.key, serviceapi.TargetCreateV1{Address: "13.232.1.2"}); err != nil {
 		t.Fatal(err)

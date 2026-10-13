@@ -51,6 +51,16 @@ func (d *testDeployments) RemoveSite(_ context.Context, target, site string, r S
 	return sampleOperation, d.err
 }
 
+func (d *testDeployments) Backups(_ context.Context, target, site string) (BackupsV1, error) {
+	d.calls = append(d.calls, "backups:"+target+":"+site)
+	return BackupsV1{SchemaVersion: BackupsSchemaV1, Target: target, Site: site, Database: "app_shop",
+		Backups: []BackupV1{{BackupID: "bk-20261014T013000Z-0a1b", Reason: "before_update", TakenAt: "2026-10-14T01:30:00Z", Bytes: 2048}}}, d.err
+}
+func (d *testDeployments) BackUp(_ context.Context, target, site string, c BackupCreateV1) (OperationV1, error) {
+	d.calls = append(d.calls, "backup:"+target+":"+site+":"+c.RequestID)
+	return sampleOperation, d.err
+}
+
 func deploymentServer(t *testing.T, grant bool) (*Server, *testDeployments) {
 	s, _ := targetServer(t, grant)
 	backend := &testDeployments{}
@@ -92,9 +102,17 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 	if r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/remove", `{"request_id":"req-87654321"}`); r.Code != http.StatusAccepted {
 		t.Fatalf("remove = %d", r.Code)
 	}
+	if r := call(s, http.MethodGet, "/v1/targets/srv-0123456789ab/sites/shop/backups", ""); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"database":"app_shop"`) ||
+		!strings.Contains(r.Body.String(), `"reason":"before_update"`) {
+		t.Fatalf("backups = %d %s", r.Code, r.Body.String())
+	}
+	if r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups", `{"request_id":"req-backup-01"}`); r.Code != http.StatusAccepted {
+		t.Fatalf("back up = %d", r.Code)
+	}
 	want := []string{"put:" + digest, "get:" + digest, "plan:srv-0123456789ab:abababab:shop:13-232-1-2.sslip.io",
 		"apply:srv-0123456789ab:pln-0123456789abcdef:req-12345678", "op:srv-0123456789ab:op-0123456789abcdef", "sites:srv-0123456789ab",
-		"remove:srv-0123456789ab:shop:req-87654321"}
+		"remove:srv-0123456789ab:shop:req-87654321",
+		"backups:srv-0123456789ab:shop", "backup:srv-0123456789ab:shop:req-backup-01"}
 	if strings.Join(backend.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v", backend.calls)
 	}
@@ -111,6 +129,9 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 		{http.MethodDelete, "/v1/targets/srv-0123456789ab/sites/shop", ""},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/remove/now", `{}`},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/reboot/now", ""},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/Shop/backups", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups", `{"request_id":"req-backup-01","extra":1}`},
+		{http.MethodDelete, "/v1/targets/srv-0123456789ab/sites/shop/backups", ""},
 	} {
 		if r := call(s, bad.method, bad.path, bad.body); r.Code != http.StatusBadRequest {
 			t.Errorf("%s %s = %d", bad.method, bad.path, r.Code)
