@@ -174,6 +174,9 @@ type ServerConfig struct {
 	// BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md, BF-14.1) for a service principal
 	// granted targets.control.
 	Targets TargetController
+	// Deployments, when set, answers /v1/releases and a target's plans,
+	// apply, operations and sites (BF-14.2a) for the same principal.
+	Deployments DeploymentController
 	// RequestLog, when set, gets one line per request with its X-Request-ID (Repo C design note REQUEST_IDS.md).
 	RequestLog io.Writer
 }
@@ -361,14 +364,24 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.writeError(writer, http.StatusUnauthorized, ErrorV1{Code: "unauthenticated", Message: "authentication required", RequestID: requestID})
 		return
 	}
-	if request.ContentLength > MaxRequestBodyBytes {
+	limit := int64(MaxRequestBodyBytes)
+	if isReleaseUpload(request) {
+		// A release is the one body larger than a megabyte; it gets its own
+		// bound and a longer read than the server's ordinary timeout.
+		limit = MaxReleaseBytes
+		if err := http.NewResponseController(writer).SetReadDeadline(time.Now().Add(releaseReadTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			s.writeError(writer, http.StatusServiceUnavailable, ErrorV1{Code: "target_unavailable", Message: "targets are unavailable", RequestID: requestID, Retryable: true})
+			return
+		}
+	}
+	if request.ContentLength > limit {
 		s.writeError(writer, http.StatusRequestEntityTooLarge, ErrorV1{Code: "invalid_request", Message: "request body exceeds limit", RequestID: requestID})
 		return
 	}
 	if request.Body == nil {
 		request.Body = http.NoBody
 	}
-	request.Body = http.MaxBytesReader(writer, request.Body, MaxRequestBodyBytes)
+	request.Body = http.MaxBytesReader(writer, request.Body, limit)
 	switch request.URL.Path {
 	case "/v1/extensions/pdlc-experience":
 		s.experienceCapabilities(writer, request, principal, requestID)
@@ -397,6 +410,10 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		if strings.HasPrefix(request.URL.Path, "/v1/targets/") {
 			s.targets(writer, request, principal, requestID)
+			return
+		}
+		if strings.HasPrefix(request.URL.Path, "/v1/releases/") {
+			s.releases(writer, request, principal, requestID)
 			return
 		}
 		s.runRoute(writer, request, principal, requestID)

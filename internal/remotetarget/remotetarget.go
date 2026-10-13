@@ -95,6 +95,9 @@ type record struct {
 	Fingerprint   string                        `json:"fingerprint,omitempty"`
 	CreatedAt     string                        `json:"created_at"`
 	Preflight     *serviceapi.TargetPreflightV1 `json:"preflight,omitempty"`
+	// Sites ABCP put on the target, and the releases whose files are there (BF-14.2a).
+	Sites    []siteRecord `json:"sites,omitempty"`
+	Releases []string     `json:"releases,omitempty"`
 }
 
 // Manager keeps the targets in one private folder.
@@ -105,6 +108,15 @@ type Manager struct {
 	resolve func(context.Context, string) ([]net.IP, error)
 	allow   func(net.IP) bool
 	dial    func(context.Context, string, string) (net.Conn, error)
+
+	// Deployments (deploy.go, releases.go).
+	releaseMu  sync.Mutex
+	busy       map[string]bool
+	wg         sync.WaitGroup
+	remote     func(context.Context, record) (remote, string)
+	fetch      func(context.Context, net.IP, string) (string, error)
+	checkEvery time.Duration
+	checkFor   time.Duration
 }
 
 // New keeps targets in dir, a folder open to the controller's user alone.
@@ -116,14 +128,17 @@ func New(dir string, clock func() time.Time) (*Manager, error) {
 		clock = time.Now
 	}
 	dialer := &net.Dialer{Timeout: dialTimeout}
-	return &Manager{
+	m := &Manager{
 		dir: dir, now: clock,
 		resolve: func(ctx context.Context, host string) ([]net.IP, error) {
 			return net.DefaultResolver.LookupIP(ctx, "ip", host)
 		},
 		allow: PublicAddress,
 		dial:  dialer.DialContext,
-	}, nil
+		busy:  map[string]bool{}, fetch: httpsFetch, checkEvery: defaultCheckEvery, checkFor: checkWindow,
+	}
+	m.interrupted()
+	return m, nil
 }
 
 var refusedNetworks = func() []*net.IPNet {
@@ -356,8 +371,14 @@ func (m *Manager) PreflightTarget(ctx context.Context, key string) (serviceapi.T
 	return current.view(), nil
 }
 
-// connect dials a public address of the target and starts SSH.
+// connect dials a public address of the target and starts SSH, for one check.
 func (m *Manager) connect(ctx context.Context, r record, config *ssh.ClientConfig) (*ssh.Client, string) {
+	return m.connectFor(ctx, r, config, runTimeout)
+}
+
+// connectFor dials a public address of the target and starts SSH; the
+// connection ends after deadline whatever happens on it.
+func (m *Manager) connectFor(ctx context.Context, r record, config *ssh.ClientConfig, deadline time.Duration) (*ssh.Client, string) {
 	ips, err := m.addresses(ctx, r.Address)
 	if err != nil {
 		return nil, "refused_address"
@@ -372,7 +393,7 @@ func (m *Manager) connect(ctx context.Context, r record, config *ssh.ClientConfi
 		}
 		return nil, "unreachable"
 	}
-	_ = conn.SetDeadline(time.Now().Add(runTimeout))
+	_ = conn.SetDeadline(time.Now().Add(deadline))
 	config.Timeout = dialTimeout
 	client, chans, reqs, err := ssh.NewClientConn(conn, target, config)
 	if err != nil {
@@ -424,30 +445,7 @@ func (m *Manager) readHostKey(ctx context.Context, r record) (ssh.PublicKey, str
 
 // check signs in with the target's key, the pinned host key only, and runs PreflightScript.
 func (m *Manager) check(ctx context.Context, r record) (string, *serviceapi.TargetFactsV1, []serviceapi.TargetCheckV1) {
-	pinned, _, _, _, err := ssh.ParseAuthorizedKey([]byte(r.HostKey))
-	if err != nil {
-		return "failed", nil, nil
-	}
-	data, err := os.ReadFile(filepath.Join(m.dir, r.Key+".key"))
-	if err != nil {
-		return "failed", nil, nil
-	}
-	signer, err := ssh.ParsePrivateKey(data)
-	if err != nil {
-		return "failed", nil, nil
-	}
-	config := &ssh.ClientConfig{
-		User: r.User,
-		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
-			if !bytes.Equal(key.Marshal(), pinned.Marshal()) {
-				return errKeyChanged
-			}
-			return nil
-		},
-		HostKeyAlgorithms: hostKeyAlgorithms(pinned),
-	}
-	client, outcome := m.connect(ctx, r, config)
+	client, outcome := m.pinnedClient(ctx, r, runTimeout)
 	if client == nil {
 		return outcome, nil, nil
 	}
@@ -661,4 +659,7 @@ func writePrivate(path string, data []byte) error {
 	return os.Rename(name, path)
 }
 
-var _ serviceapi.TargetController = (*Manager)(nil)
+var (
+	_ serviceapi.TargetController     = (*Manager)(nil)
+	_ serviceapi.DeploymentController = (*Manager)(nil)
+)

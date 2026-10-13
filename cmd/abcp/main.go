@@ -954,14 +954,16 @@ func serveCommand(args []string, stderr io.Writer) int {
 		accountLanes = manager
 	}
 	// Remote targets (docs/plans/remote-targets.md): without the folder the routes say they are unsupported.
+	// The same folder keeps their releases, plans and operations (BF-14.2a).
 	var targets serviceapi.TargetController
+	var deployments serviceapi.DeploymentController
 	if *targetsDir != "" {
 		manager, err := remotetarget.New(*targetsDir, time.Now)
 		if err != nil {
 			fmt.Fprintln(stderr, "load remote targets:", err)
 			return 1
 		}
-		targets = manager
+		targets, deployments = manager, manager
 	}
 	// Only a controller with its profiles answers GET /v1/engines; without one the route says it is unsupported.
 	var engines serviceapi.EngineCatalog
@@ -977,6 +979,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
 		RunAdmission: admissions, DevelopmentRunAdmission: admissions, Engines: engines, AccountLanes: accountLanes, Targets: targets,
+		Deployments: deployments,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "construct service API")
