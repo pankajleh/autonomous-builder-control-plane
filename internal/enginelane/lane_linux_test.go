@@ -141,3 +141,15 @@ func TestALaneFileThatIsNotTheOperatorsPrivateFileOrGivesAnythingElseIsRefused(t
 		}
 	}
 }
+
+func TestAClaudeAccountLaneTakesASetupToken(t *testing.T) {
+	path := write(t, "CLAUDE_CONFIG_DIR=/home/devagent/lanes/claude-account-home\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-"+secret+"\n", 0o600)
+	lane, err := Load("claude-account", path, "claude")
+	if err != nil || !reflect.DeepEqual(lane.Keys(), []string{"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"}) {
+		t.Fatalf("lane %v %v", lane.Keys(), err)
+	}
+	if _, err := Load("codex-account", write(t, "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-"+secret+"\n", 0o600), "codex"); err == nil ||
+		strings.Contains(err.Error(), secret) {
+		t.Fatalf("a Codex lane refuses a Claude token without showing it: %v", err)
+	}
+}

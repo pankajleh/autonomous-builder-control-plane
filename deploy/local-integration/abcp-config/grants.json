@@ -5,7 +5,8 @@
       "required_authorities": [
         "preview.control",
         "worktree.release",
-        "hosting.control"
+        "hosting.control",
+        "accounts.control"
       ],
       "may_assert_delegated_actor": true
     }

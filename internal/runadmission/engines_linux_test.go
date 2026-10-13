@@ -120,6 +120,15 @@ func TestAnEngineOnALaneIsReadyWithItsKeyAndShowsItsModelNeverAValue(t *testing.
 	if got := engineOf("p", authority.ExecutorPolicy{Executor: "claude", Lane: "claude-api", LaneFile: open}, os.Getenv); got.Reason != "lane_unreadable" {
 		t.Fatalf("a lane others can read = %+v", got)
 	}
+	// An account lane (docs/plans/account-lanes.md): Claude on an administrator's own plan, ready once it holds their setup token.
+	account := authority.ExecutorPolicy{Executor: "claude", Lane: "claude-account", LaneFile: laneFile(t, "claude-account", "CLAUDE_CONFIG_DIR=/home/devagent/lanes/claude-account-home\n")}
+	if got := engineOf("local-p02-claude-account", account, os.Getenv); got.Ready || got.Reason != "lane_no_key" {
+		t.Fatalf("a signed-out account lane = %+v", got)
+	}
+	account.LaneFile = laneFile(t, "claude-account", "CLAUDE_CONFIG_DIR=/home/devagent/lanes/claude-account-home\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-"+engineSecret+"\n")
+	if got := engineOf("local-p02-claude-account", account, os.Getenv); !got.Ready || got.Access != "lane" {
+		t.Fatalf("a signed-in account lane = %+v", got)
+	}
 	odd := laneFile(t, "claude-bedrock", "CLAUDE_CODE_USE_BEDROCK=1\nAWS_ACCESS_KEY_ID=AKIAEXAMPLE\nANTHROPIC_MODEL=a model with spaces\n")
 	if got := engineOf("p", authority.ExecutorPolicy{Executor: "claude", Lane: "claude-bedrock", LaneFile: odd}, os.Getenv); got.Ready || got.LaneModel != "" || got.Reason != "lane_no_key" {
 		t.Fatalf("bedrock without its secret, odd model = %+v", got)

@@ -167,6 +167,9 @@ type ServerConfig struct {
 	DevelopmentRunAdmission DevelopmentRunAdmissionController
 	// Engines, when set, answers GET /v1/engines (Repo C design note AI_KEYS_AND_MODELS §9.5).
 	Engines EngineCatalog
+	// AccountLanes, when set, answers /v1/account-lanes (step 4c) for a service
+	// principal granted accounts.control.
+	AccountLanes AccountLaneController
 	// RequestLog, when set, gets one line per request with its X-Request-ID (Repo C design note REQUEST_IDS.md).
 	RequestLog io.Writer
 }
@@ -369,6 +372,8 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.capabilities(writer, request, requestID)
 	case "/v1/engines":
 		s.engines(writer, request, requestID)
+	case "/v1/account-lanes":
+		s.accountLanes(writer, request, principal, requestID)
 	case "/v1/runs":
 		s.runs(writer, request, principal, requestID)
 	case "/v1/development-runs":
@@ -378,6 +383,10 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	default:
 		if strings.HasPrefix(request.URL.Path, "/v1/hosted/") {
 			s.hostedRoute(writer, request, principal, requestID)
+			return
+		}
+		if strings.HasPrefix(request.URL.Path, "/v1/account-lanes/") {
+			s.accountLanes(writer, request, principal, requestID)
 			return
 		}
 		s.runRoute(writer, request, principal, requestID)
