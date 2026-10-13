@@ -267,7 +267,7 @@ func TestEveryNightEachNodeAppIsBackedUpAndItsBackupChecked(t *testing.T) {
 		names = append(names, s.Name+":"+s.Site+":"+s.State)
 	}
 	if op.State != opSucceeded || op.Kind != "nightly" || op.Site != "" ||
-		strings.Join(names, ",") != "back_up:blog:done,check_restore:blog:done,back_up:crm:done,check_restore:crm:done" ||
+		strings.Join(names, ",") != "back_up:blog:done,check_restore:blog:done,back_up:crm:done,check_restore:crm:done,read_server::done" ||
 		stepOf(op, "check_restore", "blog").Detail != "2 tables, 10 rows, as when it was taken" {
 		t.Fatalf("nightly = %+v", op)
 	}

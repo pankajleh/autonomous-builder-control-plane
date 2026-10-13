@@ -70,6 +70,36 @@ func (d *testDeployments) CheckBackup(_ context.Context, target, site, backup st
 	return sampleOperation, d.err
 }
 
+func (d *testDeployments) StopSite(_ context.Context, target, site string, r OperationRequestV1) (OperationV1, error) {
+	d.calls = append(d.calls, "stop:"+target+":"+site+":"+r.RequestID)
+	return sampleOperation, d.err
+}
+func (d *testDeployments) StartSite(_ context.Context, target, site string, r OperationRequestV1) (OperationV1, error) {
+	d.calls = append(d.calls, "start:"+target+":"+site+":"+r.RequestID)
+	return sampleOperation, d.err
+}
+func (d *testDeployments) Databases(_ context.Context, target string) (DatabasesV1, error) {
+	d.calls = append(d.calls, "databases:"+target)
+	return DatabasesV1{SchemaVersion: DatabasesSchemaV1, Target: target, Databases: []DatabaseV1{{Site: "shop", Database: "app_shop", CreatedAt: "2026-10-14T01:00:00Z"}}}, d.err
+}
+func (d *testDeployments) RemoveData(_ context.Context, target, site string, r ConfirmedRequestV1) (OperationV1, error) {
+	d.calls = append(d.calls, "remove-data:"+target+":"+site+":"+r.RequestID+":"+r.Confirm)
+	return sampleOperation, d.err
+}
+func (d *testDeployments) CleanTarget(_ context.Context, target string, r ConfirmedRequestV1) (OperationV1, error) {
+	d.calls = append(d.calls, "clean:"+target+":"+r.RequestID+":"+r.Confirm)
+	return sampleOperation, d.err
+}
+func (d *testDeployments) CheckDrift(_ context.Context, target string, r OperationRequestV1) (OperationV1, error) {
+	d.calls = append(d.calls, "drift:"+target+":"+r.RequestID)
+	return sampleOperation, d.err
+}
+func (d *testDeployments) Drift(_ context.Context, target string) (DriftV1, error) {
+	d.calls = append(d.calls, "drift-report:"+target)
+	return DriftV1{SchemaVersion: DriftSchemaV1, Target: target, Checked: true, CheckedAt: "2026-10-14T01:00:00Z", OK: true,
+		Findings: []DriftFindingV1{}, Reconciled: []string{}}, d.err
+}
+
 func deploymentServer(t *testing.T, grant bool) (*Server, *testDeployments) {
 	s, _ := targetServer(t, grant)
 	backend := &testDeployments{}
@@ -124,11 +154,31 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 	if r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b/check", `{"request_id":"req-check-001"}`); r.Code != http.StatusAccepted {
 		t.Fatalf("check = %d %s", r.Code, r.Body.String())
 	}
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/stop", `{"request_id":"req-stop-0001"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/start", `{"request_id":"req-start-001"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/databases/shop/remove", `{"request_id":"req-data-0001","confirm":"app_shop"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/clean", `{"request_id":"req-clean-001","confirm":"srv-0123456789ab"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/drift", `{"request_id":"req-drift-001"}`},
+	} {
+		if r := call(s, c.method, c.path, c.body); r.Code != http.StatusAccepted {
+			t.Fatalf("%s = %d %s", c.path, r.Code, r.Body.String())
+		}
+	}
+	if r := call(s, http.MethodGet, "/v1/targets/srv-0123456789ab/databases", ""); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"on_server":false`) {
+		t.Fatalf("databases = %d %s", r.Code, r.Body.String())
+	}
+	if r := call(s, http.MethodGet, "/v1/targets/srv-0123456789ab/drift", ""); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"schema_version":"DriftV1"`) {
+		t.Fatalf("drift = %d %s", r.Code, r.Body.String())
+	}
 	want := []string{"put:" + digest, "get:" + digest, "plan:srv-0123456789ab:abababab:shop:13-232-1-2.sslip.io",
 		"apply:srv-0123456789ab:pln-0123456789abcdef:req-12345678", "op:srv-0123456789ab:op-0123456789abcdef", "sites:srv-0123456789ab",
 		"remove:srv-0123456789ab:shop:req-87654321",
 		"backups:srv-0123456789ab:shop", "backup:srv-0123456789ab:shop:req-backup-01",
-		"restore:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b", "check:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b:req-check-001"}
+		"restore:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b", "check:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b:req-check-001",
+		"stop:srv-0123456789ab:shop:req-stop-0001", "start:srv-0123456789ab:shop:req-start-001",
+		"remove-data:srv-0123456789ab:shop:req-data-0001:app_shop", "clean:srv-0123456789ab:req-clean-001:srv-0123456789ab",
+		"drift:srv-0123456789ab:req-drift-001", "databases:srv-0123456789ab", "drift-report:srv-0123456789ab"}
 	if strings.Join(backend.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v", backend.calls)
 	}
@@ -154,6 +204,15 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b/check", ""},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b/restore", `{"request_id":"req-check-001"}`},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b/check/now", `{"request_id":"req-check-001"}`},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/shop/stop", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/pause", `{"request_id":"req-stop-0001"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/stop", `{"request_id":"req-stop-0001","x":1}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/databases/Shop/remove", `{"request_id":"req-data-0001","confirm":"app_shop"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/databases/shop/remove", `{"request_id":"req-data-0001"}x`},
+		{http.MethodDelete, "/v1/targets/srv-0123456789ab/databases", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/clean", `{"request_id":"req-clean-001","confirm":"x","y":1}`},
+		{http.MethodPut, "/v1/targets/srv-0123456789ab/drift", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/drift/now", `{"request_id":"req-drift-001"}`},
 	} {
 		if r := call(s, bad.method, bad.path, bad.body); r.Code != http.StatusBadRequest {
 			t.Errorf("%s %s = %d", bad.method, bad.path, r.Code)
@@ -200,6 +259,10 @@ func TestDeploymentsNeedTheGrantAndMapErrorsToStableCodes(t *testing.T) {
 		ErrTargetInvalid:     {http.StatusBadRequest, "invalid_request"},
 		ErrTargetLimit:       {http.StatusConflict, "target_limit"},
 		ErrTargetUnavailable: {http.StatusServiceUnavailable, "target_unavailable"},
+		ErrBackupUnknown:     {http.StatusNotFound, "backup_unknown"},
+		ErrSiteStopped:       {http.StatusConflict, "site_stopped"},
+		ErrDataInUse:         {http.StatusConflict, "data_in_use"},
+		ErrTargetInUse:       {http.StatusConflict, "target_in_use"},
 	} {
 		backend.err = err
 		r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/apply", `{"plan_id":"pln-0123456789abcdef","plan_hash":"`+strings.Repeat("a", 64)+`","request_id":"req-12345678"}`)

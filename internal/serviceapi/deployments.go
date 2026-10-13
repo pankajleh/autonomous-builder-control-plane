@@ -22,7 +22,10 @@ import (
 // and an app container on a network of its own, with a backup before every
 // update. A Node app's backup can be restored (an approved plan) and checked
 // by restoring it into a separate database; every night ABCP backs up each
-// Node app and checks the backup (BF-14.2b-1, second part).
+// Node app and checks the backup (BF-14.2b-1, second part). A Node app can be
+// stopped and started, an app's data removed once its site is off, a target
+// cleaned up once nothing is left, and a target checked against ABCP's record
+// (BF-14.5a).
 
 // ReleaseV1 describes a release ABCP keeps.
 type ReleaseV1 struct {
@@ -116,8 +119,9 @@ type OperationStepV1 struct {
 }
 
 // OperationV1 is a change ABCP carries out on a target. Kind is "apply",
-// "remove", "backup", "restore", "check_backup" or "nightly" (every Node app
-// on the target, with no site of its own). State is "queued", "running",
+// "remove", "backup", "restore", "check_backup", "nightly" (every Node app on
+// the target, with no site of its own), "stop", "start", "remove_data",
+// "clean" or "drift" (the last two with no site). State is "queued", "running",
 // "succeeded", "failed" or "unknown" (interrupted: unknown until reconciled,
 // never safe to repeat blindly).
 type OperationV1 struct {
@@ -142,7 +146,7 @@ type SiteCheckV1 struct {
 }
 
 // SiteV1 is a site ABCP put on a target. State is "deploying", "live",
-// "failed", "removing" or "unknown".
+// "failed", "removing", "stopped" (a Node app paused, BF-14.5a) or "unknown".
 type SiteV1 struct {
 	Name string `json:"name"`
 	Host string `json:"host"`
@@ -205,7 +209,64 @@ type BackupCreateV1 struct {
 	RequestID string `json:"request_id"`
 }
 
+// OperationRequestV1 starts an operation with nothing more than its request
+// id: a Node app's stop or start, or a check of the target (BF-14.5a).
+type OperationRequestV1 struct {
+	RequestID string `json:"request_id"`
+}
+
+// ConfirmedRequestV1 starts an operation that removes something for good;
+// Confirm repeats its name: an app's database, or the target's key.
+type ConfirmedRequestV1 struct {
+	RequestID string `json:"request_id"`
+	Confirm   string `json:"confirm"`
+}
+
+// DatabaseV1 is a Node app's database on a target; OnServer is whether its
+// site is still on the target.
+type DatabaseV1 struct {
+	Site      string `json:"site"`
+	Database  string `json:"database"`
+	CreatedAt string `json:"created_at"`
+	Backups   int    `json:"backups"`
+	OnServer  bool   `json:"on_server"`
+}
+
+// DatabasesV1 lists a target's app databases.
+type DatabasesV1 struct {
+	SchemaVersion string       `json:"schema_version"`
+	Target        string       `json:"target"`
+	Databases     []DatabaseV1 `json:"databases"`
+}
+
+// DriftFindingV1 is one way a target differs from ABCP's record. Kind is one
+// of container_missing, container_stopped, container_unknown,
+// network_missing, network_unknown, volume_missing, volume_unknown,
+// link_missing, link_wrong, link_unknown, release_missing, release_unknown,
+// database_missing, database_unknown, copy_left, backup_missing,
+// backup_unknown, frontdoor_config or site_unknown.
+type DriftFindingV1 struct {
+	Kind   string `json:"kind"`
+	Site   string `json:"site,omitempty"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// DriftV1 is the last check of a target against ABCP's record. Reconciled
+// names the sites an interrupted operation had left unknown that the check
+// found unambiguous and made live again.
+type DriftV1 struct {
+	SchemaVersion string           `json:"schema_version"`
+	Target        string           `json:"target"`
+	Checked       bool             `json:"checked"`
+	CheckedAt     string           `json:"checked_at,omitempty"`
+	OK            bool             `json:"ok"`
+	Findings      []DriftFindingV1 `json:"findings"`
+	Reconciled    []string         `json:"reconciled"`
+}
+
 const (
+	DatabasesSchemaV1 = "DatabasesV1"
+	DriftSchemaV1     = "DriftV1"
 	BackupsSchemaV1   = "BackupsV1"
 	ReleaseSchemaV1   = "ReleaseV1"
 	PlanSchemaV1      = "PlanV1"
@@ -229,6 +290,13 @@ type DeploymentController interface {
 	Backups(ctx context.Context, target, site string) (BackupsV1, error)
 	BackUp(ctx context.Context, target, site string, create BackupCreateV1) (OperationV1, error)
 	CheckBackup(ctx context.Context, target, site, backup string, create BackupCreateV1) (OperationV1, error)
+	StopSite(ctx context.Context, target, site string, request OperationRequestV1) (OperationV1, error)
+	StartSite(ctx context.Context, target, site string, request OperationRequestV1) (OperationV1, error)
+	Databases(ctx context.Context, target string) (DatabasesV1, error)
+	RemoveData(ctx context.Context, target, site string, request ConfirmedRequestV1) (OperationV1, error)
+	CleanTarget(ctx context.Context, target string, request ConfirmedRequestV1) (OperationV1, error)
+	CheckDrift(ctx context.Context, target string, request OperationRequestV1) (OperationV1, error)
+	Drift(ctx context.Context, target string) (DriftV1, error)
 }
 
 var (
@@ -241,6 +309,9 @@ var (
 	ErrSiteUnknown      = errors.New("site unknown")
 	ErrOperationUnknown = errors.New("operation unknown")
 	ErrBackupUnknown    = errors.New("backup unknown")
+	ErrSiteStopped      = errors.New("site stopped")
+	ErrDataInUse        = errors.New("data in use")
+	ErrTargetInUse      = errors.New("target in use")
 )
 
 var (
@@ -306,8 +377,9 @@ func (s *Server) releases(w http.ResponseWriter, r *http.Request, principal Prin
 	}
 }
 
-// /v1/targets/{key}/plans, /apply, /operations/{id}, /sites, /sites/{name}/remove, /sites/{name}/backups and
-// /sites/{name}/backups/{backup}/check
+// /v1/targets/{key}/plans, /apply, /operations/{id}, /sites, /sites/{name}/remove, /sites/{name}/backups,
+// /sites/{name}/backups/{backup}/check, /sites/{name}/stop and /start, /databases, /databases/{name}/remove, /clean and
+// /drift
 func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id string, parts []string, body func(any) bool) {
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid deployment request", RequestID: id})
@@ -399,6 +471,67 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 		}
 		op, err := s.reserved.Deployments.CheckBackup(r.Context(), key, parts[2], parts[4], create)
 		operation(op, err, http.StatusAccepted)
+	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && (parts[3] == "stop" || parts[3] == "start") &&
+		r.Method == http.MethodPost:
+		var request OperationRequestV1
+		if !body(&request) {
+			bad()
+			return
+		}
+		var op OperationV1
+		var err error
+		if parts[3] == "stop" {
+			op, err = s.reserved.Deployments.StopSite(r.Context(), key, parts[2], request)
+		} else {
+			op, err = s.reserved.Deployments.StartSite(r.Context(), key, parts[2], request)
+		}
+		operation(op, err, http.StatusAccepted)
+	case len(parts) == 2 && parts[1] == "databases" && r.Method == http.MethodGet:
+		if !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		databases, err := s.reserved.Deployments.Databases(r.Context(), key)
+		if err != nil {
+			s.writeDeploymentError(w, id, err)
+			return
+		}
+		s.writeJSON(w, http.StatusOK, databases)
+	case len(parts) == 4 && parts[1] == "databases" && siteNamePattern.MatchString(parts[2]) && parts[3] == "remove" && r.Method == http.MethodPost:
+		var request ConfirmedRequestV1
+		if !body(&request) {
+			bad()
+			return
+		}
+		op, err := s.reserved.Deployments.RemoveData(r.Context(), key, parts[2], request)
+		operation(op, err, http.StatusAccepted)
+	case len(parts) == 2 && parts[1] == "clean" && r.Method == http.MethodPost:
+		var request ConfirmedRequestV1
+		if !body(&request) {
+			bad()
+			return
+		}
+		op, err := s.reserved.Deployments.CleanTarget(r.Context(), key, request)
+		operation(op, err, http.StatusAccepted)
+	case len(parts) == 2 && parts[1] == "drift" && r.Method == http.MethodPost:
+		var request OperationRequestV1
+		if !body(&request) {
+			bad()
+			return
+		}
+		op, err := s.reserved.Deployments.CheckDrift(r.Context(), key, request)
+		operation(op, err, http.StatusAccepted)
+	case len(parts) == 2 && parts[1] == "drift" && r.Method == http.MethodGet:
+		if !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		drift, err := s.reserved.Deployments.Drift(r.Context(), key)
+		if err != nil {
+			s.writeDeploymentError(w, id, err)
+			return
+		}
+		s.writeJSON(w, http.StatusOK, drift)
 	default:
 		bad()
 	}
@@ -420,6 +553,12 @@ func (s *Server) writeDeploymentError(w http.ResponseWriter, id string, err erro
 		s.writeError(w, http.StatusConflict, ErrorV1{Code: "target_not_ready", Message: "target's host key is not confirmed", RequestID: id})
 	case errors.Is(err, ErrSiteUnknown):
 		s.writeError(w, http.StatusNotFound, ErrorV1{Code: "site_unknown", Message: "site is not on this target", RequestID: id})
+	case errors.Is(err, ErrSiteStopped):
+		s.writeError(w, http.StatusConflict, ErrorV1{Code: "site_stopped", Message: "the app is stopped: start it first", RequestID: id})
+	case errors.Is(err, ErrDataInUse):
+		s.writeError(w, http.StatusConflict, ErrorV1{Code: "data_in_use", Message: "the app is still on this target: take it off first", RequestID: id})
+	case errors.Is(err, ErrTargetInUse):
+		s.writeError(w, http.StatusConflict, ErrorV1{Code: "target_in_use", Message: "sites or app data are still on this target", RequestID: id})
 	case errors.Is(err, ErrBackupUnknown):
 		s.writeError(w, http.StatusNotFound, ErrorV1{Code: "backup_unknown", Message: "backup is not kept or cannot be restored", RequestID: id})
 	case errors.Is(err, ErrOperationUnknown):

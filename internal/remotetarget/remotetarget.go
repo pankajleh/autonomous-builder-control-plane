@@ -100,6 +100,8 @@ type record struct {
 	Releases []string     `json:"releases,omitempty"`
 	// Node apps' databases, kept after an app is removed (BF-14.2b).
 	Databases []databaseRecord `json:"databases,omitempty"`
+	// The last check of the target against this record (BF-14.5a).
+	Drift *serviceapi.DriftV1 `json:"drift,omitempty"`
 }
 
 // Manager keeps the targets in one private folder.
