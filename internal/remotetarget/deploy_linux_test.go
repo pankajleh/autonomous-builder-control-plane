@@ -110,7 +110,11 @@ case "$1" in
     touch "$S/c-$n"; mkdir -p "$S/nets/$n"
     if [ -n "$net" ]; then touch "$S/nets/$n/$net"; fi
     case "$n" in autobuild-app-*) if [ -f "$HOME/app.fails-once" ]; then touch "$S/c-$n.unhealthy"; rm -f "$HOME/app.fails-once"; fi ;; esac ;;
-  rm) n=$(last "$@"); rm -rf "$S/c-$n" "$S/c-$n.unhealthy" "$S/nets/$n" ;;
+  rm) n=$(last "$@"); rm -rf "$S/c-$n" "$S/c-$n.unhealthy" "$S/c-$n.exited" "$S/nets/$n" ;;
+  ps) for f in "$S"/c-*; do
+        n=${f##*/c-}; case "$n" in *.unhealthy|*.exited|'*') continue ;; esac
+        if [ -f "$S/c-$n.exited" ]; then echo "container $n exited"; else echo "container $n running"; fi
+      done ;;
   exec)
     shift; if [ "$1" = "-i" ]; then shift; fi
     n=$1; shift
@@ -125,6 +129,7 @@ case "$1" in
         [ -f "$S/db-$db" ] || exit 1
         tail -n +2 > "$S/db-$db"
         if [ -f "$HOME/restore.loses-rows" ]; then echo '{"public.members":0}' > "$S/db-$db"; fi ;;
+      *"datname ~"*) for f in "$S"/db-*; do [ -e "$f" ] && echo "${f##*/db-}"; done ;;
       *"FROM pg_roles"*) r=$(echo "$*" | sed -n "s/.*rolname = '\([a-z0-9_]*\)'.*/\1/p"); if [ -f "$S/role-$r" ]; then echo 1; fi ;;
       *"FROM pg_database"*) d=$(echo "$*" | sed -n "s/.*datname = '\([a-z0-9_]*\)'.*/\1/p"); if [ -f "$S/db-$d" ]; then echo 1; fi ;;
       *"CREATE DATABASE"*) d=$(echo "$*" | sed -n 's/.*CREATE DATABASE \([a-z0-9_]*\) .*/\1/p'); touch "$S/db-$d" ;;
@@ -142,6 +147,7 @@ case "$1" in
         echo "$sql" | while IFS= read -r line; do
           case "$line" in
             "DROP DATABASE "*) rm -f "$S/db-$(echo "$line" | sed -n 's/^DROP DATABASE \(IF EXISTS \)\{0,1\}\([a-z0-9_]*\).*/\2/p')" ;;
+            "DROP ROLE "*) rm -f "$S/role-$(echo "$line" | sed -n 's/^DROP ROLE \(IF EXISTS \)\{0,1\}\([a-z0-9_]*\).*/\2/p')" ;;
             "ALTER DATABASE "*)
               from=$(echo "$line" | sed -n 's/^ALTER DATABASE \([a-z0-9_]*\) RENAME TO .*/\1/p')
               to=$(echo "$line" | sed -n 's/^ALTER DATABASE [a-z0-9_]* RENAME TO \([a-z0-9_]*\);$/\1/p')
@@ -162,14 +168,23 @@ case "$1" in
         [ -f "$S/net-$net" ] && [ -f "$S/c-$c" ] || exit 1
         touch "$S/nets/$c/$net" ;;
       rm) rm -f "$S/net-$3" "$S/site-net-$3" ;;
-      ls) for f in "$S"/site-net-*; do [ -e "$f" ] && echo "${f##*/site-net-}"; done ;;
+      ls) case "$*" in
+            *label=*) for f in "$S"/site-net-*; do [ -e "$f" ] && echo "${f##*/site-net-}"; done ;;
+            *) for f in "$S"/net-*; do [ -e "$f" ] && echo "network ${f##*/net-}"; done ;;
+          esac ;;
     esac ;;
   volume)
     case "$2" in
       inspect) if [ -f "$S/vol-$3" ]; then exit 0; else exit 1; fi ;;
       create) touch "$S/vol-$(last "$@")" ;;
+      ls) for f in "$S"/vol-*; do [ -e "$f" ] && echo "volume ${f##*/vol-}"; done ;;
+      rm) rm -f "$S/vol-$(last "$@")" ;;
     esac ;;
-  image) if [ -f "$S/img-$(echo "$3" | cksum | cut -d' ' -f1)" ]; then exit 0; else exit 1; fi ;;
+  image)
+    case "$2" in
+      rm) rm -f "$S/img-$(echo "$3" | cksum | cut -d' ' -f1)" ;;
+      *) if [ -f "$S/img-$(echo "$3" | cksum | cut -d' ' -f1)" ]; then exit 0; else exit 1; fi ;;
+    esac ;;
   pull) touch "$S/img-$(last "$@" | cksum | cut -d' ' -f1)" ;;
 esac
 exit 0

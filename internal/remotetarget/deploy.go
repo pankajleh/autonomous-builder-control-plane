@@ -112,6 +112,8 @@ type operationRecord struct {
 	Replaces string `json:"replaces,omitempty"`
 	Sandbox  string `json:"sandbox,omitempty"`
 	Backup   string `json:"backup,omitempty"`
+	// Paused is a start whose app never answered and was stopped again (BF-14.5a).
+	Paused bool `json:"paused,omitempty"`
 }
 
 // remote runs scripts on a target.
@@ -426,9 +428,15 @@ func (m *Manager) run(rec operationRecord) {
 			m.dropSite(&r, op.Site)
 		case ok && site.Operation == op.OperationID && failed == "":
 			site.State, site.UpdatedAt = siteLive, m.stamp()
+			if op.Kind == "stop" {
+				site.State = siteStopped
+			}
 			m.setSite(&r, site)
 		case ok && site.Operation == op.OperationID:
 			site.State, site.UpdatedAt = siteFailed, m.stamp()
+			if rec.Paused {
+				site.State = siteStopped
+			}
 			m.setSite(&r, site)
 		}
 		_ = m.write(r)
@@ -461,6 +469,16 @@ func (m *Manager) run(rec operationRecord) {
 		failed = m.runCheckBackup(ctx, &rec, r, session)
 	case "nightly":
 		failed = m.runNightly(ctx, &rec, r, session)
+	case "stop":
+		failed = m.runStop(ctx, &rec, r, session)
+	case "start":
+		failed = m.runStart(ctx, &rec, r, session)
+	case "remove_data":
+		failed = m.runRemoveData(ctx, &rec, r, session)
+	case "clean":
+		failed = m.runClean(ctx, &rec, r, session)
+	case "drift":
+		failed = m.runDrift(ctx, &rec, r, session)
 	default:
 		failed = m.runApply(ctx, &rec, r, session)
 	}
@@ -774,9 +792,16 @@ func (m *Manager) caddyfile(key, site, host string) string {
 	m.mu.Lock()
 	r, _ := m.read(key)
 	m.mu.Unlock()
-	hosts, kinds := map[string]string{}, map[string]string{}
+	return caddyfileFor(r, site, host)
+}
+
+// caddyfileFor is caddyfile for a record already read. A stopped Node app's
+// host answers a plain 503 saying it is paused (BF-14.5a).
+func caddyfileFor(r record, site, host string) string {
+	hosts, kinds, paused := map[string]string{}, map[string]string{}, map[string]bool{}
 	for _, s := range r.Sites {
 		kinds[s.Name] = siteKind(s)
+		paused[s.Name] = s.State == siteStopped
 		if served(s) {
 			hosts[s.Name] = s.Host
 		}
@@ -794,7 +819,10 @@ func (m *Manager) caddyfile(key, site, host string) string {
 	b.WriteString("# Written by ABCP (BF-14.2a, BF-14.2b). A static site serves the release its link points to; a Node app is its container.\n")
 	for _, name := range names {
 		serve := "\troot * /srv/sites/" + name + "\n\tfile_server\n"
-		if kinds[name] == kindNode {
+		switch {
+		case kinds[name] == kindNode && paused[name]:
+			serve = "\trespond \"This app is paused.\" 503\n"
+		case kinds[name] == kindNode:
 			serve = "\treverse_proxy autobuild-app-" + name + ":8080\n"
 		}
 		fmt.Fprintf(&b, "\n%s {\n%s\tencode zstd gzip\n\theader {\n\t\tX-Content-Type-Options nosniff\n\t\tReferrer-Policy strict-origin-when-cross-origin\n\t\t-Server\n\t}\n}\n", hosts[name], serve)

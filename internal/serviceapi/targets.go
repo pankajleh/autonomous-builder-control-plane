@@ -166,7 +166,8 @@ func (s *Server) targets(w http.ResponseWriter, r *http.Request, principal Princ
 		s.writeJSON(w, http.StatusOK, list)
 	case rest == "" || !targetKeyPattern.MatchString(parts[0]) || len(parts) > 6:
 		bad()
-	case len(parts) >= 2 && (parts[1] == "plans" || parts[1] == "apply" || parts[1] == "operations" || parts[1] == "sites"):
+	case len(parts) >= 2 && (parts[1] == "plans" || parts[1] == "apply" || parts[1] == "operations" || parts[1] == "sites" ||
+		parts[1] == "databases" || parts[1] == "clean" || parts[1] == "drift"):
 		s.targetDeployments(w, r, id, parts, body)
 	case len(parts) > 2:
 		bad()

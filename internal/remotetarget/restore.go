@@ -67,6 +67,10 @@ func (m *Manager) createRestorePlan(key string, create serviceapi.PlanCreateV1) 
 	if !ok || !kept || siteKind(site) != kindNode || !served(site) {
 		return serviceapi.PlanV1{}, serviceapi.ErrSiteUnknown
 	}
+	if site.State == siteStopped {
+		// A restore starts the app; a stopped app is started first (BF-14.5a).
+		return serviceapi.PlanV1{}, serviceapi.ErrSiteStopped
+	}
 	backup, ok := findBackup(d, want.Backup)
 	if !ok || backup.Tables == nil {
 		// A backup restores only when its rows were counted, to be compared.
@@ -101,7 +105,7 @@ func (m *Manager) createRestorePlan(key string, create serviceapi.PlanCreateV1) 
 func restoreStale(r record, plan serviceapi.PlanV1) bool {
 	site, ok := findSite(r, plan.Site.Name)
 	d, kept := findDatabase(r, plan.Site.Name)
-	if !ok || !kept || siteKind(site) != kindNode || !served(site) || site.Release != plan.Release.Digest || plan.Backup == nil {
+	if !ok || !kept || siteKind(site) != kindNode || !served(site) || site.State == siteStopped || site.Release != plan.Release.Digest || plan.Backup == nil {
 		return true
 	}
 	_, ok = findBackup(d, plan.Backup.BackupID)
@@ -387,9 +391,10 @@ func (m *Manager) Nightly(ctx context.Context) {
 	}
 }
 
-// NightlyPass runs tonight's backups on each confirmed target with a Node app
+// NightlyPass runs tonight's backups on each confirmed target with a site
 // (only the targets named, when some are), one target after another, and
-// answers the targets that were busy. A target's night runs at most once.
+// answers the targets that were busy; each night ends with a check of the
+// target against its record (BF-14.5a). A target's night runs at most once.
 func (m *Manager) NightlyPass(ctx context.Context, only []string) []string {
 	m.mu.Lock()
 	records, err := m.all()
@@ -427,15 +432,19 @@ func (m *Manager) startNightly(key, night string) (operationRecord, string) {
 		return operationRecord{}, "none"
 	}
 	var steps []serviceapi.OperationStepV1
+	anyServed := false
 	for _, s := range r.Sites {
-		if _, kept := findDatabase(r, s.Name); kept && siteKind(s) == kindNode && served(s) {
+		anyServed = anyServed || served(s)
+		// A stopped app's data cannot change, so it is not backed up again.
+		if _, kept := findDatabase(r, s.Name); kept && siteKind(s) == kindNode && served(s) && s.State != siteStopped {
 			steps = append(steps, serviceapi.OperationStepV1{Name: "back_up", Site: s.Name, State: "pending"},
 				serviceapi.OperationStepV1{Name: "check_restore", Site: s.Name, State: "pending"})
 		}
 	}
-	if len(steps) == 0 {
+	if !anyServed {
 		return operationRecord{}, "none"
 	}
+	steps = append(steps, serviceapi.OperationStepV1{Name: "read_server", State: "pending"})
 	if _, done := m.operationByRequest(key, night); done {
 		return operationRecord{}, "done"
 	}
@@ -498,6 +507,9 @@ func (m *Manager) runNightly(ctx context.Context, rec *operationRecord, r record
 		}); err != nil {
 			note(site, err)
 		}
+	}
+	if err := m.step(rec, "read_server", func() (string, error) { return m.readServer(ctx, session, r.Key) }); err != nil && failed == "" {
+		failed = stepDetail(err)
 	}
 	return failed
 }
