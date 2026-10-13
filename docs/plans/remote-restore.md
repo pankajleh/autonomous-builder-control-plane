@@ -1,6 +1,7 @@
 # Remote restore: restoring a Node app's backup, checking backups, and nightly backups (BF-14.2b-1, second part)
 
-Status: **built in #97**, not live until ABCP is restarted on its merge with no build running. Repo C design note
+Status: **live since 2026-10-13 23:04 UTC on `fbff5c3`** (#97, recorded in #98); no Node app on a target yet, so no nightly
+backup has run. Repo C's side follows. Repo C design note
 `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md` §11 (BF-14.2b, P0480), under the owner's approval of the design ("agree with
 1,2,3") and "go with your recommendation options" (2026-10-13). Builds on `docs/plans/remote-node-apps.md` (#95).
 
