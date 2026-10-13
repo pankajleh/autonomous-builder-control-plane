@@ -1,6 +1,6 @@
 # Remote lifecycle: stopping and starting a Node app, removing its data, cleaning up a target, checking for drift (BF-14.5a)
 
-Status: **built in #99**, not live until ABCP is restarted on its merge with no build running. Repo C design note
+Status: **live since 2026-10-13 23:51 UTC on `b5a5a5e`** (#99, recorded in #100); no target is enrolled yet. Repo C's side follows. Repo C design note
 `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md` §11 (BF-14.5a, P0486), under the owner's "go with your recommendation options"
 (2026-10-13). Builds on `docs/plans/remote-sites.md`, `remote-node-apps.md` and `remote-restore.md`.
 
