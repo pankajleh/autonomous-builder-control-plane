@@ -161,3 +161,5 @@ PR #88 (2026-10-13) adds account lanes: engine lanes for an administrator's own 
 PR #89 (2026-10-13) records #88 live: ABCP on `ab633e7` since 07:02:24 UTC with the account lanes `codex-account` and `claude-account`, both signed out.
 
 PR #90 (2026-10-14) adds remote targets: Linux servers ABCP reaches over SSH with a key pair it makes and keeps, the host key pinned after the owner confirms its fingerprint, and a constant read-only preflight (`docs/plans/remote-targets.md`), for a service principal granted `targets.control`. Its authority is the owner's 2026-10-13 order to put BF-14 first and approval of Repo C design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md` ("agree with 1,2,3": ABCP runs deployments).
+
+PR #91 (2026-10-14) adds `targets.control` to Repo C's principal in the versioned `grants.json`, for #90's routes.
