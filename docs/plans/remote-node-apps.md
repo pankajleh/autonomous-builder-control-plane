@@ -1,6 +1,6 @@
 # Remote Node apps: Node apps and the shared Postgres on a remote target (BF-14.2b-1)
 
-Status: **built in #95; not live** (ABCP is restarted on it with no build running, then Repo C's side follows). Repo C
+Status: **live since 2026-10-13 22:01 UTC on `a4d0506`** (#95, recorded in #96); no Node app on a target yet. Repo C's side follows. Repo C
 design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md` §11 (BF-14.2b, P0480), under the owner's approval of the design
 ("agree with 1,2,3") and "go with your recommendation options" (2026-10-13). Builds on `docs/plans/remote-sites.md`;
 the kit's Postgres `server` mode is Repo C P0481 (#494).

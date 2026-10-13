@@ -171,3 +171,5 @@ PR #93 (2026-10-14) adds remote sites (BF-14.2a): releases checked against their
 PR #94 (2026-10-14) records #93 live: ABCP on `15f994b` since 20:47 UTC on 2026-10-13; no release or site yet; a wrong digest and a release without a manifest refused.
 
 PR #95 (2026-10-14) adds remote Node apps (BF-14.2b-1): Node releases, one shared Postgres per target with a login, database and internal network per app (the password made and kept on the server), the app container, a backup before every update, a switch back when a new version never answers, and the backups routes.
+
+PR #96 (2026-10-14) records #95 live: ABCP on `a4d0506` since 22:01 UTC on 2026-10-13; no Node app yet; malformed Node releases and unknown targets refused.
