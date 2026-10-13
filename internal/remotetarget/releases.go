@@ -20,7 +20,8 @@ import (
 )
 
 // A release is one app version's files as a tar, named by the tar's SHA-256
-// (Repo C design note BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md §11, BF-14.2a). It
+// (Repo C design note BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md §11, BF-14.2a, and
+// kind node from BF-14.2b). It
 // carries autobuild-release.json, the manifest, which names every other file
 // with its SHA-256 and size. ABCP keeps it under <dir>/releases and never
 // changes it; what reaches a server is checked against the manifest there.
@@ -244,7 +245,7 @@ func readReleaseTar(r io.Reader) (manifest, error) {
 	}
 	var man manifest
 	if strictjson.Decode(manifestData, &man) != nil || man.SchemaVersion != manifestSchema || !appPattern.MatchString(man.App) ||
-		!versionPattern.MatchString(man.Version) || man.Kind != "static" || len(man.Files) != len(seen) || len(man.Files) == 0 {
+		!versionPattern.MatchString(man.Version) || (man.Kind != kindStatic && man.Kind != kindNode) || len(man.Files) != len(seen) || len(man.Files) == 0 {
 		return manifest{}, invalid
 	}
 	if !sort.SliceIsSorted(man.Files, func(i, j int) bool { return man.Files[i].Path < man.Files[j].Path }) {
@@ -257,7 +258,8 @@ func readReleaseTar(r io.Reader) (manifest, error) {
 		}
 		index = index || f.Path == "index.html"
 	}
-	if !index {
+	// A static site opens from index.html; a Node app follows Node format 1.
+	if (man.Kind == kindStatic && !index) || (man.Kind == kindNode && !validNodeFiles(man.Files)) {
 		return manifest{}, invalid
 	}
 	return man, nil
