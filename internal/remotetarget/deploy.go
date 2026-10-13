@@ -107,9 +107,11 @@ type operationRecord struct {
 	Host          string                 `json:"host,omitempty"`
 	Release       string                 `json:"release,omitempty"`
 	// Replaces and Sandbox are a Node app's (BF-14.2b): the release a failed
-	// update switches back to, and the runtime its app runs on.
+	// update switches back to, and the runtime its app runs on. Backup is the
+	// backup a restore puts back or a check restores.
 	Replaces string `json:"replaces,omitempty"`
 	Sandbox  string `json:"sandbox,omitempty"`
+	Backup   string `json:"backup,omitempty"`
 }
 
 // remote runs scripts on a target.
@@ -147,9 +149,13 @@ func planHash(p serviceapi.PlanV1) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// CreatePlan says what putting a release on a target as a site would do.
-// Nothing on the target changes.
+// CreatePlan says what putting a release on a target as a site would do, or
+// restoring one of a Node app's backups (restore.go). Nothing on the target
+// changes.
 func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.PlanCreateV1) (serviceapi.PlanV1, error) {
+	if create.Restore != nil {
+		return m.createRestorePlan(key, create)
+	}
 	name, host := create.Site.Name, strings.TrimSuffix(strings.ToLower(strings.TrimSpace(create.Site.Host)), ".")
 	if !siteNamePattern.MatchString(name) || !validHost(host) || !digestPattern.MatchString(create.Release) {
 		return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
@@ -264,15 +270,22 @@ func (m *Manager) Apply(_ context.Context, key string, apply serviceapi.ApplyV1)
 			return serviceapi.OperationV1{}, serviceapi.ErrPlanStale
 		}
 	}
+	kind, backup := "apply", ""
+	if plan.Kind == planRestore {
+		if restoreStale(r, plan) {
+			return serviceapi.OperationV1{}, serviceapi.ErrPlanStale
+		}
+		kind, backup = "restore", plan.Backup.BackupID
+	}
 	op := serviceapi.OperationV1{
-		SchemaVersion: serviceapi.OperationSchemaV1, OperationID: newID("op-"), Target: key, Kind: "apply",
+		SchemaVersion: serviceapi.OperationSchemaV1, OperationID: newID("op-"), Target: key, Kind: kind,
 		Site: plan.Site.Name, PlanID: plan.PlanID, RequestID: apply.RequestID, State: opQueued, StartedAt: m.stamp(),
 	}
 	for _, step := range plan.Steps {
 		op.Steps = append(op.Steps, serviceapi.OperationStepV1{Name: step, State: "pending"})
 	}
 	rec := operationRecord{SchemaVersion: operationSchema, Operation: op, Host: plan.Site.Host, Release: plan.Release.Digest,
-		Replaces: plan.Replaces, Sandbox: plan.Sandbox}
+		Replaces: plan.Replaces, Sandbox: plan.Sandbox, Backup: backup}
 	if err := m.writeJSON(filepath.Join(m.dir, "operations"), op.OperationID, rec); err != nil {
 		return serviceapi.OperationV1{}, err
 	}
@@ -442,6 +455,12 @@ func (m *Manager) run(rec operationRecord) {
 		failed = m.runRemove(ctx, &rec, r, session)
 	case "backup":
 		failed = m.runBackup(ctx, &rec, r, session)
+	case "restore":
+		failed = m.runRestore(ctx, &rec, r, session)
+	case "check_backup":
+		failed = m.runCheckBackup(ctx, &rec, r, session)
+	case "nightly":
+		failed = m.runNightly(ctx, &rec, r, session)
 	default:
 		failed = m.runApply(ctx, &rec, r, session)
 	}
@@ -449,21 +468,26 @@ func (m *Manager) run(rec operationRecord) {
 
 // step runs one named step, recording it before and after.
 func (m *Manager) step(rec *operationRecord, name string, work func() (string, error)) error {
-	m.setStep(rec, name, "running", "")
+	return m.siteStep(rec, name, "", work)
+}
+
+// siteStep runs the named step for one app of the nightly backups.
+func (m *Manager) siteStep(rec *operationRecord, name, site string, work func() (string, error)) error {
+	m.setStep(rec, name, site, "running", "")
 	detail, err := work()
 	if err != nil {
-		m.setStep(rec, name, "failed", stepDetail(err))
+		m.setStep(rec, name, site, "failed", stepDetail(err))
 		return err
 	}
-	m.setStep(rec, name, "done", detail)
+	m.setStep(rec, name, site, "done", detail)
 	return nil
 }
 
-func (m *Manager) setStep(rec *operationRecord, name, state, detail string) {
+func (m *Manager) setStep(rec *operationRecord, name, site, state, detail string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i := range rec.Operation.Steps {
-		if rec.Operation.Steps[i].Name == name {
+		if rec.Operation.Steps[i].Name == name && rec.Operation.Steps[i].Site == site {
 			rec.Operation.Steps[i].State, rec.Operation.Steps[i].At, rec.Operation.Steps[i].Detail = state, m.stamp(), detail
 		}
 	}
@@ -473,7 +497,7 @@ func (m *Manager) setStep(rec *operationRecord, name, state, detail string) {
 func (m *Manager) markFirstPending(rec *operationRecord, state, detail string) {
 	for _, s := range rec.Operation.Steps {
 		if s.State == "pending" {
-			m.setStep(rec, s.Name, state, detail)
+			m.setStep(rec, s.Name, s.Site, state, detail)
 			return
 		}
 	}
@@ -548,7 +572,8 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 			}
 		case "back_up":
 			err = m.step(rec, s.Name, func() (string, error) {
-				return m.backUp(ctx, session, r.Key, site, reasonBeforeUpdate, rec.Replaces)
+				_, detail, err := m.backUp(ctx, session, r.Key, site, reasonBeforeUpdate, rec.Replaces, "")
+				return detail, err
 			})
 		case "start_app":
 			err = m.step(rec, s.Name, func() (string, error) {

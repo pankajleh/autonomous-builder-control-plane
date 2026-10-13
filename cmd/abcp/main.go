@@ -954,7 +954,8 @@ func serveCommand(args []string, stderr io.Writer) int {
 		accountLanes = manager
 	}
 	// Remote targets (docs/plans/remote-targets.md): without the folder the routes say they are unsupported.
-	// The same folder keeps their releases, plans and operations (BF-14.2a).
+	// The same folder keeps their releases, plans and operations (BF-14.2a); the targets' Node apps are
+	// backed up and their backups checked every night at 02:30 India time (docs/plans/remote-restore.md).
 	var targets serviceapi.TargetController
 	var deployments serviceapi.DeploymentController
 	if *targetsDir != "" {
@@ -964,6 +965,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 			return 1
 		}
 		targets, deployments = manager, manager
+		go manager.Nightly(ctx)
 	}
 	// Only a controller with its profiles answers GET /v1/engines; without one the route says it is unsupported.
 	var engines serviceapi.EngineCatalog

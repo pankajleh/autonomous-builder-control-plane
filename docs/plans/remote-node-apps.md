@@ -68,5 +68,5 @@ gains the backups routes.
 
 Restart ABCP on the merged commit with no build running (same flags), and check that `GET /v1/targets/{key}/sites/x/backups`
 answers `404` for an unknown target and a Node release missing `server.js` is refused `400 release_invalid`. P1, P1b
-and P2 on the server run on host 1 once it is enrolled and P0 has passed. Restore, the restore proof and nightly
-backups follow (BF-14.2b-1, second part).
+and P2 on the server run on host 1 once it is enrolled and P0 has passed. Restore, the restore check and nightly
+backups are `docs/plans/remote-restore.md` (#97).

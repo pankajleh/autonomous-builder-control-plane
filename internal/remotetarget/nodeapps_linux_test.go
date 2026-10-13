@@ -155,7 +155,8 @@ func TestANodeAppGetsTheSharedDatabaseItsOwnLoginAndNetworkAndABackupBeforeEachU
 	}
 	backups, _ := f.m.Backups(context.Background(), f.key, "crm")
 	if len(backups.Backups) != 1 || backups.Backups[0].Reason != reasonBeforeUpdate || backups.Backups[0].Release != first || backups.Backups[0].Bytes == 0 ||
-		!backupIDPattern.MatchString(backups.Backups[0].BackupID) {
+		!backupIDPattern.MatchString(backups.Backups[0].BackupID) || backups.Backups[0].Tables == nil || *backups.Backups[0].Tables != 0 ||
+		backups.Backups[0].Rows == nil || *backups.Backups[0].Rows != 0 || backups.Backups[0].Check != nil {
 		t.Fatalf("backups = %+v", backups)
 	}
 	dump, err := os.ReadFile(filepath.Join(home, "autobuild/backups/crm", backups.Backups[0].BackupID+".dump"))
@@ -324,20 +325,29 @@ func TestANodeAppRunsUnderGVisorWhenTheServerHasIt(t *testing.T) {
 
 func TestBackupsAreKeptSevenDaysAndAtMostFourteenAndTheNewestAlways(t *testing.T) {
 	now := time.Date(2026, 10, 14, 1, 0, 0, 0, time.UTC)
-	backup := func(age time.Duration, n int) serviceapi.BackupV1 {
-		return serviceapi.BackupV1{BackupID: fmt.Sprintf("bk-%s-%04x", now.Add(-age).Format("20060102T150405Z"), n), TakenAt: now.Add(-age).Format(time.RFC3339)}
+	backup := func(age time.Duration, n int) backupRecord {
+		return backupRecord{BackupV1: serviceapi.BackupV1{BackupID: fmt.Sprintf("bk-%s-%04x", now.Add(-age).Format("20060102T150405Z"), n),
+			TakenAt: now.Add(-age).Format(time.RFC3339)}}
 	}
-	var list []serviceapi.BackupV1
+	var list []backupRecord
 	for i := 16; i > 0; i-- {
 		list = append(list, backup(time.Duration(i)*time.Hour, i))
 	}
-	kept, drop := pruneBackupList(list, now)
+	kept, drop := pruneBackupList(list, now, "")
 	if len(kept) != 14 || len(drop) != 2 || drop[0] != list[0].BackupID || kept[13].BackupID != list[15].BackupID {
 		t.Fatalf("kept %d, dropped %v", len(kept), drop)
 	}
-	old := []serviceapi.BackupV1{backup(10*24*time.Hour, 1), backup(9*24*time.Hour, 2)}
-	kept, drop = pruneBackupList(old, now)
+	// The backup a restore puts back is kept while it runs.
+	kept, drop = pruneBackupList(list, now, list[0].BackupID)
+	if len(kept) != 14 || kept[0].BackupID != list[0].BackupID || strings.Join(drop, " ") != list[1].BackupID+" "+list[2].BackupID {
+		t.Fatalf("kept %d, dropped %v", len(kept), drop)
+	}
+	old := []backupRecord{backup(10*24*time.Hour, 1), backup(9*24*time.Hour, 2)}
+	kept, drop = pruneBackupList(old, now, "")
 	if len(kept) != 1 || kept[0].BackupID != old[1].BackupID || len(drop) != 1 {
 		t.Fatalf("the newest stays: kept %+v dropped %v", kept, drop)
+	}
+	if kept, _ = pruneBackupList(old, now, old[0].BackupID); len(kept) != 2 {
+		t.Fatalf("an old backup being restored stays: %+v", kept)
 	}
 }
