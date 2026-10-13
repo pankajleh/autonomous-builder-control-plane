@@ -166,4 +166,6 @@ PR #91 (2026-10-14) adds `targets.control` to Repo C's principal in the versione
 
 PR #92 (2026-10-14) records #90 live: ABCP on `5ab7575` since 19:22:19 UTC on 2026-10-13 with `--targets-dir`, no targets yet; private and loopback addresses refused.
 
-PR #93 (2026-10-14) adds remote sites (BF-14.2a): releases checked against their manifest, plans sealed by a hash, apply as an operation, and on the server releases, a link per site and one rootless Caddy front door; not live yet.
+PR #93 (2026-10-14) adds remote sites (BF-14.2a): releases checked against their manifest, plans sealed by a hash, apply as an operation, and on the server releases, a link per site and one rootless Caddy front door.
+
+PR #94 (2026-10-14) records #93 live: ABCP on `15f994b` since 20:47 UTC on 2026-10-13; no release or site yet; a wrong digest and a release without a manifest refused.
