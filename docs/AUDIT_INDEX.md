@@ -157,3 +157,5 @@ PR #86 (2026-10-12) lets a product admission carry an optional model and reasoni
 PR #87 (2026-10-12) records #86 live: ABCP on `813bdfe` since 20:47:45 UTC with the versioned profiles, `GET /v1/engines` answering 31 profiles with choices.
 
 PR #88 (2026-10-13) adds account lanes: engine lanes for an administrator's own Codex or Claude account, signed in and out through `/v1/account-lanes` by a service principal granted `accounts.control` (`docs/plans/account-lanes.md`). Its authority is the owner's 2026-10-11 request to allow personal Codex and Claude accounts and their 2026-10-13 go ("u can do 4c."), recorded in Repo C `docs/operator/OWNER_INPUTS_LEDGER.md` and design note `AI_KEYS_AND_MODELS.md` §9.5 (step 4c). No credential leaves ABCP.
+
+PR #89 (2026-10-13) records #88 live: ABCP on `ab633e7` since 07:02:24 UTC with the account lanes `codex-account` and `claude-account`, both signed out.

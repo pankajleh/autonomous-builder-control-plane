@@ -1,6 +1,6 @@
 # Account lanes: an administrator's own Codex or Claude account
 
-Status: **built, not yet live** (this PR). Repo C design note `AI_KEYS_AND_MODELS.md` §9.5, step 4c.
+Status: **live since 2026-10-13 07:02 UTC** (#88, `ab633e7`; host lanes, templates and files in place, ABCP restarted with no build running; recorded in #89). Repo C design note `AI_KEYS_AND_MODELS.md` §9.5, step 4c.
 
 ## Why
 
@@ -69,3 +69,14 @@ stay on the server's sign-in or an API key (Repo C decides which builds use it).
 ## Next
 
 - Repo C's page and routing.
+
+## Live check (2026-10-13)
+
+- **The host:** in `abcp-config/lanes`, the two homes (0700) and lane files (0600, giving only their home); the four
+  manifest templates; the versioned `account-lanes.json`, `grants.json` and `profiles.json`. The drift check says OK
+  for the three.
+- **The restart:** ABCP started on `ab633e7` at 07:02:24 UTC, with no build running, and listens with its 8 preview
+  profiles available.
+- **The answers:** `GET /v1/engines` answers 36 profiles; the 32 before are ready and the four account ones say
+  `lane_no_key` until signed in. `GET /v1/account-lanes` answers both lanes `signed_out`. A token that is not one
+  answers 400, an unknown lane 404. Nothing was signed in.
