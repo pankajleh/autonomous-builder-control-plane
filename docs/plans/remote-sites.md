@@ -1,6 +1,7 @@
 # Remote sites: a static site on a remote target (BF-14.2a)
 
-Status: **built in #93; not live** (ABCP is restarted on it with no build running, then Repo C's side follows). Repo C
+Status: **live since 2026-10-13 20:47 UTC** (#93, `15f994b`; ABCP restarted on it with no build running, recorded in #94).
+No site exists yet: Repo C's side follows, then P0 on host 1. Repo C
 design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md` §11 (BF-14.2a, P0477), under the owner's approval of the design
 ("agree with 1,2,3") and "go with your recommendation options" (2026-10-13). Builds on `docs/plans/remote-targets.md`.
 
