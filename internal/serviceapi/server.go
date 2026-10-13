@@ -170,6 +170,10 @@ type ServerConfig struct {
 	// AccountLanes, when set, answers /v1/account-lanes (step 4c) for a service
 	// principal granted accounts.control.
 	AccountLanes AccountLaneController
+	// Targets, when set, answers /v1/targets (Repo C design note
+	// BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md, BF-14.1) for a service principal
+	// granted targets.control.
+	Targets TargetController
 	// RequestLog, when set, gets one line per request with its X-Request-ID (Repo C design note REQUEST_IDS.md).
 	RequestLog io.Writer
 }
@@ -374,6 +378,8 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.engines(writer, request, requestID)
 	case "/v1/account-lanes":
 		s.accountLanes(writer, request, principal, requestID)
+	case "/v1/targets":
+		s.targets(writer, request, principal, requestID)
 	case "/v1/runs":
 		s.runs(writer, request, principal, requestID)
 	case "/v1/development-runs":
@@ -387,6 +393,10 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		if strings.HasPrefix(request.URL.Path, "/v1/account-lanes/") {
 			s.accountLanes(writer, request, principal, requestID)
+			return
+		}
+		if strings.HasPrefix(request.URL.Path, "/v1/targets/") {
+			s.targets(writer, request, principal, requestID)
 			return
 		}
 		s.runRoute(writer, request, principal, requestID)

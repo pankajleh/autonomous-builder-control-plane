@@ -22,6 +22,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
   - engine lanes (#68, #70, #72);
   - parallel builds, three at once on the live host (#73);
   - review settings: an outside review tool and the review helpers (#76);
+  - remote targets: Linux servers reached over SSH, registered, confirmed and checked read-only (#90; BF-14.1);
   - a build that starts from a template copy: the request names the template, ABCP checks the copy before acceptance (#80, live since 2026-10-11 03:30 UTC); the web-app and node-app profiles name the library's mirror (#83);
   - the engines read by Repo C: `GET /v1/engines` answers each profile's executor, models, reasoning, lane and whether its credentials are in place, never a value (#84, live since 2026-10-12 19:59 UTC, recorded in #85);
   - model and reasoning per build: a request may pick the task's model and level from its profile's `executor_choices`, pinned in the run's manifest; `/v1/engines` gives the choices (#86, live since 2026-10-12 20:47 UTC, recorded in #87);
