@@ -85,8 +85,11 @@ func newLocalRemote(t *testing.T) *localRemote {
 	l := &localRemote{home: t.TempDir(), bin: t.TempDir()}
 	// The fake keeps containers, networks, volumes and images as files under
 	// $HOME/.docker, and the shared Postgres's roles and databases too, so a
-	// script sees what earlier scripts did. A Node app answers /health unless
-	// $HOME/app.fails-once was there when it started.
+	// script sees what earlier scripts did; a database's file holds its rows
+	// as the backup and restore scripts count them, which a dump carries after
+	// its first line. A Node app answers /health unless $HOME/app.fails-once
+	// was there when it started; $HOME/restore.loses-rows makes a restore
+	// lose every row.
 	fake := `#!/bin/sh
 echo "$@" >> "$HOME/docker.log"
 S="$HOME/.docker"
@@ -112,15 +115,40 @@ case "$1" in
     shift; if [ "$1" = "-i" ]; then shift; fi
     n=$1; shift
     [ -f "$S/c-$n" ] || exit 1
+    db=""; prev=""; for a; do [ "$prev" = "-d" ] && db=$a; prev=$a; done
+    rows() { if [ -s "$S/db-$1" ]; then cat "$S/db-$1"; else echo '{}'; fi; }
+    mkdir -p "$S/scratch"
     case "$*" in
       *pg_isready*) exit 0 ;;
-      *pg_dump*) printf 'PGDMP fake dump of %s\n' "$(last "$@")" ;;
+      "/bin/sh -c "*) shift 2; sh -c "$(printf '%s' "$1" | sed "s|/scratch|$S/scratch|g")" ;;
+      *pg_restore*)
+        [ -f "$S/db-$db" ] || exit 1
+        tail -n +2 > "$S/db-$db"
+        if [ -f "$HOME/restore.loses-rows" ]; then echo '{"public.members":0}' > "$S/db-$db"; fi ;;
       *"FROM pg_roles"*) r=$(echo "$*" | sed -n "s/.*rolname = '\([a-z0-9_]*\)'.*/\1/p"); if [ -f "$S/role-$r" ]; then echo 1; fi ;;
       *"FROM pg_database"*) d=$(echo "$*" | sed -n "s/.*datname = '\([a-z0-9_]*\)'.*/\1/p"); if [ -f "$S/db-$d" ]; then echo 1; fi ;;
       *"CREATE DATABASE"*) d=$(echo "$*" | sed -n 's/.*CREATE DATABASE \([a-z0-9_]*\) .*/\1/p'); touch "$S/db-$d" ;;
+      *"DROP DATABASE"*) d=$(echo "$*" | sed -n 's/.*DROP DATABASE IF EXISTS \([a-z0-9_]*\) .*/\1/p'); rm -f "$S/db-$d" ;;
       *psql*)
         sql=$(cat); echo "$sql" >> "$S/psql.stdin"
-        r=$(echo "$sql" | sed -n 's/^\(CREATE\|ALTER\) ROLE \([a-z0-9_]*\) .*/\2/p'); if [ -n "$r" ]; then touch "$S/role-$r"; fi ;;
+        r=$(echo "$sql" | sed -n 's/^\(CREATE\|ALTER\) ROLE \([a-z0-9_]*\) .*/\2/p'); if [ -n "$r" ]; then touch "$S/role-$r"; fi
+        case "$sql" in
+          *pg_export_snapshot*)
+            c=$(echo "$sql" | sed -n 's|^\\o /scratch/\(.*\)$|\1|p')
+            rows "$db" > "$S/scratch/$c"
+            printf 'PGDMP fake dump of %s\n' "$db"; rows "$db" ;;
+          *json_object_agg*) rows "$db" ;;
+        esac
+        echo "$sql" | while IFS= read -r line; do
+          case "$line" in
+            "DROP DATABASE "*) rm -f "$S/db-$(echo "$line" | sed -n 's/^DROP DATABASE \(IF EXISTS \)\{0,1\}\([a-z0-9_]*\).*/\2/p')" ;;
+            "ALTER DATABASE "*)
+              from=$(echo "$line" | sed -n 's/^ALTER DATABASE \([a-z0-9_]*\) RENAME TO .*/\1/p')
+              to=$(echo "$line" | sed -n 's/^ALTER DATABASE [a-z0-9_]* RENAME TO \([a-z0-9_]*\);$/\1/p')
+              [ -f "$S/db-$from" ] || exit 1
+              mv "$S/db-$from" "$S/db-$to" ;;
+          esac
+        done || exit 1 ;;
       *wget*) if [ -f "$S/c-$n.unhealthy" ]; then exit 1; fi ;;
     esac ;;
   network)

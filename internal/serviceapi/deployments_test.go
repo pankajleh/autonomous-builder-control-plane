@@ -31,7 +31,11 @@ func (d *testDeployments) Release(_ context.Context, digest string) (ReleaseV1, 
 	return ReleaseV1{SchemaVersion: ReleaseSchemaV1, Digest: digest}, d.err
 }
 func (d *testDeployments) CreatePlan(_ context.Context, target string, c PlanCreateV1) (PlanV1, error) {
-	d.calls = append(d.calls, "plan:"+target+":"+c.Release[:8]+":"+c.Site.Name+":"+c.Site.Host)
+	if c.Restore != nil {
+		d.calls = append(d.calls, "restore:"+target+":"+c.Restore.Site+":"+c.Restore.Backup)
+	} else {
+		d.calls = append(d.calls, "plan:"+target+":"+c.Release[:8]+":"+c.Site.Name+":"+c.Site.Host)
+	}
 	return PlanV1{SchemaVersion: PlanSchemaV1, PlanID: "pln-0123456789abcdef", Target: target, Steps: []string{"send_files"}, Hash: strings.Repeat("a", 64)}, d.err
 }
 func (d *testDeployments) Apply(_ context.Context, target string, a ApplyV1) (OperationV1, error) {
@@ -58,6 +62,11 @@ func (d *testDeployments) Backups(_ context.Context, target, site string) (Backu
 }
 func (d *testDeployments) BackUp(_ context.Context, target, site string, c BackupCreateV1) (OperationV1, error) {
 	d.calls = append(d.calls, "backup:"+target+":"+site+":"+c.RequestID)
+	return sampleOperation, d.err
+}
+
+func (d *testDeployments) CheckBackup(_ context.Context, target, site, backup string, c BackupCreateV1) (OperationV1, error) {
+	d.calls = append(d.calls, "check:"+target+":"+site+":"+backup+":"+c.RequestID)
 	return sampleOperation, d.err
 }
 
@@ -109,10 +118,17 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 	if r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups", `{"request_id":"req-backup-01"}`); r.Code != http.StatusAccepted {
 		t.Fatalf("back up = %d", r.Code)
 	}
+	if r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/plans", `{"restore":{"site":"shop","backup":"bk-20261014T013000Z-0a1b"}}`); r.Code != http.StatusCreated {
+		t.Fatalf("restore plan = %d %s", r.Code, r.Body.String())
+	}
+	if r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b/check", `{"request_id":"req-check-001"}`); r.Code != http.StatusAccepted {
+		t.Fatalf("check = %d %s", r.Code, r.Body.String())
+	}
 	want := []string{"put:" + digest, "get:" + digest, "plan:srv-0123456789ab:abababab:shop:13-232-1-2.sslip.io",
 		"apply:srv-0123456789ab:pln-0123456789abcdef:req-12345678", "op:srv-0123456789ab:op-0123456789abcdef", "sites:srv-0123456789ab",
 		"remove:srv-0123456789ab:shop:req-87654321",
-		"backups:srv-0123456789ab:shop", "backup:srv-0123456789ab:shop:req-backup-01"}
+		"backups:srv-0123456789ab:shop", "backup:srv-0123456789ab:shop:req-backup-01",
+		"restore:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b", "check:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b:req-check-001"}
 	if strings.Join(backend.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v", backend.calls)
 	}
@@ -132,6 +148,12 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/Shop/backups", ""},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups", `{"request_id":"req-backup-01","extra":1}`},
 		{http.MethodDelete, "/v1/targets/srv-0123456789ab/sites/shop/backups", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/plans", `{"restore":{"site":"shop","backup":"bk-1","extra":1}}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-1/check", `{"request_id":"req-check-001"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b/check", `{"request_id":"req-check-001","x":1}`},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b/check", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b/restore", `{"request_id":"req-check-001"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b/check/now", `{"request_id":"req-check-001"}`},
 	} {
 		if r := call(s, bad.method, bad.path, bad.body); r.Code != http.StatusBadRequest {
 			t.Errorf("%s %s = %d", bad.method, bad.path, r.Code)

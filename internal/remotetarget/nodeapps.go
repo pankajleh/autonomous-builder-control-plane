@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -24,7 +25,9 @@ import (
 // ~/autobuild/apps/<site>/database.env. Before an update replaces a release,
 // the app's database is backed up into ~/autobuild/backups/<site>/; a new
 // version that never answers /health is switched back to the release it
-// replaced, and data is never restored on its own.
+// replaced, and data is never restored on its own. Every backup counts each
+// table's rows in the same snapshot as its dump, so restoring it can be checked
+// (restore.go).
 
 // The kit's images, by digest: Node format 1's runtime, and the Postgres with
 // its server mode (Repo C tools/node-kit, published by node-runtime.yml: the
@@ -41,12 +44,18 @@ const (
 	sandboxGVisor   = "gvisor"
 	sandboxStandard = "standard"
 
-	reasonBeforeUpdate = "before_update"
-	reasonManual       = "manual"
+	reasonBeforeUpdate  = "before_update"
+	reasonBeforeRestore = "before_restore"
+	reasonNightly       = "nightly"
+	reasonManual        = "manual"
 
 	// Backups are kept 7 days and at most 14, and the newest always.
 	backupKeep  = 7 * 24 * time.Hour
 	backupLimit = 14
+	// A database's tables, as a backup counts them, and the length of a
+	// table's name as quote_ident gives it with its schema.
+	maxTables    = 2000
+	maxTableName = 260
 	// defaultHealthWait bounds how long a new version may take to answer
 	// /health, migrations first.
 	defaultHealthWait = 120
@@ -61,10 +70,51 @@ var (
 // databaseRecord is a Node app's database on its target. It is kept after the
 // app is removed, with its backups, until it is removed in its own right.
 type databaseRecord struct {
-	Site      string                `json:"site"`
-	Name      string                `json:"name"`
-	CreatedAt string                `json:"created_at"`
-	Backups   []serviceapi.BackupV1 `json:"backups,omitempty"`
+	Site      string         `json:"site"`
+	Name      string         `json:"name"`
+	CreatedAt string         `json:"created_at"`
+	Backups   []backupRecord `json:"backups,omitempty"`
+}
+
+// backupRecord is a backup as ABCP keeps it: what it shows, and each table's
+// rows when it was taken (when Tables is set), which a check compares a
+// restore with.
+type backupRecord struct {
+	serviceapi.BackupV1
+	Counts map[string]int64 `json:"counts,omitempty"`
+}
+
+func findBackup(d databaseRecord, id string) (backupRecord, bool) {
+	for _, b := range d.Backups {
+		if b.BackupID == id {
+			return b, true
+		}
+	}
+	return backupRecord{}, false
+}
+
+// parseCounts reads the rows of each table as a backup or a restore counted
+// them: a JSON object of table names and counts.
+func parseCounts(text string) (map[string]int64, error) {
+	counts := map[string]int64{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &counts); err != nil || len(counts) > maxTables {
+		return nil, errStep("the rows could not be counted")
+	}
+	for name, n := range counts {
+		if name == "" || len(name) > maxTableName || n < 0 {
+			return nil, errStep("the rows could not be counted")
+		}
+	}
+	return counts, nil
+}
+
+// countTotals is a database's tables and rows.
+func countTotals(counts map[string]int64) (int, int64) {
+	var rows int64
+	for _, n := range counts {
+		rows += n
+	}
+	return len(counts), rows
 }
 
 // databaseName is a site's database and login: app_ and its name, hyphens as
@@ -164,23 +214,28 @@ func newBackupID(now time.Time) string {
 	return "bk-" + now.UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b)
 }
 
-// backUp dumps a Node app's database on its target, records the backup and
-// prunes the ones no longer kept. It answers the step's detail.
-func (m *Manager) backUp(ctx context.Context, session remote, key, site, reason, release string) (string, error) {
+// backUp dumps a Node app's database on its target, with each table's rows
+// counted in the dump's own snapshot, records the backup and prunes the ones
+// no longer kept, never the one named keep (a restore's). It answers the new
+// backup's id and the step's detail.
+func (m *Manager) backUp(ctx context.Context, session remote, key, site, reason, release, keep string) (string, string, error) {
 	db := databaseName(site)
 	if !siteNamePattern.MatchString(site) || !databasePattern.MatchString(db) {
-		return "", errStep("failed")
+		return "", "", errStep("failed")
 	}
 	id := newBackupID(m.now())
 	out, err := run(ctx, session, fill(backupScript, "N", site, "DB", db, "ID", id), nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	size, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-	if err != nil || size <= 0 {
-		return "", errStep("the backup is empty")
+	size, counts, err := parseBackup(out)
+	if err != nil {
+		_, _ = run(ctx, session, fill(removeBackupsScript, "N", site, "LIST", id), nil)
+		return "", "", err
 	}
-	backup := serviceapi.BackupV1{BackupID: id, Reason: reason, TakenAt: m.stamp(), Bytes: size, Release: release}
+	tables, rows := countTotals(counts)
+	backup := backupRecord{BackupV1: serviceapi.BackupV1{BackupID: id, Reason: reason, TakenAt: m.stamp(), Bytes: size, Release: release,
+		Tables: &tables, Rows: &rows}, Counts: counts}
 	m.mu.Lock()
 	var drop []string
 	if r, err := m.read(key); err == nil {
@@ -189,7 +244,7 @@ func (m *Manager) backUp(ctx context.Context, session remote, key, site, reason,
 			d = databaseRecord{Site: site, Name: db, CreatedAt: m.stamp()}
 		}
 		d.Backups = append(d.Backups, backup)
-		d.Backups, drop = pruneBackupList(d.Backups, m.now())
+		d.Backups, drop = pruneBackupList(d.Backups, m.now(), keep)
 		setDatabase(&r, d)
 		_ = m.write(r)
 	}
@@ -197,27 +252,46 @@ func (m *Manager) backUp(ctx context.Context, session remote, key, site, reason,
 	if len(drop) > 0 {
 		_, _ = run(ctx, session, fill(removeBackupsScript, "N", site, "LIST", strings.Join(drop, " ")), nil)
 	}
-	return fmt.Sprintf("%d bytes", size), nil
+	return id, fmt.Sprintf("%d bytes, %d tables, %d rows", size, tables, rows), nil
 }
 
-// pruneBackupList keeps the backups of the last 7 days, at most 14, and the
-// newest always; it answers what it keeps and the ids it drops.
-func pruneBackupList(backups []serviceapi.BackupV1, now time.Time) ([]serviceapi.BackupV1, []string) {
-	var kept []serviceapi.BackupV1
+// parseBackup reads what the backup script printed: the dump's size, then each
+// table's rows.
+func parseBackup(out string) (int64, map[string]int64, error) {
+	size, rest, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	n, err := strconv.ParseInt(strings.TrimSpace(size), 10, 64)
+	if err != nil || n <= 0 {
+		return 0, nil, errStep("the backup is empty")
+	}
+	counts, err := parseCounts(rest)
+	if err != nil {
+		return 0, nil, err
+	}
+	return n, counts, nil
+}
+
+// pruneBackupList keeps the backups of the last 7 days, at most 14, the newest
+// always and the one named keep; it answers what it keeps and the ids it drops.
+func pruneBackupList(backups []backupRecord, now time.Time, keep string) ([]backupRecord, []string) {
+	var kept []backupRecord
 	var drop []string
 	for i, b := range backups {
 		taken, err := time.Parse(time.RFC3339, b.TakenAt)
-		if i == len(backups)-1 || (err == nil && now.Sub(taken) < backupKeep) {
+		if i == len(backups)-1 || b.BackupID == keep || (err == nil && now.Sub(taken) < backupKeep) {
 			kept = append(kept, b)
 		} else if backupIDPattern.MatchString(b.BackupID) {
 			drop = append(drop, b.BackupID)
 		}
 	}
-	for len(kept) > backupLimit {
-		if backupIDPattern.MatchString(kept[0].BackupID) {
-			drop = append(drop, kept[0].BackupID)
+	for i := 0; len(kept) > backupLimit && i < len(kept); {
+		if kept[i].BackupID == keep {
+			i++
+			continue
 		}
-		kept = kept[1:]
+		if backupIDPattern.MatchString(kept[i].BackupID) {
+			drop = append(drop, kept[i].BackupID)
+		}
+		kept = append(kept[:i], kept[i+1:]...)
 	}
 	return kept, drop
 }
@@ -238,7 +312,9 @@ func (m *Manager) Backups(_ context.Context, key, site string) (serviceapi.Backu
 		return serviceapi.BackupsV1{}, serviceapi.ErrSiteUnknown
 	}
 	out := serviceapi.BackupsV1{SchemaVersion: serviceapi.BackupsSchemaV1, Target: key, Site: site, Database: d.Name, Backups: []serviceapi.BackupV1{}}
-	out.Backups = append(out.Backups, d.Backups...)
+	for _, b := range d.Backups {
+		out.Backups = append(out.Backups, b.BackupV1)
+	}
 	return out, nil
 }
 
@@ -290,7 +366,10 @@ func (m *Manager) runBackup(ctx context.Context, rec *operationRecord, r record,
 	if s, ok := findSite(r, site); ok {
 		current = s.Release
 	}
-	if err := m.step(rec, "back_up", func() (string, error) { return m.backUp(ctx, session, r.Key, site, reasonManual, current) }); err != nil {
+	if err := m.step(rec, "back_up", func() (string, error) {
+		_, detail, err := m.backUp(ctx, session, r.Key, site, reasonManual, current, "")
+		return detail, err
+	}); err != nil {
 		return stepDetail(err)
 	}
 	return ""
@@ -336,7 +415,15 @@ func runtimeFlag(sandbox string) string {
 // number of seconds) is checked by ABCP against a narrow pattern or fixed
 // before it is put in.
 const (
-	psql = `/usr/lib/postgresql/17/bin/psql -h /scratch -U postgres -d postgres`
+	psqlBin = `/usr/lib/postgresql/17/bin/psql -h /scratch -U postgres`
+	psql    = psqlBin + ` -d postgres`
+
+	// countRows answers each ordinary table's rows, by schema and name, as one
+	// JSON object (query_to_xml counts each table in the same transaction).
+	countRows = `SELECT coalesce(json_object_agg(t.name, t.n ORDER BY t.name), '{}') FROM (SELECT quote_ident(s.nspname) || '.' || ` +
+		`quote_ident(c.relname) AS name, (xpath('/row/n/text()', query_to_xml(format('SELECT count(*) AS n FROM %I.%I', s.nspname, ` +
+		`c.relname), false, true, '')))[1]::text::bigint AS n FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace ` +
+		`WHERE c.relkind = 'r' AND s.nspname <> 'information_schema' AND s.nspname NOT LIKE 'pg\_%') t`
 
 	getImagesScript = `set -eu
 ` + dockerHost + `
@@ -390,15 +477,31 @@ printf 'DATABASE_URL=postgres://@DB@:%s@autobuild-postgres:5432/@DB@\n' "$pw" > 
 mv "$A/apps/@N@/.database.env.next" "$A/apps/@N@/database.env"
 echo made
 `
+	// backupScript dumps the app's database inside a transaction whose
+	// snapshot it exports, so the rows it counts there are the rows the dump
+	// holds; the counts go through the Postgres's own /scratch.
 	backupScript = `set -eu
 ` + dockerHost + `
 B="$HOME/autobuild/backups/@N@"
 umask 077
 mkdir -p "$B"
-docker exec autobuild-postgres /usr/lib/postgresql/17/bin/pg_dump -Fc -h /scratch -U postgres @DB@ > "$B/.@ID@.part"
-if [ ! -s "$B/.@ID@.part" ]; then rm -f "$B/.@ID@.part"; echo "the backup is empty" >&2; exit 4; fi
+trap 'rm -f "$B/.@ID@.part"' EXIT
+docker exec -i autobuild-postgres ` + psqlBin + ` -d @DB@ -qAtX > "$B/.@ID@.part" <<'SQL'
+\set ON_ERROR_STOP 1
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_export_snapshot() AS snap \gset
+\setenv SNAP :snap
+\o /scratch/.@ID@.counts
+` + countRows + `;
+\o
+\! /usr/lib/postgresql/17/bin/pg_dump -Fc -h /scratch -U postgres --snapshot="$SNAP" @DB@ || echo failed > /scratch/.@ID@.failed
+COMMIT;
+SQL
+counts=$(docker exec autobuild-postgres /bin/sh -c 'if [ -e /scratch/.@ID@.failed ]; then echo failed; else cat /scratch/.@ID@.counts; fi; rm -f /scratch/.@ID@.failed /scratch/.@ID@.counts')
+if [ "$counts" = failed ] || [ -z "$counts" ] || [ ! -s "$B/.@ID@.part" ]; then echo "the backup failed" >&2; exit 4; fi
 mv "$B/.@ID@.part" "$B/@ID@.dump"
 wc -c < "$B/@ID@.dump"
+printf '%s\n' "$counts"
 `
 	removeBackupsScript = `set -eu
 cd "$HOME/autobuild/backups/@N@"
