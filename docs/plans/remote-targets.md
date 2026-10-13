@@ -1,7 +1,7 @@
 # Remote targets: Linux servers ABCP reaches over SSH (BF-14.1)
 
-Status: **built in #90; not live until ABCP is restarted with `--targets-dir` and `grants.json` gives Repo C
-`targets.control`.** Repo C design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md` §5 and §11 (BF-14.1), approved by the owner
+Status: **live since 2026-10-13 19:22 UTC** (#90, `dc8b8b9`; grant #91; ABCP restarted on `5ab7575` with `--targets-dir`, recorded
+in #92). Repo C design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md` §5 and §11 (BF-14.1), approved by the owner
 on 2026-10-13 ("agree with 1,2,3").
 
 ## Why
