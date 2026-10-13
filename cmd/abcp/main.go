@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/accountlane"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/actionapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/actioncontrol"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/activity"
@@ -789,6 +790,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	grantsFile := flags.String("authority-grants-file", "", "protected exact authority grant file")
 	previewProfileFile := flags.String("preview-profile-file", "", "optional protected preview profile file")
 	admissionProfileFile := flags.String("admission-profile-file", "", "optional protected run admission profile file")
+	accountLanesFile := flags.String("account-lanes-file", "", "optional protected account lanes file (administrators' own Codex and Claude accounts)")
 	evictionInterval := flags.Duration("worktree-eviction-interval", eviction.DefaultInterval, "how often to evict retained governed worktrees (0 disables eviction)")
 	evictionIdle := flags.Duration("worktree-eviction-idle", eviction.DefaultIdle, "evict a finished run's worktree after this long without a live activity stream (0 disables the rule)")
 	evictionMaxAge := flags.Duration("worktree-eviction-max-age", eviction.DefaultMaxAge, "evict a finished run's worktree this long after it finished (0 disables the rule)")
@@ -802,7 +804,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
@@ -933,6 +935,22 @@ func serveCommand(args []string, stderr io.Writer) int {
 	if *evictionInterval > 0 {
 		go sweeper.Run(ctx, *evictionInterval)
 	}
+	// Account lanes (docs/plans/account-lanes.md): without the file the routes say they are unsupported.
+	var accountLanes serviceapi.AccountLaneController
+	if *accountLanesFile != "" {
+		file, err := accountlane.ReadFile(*accountLanesFile)
+		if err != nil {
+			fmt.Fprintln(stderr, "load account lanes configuration:", err)
+			return 1
+		}
+		manager, err := accountlane.New(file, accountlane.CodexDeviceLogin, time.Now)
+		if err != nil {
+			fmt.Fprintln(stderr, "load account lanes configuration:", err)
+			return 1
+		}
+		defer manager.Close()
+		accountLanes = manager
+	}
 	// Only a controller with its profiles answers GET /v1/engines; without one the route says it is unsupported.
 	var engines serviceapi.EngineCatalog
 	if admissions != nil {
@@ -946,7 +964,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Hosting:       hosting,
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
-		RunAdmission: admissions, DevelopmentRunAdmission: admissions, Engines: engines,
+		RunAdmission: admissions, DevelopmentRunAdmission: admissions, Engines: engines, AccountLanes: accountLanes,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "construct service API")

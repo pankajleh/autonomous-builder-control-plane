@@ -25,6 +25,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
   - a build that starts from a template copy: the request names the template, ABCP checks the copy before acceptance (#80, live since 2026-10-11 03:30 UTC); the web-app and node-app profiles name the library's mirror (#83);
   - the engines read by Repo C: `GET /v1/engines` answers each profile's executor, models, reasoning, lane and whether its credentials are in place, never a value (#84, live since 2026-10-12 19:59 UTC, recorded in #85);
   - model and reasoning per build: a request may pick the task's model and level from its profile's `executor_choices`, pinned in the run's manifest; `/v1/engines` gives the choices (#86, live since 2026-10-12 20:47 UTC, recorded in #87);
+  - account lanes: an administrator's own Codex or Claude account, signed in and out through `/v1/account-lanes` (Codex device sign-in; a Claude setup token kept only here) (#88, not yet live);
   - a preview's sample setup token: a preview profile may name `BOOTSTRAP_TOKEN` with a sample value, a hosted one never (#81, live since 2026-10-11 03:30 UTC);
   - a provider replay gap no longer makes a run impossible to preview (#82).
 - The post-EP-006 A/B/C assurance expansion remains discarded and is not part of current runtime authority.

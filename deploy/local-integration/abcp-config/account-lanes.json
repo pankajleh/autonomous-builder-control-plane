@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "lanes": [
+    {
+      "lane": "codex-account",
+      "executor": "codex",
+      "lane_file": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/lanes/codex-account.env",
+      "home": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/lanes/codex-account-home"
+    },
+    {
+      "lane": "claude-account",
+      "executor": "claude",
+      "lane_file": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/lanes/claude-account.env",
+      "home": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/lanes/claude-account-home"
+    }
+  ]
+}

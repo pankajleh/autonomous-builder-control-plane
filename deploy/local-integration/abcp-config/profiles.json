@@ -672,6 +672,94 @@
           "xhigh"
         ]
       }
+    },
+    {
+      "profile_id": "local-p02-codex-account",
+      "repository_path": "/home/devagent/local-integration/repo-c-abcp/runtime/product-repo",
+      "repository_identity": "example/product",
+      "manifest_template_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/manifest-template-codex-account.json",
+      "input_directory": ".abcp-input",
+      "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
+      "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
+      "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "profile_id": "local-p02-node-codex-account",
+      "repository_path": "/home/devagent/local-integration/repo-c-abcp/runtime/product-repo",
+      "repository_identity": "example/product",
+      "manifest_template_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/manifest-template-node-codex-account.json",
+      "input_directory": ".abcp-input",
+      "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
+      "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
+      "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "gpt-6-astra",
+          "gpt-5.6-sol"
+        ],
+        "efforts": [
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "profile_id": "local-p02-claude-account",
+      "repository_path": "/home/devagent/local-integration/repo-c-abcp/runtime/product-repo",
+      "repository_identity": "example/product",
+      "manifest_template_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/manifest-template-claude-account.json",
+      "input_directory": ".abcp-input",
+      "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
+      "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
+      "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "profile_id": "local-p02-node-claude-account",
+      "repository_path": "/home/devagent/local-integration/repo-c-abcp/runtime/product-repo",
+      "repository_identity": "example/product",
+      "manifest_template_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/manifest-template-node-claude-account.json",
+      "input_directory": ".abcp-input",
+      "ledger_root": "/home/devagent/local-integration/repo-c-abcp/runtime/ledger",
+      "evidence_root": "/home/devagent/local-integration/repo-c-abcp/runtime/evidence",
+      "cgroup_root": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
+      "workflow_authority_config_path": "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config/workflow.json",
+      "template_mirror_path": "/home/devagent/autobuild-vendor/templates-mirror.git",
+      "executor_choices": {
+        "models": [
+          "claude-sonnet-5-5",
+          "claude-opus-5-5"
+        ],
+        "efforts": [
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
     }
   ]
 }

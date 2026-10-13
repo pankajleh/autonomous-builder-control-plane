@@ -82,7 +82,8 @@ func engineOf(profileID string, policy authority.ExecutorPolicy, getenv func(str
 }
 
 // laneHoldsKey says whether a lane can sign its engine in: an API key, Codex
-// signed in once in the lane's own home, or Bedrock's credentials.
+// signed in once in the lane's own home, a Claude setup token (an account
+// lane, docs/plans/account-lanes.md), or Bedrock's credentials.
 func laneHoldsKey(executor string, settings map[string]string) bool {
 	switch executor {
 	case "codex":
@@ -92,7 +93,7 @@ func laneHoldsKey(executor string, settings map[string]string) bool {
 		home := settings["CODEX_HOME"]
 		return filepath.IsAbs(home) && regularFile(filepath.Join(home, "auth.json"))
 	case "claude":
-		if settings["ANTHROPIC_API_KEY"] != "" {
+		if settings["ANTHROPIC_API_KEY"] != "" || settings["CLAUDE_CODE_OAUTH_TOKEN"] != "" {
 			return true
 		}
 		return settings["CLAUDE_CODE_USE_BEDROCK"] != "" && settings["AWS_ACCESS_KEY_ID"] != "" && settings["AWS_SECRET_ACCESS_KEY"] != ""

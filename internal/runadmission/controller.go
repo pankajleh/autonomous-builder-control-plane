@@ -22,7 +22,7 @@ import (
 const (
 	MaxProfileFileBytes      = 256 << 10
 	MaxManifestTemplateBytes = 256 << 10
-	MaxProfiles              = 32
+	MaxProfiles              = 64
 	MaxReceiptBytes          = 16 << 10
 	MaxBindingBytes          = 32 << 10
 	MaxLaunchIntentBytes     = 4 << 10
