@@ -451,6 +451,10 @@ func (m *Manager) run(rec operationRecord) {
 		m.markFirstPending(&rec, "failed", failed)
 		return
 	}
+	if op.Kind == "check_site" {
+		failed = m.runCheckSite(ctx, &rec, r)
+		return
+	}
 	session, outcome := m.open(ctx, r)
 	if session == nil {
 		failed = outcome

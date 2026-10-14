@@ -264,7 +264,21 @@ type DriftV1 struct {
 	Reconciled    []string         `json:"reconciled"`
 }
 
+// NameV1 answers whether a name points at a target (BF-14.3a): the target's
+// address, the addresses the name has now (A and AAAA, at most eight, IPv4
+// first) and whether one of them is the target's.
+type NameV1 struct {
+	SchemaVersion string   `json:"schema_version"`
+	Target        string   `json:"target"`
+	Host          string   `json:"host"`
+	Address       string   `json:"address"`
+	Addresses     []string `json:"addresses"`
+	Points        bool     `json:"points"`
+	CheckedAt     string   `json:"checked_at"`
+}
+
 const (
+	NameSchemaV1      = "NameV1"
 	DatabasesSchemaV1 = "DatabasesV1"
 	DriftSchemaV1     = "DriftV1"
 	BackupsSchemaV1   = "BackupsV1"
@@ -297,6 +311,10 @@ type DeploymentController interface {
 	CleanTarget(ctx context.Context, target string, request ConfirmedRequestV1) (OperationV1, error)
 	CheckDrift(ctx context.Context, target string, request OperationRequestV1) (OperationV1, error)
 	Drift(ctx context.Context, target string) (DriftV1, error)
+	// Name looks a host up once and says whether it points at the target;
+	// CheckSite runs a site's check once more (BF-14.3a).
+	Name(ctx context.Context, target, host string) (NameV1, error)
+	CheckSite(ctx context.Context, target, site string, request OperationRequestV1) (OperationV1, error)
 }
 
 var (
@@ -471,6 +489,25 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 		}
 		op, err := s.reserved.Deployments.CheckBackup(r.Context(), key, parts[2], parts[4], create)
 		operation(op, err, http.StatusAccepted)
+	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "check" && r.Method == http.MethodPost:
+		var request OperationRequestV1
+		if !body(&request) {
+			bad()
+			return
+		}
+		op, err := s.reserved.Deployments.CheckSite(r.Context(), key, parts[2], request)
+		operation(op, err, http.StatusAccepted)
+	case len(parts) == 3 && parts[1] == "names" && r.Method == http.MethodGet:
+		if !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		name, err := s.reserved.Deployments.Name(r.Context(), key, parts[2])
+		if err != nil {
+			s.writeDeploymentError(w, id, err)
+			return
+		}
+		s.writeJSON(w, http.StatusOK, name)
 	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && (parts[3] == "stop" || parts[3] == "start") &&
 		r.Method == http.MethodPost:
 		var request OperationRequestV1
