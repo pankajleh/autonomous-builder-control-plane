@@ -100,6 +100,16 @@ func (d *testDeployments) Drift(_ context.Context, target string) (DriftV1, erro
 		Findings: []DriftFindingV1{}, Reconciled: []string{}}, d.err
 }
 
+func (d *testDeployments) Name(_ context.Context, target, host string) (NameV1, error) {
+	d.calls = append(d.calls, "name:"+target+":"+host)
+	return NameV1{SchemaVersion: NameSchemaV1, Target: target, Host: host, Address: "13.232.1.2", Addresses: []string{"13.232.1.2"}, Points: true,
+		CheckedAt: "2026-10-14T01:00:00Z"}, d.err
+}
+func (d *testDeployments) CheckSite(_ context.Context, target, site string, r OperationRequestV1) (OperationV1, error) {
+	d.calls = append(d.calls, "check-site:"+target+":"+site+":"+r.RequestID)
+	return sampleOperation, d.err
+}
+
 func deploymentServer(t *testing.T, grant bool) (*Server, *testDeployments) {
 	s, _ := targetServer(t, grant)
 	backend := &testDeployments{}
@@ -160,6 +170,7 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/databases/shop/remove", `{"request_id":"req-data-0001","confirm":"app_shop"}`},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/clean", `{"request_id":"req-clean-001","confirm":"srv-0123456789ab"}`},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/drift", `{"request_id":"req-drift-001"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/check", `{"request_id":"req-site-0001"}`},
 	} {
 		if r := call(s, c.method, c.path, c.body); r.Code != http.StatusAccepted {
 			t.Fatalf("%s = %d %s", c.path, r.Code, r.Body.String())
@@ -171,6 +182,10 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 	if r := call(s, http.MethodGet, "/v1/targets/srv-0123456789ab/drift", ""); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"schema_version":"DriftV1"`) {
 		t.Fatalf("drift = %d %s", r.Code, r.Body.String())
 	}
+	if r := call(s, http.MethodGet, "/v1/targets/srv-0123456789ab/names/shop.example.com", ""); r.Code != http.StatusOK ||
+		!strings.Contains(r.Body.String(), `"schema_version":"NameV1"`) || !strings.Contains(r.Body.String(), `"points":true`) {
+		t.Fatalf("name = %d %s", r.Code, r.Body.String())
+	}
 	want := []string{"put:" + digest, "get:" + digest, "plan:srv-0123456789ab:abababab:shop:13-232-1-2.sslip.io",
 		"apply:srv-0123456789ab:pln-0123456789abcdef:req-12345678", "op:srv-0123456789ab:op-0123456789abcdef", "sites:srv-0123456789ab",
 		"remove:srv-0123456789ab:shop:req-87654321",
@@ -178,7 +193,8 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 		"restore:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b", "check:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b:req-check-001",
 		"stop:srv-0123456789ab:shop:req-stop-0001", "start:srv-0123456789ab:shop:req-start-001",
 		"remove-data:srv-0123456789ab:shop:req-data-0001:app_shop", "clean:srv-0123456789ab:req-clean-001:srv-0123456789ab",
-		"drift:srv-0123456789ab:req-drift-001", "databases:srv-0123456789ab", "drift-report:srv-0123456789ab"}
+		"drift:srv-0123456789ab:req-drift-001", "check-site:srv-0123456789ab:shop:req-site-0001", "databases:srv-0123456789ab",
+		"drift-report:srv-0123456789ab", "name:srv-0123456789ab:shop.example.com"}
 	if strings.Join(backend.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v", backend.calls)
 	}
@@ -213,6 +229,12 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/clean", `{"request_id":"req-clean-001","confirm":"x","y":1}`},
 		{http.MethodPut, "/v1/targets/srv-0123456789ab/drift", ""},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/drift/now", `{"request_id":"req-drift-001"}`},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/shop/check", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/Shop/check", `{"request_id":"req-site-0001"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/check", `{"request_id":"req-site-0001","x":1}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/names/shop.example.com", ""},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/names", ""},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/names/shop.example.com/x", ""},
 	} {
 		if r := call(s, bad.method, bad.path, bad.body); r.Code != http.StatusBadRequest {
 			t.Errorf("%s %s = %d", bad.method, bad.path, r.Code)
