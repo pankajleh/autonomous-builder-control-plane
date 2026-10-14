@@ -63,6 +63,10 @@ type PlanCreateV1 struct {
 // MaxConversionBytes bounds a plan's conversion.
 const MaxConversionBytes = 64 << 10
 
+// maxPlanBody bounds a plan request: the other target requests' bound plus a
+// conversion, each of whose bytes JSON writes as at most six (\u00XX).
+const maxPlanBody = maxTargetBody + 6*MaxConversionBytes
+
 // PlanConversionV1 is the conversion a plan runs, by its SHA-256 and size; the
 // plan's hash covers it, so an approval covers the exact SQL.
 type PlanConversionV1 struct {
@@ -453,8 +457,10 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 	key := parts[0]
 	switch {
 	case len(parts) == 2 && parts[1] == "plans" && r.Method == http.MethodPost:
+		// A plan may carry a conversion, so it has a bound of its own.
 		var create PlanCreateV1
-		if !body(&create) {
+		data, err := io.ReadAll(io.LimitReader(r.Body, maxPlanBody+1))
+		if err != nil || len(data) == 0 || len(data) > maxPlanBody || decodeStrictJSON(data, &create) != nil {
 			bad()
 			return
 		}

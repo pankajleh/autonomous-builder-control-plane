@@ -3,6 +3,7 @@ package serviceapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,9 +12,10 @@ import (
 )
 
 type testDeployments struct {
-	calls []string
-	got   int64
-	err   error
+	calls      []string
+	got        int64
+	conversion int
+	err        error
 }
 
 var sampleOperation = OperationV1{SchemaVersion: OperationSchemaV1, OperationID: "op-0123456789abcdef", Target: "srv-0123456789ab", Kind: "apply",
@@ -31,6 +33,7 @@ func (d *testDeployments) Release(_ context.Context, digest string) (ReleaseV1, 
 	return ReleaseV1{SchemaVersion: ReleaseSchemaV1, Digest: digest}, d.err
 }
 func (d *testDeployments) CreatePlan(_ context.Context, target string, c PlanCreateV1) (PlanV1, error) {
+	d.conversion = len(c.Conversion)
 	if c.Restore != nil {
 		d.calls = append(d.calls, "restore:"+target+":"+c.Restore.Site+":"+c.Restore.Backup)
 	} else {
@@ -261,6 +264,35 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 	}
 	if r := upload(s, digest, bytes.Repeat([]byte{'x'}, MaxReleaseBytes+1), "application/x-tar"); r.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("a release over the bound = %d", r.Code)
+	}
+	if len(backend.calls) != 0 {
+		t.Fatalf("calls = %v", backend.calls)
+	}
+}
+
+func TestAPlanMayCarryAConversionLargerThanAnyOtherTargetRequest(t *testing.T) {
+	s, backend := deploymentServer(t, true)
+	digest := strings.Repeat("ab", 32)
+	plan := func(conversion string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(PlanCreateV1{Release: digest, Site: PlanSiteV1{Name: "shop", Host: "shop.example.com"}, Conversion: conversion})
+		return call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/plans", string(body))
+	}
+	// A conversion of the largest size, written as JSON escapes throughout, reaches the backend as given.
+	largest := strings.Repeat("\x01", MaxConversionBytes)
+	if r := plan(largest); r.Code != http.StatusCreated || backend.conversion != MaxConversionBytes {
+		t.Fatalf("plan with the largest conversion = %d %s (backend got %d bytes)", r.Code, r.Body.String(), backend.conversion)
+	}
+	if r := plan(strings.Repeat("SELECT 1;\n", 6000)); r.Code != http.StatusCreated || backend.conversion != 60000 {
+		t.Fatalf("plan with a conversion = %d %s", r.Code, r.Body.String())
+	}
+	backend.calls = nil
+	// Past its own bound a plan is refused before the backend sees it (here a valid plan padded with spaces); every
+	// other target request keeps 4 KiB.
+	if r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/plans", `{"release":"`+digest+`","site":{"name":"shop","host":"shop.example.com"}`+strings.Repeat(" ", maxPlanBody)+`}`); r.Code != http.StatusBadRequest {
+		t.Fatalf("a plan over its bound = %d", r.Code)
+	}
+	if r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/apply", `{"plan_id":"pln-0123456789abcdef","plan_hash":"`+strings.Repeat("a", 64)+`","request_id":"req-12345678"`+strings.Repeat(" ", maxTargetBody)+`}`); r.Code != http.StatusBadRequest {
+		t.Fatalf("an apply over 4 KiB = %d", r.Code)
 	}
 	if len(backend.calls) != 0 {
 		t.Fatalf("calls = %v", backend.calls)
