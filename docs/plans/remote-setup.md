@@ -1,6 +1,6 @@
 # Remote setup: the first administrator of a Node app on a target (BF-14.2c)
 
-Status: **built in this PR; goes live when ABCP restarts on it.** Repo C design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md`
+Status: **live since 2026-10-14 04:51 UTC on `1d24614`** (#103, recorded in #104); the owner's Node app on host 1 has its token. Repo C design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md`
 §11 (BF-14.2c, P0494), under the owner's "go with your recommendation options" (2026-10-13). Builds on
 `docs/plans/remote-sites.md` (Node apps) and `docs/plans/remote-lifecycle.md`.
 
