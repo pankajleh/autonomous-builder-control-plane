@@ -74,6 +74,7 @@ if command -v docker >/dev/null 2>&1; then
   echo "docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null)"
   echo "docker_security=$(docker info --format '{{join .SecurityOptions ","}}' 2>/dev/null)"
   echo "docker_runtimes=$(docker info --format '{{range $name, $value := .Runtimes}}{{$name}} {{end}}' 2>/dev/null)"
+  echo "frontdoor=$(docker ps -q --filter name=^autobuild-frontdoor$ --filter status=running 2>/dev/null | head -n 1)"
 fi
 if command -v runsc >/dev/null 2>&1; then echo "runsc=$(runsc --version 2>/dev/null | head -n 1)"; fi
 echo "listening=$(ss -Htln 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
@@ -534,6 +535,22 @@ func Evaluate(v map[string]string) (*serviceapi.TargetFactsV1, []serviceapi.Targ
 		}
 		return false
 	}
+	// A port is free when nothing listens on it, or when ABCP's own front door
+	// does (a target that already has sites): checking such a target again must
+	// not make it look unready for its next app.
+	ours := v["frontdoor"] != ""
+	portFree := func(port string) (bool, string) {
+		switch {
+		case !listening(port):
+			return true, "yes"
+		case ours:
+			return true, "front door"
+		default:
+			return false, "no"
+		}
+	}
+	free80, held80 := portFree("80")
+	free443, held443 := portFree("443")
 	yesNo := func(ok bool) string {
 		if ok {
 			return "yes"
@@ -552,8 +569,8 @@ func Evaluate(v map[string]string) (*serviceapi.TargetFactsV1, []serviceapi.Targ
 		// gVisor is required on servers shared by different customers (the
 		// design note §7); the product decides that per target.
 		{Name: "gvisor", Required: false, OK: facts.GVisor, Value: yesNo(facts.GVisor)},
-		{Name: "port_80_free", Required: true, OK: !listening("80"), Value: yesNo(!listening("80"))},
-		{Name: "port_443_free", Required: true, OK: !listening("443"), Value: yesNo(!listening("443"))},
+		{Name: "port_80_free", Required: true, OK: free80, Value: held80},
+		{Name: "port_443_free", Required: true, OK: free443, Value: held443},
 		{Name: "clock_synced", Required: true, OK: v["ntp"] == "yes", Value: yesNo(v["ntp"] == "yes")},
 		{Name: "registry_reachable", Required: true, OK: registry == "200" || registry == "401", Value: yesNo(registry == "200" || registry == "401")},
 	}

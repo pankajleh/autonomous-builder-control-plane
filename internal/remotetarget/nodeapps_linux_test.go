@@ -351,3 +351,11 @@ func TestBackupsAreKeptSevenDaysAndAtMostFourteenAndTheNewestAlways(t *testing.T
 		t.Fatalf("an old backup being restored stays: %+v", kept)
 	}
 }
+
+// The app's heap stays under its 256 MB whichever sandbox runs it: gVisor shows
+// the app the server's memory, not the container's limit.
+func TestStartAppCapsTheHeap(t *testing.T) {
+	if !strings.Contains(startAppScript, "--memory 256m") || !strings.Contains(startAppScript, "-e NODE_OPTIONS=--max-old-space-size=160 ") {
+		t.Fatal("the app's start has no heap cap under its memory limit")
+	}
+}

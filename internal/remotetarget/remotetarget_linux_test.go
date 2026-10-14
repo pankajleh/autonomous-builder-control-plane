@@ -376,3 +376,33 @@ func TestTheFolderMustBePrivate(t *testing.T) {
 		t.Fatal("an open folder was accepted")
 	}
 }
+
+// A target that already has sites listens on 80 and 443 through ABCP's own
+// front door: checking it again keeps it ready, while anything else on those
+// ports still fails the check.
+func TestEvaluatePortsHeldByTheFrontDoor(t *testing.T) {
+	held := strings.Replace(goodOutput, "listening=127.0.0.53%lo:53 0.0.0.0:22 [::]:22", "listening=127.0.0.53%lo:53 0.0.0.0:22 0.0.0.0:80 0.0.0.0:443", 1)
+	ports := func(output string) map[string]serviceapi.TargetCheckV1 {
+		_, checks := Evaluate(parse(output))
+		found := map[string]serviceapi.TargetCheckV1{}
+		for _, c := range checks {
+			found[c.Name] = c
+		}
+		return found
+	}
+	for name, c := range ports(held + "frontdoor=0123456789ab\n") {
+		if (name == "port_80_free" || name == "port_443_free") && (!c.OK || c.Value != "front door") {
+			t.Errorf("%s held by the front door = %+v", name, c)
+		}
+	}
+	for name, c := range ports(held + "frontdoor=\n") {
+		if (name == "port_80_free" || name == "port_443_free") && (c.OK || c.Value != "no") {
+			t.Errorf("%s held by something else = %+v", name, c)
+		}
+	}
+	for name, c := range ports(goodOutput + "frontdoor=0123456789ab\n") {
+		if (name == "port_80_free" || name == "port_443_free") && (!c.OK || c.Value != "yes") {
+			t.Errorf("%s free = %+v", name, c)
+		}
+	}
+}

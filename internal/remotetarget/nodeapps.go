@@ -413,6 +413,10 @@ func runtimeFlag(sandbox string) string {
 	return ""
 }
 
+// The app's heap is capped below its 256 MB (NODE_OPTIONS): under gVisor the
+// app sees the server's memory, not the container's limit, and Node would size
+// its heap from that.
+//
 // The Node scripts. Each value in them (@N@ a site name, @DB@ its database,
 // @ID@ a backup id, @LIST@ backup ids, @RUNTIME@ the sandbox flag, @WAIT@ a
 // number of seconds) is checked by ABCP against a narrow pattern or fixed
@@ -530,7 +534,8 @@ docker run -d --name autobuild-app-@N@ --restart unless-stopped --network autobu
   --user 65534:65534 --read-only --cap-drop ALL --security-opt no-new-privileges --memory 256m --memory-swap 256m \
   --pids-limit 256 --ulimit nofile=1024:1024 --tmpfs /scratch:rw,nosuid,nodev,noexec,size=67108864,mode=700,uid=65534,gid=65534 \
   --workdir /scratch --mount type=bind,src="$src",dst=/source,readonly --env-file "$A/apps/@N@/database.env" \
-  --env-file "$A/apps/@N@/setup.env" -e HOME=/scratch -e TMPDIR=/scratch --label autobuild.site=@N@ --entrypoint /usr/local/bin/node \
+  --env-file "$A/apps/@N@/setup.env" -e HOME=/scratch -e TMPDIR=/scratch -e NODE_OPTIONS=--max-old-space-size=160 \
+  --label autobuild.site=@N@ --entrypoint /usr/local/bin/node \
   ` + NodeRuntimeImage + ` /opt/autobuild/start.mjs >/dev/null
 echo started
 `
