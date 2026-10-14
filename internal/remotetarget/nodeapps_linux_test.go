@@ -127,7 +127,7 @@ func TestANodeAppGetsTheSharedDatabaseItsOwnLoginAndNetworkAndABackupBeforeEachU
 		}
 	}
 	caddy, _ := os.ReadFile(filepath.Join(home, "autobuild/frontdoor/config/Caddyfile"))
-	if !strings.Contains(string(caddy), testHost+" {\n\treverse_proxy autobuild-app-crm:8080\n") {
+	if !strings.Contains(string(caddy), testHost+" {\n\treverse_proxy autobuild-app-crm:8080 {\n\t\theader_up Origin ^https:// http://\n\t}\n") {
 		t.Fatalf("Caddyfile = %s", caddy)
 	}
 	sites, _ := f.m.Sites(context.Background(), f.key)

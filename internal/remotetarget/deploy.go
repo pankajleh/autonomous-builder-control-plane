@@ -797,6 +797,16 @@ func (m *Manager) caddyfile(key, site, host string) string {
 	return caddyfileFor(r, site, host)
 }
 
+// A Node app refuses a write whose Origin is not its own address, which it
+// sees as plain http because the front door ends TLS. The front door hands it
+// the browser's Origin with only that scheme changed, so a write from the
+// app's own page is its own and one from any other site is still refused. An
+// app that took its scheme from X-Forwarded-Proto would need this gone.
+const (
+	originFrom = "^https://"
+	originTo   = "http://"
+)
+
 // caddyfileFor is caddyfile for a record already read. A stopped Node app's
 // host answers a plain 503 saying it is paused (BF-14.5a).
 func caddyfileFor(r record, site, host string) string {
@@ -818,14 +828,14 @@ func caddyfileFor(r record, site, host string) string {
 	}
 	sort.Strings(names)
 	var b strings.Builder
-	b.WriteString("# Written by ABCP (BF-14.2a, BF-14.2b). A static site serves the release its link points to; a Node app is its container.\n")
+	b.WriteString("# Written by ABCP (BF-14.2a, BF-14.2b, BF-14.2c). A static site serves the release its link points to; a Node app is its container.\n")
 	for _, name := range names {
 		serve := "\troot * /srv/sites/" + name + "\n\tfile_server\n"
 		switch {
 		case kinds[name] == kindNode && paused[name]:
 			serve = "\trespond \"This app is paused.\" 503\n"
 		case kinds[name] == kindNode:
-			serve = "\treverse_proxy autobuild-app-" + name + ":8080\n"
+			serve = "\treverse_proxy autobuild-app-" + name + ":8080 {\n\t\theader_up Origin " + originFrom + " " + originTo + "\n\t}\n"
 		}
 		fmt.Fprintf(&b, "\n%s {\n%s\tencode zstd gzip\n\theader {\n\t\tX-Content-Type-Options nosniff\n\t\tReferrer-Policy strict-origin-when-cross-origin\n\t\t-Server\n\t}\n}\n", hosts[name], serve)
 	}

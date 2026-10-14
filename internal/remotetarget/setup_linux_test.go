@@ -136,3 +136,48 @@ func TestTheStartScriptRefusesAnythingButASetupToken(t *testing.T) {
 		}
 	}
 }
+
+// An app compares a write's Origin with its own address, which it sees as plain
+// http behind the front door (the template library's kit/server.js does this).
+func appTakesWrite(origin, host string) bool {
+	return origin == "" || origin == "http://"+host
+}
+
+func TestTheFrontDoorHandsANodeAppItsOwnPagesOriginAndNoOtherSitesAsItsOwn(t *testing.T) {
+	f := newDeployFixture(t)
+	f.deploy(f.putNode("one"), "crm", testHost, "req-crm-first")
+	f.deploy(f.put(map[string]string{"index.html": "blog"}), "blog", "blog.example.com", "req-blog-0001")
+	caddy := f.caddy()
+	// Only the app's block changes the Origin, and only its scheme, with Caddy's
+	// header_up search and replacement (a regular expression and its replacement).
+	block := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(testHost) + ` \{\n\treverse_proxy autobuild-app-crm:8080 \{\n\t\theader_up Origin (\S+) (\S+)\n\t\}\n`).FindStringSubmatch(caddy)
+	if block == nil || strings.Count(caddy, "header_up") != 1 {
+		t.Fatalf("Caddyfile = %s", caddy)
+	}
+	rewrite := func(origin string) string {
+		if origin == "" {
+			return "" // Caddy changes only a header the request has
+		}
+		return regexp.MustCompile(block[1]).ReplaceAllString(origin, block[2])
+	}
+	for _, c := range []struct {
+		origin string
+		takes  bool
+	}{
+		{"https://" + testHost, true},
+		{"", true}, // no Origin: the app's Sec-Fetch-Site check still applies
+		{"https://evil.example", false},
+		{"https://" + testHost + ".evil.example", false},
+		{"https://evil.example/https://" + testHost, false},
+		{"null", false},
+		{"https://blog.example.com", false},
+	} {
+		if got := appTakesWrite(rewrite(c.origin), testHost); got != c.takes {
+			t.Errorf("Origin %q reaches the app as %q: takes the write = %v", c.origin, rewrite(c.origin), got)
+		}
+	}
+	// Before this, the app's own page was refused.
+	if appTakesWrite("https://"+testHost, testHost) {
+		t.Fatal("the app's own page needs no change")
+	}
+}

@@ -233,7 +233,7 @@ func (l *localRemote) serve(host, path string) (string, error) {
 	for i, line := range lines {
 		if line == host+" {" && i+1 < len(lines) {
 			if app, ok := strings.CutPrefix(strings.TrimSpace(lines[i+1]), "reverse_proxy autobuild-app-"); ok {
-				app = strings.TrimSuffix(app, ":8080")
+				app = strings.TrimSuffix(app, ":8080 {")
 				state := filepath.Join(l.home, ".docker")
 				_, running := os.Stat(filepath.Join(state, "c-autobuild-app-"+app))
 				_, unhealthy := os.Stat(filepath.Join(state, "c-autobuild-app-"+app+".unhealthy"))
