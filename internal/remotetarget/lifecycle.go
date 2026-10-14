@@ -182,9 +182,7 @@ func (m *Manager) runStart(ctx context.Context, rec *operationRecord, r record, 
 		name string
 		work func() (string, error)
 	}{
-		{"start_app", func() (string, error) {
-			return run(ctx, session, fill(startAppScript, "N", site, "RUNTIME", runtimeFlag(rec.Sandbox)), nil)
-		}},
+		{"start_app", func() (string, error) { return m.startApp(ctx, session, r.Key, site, rec.Sandbox) }},
 		{"wait_health", func() (string, error) {
 			out, err := run(ctx, session, fill(waitHealthScript, "N", site, "WAIT", fmt.Sprint(m.healthWait)), nil)
 			if err != nil {
@@ -647,7 +645,7 @@ func sortedKeys[V any](m map[string]V) []string {
 // database) is checked by ABCP before it is put in; the rest is fixed.
 const (
 	// dropDataScript drops an app's database (and any copy a restore or check
-	// left), its login and database.env.
+	// left), its login, database.env and its setup token.
 	dropDataScript = `set -eu
 ` + dockerHost + `
 docker exec -i autobuild-postgres ` + psql + ` -v ON_ERROR_STOP=1 -qAtX >/dev/null <<'SQL'
@@ -657,7 +655,7 @@ DROP DATABASE IF EXISTS restore_@DB@ WITH (FORCE);
 DROP DATABASE IF EXISTS previous_@DB@ WITH (FORCE);
 DROP ROLE IF EXISTS @DB@;
 SQL
-rm -f "$HOME/autobuild/apps/@N@/database.env"
+rm -f "$HOME/autobuild/apps/@N@/database.env" "$HOME/autobuild/apps/@N@/setup.env"
 rmdir "$HOME/autobuild/apps/@N@" 2>/dev/null || true
 echo "its database and login are dropped"
 `

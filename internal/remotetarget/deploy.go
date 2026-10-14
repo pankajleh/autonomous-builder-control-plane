@@ -598,9 +598,7 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 				return detail, err
 			})
 		case "start_app":
-			err = m.step(rec, s.Name, func() (string, error) {
-				return run(ctx, session, fill(startAppScript, "N", site, "RUNTIME", runtimeFlag(rec.Sandbox)), nil)
-			})
+			err = m.step(rec, s.Name, func() (string, error) { return m.startApp(ctx, session, r.Key, site, rec.Sandbox) })
 		case "wait_health":
 			err = m.step(rec, s.Name, func() (string, error) {
 				out, err := run(ctx, session, fill(waitHealthScript, "N", site, "WAIT", fmt.Sprint(m.healthWait)), nil)

@@ -286,9 +286,7 @@ func (m *Manager) runRestore(ctx context.Context, rec *operationRecord, r record
 		return "the backup is no longer kept"
 	}
 	db := databaseName(site)
-	start := func() (string, error) {
-		return run(ctx, session, fill(startAppScript, "N", site, "RUNTIME", runtimeFlag(rec.Sandbox)), nil)
-	}
+	start := func() (string, error) { return m.startApp(ctx, session, r.Key, site, rec.Sandbox) }
 	for _, s := range rec.Operation.Steps {
 		var err error
 		switch s.Name {

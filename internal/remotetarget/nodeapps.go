@@ -74,6 +74,9 @@ type databaseRecord struct {
 	Name      string         `json:"name"`
 	CreatedAt string         `json:"created_at"`
 	Backups   []backupRecord `json:"backups,omitempty"`
+	// SetupToken is the app's setup token (BF-14.2c, setup.go), kept with its
+	// data and gone with it.
+	SetupToken string `json:"setup_token,omitempty"`
 }
 
 // backupRecord is a backup as ABCP keeps it: what it shows, and each table's
@@ -397,7 +400,7 @@ func (m *Manager) rollBack(ctx context.Context, rec *operationRecord, key string
 		}
 	}
 	m.mu.Unlock()
-	if _, err := run(ctx, session, fill(startAppScript, "N", site, "RUNTIME", runtimeFlag(rec.Sandbox)), nil); err != nil {
+	if _, err := m.startApp(ctx, session, key, site, rec.Sandbox); err != nil {
 		return "the release it replaced is linked but did not start"
 	}
 	return "switched back to the release it replaced"
@@ -507,10 +510,18 @@ printf '%s\n' "$counts"
 cd "$HOME/autobuild/backups/@N@"
 for b in @LIST@; do rm -f "./$b.dump"; done
 `
+	// startAppScript reads the app's setup token on its input, so no command
+	// line and no script holds it, and keeps it beside database.env.
 	startAppScript = `set -eu
 ` + dockerHost + `
 A="$HOME/autobuild"
+umask 077
 test -s "$A/apps/@N@/database.env"
+IFS= read -r token
+case "$token" in *[!a-f0-9]*|'') echo "no setup token" >&2; exit 3 ;; esac
+if [ "${#token}" -ne 32 ]; then echo "no setup token" >&2; exit 3; fi
+printf 'BOOTSTRAP_TOKEN=%s\n' "$token" > "$A/apps/@N@/.setup.env.next"
+mv "$A/apps/@N@/.setup.env.next" "$A/apps/@N@/setup.env"
 R=$(readlink -f "$A/releases")
 src=$(readlink -f "$A/sites/@N@")
 case "$src" in "$R"/*) ;; *) echo "the site's link is not a release" >&2; exit 3 ;; esac
@@ -519,7 +530,7 @@ docker run -d --name autobuild-app-@N@ --restart unless-stopped --network autobu
   --user 65534:65534 --read-only --cap-drop ALL --security-opt no-new-privileges --memory 256m --memory-swap 256m \
   --pids-limit 256 --ulimit nofile=1024:1024 --tmpfs /scratch:rw,nosuid,nodev,noexec,size=67108864,mode=700,uid=65534,gid=65534 \
   --workdir /scratch --mount type=bind,src="$src",dst=/source,readonly --env-file "$A/apps/@N@/database.env" \
-  -e HOME=/scratch -e TMPDIR=/scratch --label autobuild.site=@N@ --entrypoint /usr/local/bin/node \
+  --env-file "$A/apps/@N@/setup.env" -e HOME=/scratch -e TMPDIR=/scratch --label autobuild.site=@N@ --entrypoint /usr/local/bin/node \
   ` + NodeRuntimeImage + ` /opt/autobuild/start.mjs >/dev/null
 echo started
 `
