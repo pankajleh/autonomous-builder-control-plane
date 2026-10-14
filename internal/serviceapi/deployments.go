@@ -51,6 +51,23 @@ type PlanCreateV1 struct {
 	Release string         `json:"release,omitempty"`
 	Site    PlanSiteV1     `json:"site"`
 	Restore *PlanRestoreV1 `json:"restore,omitempty"`
+	// Conversion is SQL that converts a Node app's data for the release that
+	// replaces it, when that release is another app's (Repo C design note
+	// BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md, an app replaced by another): run
+	// once, as the app's own login, in one transaction, after the app is
+	// stopped and backed up. At most MaxConversionBytes of UTF-8 text with no
+	// backslash, so psql runs no command of its own.
+	Conversion string `json:"conversion,omitempty"`
+}
+
+// MaxConversionBytes bounds a plan's conversion.
+const MaxConversionBytes = 64 << 10
+
+// PlanConversionV1 is the conversion a plan runs, by its SHA-256 and size; the
+// plan's hash covers it, so an approval covers the exact SQL.
+type PlanConversionV1 struct {
+	Digest string `json:"digest"`
+	Bytes  int    `json:"bytes"`
 }
 
 // PlanRestoreV1 names the Node app and the backup a restore plan puts back.
@@ -77,9 +94,14 @@ type PlanV1 struct {
 	// A Node app (BF-14.2b): send_files (or reuse_files), get_images,
 	// start_database, make_database, back_up (when it replaces a release),
 	// switch_site, start_app, wait_health, write_site, start_frontdoor (or
-	// reload_frontdoor), check. A restore: back_up, restore_copy, stop_app,
-	// switch_database, start_app, wait_health, check, clean_up.
+	// reload_frontdoor), check. A Node app replaced with a conversion: the same
+	// with stop_app, back_up, convert before switch_site. A restore: back_up,
+	// restore_copy, stop_app, switch_database, start_app, wait_health, check,
+	// clean_up.
 	Steps []string `json:"steps"`
+	// Conversion is the SQL a plan runs on the app's data before the release
+	// starts, when it has one.
+	Conversion *PlanConversionV1 `json:"conversion,omitempty"`
 	// Images are what a Node app runs, by digest; Database is its database and
 	// login, made on the server the first time; Sandbox is "gvisor" or
 	// "standard". All three are empty for a static site.

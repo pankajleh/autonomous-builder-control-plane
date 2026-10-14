@@ -116,12 +116,22 @@ case "$1" in
         if [ -f "$S/c-$n.exited" ]; then echo "container $n exited"; else echo "container $n running"; fi
       done ;;
   exec)
-    shift; if [ "$1" = "-i" ]; then shift; fi
+    shift; env=""
+    while :; do case "$1" in -i) shift ;; -e) env="$env $2"; shift 2 ;; *) break ;; esac; done
     n=$1; shift
     [ -f "$S/c-$n" ] || exit 1
     db=""; prev=""; for a; do [ "$prev" = "-d" ] && db=$a; prev=$a; done
     rows() { if [ -s "$S/db-$1" ]; then cat "$S/db-$1"; else echo '{}'; fi; }
     mkdir -p "$S/scratch"
+    case "$env" in
+      *PGPASSFILE=*)
+        # A conversion: what it ran, as whom and with which password file. It
+        # fails when $HOME/convert.fails is there, else leaves two rows.
+        cat >> "$S/convert.sql"; echo "$env $*" >> "$S/convert.args"
+        cp "$S/scratch/.convert-$db.pgpass" "$S/convert.pgpass" 2>/dev/null || true
+        if [ -f "$HOME/convert.fails" ]; then echo 'psql:<stdin>:3: ERROR:  column "cut_date" does not exist' >&2; exit 3; fi
+        echo '{"public.people":2}' > "$S/db-$db"; exit 0 ;;
+    esac
     case "$*" in
       *pg_isready*) exit 0 ;;
       "/bin/sh -c "*) shift 2; sh -c "$(printf '%s' "$1" | sed "s|/scratch|$S/scratch|g")" ;;
