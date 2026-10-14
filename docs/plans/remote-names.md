@@ -1,6 +1,6 @@
 # Remote names: whether a site's address points at a target, and checking a site again (BF-14.3a)
 
-Status: **built in #101**; not live yet. Repo C design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md` §11 (BF-14.3a, P0489),
+Status: **live since 2026-10-14 00:37 UTC on `cc4ac88`** (#101, recorded in #102); no target is enrolled yet. Repo C design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md` §11 (BF-14.3a, P0489),
 under the owner's "go with your recommendation options" (2026-10-13), for the owner's "Customer buys their own domain
 anywhere". Builds on `docs/plans/remote-sites.md`.
 
