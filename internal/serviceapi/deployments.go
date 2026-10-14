@@ -277,7 +277,18 @@ type NameV1 struct {
 	CheckedAt     string   `json:"checked_at"`
 }
 
+// SiteSetupV1 is a Node app's setup token and the host its first-admin form
+// is on (BF-14.2c). Only the service principal reads it.
+type SiteSetupV1 struct {
+	SchemaVersion string `json:"schema_version"`
+	Target        string `json:"target"`
+	Site          string `json:"site"`
+	Host          string `json:"host"`
+	Token         string `json:"token"`
+}
+
 const (
+	SiteSetupSchemaV1 = "SiteSetupV1"
 	NameSchemaV1      = "NameV1"
 	DatabasesSchemaV1 = "DatabasesV1"
 	DriftSchemaV1     = "DriftV1"
@@ -315,6 +326,9 @@ type DeploymentController interface {
 	// CheckSite runs a site's check once more (BF-14.3a).
 	Name(ctx context.Context, target, host string) (NameV1, error)
 	CheckSite(ctx context.Context, target, site string, request OperationRequestV1) (OperationV1, error)
+	// SiteSetup answers a Node app's setup token, with which its first
+	// administrator is made (BF-14.2c).
+	SiteSetup(ctx context.Context, target, site string) (SiteSetupV1, error)
 }
 
 var (
@@ -330,6 +344,7 @@ var (
 	ErrSiteStopped      = errors.New("site stopped")
 	ErrDataInUse        = errors.New("data in use")
 	ErrTargetInUse      = errors.New("target in use")
+	ErrSetupPending     = errors.New("setup pending")
 )
 
 var (
@@ -497,6 +512,17 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 		}
 		op, err := s.reserved.Deployments.CheckSite(r.Context(), key, parts[2], request)
 		operation(op, err, http.StatusAccepted)
+	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "setup" && r.Method == http.MethodGet:
+		if !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		setup, err := s.reserved.Deployments.SiteSetup(r.Context(), key, parts[2])
+		if err != nil {
+			s.writeDeploymentError(w, id, err)
+			return
+		}
+		s.writeJSON(w, http.StatusOK, setup)
 	case len(parts) == 3 && parts[1] == "names" && r.Method == http.MethodGet:
 		if !requestBodyEmpty(r) {
 			bad()
@@ -598,6 +624,8 @@ func (s *Server) writeDeploymentError(w http.ResponseWriter, id string, err erro
 		s.writeError(w, http.StatusConflict, ErrorV1{Code: "target_in_use", Message: "sites or app data are still on this target", RequestID: id})
 	case errors.Is(err, ErrBackupUnknown):
 		s.writeError(w, http.StatusNotFound, ErrorV1{Code: "backup_unknown", Message: "backup is not kept or cannot be restored", RequestID: id})
+	case errors.Is(err, ErrSetupPending):
+		s.writeError(w, http.StatusConflict, ErrorV1{Code: "setup_pending", Message: "the app has no setup token yet: start it again", RequestID: id})
 	case errors.Is(err, ErrOperationUnknown):
 		s.writeError(w, http.StatusNotFound, ErrorV1{Code: "operation_unknown", Message: "operation is not known", RequestID: id})
 	default:
