@@ -39,3 +39,7 @@ failed; free: passed, `yes`) and `TestStartAppCapsTheHeap`.
 
 Restart ABCP on the merged commit with no build and no server operation running (same flags). A target's next check
 reports its ports this way; an app gets the heap cap at its next start (an update, a restore, a start after a pause).
+
+**Live (#108).** ABCP runs `6564f4e` since 12:32 UTC on 2026-10-14. Host 1 runs gVisor since 12:35 UTC: its check passes
+every item (`gvisor: yes`, ports `front door`), and a new plan there uses `sandbox: gvisor` (Team Kudos, a QA app). Apps
+already running there keep runc until their next start from a plan.
