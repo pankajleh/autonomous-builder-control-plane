@@ -1,6 +1,8 @@
 # Remote setup: the first administrator of a Node app on a target (BF-14.2c)
 
-Status: **live since 2026-10-14 04:51 UTC on `1d24614`** (#103, recorded in #104); the owner's Node app on host 1 has its token. Repo C design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md`
+Status: **live since 2026-10-14 04:51 UTC on `1d24614`** (#103, recorded in #104); the owner's Node app on host 1 has its token.
+Writes behind the front door (#105) live since 05:32 UTC on `1a6a3d2` (recorded in #106); host 1's front door has the rule
+since 05:41 UTC, and Repo C's proof P1 passed on it at 06:00 UTC. Repo C design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md`
 §11 (BF-14.2c, P0494), under the owner's "go with your recommendation options" (2026-10-13). Builds on
 `docs/plans/remote-sites.md` (Node apps) and `docs/plans/remote-lifecycle.md`.
 
