@@ -99,6 +99,8 @@ type planRecord struct {
 	SchemaVersion int               `json:"schema_version"`
 	Plan          serviceapi.PlanV1 `json:"plan"`
 	Applied       string            `json:"applied,omitempty"`
+	// Conversion is the SQL of the plan's conversion, which Plan names by digest.
+	Conversion string `json:"conversion,omitempty"`
 }
 
 type operationRecord struct {
@@ -112,6 +114,10 @@ type operationRecord struct {
 	Replaces string `json:"replaces,omitempty"`
 	Sandbox  string `json:"sandbox,omitempty"`
 	Backup   string `json:"backup,omitempty"`
+	// Conversion is the SQL an apply runs on the app's data; Backup is then the
+	// backup taken just before it, which puts the data back when the new
+	// release never answers.
+	Conversion string `json:"conversion,omitempty"`
 	// Paused is a start whose app never answered and was stopped again (BF-14.5a).
 	Paused bool `json:"paused,omitempty"`
 }
@@ -212,6 +218,19 @@ func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.Pl
 	} else {
 		steps = append(steps, "switch_site", "write_site", frontdoor, "check")
 	}
+	if create.Conversion != "" {
+		// A conversion is for a Node app that runs, with its data, and is
+		// replaced by another release.
+		site, _ := findSite(r, name)
+		_, kept := findDatabase(r, name)
+		if release.Release.Kind != kindNode || replaces == "" || !kept || !validConversion(create.Conversion) {
+			return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
+		}
+		if site.State == siteStopped {
+			return serviceapi.PlanV1{}, serviceapi.ErrSiteStopped
+		}
+		steps = convertSteps(steps[0], frontdoor)
+	}
 	now := m.now().UTC()
 	plan := serviceapi.PlanV1{
 		SchemaVersion: serviceapi.PlanSchemaV1, PlanID: newID("pln-"), Target: key, Release: release.Release,
@@ -221,8 +240,11 @@ func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.Pl
 	if release.Release.Kind == kindNode {
 		plan.Images, plan.Database, plan.Sandbox = []string{NodeRuntimeImage, NodePostgresImage}, databaseName(name), sandbox(r)
 	}
+	if create.Conversion != "" {
+		plan.Conversion = &serviceapi.PlanConversionV1{Digest: conversionDigest(create.Conversion), Bytes: len(create.Conversion)}
+	}
 	plan.Hash = planHash(plan)
-	if err := m.writeJSON(filepath.Join(m.dir, "plans"), plan.PlanID, planRecord{SchemaVersion: planSchema, Plan: plan}); err != nil {
+	if err := m.writeJSON(filepath.Join(m.dir, "plans"), plan.PlanID, planRecord{SchemaVersion: planSchema, Plan: plan, Conversion: create.Conversion}); err != nil {
 		return serviceapi.PlanV1{}, err
 	}
 	m.prunePlans(now)
@@ -279,6 +301,16 @@ func (m *Manager) Apply(_ context.Context, key string, apply serviceapi.ApplyV1)
 		}
 		kind, backup = "restore", plan.Backup.BackupID
 	}
+	conversion := ""
+	if plan.Conversion != nil {
+		// The SQL is the one the approval covers, and the app still runs.
+		site, _ := findSite(r, plan.Site.Name)
+		if pr.Conversion == "" || conversionDigest(pr.Conversion) != plan.Conversion.Digest || len(pr.Conversion) != plan.Conversion.Bytes ||
+			site.State == siteStopped {
+			return serviceapi.OperationV1{}, serviceapi.ErrPlanStale
+		}
+		conversion = pr.Conversion
+	}
 	op := serviceapi.OperationV1{
 		SchemaVersion: serviceapi.OperationSchemaV1, OperationID: newID("op-"), Target: key, Kind: kind,
 		Site: plan.Site.Name, PlanID: plan.PlanID, RequestID: apply.RequestID, State: opQueued, StartedAt: m.stamp(),
@@ -287,7 +319,7 @@ func (m *Manager) Apply(_ context.Context, key string, apply serviceapi.ApplyV1)
 		op.Steps = append(op.Steps, serviceapi.OperationStepV1{Name: step, State: "pending"})
 	}
 	rec := operationRecord{SchemaVersion: operationSchema, Operation: op, Host: plan.Site.Host, Release: plan.Release.Digest,
-		Replaces: plan.Replaces, Sandbox: plan.Sandbox, Backup: backup}
+		Replaces: plan.Replaces, Sandbox: plan.Sandbox, Backup: backup, Conversion: conversion}
 	if err := m.writeJSON(filepath.Join(m.dir, "operations"), op.OperationID, rec); err != nil {
 		return serviceapi.OperationV1{}, err
 	}
@@ -533,9 +565,38 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 		return "release_missing"
 	}
 	site := op.Site
+	converting := rec.Conversion != ""
+	// again starts the app that ran before on the data it had: a conversion
+	// stopped before it changed anything.
+	again := func(err error) error {
+		if _, startErr := m.startApp(ctx, session, r.Key, site, rec.Sandbox); startErr != nil {
+			return errStep(stepDetail(err) + "; nothing changed but the app did not start again")
+		}
+		return errStep(stepDetail(err) + "; nothing changed and the app is started again")
+	}
+	// undo puts back the data a conversion changed and the release it replaced.
+	undo := func(err error) error {
+		return errStep(stepDetail(err) + "; " + m.unConvert(ctx, rec, r.Key, session) + "; " + m.rollBack(ctx, rec, r.Key, session))
+	}
 	for _, s := range op.Steps {
 		var err error
 		switch s.Name {
+		case "stop_app":
+			err = m.step(rec, s.Name, func() (string, error) {
+				out, err := run(ctx, session, fill(stopAppOnlyScript, "N", site), nil)
+				if err != nil {
+					return "", again(err)
+				}
+				return out, nil
+			})
+		case "convert":
+			err = m.step(rec, s.Name, func() (string, error) {
+				out, err := m.convert(ctx, session, site, rec.Conversion)
+				if err != nil {
+					return "", again(err)
+				}
+				return out, nil
+			})
 		case "send_files", "reuse_files":
 			err = m.step(rec, s.Name, func() (string, error) { return m.sendRelease(ctx, session, release) })
 			if err == nil {
@@ -551,7 +612,11 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 			}
 		case "switch_site":
 			err = m.step(rec, s.Name, func() (string, error) {
-				return run(ctx, session, fill(switchScript, "N", site, "D", release.Release.Digest), nil)
+				out, err := run(ctx, session, fill(switchScript, "N", site, "D", release.Release.Digest), nil)
+				if err != nil && converting {
+					return "", undo(err)
+				}
+				return out, err
 			})
 			if err == nil {
 				m.mu.Lock()
@@ -594,14 +659,30 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 			}
 		case "back_up":
 			err = m.step(rec, s.Name, func() (string, error) {
-				_, detail, err := m.backUp(ctx, session, r.Key, site, reasonBeforeUpdate, rec.Replaces, "")
+				id, detail, err := m.backUp(ctx, session, r.Key, site, reasonBeforeUpdate, rec.Replaces, "")
+				if converting {
+					if err != nil {
+						return "", again(err)
+					}
+					// The data a conversion changes comes back from this backup.
+					rec.Backup = id
+				}
 				return detail, err
 			})
 		case "start_app":
-			err = m.step(rec, s.Name, func() (string, error) { return m.startApp(ctx, session, r.Key, site, rec.Sandbox) })
+			err = m.step(rec, s.Name, func() (string, error) {
+				out, err := m.startApp(ctx, session, r.Key, site, rec.Sandbox)
+				if err != nil && converting {
+					return "", undo(err)
+				}
+				return out, err
+			})
 		case "wait_health":
 			err = m.step(rec, s.Name, func() (string, error) {
 				out, err := run(ctx, session, fill(waitHealthScript, "N", site, "WAIT", fmt.Sprint(m.healthWait)), nil)
+				if err != nil && converting {
+					return "", undo(err)
+				}
 				if err != nil {
 					return "", errStep(stepDetail(err) + "; " + m.rollBack(ctx, rec, r.Key, session))
 				}
