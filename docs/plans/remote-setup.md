@@ -33,6 +33,29 @@ site, an unknown site, a malformed name and an unknown target are refused; an ap
 `setup_pending` until it starts again. The start script refuses an empty, short, uppercase or shell-laden token.
 `internal/serviceapi/deployments_test.go` gains the route, its malformed forms and `setup_pending`.
 
+## Writes behind the front door
+
+Found on host 1 the same morning, making the first administrator of a QA app: every write to a Node app on a target was
+refused (`403 kit.forbidden`), the first-admin form and sign-in among them. The template library's app compares a
+write's `Origin` with its own address, which it builds from the scheme it sees and the `Host` header; the front door ends
+TLS, so the app sees plain `http` while a browser sends `https://<host>`. (A preview never showed it: the preview gateway
+forwards no `Origin`.)
+
+- **The front door hands the app the browser's `Origin` with only the scheme changed:** each Node app's block proxies with
+  `header_up Origin ^https:// http://` (Caddy's search and replacement in a request header, a regular expression). A
+  write from the app's own page now matches its address; one from any other site still does not, a request without an
+  `Origin` is unchanged (the app's `Sec-Fetch-Site` check still applies), and a static site's block is unchanged.
+- **Every Caddyfile ABCP writes has it**, so a target's front door takes it at the next operation that writes the
+  Caddyfile (a deploy, a stop, a start, taking a site off); until then the target's drift check shows
+  `frontdoor_config`.
+- An app that took its scheme from `X-Forwarded-Proto` (which the front door also sends) would need this taken out;
+  the library's apps do not.
+
+Test: `TestTheFrontDoorHandsANodeAppItsOwnPagesOriginAndNoOtherSitesAsItsOwn` reads the rule from the written
+Caddyfile, applies it as Caddy does and checks the app's comparison: its own page's `Origin` is taken, no `Origin` is
+taken, and another site, a host that only starts with the app's, an `Origin` that only ends with it, `null` and the
+target's static site are refused.
+
 ## Going live
 
 Restart ABCP on the merged commit with no build running (same flags), and check that the route answers `404` for an
