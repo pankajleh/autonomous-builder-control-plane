@@ -50,3 +50,8 @@ stopped app, and SQL changed in the plan's record after the plan was made).
 
 `deployments_test.go`: a plan with a conversion of the largest size, written as JSON escapes throughout, reaches the
 backend as given, a plan past its own bound is refused before the backend sees it, and an apply keeps 4 KiB.
+
+**Live (#111).** ABCP runs `64c645f` since 19:04 UTC on 2026-10-14. The owner's `wages` moved to the newer Garment
+Production with its data converted, from 19:05:27 to 19:05:33 UTC: backed up (8 tables, 56 rows), converted (8 tables, 54
+rows: the three migration rows became the newer app's one), started and answering; a backup after holds 54 rows on the
+new release.
