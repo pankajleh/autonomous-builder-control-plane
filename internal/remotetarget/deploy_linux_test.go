@@ -101,8 +101,12 @@ case "$1" in
     case "$*" in
       *NetworkSettings*)
         [ -f "$S/c-$n" ] || exit 1
-        printf '{'; for f in "$S/nets/$n"/*; do [ -e "$f" ] && printf '"%s":{},' "${f##*/}"; done; echo '}' ;;
-      *) if [ -f "$S/c-$n" ]; then echo true; else echo false; fi ;;
+        printf '{'; for f in "$S/nets/$n"/*; do
+          [ -e "$f" ] || continue
+          ip="10.$(( $(printf '%s' "$n ${f##*/}" | cksum | cut -d' ' -f1) % 250 )).0.2"; echo "$n" > "$S/ip-$ip"
+          printf '"%s":{"IPAddress":"%s"},' "${f##*/}" "$ip"
+        done; echo '}' ;;
+      *) if [ -f "$S/c-$n" ] && [ ! -f "$S/c-$n.down" ]; then echo true; else echo false; fi ;;
     esac ;;
   run)
     n=""; net=""; prev=""
@@ -110,16 +114,18 @@ case "$1" in
     touch "$S/c-$n"; mkdir -p "$S/nets/$n"
     if [ -n "$net" ]; then touch "$S/nets/$n/$net"; fi
     case "$n" in autobuild-app-*) if [ -f "$HOME/app.fails-once" ]; then touch "$S/c-$n.unhealthy"; rm -f "$HOME/app.fails-once"; fi ;; esac ;;
-  rm) n=$(last "$@"); rm -rf "$S/c-$n" "$S/c-$n.unhealthy" "$S/c-$n.exited" "$S/nets/$n" ;;
+  rm) n=$(last "$@"); rm -rf "$S/c-$n" "$S/c-$n.unhealthy" "$S/c-$n.exited" "$S/c-$n.down" "$S/nets/$n" ;;
+  kill) n=$(last "$@"); [ -f "$S/c-$n" ] || exit 1; if [ ! -f "$HOME/app.restarts" ]; then touch "$S/c-$n.down"; fi ;;
+  start) n=$(last "$@"); [ -f "$S/c-$n" ] || exit 1; rm -f "$S/c-$n.down" ;;
   ps) for f in "$S"/c-*; do
-        n=${f##*/c-}; case "$n" in *.unhealthy|*.exited|'*') continue ;; esac
-        if [ -f "$S/c-$n.exited" ]; then echo "container $n exited"; else echo "container $n running"; fi
+        n=${f##*/c-}; case "$n" in *.unhealthy|*.exited|*.down|'*') continue ;; esac
+        if [ -f "$S/c-$n.exited" ] || [ -f "$S/c-$n.down" ]; then echo "container $n exited"; else echo "container $n running"; fi
       done ;;
   exec)
     shift; env=""
     while :; do case "$1" in -i) shift ;; -e) env="$env $2"; shift 2 ;; *) break ;; esac; done
     n=$1; shift
-    [ -f "$S/c-$n" ] || exit 1
+    [ -f "$S/c-$n" ] && [ ! -f "$S/c-$n.down" ] || exit 1
     db=""; prev=""; for a; do [ "$prev" = "-d" ] && db=$a; prev=$a; done
     rows() { if [ -s "$S/db-$1" ]; then cat "$S/db-$1"; else echo '{}'; fi; }
     mkdir -p "$S/scratch"
@@ -134,6 +140,17 @@ case "$1" in
     esac
     case "$*" in
       *pg_isready*) exit 0 ;;
+      *"-h 127.0.0.1"*)
+        u=$(echo "$*" | sed -n 's/.* -U \([a-z0-9_]*\) .*/\1/p'); d=$(echo "$*" | sed -n 's/.* -d \([a-z0-9_]*\) .*/\1/p')
+        IFS= read -r pw
+        if [ "$u" != "$d" ] && [ ! -f "$HOME/hba.open" ]; then
+          echo "psql: error: connection to server at \"127.0.0.1\", port 5432 failed: FATAL:  no pg_hba.conf entry for host \"127.0.0.1\", user \"$u\", database \"$d\", no encryption"
+        elif [ -s "$S/role-$u" ] && [ "$pw" = "$(cat "$S/role-$u")" ]; then echo 1
+        else echo "psql: error: FATAL:  password authentication failed for user \"$u\""; fi ;;
+      *has_database_privilege*)
+        r=$(echo "$*" | sed -n "s/.*has_database_privilege('\([a-z0-9_]*\)', '\([a-z0-9_]*\)'.*/\1/p")
+        d=$(echo "$*" | sed -n "s/.*has_database_privilege('\([a-z0-9_]*\)', '\([a-z0-9_]*\)'.*/\2/p")
+        if [ "$r" = "$d" ] || [ -f "$HOME/connect.open" ]; then echo t; else echo f; fi ;;
       "/bin/sh -c "*) shift 2; sh -c "$(printf '%s' "$1" | sed "s|/scratch|$S/scratch|g")" ;;
       *pg_restore*)
         [ -f "$S/db-$db" ] || exit 1
@@ -146,7 +163,8 @@ case "$1" in
       *"DROP DATABASE"*) d=$(echo "$*" | sed -n 's/.*DROP DATABASE IF EXISTS \([a-z0-9_]*\) .*/\1/p'); rm -f "$S/db-$d" ;;
       *psql*)
         sql=$(cat); echo "$sql" >> "$S/psql.stdin"
-        r=$(echo "$sql" | sed -n 's/^\(CREATE\|ALTER\) ROLE \([a-z0-9_]*\) .*/\2/p'); if [ -n "$r" ]; then touch "$S/role-$r"; fi
+        r=$(echo "$sql" | sed -n 's/^\(CREATE\|ALTER\) ROLE \([a-z0-9_]*\) .*/\2/p')
+        if [ -n "$r" ]; then echo "$sql" | sed -n "s/.* PASSWORD '\([a-f0-9]*\)';\$/\1/p" > "$S/role-$r"; fi
         case "$sql" in
           *pg_export_snapshot*)
             c=$(echo "$sql" | sed -n 's|^\\o /scratch/\(.*\)$|\1|p')
@@ -165,7 +183,16 @@ case "$1" in
               mv "$S/db-$from" "$S/db-$to" ;;
           esac
         done || exit 1 ;;
-      *wget*) if [ -f "$S/c-$n.unhealthy" ]; then exit 1; fi ;;
+      *wget*)
+        h=$(echo "$*" | sed -n 's|.*http://\([^:/]*\):8080.*|\1|p')
+        case "$h" in
+          127.0.0.1|'') if [ -f "$S/c-$n.unhealthy" ]; then exit 1; fi ;;
+          *)
+            to=$h; case "$h" in autobuild-app-*) ;; *) to=$(cat "$S/ip-$h" 2>/dev/null || true) ;; esac
+            [ -n "$to" ] && [ -f "$S/c-$to" ] && [ ! -f "$S/c-$to.down" ] || exit 1
+            for f in "$S/nets/$n"/*; do [ -e "$f" ] && [ -e "$S/nets/$to/${f##*/}" ] && exit 0; done
+            exit 1 ;;
+        esac ;;
     esac ;;
   network)
     case "$2" in

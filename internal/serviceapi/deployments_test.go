@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -97,6 +98,10 @@ func (d *testDeployments) CheckDrift(_ context.Context, target string, r Operati
 	d.calls = append(d.calls, "drift:"+target+":"+r.RequestID)
 	return sampleOperation, d.err
 }
+func (d *testDeployments) CheckIsolation(_ context.Context, target string, r IsolationRequestV1) (OperationV1, error) {
+	d.calls = append(d.calls, fmt.Sprintf("isolation:%s:%s:%s:%s:%t", target, r.Site, r.Other, r.RequestID, r.Crash))
+	return sampleOperation, d.err
+}
 func (d *testDeployments) Drift(_ context.Context, target string) (DriftV1, error) {
 	d.calls = append(d.calls, "drift-report:"+target)
 	return DriftV1{SchemaVersion: DriftSchemaV1, Target: target, Checked: true, CheckedAt: "2026-10-14T01:00:00Z", OK: true,
@@ -177,6 +182,7 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/databases/shop/remove", `{"request_id":"req-data-0001","confirm":"app_shop"}`},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/clean", `{"request_id":"req-clean-001","confirm":"srv-0123456789ab"}`},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/drift", `{"request_id":"req-drift-001"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/isolation", `{"request_id":"req-apart-001","site":"shop","other":"crm","crash":true}`},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/check", `{"request_id":"req-site-0001"}`},
 	} {
 		if r := call(s, c.method, c.path, c.body); r.Code != http.StatusAccepted {
@@ -204,7 +210,8 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 		"restore:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b", "check:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b:req-check-001",
 		"stop:srv-0123456789ab:shop:req-stop-0001", "start:srv-0123456789ab:shop:req-start-001",
 		"remove-data:srv-0123456789ab:shop:req-data-0001:app_shop", "clean:srv-0123456789ab:req-clean-001:srv-0123456789ab",
-		"drift:srv-0123456789ab:req-drift-001", "check-site:srv-0123456789ab:shop:req-site-0001", "databases:srv-0123456789ab",
+		"drift:srv-0123456789ab:req-drift-001", "isolation:srv-0123456789ab:shop:crm:req-apart-001:true",
+		"check-site:srv-0123456789ab:shop:req-site-0001", "databases:srv-0123456789ab",
 		"drift-report:srv-0123456789ab", "name:srv-0123456789ab:shop.example.com", "setup:srv-0123456789ab:shop"}
 	if strings.Join(backend.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v", backend.calls)
@@ -240,6 +247,8 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/clean", `{"request_id":"req-clean-001","confirm":"x","y":1}`},
 		{http.MethodPut, "/v1/targets/srv-0123456789ab/drift", ""},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/drift/now", `{"request_id":"req-drift-001"}`},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/isolation", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/isolation", `{"request_id":"req-apart-001","site":"shop","other":"crm","extra":1}`},
 		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/shop/check", ""},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/Shop/check", `{"request_id":"req-site-0001"}`},
 		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/check", `{"request_id":"req-site-0001","x":1}`},

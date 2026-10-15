@@ -120,6 +120,10 @@ type operationRecord struct {
 	Conversion string `json:"conversion,omitempty"`
 	// Paused is a start whose app never answered and was stopped again (BF-14.5a).
 	Paused bool `json:"paused,omitempty"`
+	// Other and Crash are an isolation check's (P1b): the app the site is
+	// checked against, and whether the site is crashed and started again.
+	Other string `json:"other,omitempty"`
+	Crash bool   `json:"crash,omitempty"`
 }
 
 // remote runs scripts on a target.
@@ -515,6 +519,8 @@ func (m *Manager) run(rec operationRecord) {
 		failed = m.runClean(ctx, &rec, r, session)
 	case "drift":
 		failed = m.runDrift(ctx, &rec, r, session)
+	case "isolation":
+		failed = m.runIsolation(ctx, &rec, r, session)
 	default:
 		failed = m.runApply(ctx, &rec, r, session)
 	}
