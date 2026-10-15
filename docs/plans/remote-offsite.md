@@ -1,5 +1,8 @@
 # Remote backups off the server (BF-14.2b-2)
 
+Status: **live since 08:28 UTC on 2026-10-15** (ABCP `b8f7b97`, recorded in #115); host 1's backups are copied to the owner's
+bucket, proved on the QA account's Team Kudos at 08:29 UTC.
+
 Repo C's design note `BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md` (§12 decision 5, approved by the owner on 2026-10-14: "ok for
 S3 bucket too"). The owner's CloudShell paste (Repo C `deploy/bf14/backups-bucket.sh`) made the bucket
 `autobuild-bf14-backups-<account>` in `ap-south-1` (private, encrypted, objects kept 30 days) and attached the instance
