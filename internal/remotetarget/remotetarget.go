@@ -36,8 +36,9 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/strictjson"
 )
 
-// MaxTargets bounds the targets one ABCP keeps.
-const MaxTargets = 20
+// MaxTargets bounds the targets one ABCP keeps: 200 since BF-14 was offered to everyone (two servers of their own per
+// person while invite-only, and ours).
+const MaxTargets = 200
 
 // DefaultUser is the deploy login a target uses unless it names another.
 const DefaultUser = "autobuild"
@@ -123,6 +124,11 @@ type Manager struct {
 	checkEvery time.Duration
 	checkFor   time.Duration
 	healthWait int
+
+	// Backups copied off the server (offsite.go): the instance metadata address and, for tests, an S3 address in
+	// place of the bucket's own.
+	metadataURL string
+	s3Endpoint  string
 }
 
 // New keeps targets in dir, a folder open to the controller's user alone.
@@ -142,6 +148,7 @@ func New(dir string, clock func() time.Time) (*Manager, error) {
 		allow: PublicAddress,
 		dial:  dialer.DialContext,
 		busy:  map[string]bool{}, fetch: httpsFetch, checkEvery: defaultCheckEvery, checkFor: checkWindow, healthWait: defaultHealthWait,
+		metadataURL: "http://169.254.169.254",
 	}
 	m.interrupted()
 	return m, nil

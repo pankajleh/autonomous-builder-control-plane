@@ -255,7 +255,11 @@ func (m *Manager) backUp(ctx context.Context, session remote, key, site, reason,
 	if len(drop) > 0 {
 		_, _ = run(ctx, session, fill(removeBackupsScript, "N", site, "LIST", strings.Join(drop, " ")), nil)
 	}
-	return id, fmt.Sprintf("%d bytes, %d tables, %d rows", size, tables, rows), nil
+	detail := fmt.Sprintf("%d bytes, %d tables, %d rows", size, tables, rows)
+	if t, ok := m.offsiteFor(key); ok {
+		detail += "; " + m.copyBackups(ctx, session, key, site, id, t)
+	}
+	return id, detail, nil
 }
 
 // parseBackup reads what the backup script printed: the dump's size, then each

@@ -211,6 +211,17 @@ type BackupV1 struct {
 	// Check is the last time the backup was restored into a separate database
 	// and every table's rows compared with what it held when taken.
 	Check *BackupCheckV1 `json:"check,omitempty"`
+	// Offsite is the backup's copy off the server (BF-14.2b-2), when the target
+	// has a bucket: where it went, or why it did not.
+	Offsite *BackupOffsiteV1 `json:"offsite,omitempty"`
+}
+
+// BackupOffsiteV1 is whether a backup was copied off its server: Detail is the
+// copy's s3:// address, or why it was not copied.
+type BackupOffsiteV1 struct {
+	At     string `json:"at"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail"`
 }
 
 // BackupCheckV1 is whether a backup restored with the rows it was taken with.
