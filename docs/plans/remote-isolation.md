@@ -27,3 +27,10 @@ for another app or crash is refused. Steps:
 
 The passwords go to the Postgres container on its input and never on a command line or in ABCP's records; nothing else
 on the server changes (with `crash`, the site is down for the seconds between the kill and its `/health`).
+
+## Live (#113)
+
+On host 1 since 07:49 UTC on 2026-10-15 (ABCP `9c9eeb8`). Proof P1b passed at 07:50 UTC with the QA account's apps: three
+pairs (gVisor and standard runtimes, both ways), every login refused on the other app's database by the server's access
+rules with `CONNECT` not granted, no container reaching another, and `p2-kudos` killed while `team-kudos-app` kept
+answering, then started again (15 seconds for the whole check).
