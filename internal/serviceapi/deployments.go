@@ -147,7 +147,8 @@ type OperationStepV1 struct {
 // OperationV1 is a change ABCP carries out on a target. Kind is "apply",
 // "remove", "backup", "restore", "check_backup", "nightly" (every Node app on
 // the target, with no site of its own), "stop", "start", "remove_data",
-// "clean" or "drift" (the last two with no site). State is "queued", "running",
+// "clean" or "drift" (the last two with no site), or "isolation" (P1b: Site
+// and another app kept apart). State is "queued", "running",
 // "succeeded", "failed" or "unknown" (interrupted: unknown until reconciled,
 // never safe to repeat blindly).
 type OperationV1 struct {
@@ -239,6 +240,18 @@ type BackupCreateV1 struct {
 // id: a Node app's stop or start, or a check of the target (BF-14.5a).
 type OperationRequestV1 struct {
 	RequestID string `json:"request_id"`
+}
+
+// IsolationRequestV1 asks whether two Node apps on a target are kept apart
+// (BF-14 proof P1b): each app's database login is tried on the other's
+// database and must be refused, and neither app's container may reach the
+// other's. With Crash, Site's container is killed outright, Other must still
+// answer, and Site is then started again.
+type IsolationRequestV1 struct {
+	RequestID string `json:"request_id"`
+	Site      string `json:"site"`
+	Other     string `json:"other"`
+	Crash     bool   `json:"crash,omitempty"`
 }
 
 // ConfirmedRequestV1 starts an operation that removes something for good;
@@ -347,6 +360,8 @@ type DeploymentController interface {
 	RemoveData(ctx context.Context, target, site string, request ConfirmedRequestV1) (OperationV1, error)
 	CleanTarget(ctx context.Context, target string, request ConfirmedRequestV1) (OperationV1, error)
 	CheckDrift(ctx context.Context, target string, request OperationRequestV1) (OperationV1, error)
+	// CheckIsolation proves two Node apps on a target are kept apart (P1b).
+	CheckIsolation(ctx context.Context, target string, request IsolationRequestV1) (OperationV1, error)
 	Drift(ctx context.Context, target string) (DriftV1, error)
 	// Name looks a host up once and says whether it points at the target;
 	// CheckSite runs a site's check once more (BF-14.3a).
@@ -437,8 +452,8 @@ func (s *Server) releases(w http.ResponseWriter, r *http.Request, principal Prin
 }
 
 // /v1/targets/{key}/plans, /apply, /operations/{id}, /sites, /sites/{name}/remove, /sites/{name}/backups,
-// /sites/{name}/backups/{backup}/check, /sites/{name}/stop and /start, /databases, /databases/{name}/remove, /clean and
-// /drift
+// /sites/{name}/backups/{backup}/check, /sites/{name}/stop and /start, /databases, /databases/{name}/remove, /clean,
+// /drift and /isolation
 func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id string, parts []string, body func(any) bool) {
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid deployment request", RequestID: id})
@@ -611,6 +626,14 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 			return
 		}
 		op, err := s.reserved.Deployments.CheckDrift(r.Context(), key, request)
+		operation(op, err, http.StatusAccepted)
+	case len(parts) == 2 && parts[1] == "isolation" && r.Method == http.MethodPost:
+		var request IsolationRequestV1
+		if !body(&request) {
+			bad()
+			return
+		}
+		op, err := s.reserved.Deployments.CheckIsolation(r.Context(), key, request)
 		operation(op, err, http.StatusAccepted)
 	case len(parts) == 2 && parts[1] == "drift" && r.Method == http.MethodGet:
 		if !requestBodyEmpty(r) {
