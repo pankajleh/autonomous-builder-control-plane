@@ -238,7 +238,7 @@ func (m *Manager) Target(_ context.Context, key string) (serviceapi.TargetV1, er
 
 // CreateTarget registers a target and makes its key pair.
 func (m *Manager) CreateTarget(ctx context.Context, key string, create serviceapi.TargetCreateV1) (serviceapi.TargetV1, error) {
-	if !keyPattern.MatchString(key) {
+	if !keyPattern.MatchString(key) || key == offsiteKey {
 		return serviceapi.TargetV1{}, serviceapi.ErrTargetInvalid
 	}
 	address := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(create.Address), "."))
@@ -611,6 +611,9 @@ func (m *Manager) read(key string) (record, error) {
 	if !keyPattern.MatchString(key) {
 		return record{}, serviceapi.ErrTargetInvalid
 	}
+	if key == offsiteKey {
+		return record{}, serviceapi.ErrTargetUnknown
+	}
 	data, err := os.ReadFile(filepath.Join(m.dir, key+".json"))
 	if errors.Is(err, os.ErrNotExist) {
 		return record{}, serviceapi.ErrTargetUnknown
@@ -633,7 +636,7 @@ func (m *Manager) all() ([]record, error) {
 	var records []record
 	for _, e := range entries {
 		name := e.Name()
-		if !e.Type().IsRegular() || !strings.HasSuffix(name, ".json") {
+		if !e.Type().IsRegular() || !strings.HasSuffix(name, ".json") || name == offsiteKey+".json" {
 			continue
 		}
 		r, err := m.read(strings.TrimSuffix(name, ".json"))
