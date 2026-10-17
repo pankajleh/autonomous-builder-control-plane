@@ -31,9 +31,13 @@ var (
 // offsiteRetries bounds the earlier backups a new one tries to copy again.
 const offsiteRetries = 3
 
+// offsiteKey names the folder's own settings, offsite.json beside the targets' records: never a target, so the list of
+// targets passes it by and no target may take its name.
+const offsiteKey = "offsite"
+
 // offsiteFor reads where a target's backups are copied, read afresh each time so a change needs no restart.
 func (m *Manager) offsiteFor(key string) (offsiteTarget, bool) {
-	data, err := os.ReadFile(filepath.Join(m.dir, "offsite.json"))
+	data, err := os.ReadFile(filepath.Join(m.dir, offsiteKey+".json"))
 	if err != nil {
 		return offsiteTarget{}, false
 	}

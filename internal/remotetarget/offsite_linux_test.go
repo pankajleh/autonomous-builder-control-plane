@@ -7,6 +7,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -229,5 +230,25 @@ func TestABackupStaysOnTheServerWhenItCannotBeCopied(t *testing.T) {
 	}
 	if _, ok := f.m.offsiteFor(f.key); ok {
 		t.Fatal("a bad bucket name was used")
+	}
+}
+
+// From 2026-10-15 08:30 UTC, when the first offsite.json was written, the list of targets, a new target and every
+// night's backups failed: the list read offsite.json as a target's record. It is the folder's settings, not a target.
+func TestTheOffsiteSettingsAreNotATarget(t *testing.T) {
+	f := newDeployFixture(t)
+	if err := os.WriteFile(filepath.Join(f.m.dir, "offsite.json"),
+		[]byte(`{"targets":{"`+f.key+`":{"bucket":"autobuild-bf14-backups-123456789012","region":"ap-south-1"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	list, err := f.m.Targets(context.Background())
+	if err != nil || len(list.Targets) != 1 || list.Targets[0].Key != f.key {
+		t.Fatalf("targets = %+v, %v", list, err)
+	}
+	if _, err := f.m.Target(context.Background(), "offsite"); !errors.Is(err, serviceapi.ErrTargetUnknown) {
+		t.Fatalf("offsite as a target = %v", err)
+	}
+	if _, err := f.m.CreateTarget(context.Background(), "offsite", serviceapi.TargetCreateV1{Address: testHost}); !errors.Is(err, serviceapi.ErrTargetInvalid) {
+		t.Fatalf("a target named offsite = %v", err)
 	}
 }
