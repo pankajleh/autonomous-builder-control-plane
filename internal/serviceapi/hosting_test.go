@@ -17,6 +17,7 @@ type testHosting struct {
 	hosted  HostedV1
 	backup  HostedBackupV1
 	route   HostedRouteV1
+	setup   HostedSetupV1
 	err     error
 	calls   []string
 	lastKey string
@@ -55,6 +56,10 @@ func (t *testHosting) PurgeHosted(_ context.Context, _ Principal, _ string, key 
 	t.record("purge", key)
 	return t.hosted, t.err
 }
+func (t *testHosting) ReadHostedSetup(_ context.Context, _ Principal, key string) (HostedSetupV1, error) {
+	t.record("setup", key)
+	return t.setup, t.err
+}
 
 func readyHosted() HostedV1 {
 	return HostedV1{SchemaVersion: "HostedV1", HostingKey: "app-1", Desired: "RUNNING", Status: "READY", Health: "HEALTHY", Generation: 1,
@@ -76,6 +81,7 @@ func hostingServer(t *testing.T, grant, delegate bool, kind PrincipalType) (*Ser
 		hosted: readyHosted(),
 		backup: HostedBackupV1{SchemaVersion: "HostedBackupV1", HostingKey: "app-1", BackupID: strings.Repeat("f", 64), Reason: "manual", TakenAt: "2026-09-30T10:02:00Z", Bytes: 10, Generation: 1, SourceSHA: strings.Repeat("c", 40)},
 		route:  HostedRouteV1{SchemaVersion: "HostedRouteV1", HostingKey: "app-1", RouteHandle: strings.Repeat("e", 64), TargetURL: "http://127.0.0.1:4321"},
+		setup:  HostedSetupV1{SchemaVersion: "HostedSetupV1", HostingKey: "app-1", Token: strings.Repeat("0a", 16)},
 	}
 	s.reserved.Hosting = backend
 	return s, backend
@@ -134,6 +140,7 @@ func TestHostedRoutesServeEveryOperation(t *testing.T) {
 	}{
 		{"GET", "/v1/hosted/app-1", "", 200, "read"},
 		{"GET", "/v1/hosted/app-1/route", "", 200, "route"},
+		{"GET", "/v1/hosted/app-1/setup", "", 200, "setup"},
 		{"GET", "/v1/hosted/app-1/backups", "", 200, "backups"},
 		{"POST", "/v1/hosted/app-1/start", startBody, 202, "start"},
 		{"POST", "/v1/hosted/app-1/stop", commandBody, 200, "stop"},
@@ -155,6 +162,39 @@ func TestHostedRoutesServeEveryOperation(t *testing.T) {
 	var route HostedRouteV1
 	if json.Unmarshal(get(s, "/v1/hosted/app-1/route").Body.Bytes(), &route) != nil || route.TargetURL != "http://127.0.0.1:4321" {
 		t.Fatal("route body", route)
+	}
+	var setup HostedSetupV1
+	if json.Unmarshal(get(s, "/v1/hosted/app-1/setup").Body.Bytes(), &setup) != nil || setup != backend.setup {
+		t.Fatal("setup body", setup)
+	}
+}
+
+// H6 (Repo C design note H6_FIRST_ADMIN_ON_HOSTING.md): a hosted app's setup token is read, never written, through
+// the hosting grant; one not made yet is setup_pending, and one of another shape or key is never served.
+func TestTheHostedSetupTokenIsReadOnlyPendingUntilMadeAndNeverServedMalformed(t *testing.T) {
+	s, backend := hostingServer(t, true, true, PrincipalService)
+	if w := post(s, "/v1/hosted/app-1/setup", commandBody); w.Code != 400 || len(backend.calls) != 0 {
+		t.Fatal("a write to the setup token", w.Code, backend.calls)
+	}
+	backend.err = ErrSetupPending
+	if w := get(s, "/v1/hosted/app-1/setup"); w.Code != 409 || !strings.Contains(w.Body.String(), `"code":"setup_pending"`) {
+		t.Fatal("a pending token", w.Code, w.Body.String())
+	}
+	backend.err = nil
+	for _, bad := range []HostedSetupV1{
+		{SchemaVersion: "HostedSetupV1", HostingKey: "app-1", Token: "try-autobuild"},
+		{SchemaVersion: "HostedSetupV1", HostingKey: "app-1", Token: strings.Repeat("A", 32)},
+		{SchemaVersion: "HostedSetupV1", HostingKey: "app-2", Token: strings.Repeat("0a", 16)},
+		{SchemaVersion: "SiteSetupV1", HostingKey: "app-1", Token: strings.Repeat("0a", 16)},
+	} {
+		backend.setup = bad
+		if w := get(s, "/v1/hosted/app-1/setup"); w.Code != 500 || strings.Contains(w.Body.String(), bad.Token) {
+			t.Fatal("a malformed token was served", bad, w.Code, w.Body.String())
+		}
+	}
+	s2, _ := hostingServer(t, false, true, PrincipalService)
+	if w := get(s2, "/v1/hosted/app-1/setup"); w.Code != 403 {
+		t.Fatal("the token without the hosting grant", w.Code)
 	}
 }
 

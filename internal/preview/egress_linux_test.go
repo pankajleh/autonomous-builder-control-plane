@@ -203,16 +203,25 @@ func TestHostedSettingsLiveOnlyInTheKeysPrivateFile(t *testing.T) {
 func TestTheServiceThatTakesSettingsGetsThemFromTheirFileAndEveryServiceLearnsTheProxy(t *testing.T) {
 	gateway := previewSubnet(strings.Repeat("c", 64), 0).Addr().Next()
 	s := shopifyProfile().Services[0]
-	plain := serviceStart("app-0", s, []string{"/usr/local/bin/node", "/opt/autobuild/start.mjs"}, gateway, "")
+	plain := serviceStart("app-0", s, []string{"/usr/local/bin/node", "/opt/autobuild/start.mjs"}, gateway, "", "")
 	if strings.Join(plain, " ") != "exec --detach app-0 /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/scratch TMPDIR=/scratch NODE_ENV=development HTTPS_PROXY=http://"+gateway.String()+":3129 NODE_USE_ENV_PROXY=1 /usr/local/bin/node /opt/autobuild/start.mjs" {
 		t.Fatal("plain start", plain)
 	}
-	withSettings := serviceStart("app-0", s, []string{"/usr/local/bin/node", "/opt/autobuild/start.mjs"}, gateway, "/private/hosted/k/settings.env")
+	withSettings := serviceStart("app-0", s, []string{"/usr/local/bin/node", "/opt/autobuild/start.mjs"}, gateway, "/private/hosted/k/settings.env", "")
 	if strings.Join(withSettings, " ") != "exec --detach --env-file /private/hosted/k/settings.env app-0 /usr/bin/env -u HOSTNAME PATH=/usr/local/bin:/usr/bin:/bin HOME=/scratch TMPDIR=/scratch NODE_ENV=development HTTPS_PROXY=http://"+gateway.String()+":3129 NODE_USE_ENV_PROXY=1 /usr/local/bin/node /opt/autobuild/start.mjs" {
 		t.Fatal("start with settings", withSettings)
 	}
+	// A hosted app's presented service gets its setup token from its own file the same way (H6), with or without settings.
+	withSetup := serviceStart("app-0", s, []string{"/usr/local/bin/node", "/opt/autobuild/start.mjs"}, gateway, "", "/private/hosted/k/setup.env")
+	if strings.Join(withSetup, " ") != "exec --detach --env-file /private/hosted/k/setup.env app-0 /usr/bin/env -u HOSTNAME PATH=/usr/local/bin:/usr/bin:/bin HOME=/scratch TMPDIR=/scratch NODE_ENV=development HTTPS_PROXY=http://"+gateway.String()+":3129 NODE_USE_ENV_PROXY=1 /usr/local/bin/node /opt/autobuild/start.mjs" {
+		t.Fatal("start with a setup token", withSetup)
+	}
+	both := serviceStart("app-0", s, []string{"/x"}, netip.Addr{}, "/private/hosted/k/settings.env", "/private/hosted/k/setup.env")
+	if strings.Join(both, " ") != "exec --detach --env-file /private/hosted/k/settings.env --env-file /private/hosted/k/setup.env app-0 /usr/bin/env -u HOSTNAME PATH=/usr/local/bin:/usr/bin:/bin HOME=/scratch TMPDIR=/scratch NODE_ENV=development /x" {
+		t.Fatal("start with settings and a setup token", both)
+	}
 	// A group without a proxy tells its services nothing about one.
-	if none := strings.Join(serviceStart("app-0", testProfile().Services[0], []string{"/x"}, netip.Addr{}, ""), " "); strings.Contains(none, "PROXY") {
+	if none := strings.Join(serviceStart("app-0", testProfile().Services[0], []string{"/x"}, netip.Addr{}, "", ""), " "); strings.Contains(none, "PROXY") {
 		t.Fatal("start without a proxy", none)
 	}
 }
@@ -225,16 +234,28 @@ func TestAnEgressGroupRunsItsProxyWithTheSettingsFileUntilItStops(t *testing.T) 
 	if err := os.WriteFile(settings, []byte("SCOPES=x\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	setup := filepath.Join(t.TempDir(), "setup.env")
+	if err := os.WriteFile(setup, []byte("BOOTSTRAP_TOKEN="+strings.Repeat("0a", 16)+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(f.d.root, "sources", f.id)
 	// Only a private settings file, and only for a start that names one.
-	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, strings.Repeat("7", 64), settings); err == nil {
+	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, strings.Repeat("7", 64), settings, setup); err == nil {
 		t.Fatal("a settings file others can read was accepted")
 	}
-	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, strings.Repeat("7", 64), ""); err == nil {
+	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, strings.Repeat("7", 64), "", setup); err == nil {
 		t.Fatal("a start without the settings the profile takes was accepted")
 	}
 	os.Chmod(settings, 0600)
-	route, err := f.d.StartHosted(context.Background(), f.id, path, p, strings.Repeat("7", 64), settings)
+	// Likewise the setup token's file (H6): private, and named by every hosted start.
+	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, strings.Repeat("7", 64), settings, setup); err == nil {
+		t.Fatal("a setup token's file others can read was accepted")
+	}
+	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, strings.Repeat("7", 64), settings, ""); err == nil {
+		t.Fatal("a hosted start without its setup token's file was accepted")
+	}
+	os.Chmod(setup, 0600)
+	route, err := f.d.StartHosted(context.Background(), f.id, path, p, strings.Repeat("7", 64), settings, setup)
 	if err != nil || !sha256Pattern.MatchString(route) {
 		t.Fatal(route, err)
 	}
@@ -251,6 +272,9 @@ func TestAnEgressGroupRunsItsProxyWithTheSettingsFileUntilItStops(t *testing.T) 
 			started = true
 			if !strings.Contains(joined, "--env-file "+settings+" ") || !strings.Contains(joined, "HTTPS_PROXY=http://"+g.gateway.String()+":3129") || strings.Contains(joined, "SCOPES=x") {
 				t.Fatal("start", joined)
+			}
+			if !strings.Contains(joined, "--env-file "+setup+" ") || strings.Contains(joined, strings.Repeat("0a", 16)) {
+				t.Fatal("the presented service's setup token", joined)
 			}
 		}
 	}
@@ -283,7 +307,7 @@ func TestAnEgressGroupRunsItsProxyWithTheSettingsFileUntilItStops(t *testing.T) 
 		}
 		return l, err
 	}
-	if _, err := q.d.StartHosted(context.Background(), q.id, filepath.Join(q.d.root, "sources", q.id), p, strings.Repeat("7", 64), settings); err == nil {
+	if _, err := q.d.StartHosted(context.Background(), q.id, filepath.Join(q.d.root, "sources", q.id), p, strings.Repeat("7", 64), settings, setup); err == nil {
 		t.Fatal("the failed start succeeded")
 	}
 	if addr == "" {

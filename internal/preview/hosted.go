@@ -2,10 +2,13 @@ package preview
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -45,7 +48,7 @@ var (
 // HostedRuntime is the part of the governed runtime a hosted instance uses. The Docker runtime provides it.
 type HostedRuntime interface {
 	Available(PreviewProfileV1) bool
-	StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest, settings string) (string, error)
+	StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest, settings, setup string) (string, error)
 	Healthy(ctx context.Context, id string, p PreviewProfileV1) (bool, error)
 	ResolveRoute(ctx context.Context, id, handle string) (string, error)
 	Stop(ctx context.Context, id string) error
@@ -466,27 +469,96 @@ func (h *Hosting) writeSettings(keyDigest string, settings map[string]string) er
 	for _, name := range names {
 		data.WriteString(name + "=" + settings[name] + "\n")
 	}
-	dir := filepath.Join(h.root, keyDigest)
-	d, err := privateDirectory(dir, true)
-	if err != nil {
-		h.unavailable = true
-		return ErrUnavailable
-	}
-	defer d.Close()
-	tmp := filepath.Join(dir, "settings.next")
-	f, err := openRegular(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, true)
-	if err != nil {
-		h.unavailable = true
-		return ErrUnavailable
-	}
-	_, err = f.WriteString(data.String())
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if err != nil || syncErr != nil || closeErr != nil || os.Rename(tmp, path) != nil || d.Sync() != nil {
+	if h.writePrivate(keyDigest, "settings", data.String()) != nil {
 		h.unavailable = true
 		return ErrUnavailable
 	}
 	return nil
+}
+
+// writePrivate writes one of a key's 0600 files, {name}.env, whole: through {name}.next, renamed over it.
+func (h *Hosting) writePrivate(keyDigest, name, data string) error {
+	dir := filepath.Join(h.root, keyDigest)
+	d, err := privateDirectory(dir, true)
+	if err != nil {
+		return ErrUnavailable
+	}
+	defer d.Close()
+	tmp := filepath.Join(dir, name+".next")
+	f, err := openRegular(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, true)
+	if err != nil {
+		return ErrUnavailable
+	}
+	_, err = f.WriteString(data)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if err != nil || syncErr != nil || closeErr != nil || os.Rename(tmp, filepath.Join(dir, name+".env")) != nil || d.Sync() != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+// The first administrator of a hosted app (Repo C design note H6_FIRST_ADMIN_ON_HOSTING.md). An app built with the
+// template library's accounts block has no administrator until someone makes the first one with the app's private
+// setup token, which it reads from BOOTSTRAP_TOKEN; without one, nobody can manage it. Each hosted key keeps its own
+// token, made the first time its app starts, in setup.env (0600) beside its settings, and every start gives it to the
+// presented service from that file, never as an argument. Stopping, updating, restarting and restoring keep it; a
+// purge removes it with the data, so a fresh database gets a new one. The product reads it through ReadHostedSetup to
+// open the app's first-admin form; the app makes a first administrator only while it has none. It is the same shape as
+// a server's own (BF-14.2c), and different for every key: a hosted profile still never names BOOTSTRAP_TOKEN.
+var hostedSetupPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
+
+func (h *Hosting) setupPath(keyDigest string) string {
+	return filepath.Join(h.root, keyDigest, "setup.env")
+}
+
+// readSetup answers the token a key keeps, or "" for none. Call with h.mu held.
+func (h *Hosting) readSetup(keyDigest string) string {
+	b, err := readFile(h.setupPath(keyDigest), 64, true)
+	if err != nil {
+		return ""
+	}
+	token, ok := strings.CutPrefix(string(b), "BOOTSTRAP_TOKEN=")
+	token, end := strings.CutSuffix(token, "\n")
+	if !ok || !end || !hostedSetupPattern.MatchString(token) {
+		return ""
+	}
+	return token
+}
+
+// ensureSetup answers the file of the key's setup token, making the token the first time.
+func (h *Hosting) ensureSetup(keyDigest string) (string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.readSetup(keyDigest) == "" {
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			return "", ErrUnavailable
+		}
+		if h.writePrivate(keyDigest, "setup", "BOOTSTRAP_TOKEN="+hex.EncodeToString(b)+"\n") != nil {
+			h.unavailable = true
+			return "", ErrUnavailable
+		}
+	}
+	return h.setupPath(keyDigest), nil
+}
+
+// ReadHostedSetup answers the app's setup token; ErrSetupPending until its first start since tokens are kept.
+func (h *Hosting) ReadHostedSetup(_ context.Context, p serviceapi.Principal, key string) (serviceapi.HostedSetupV1, error) {
+	k, err := h.key(p, key, false)
+	if err != nil {
+		return serviceapi.HostedSetupV1{}, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if k.state.Key == "" {
+		return serviceapi.HostedSetupV1{}, serviceapi.ErrDependencyNotFound
+	}
+	token := h.readSetup(k.digest)
+	if token == "" {
+		return serviceapi.HostedSetupV1{}, serviceapi.ErrSetupPending
+	}
+	return serviceapi.HostedSetupV1{SchemaVersion: "HostedSetupV1", HostingKey: key, Token: token}, nil
 }
 
 func (h *Hosting) StopHosted(_ context.Context, p serviceapi.Principal, authorityDigest, key string, c serviceapi.HostedCommandRequestV1) (serviceapi.HostedV1, error) {
@@ -514,9 +586,11 @@ func (h *Hosting) PurgeHosted(ctx context.Context, p serviceapi.Principal, autho
 		if os.RemoveAll(filepath.Join(h.root, k.digest, "backups")) != nil {
 			return st, serviceapi.ErrPreviewUnavailable
 		}
-		// A purged key keeps no settings either; the next start brings them again.
-		if err := os.Remove(h.settingsPath(k.digest)); err != nil && !os.IsNotExist(err) {
-			return st, serviceapi.ErrPreviewUnavailable
+		// A purged key keeps no settings and no setup token either; the next start brings them again.
+		for _, file := range []string{h.settingsPath(k.digest), h.setupPath(k.digest)} {
+			if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+				return st, serviceapi.ErrPreviewUnavailable
+			}
 		}
 		st.Data, st.Backups, st.LastNightly = "PURGED", nil, ""
 		return st, nil
@@ -859,7 +933,11 @@ func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedStat
 	if profile.settingsService() >= 0 {
 		settings = h.settingsPath(k.digest)
 	}
-	route, err := h.runtime.StartHosted(ctx, id, path, profile, k.digest, settings)
+	setup, err := h.ensureSetup(k.digest)
+	if err != nil {
+		return
+	}
+	route, err := h.runtime.StartHosted(ctx, id, path, profile, k.digest, settings, setup)
 	if err != nil || !sha256Pattern.MatchString(route) {
 		return
 	}

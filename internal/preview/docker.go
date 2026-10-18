@@ -137,14 +137,19 @@ func cleanEnv(s ServiceProfileV1) []string {
 }
 
 // serviceStart is the `docker exec` that starts a service with argv. A group with an egress proxy tells every service
-// where it is. The service that takes settings gets them from their 0600 file with --env-file, never an argument; since
-// `env -i` would clear them, its start keeps the environment Docker gives the exec instead (the image's own settings,
-// which imageSafe allows only from a short list, and the file's), less HOSTNAME.
-func serviceStart(name string, s ServiceProfileV1, argv []string, egress netip.Addr, settings string) []string {
+// where it is. The service that takes settings gets them from their 0600 file with --env-file, never an argument, and a
+// hosted app's presented service gets its setup token the same way (H6); since `env -i` would clear them, such a start
+// keeps the environment Docker gives the exec instead (the image's own settings, which imageSafe allows only from a
+// short list, and the files'), less HOSTNAME.
+func serviceStart(name string, s ServiceProfileV1, argv []string, egress netip.Addr, settings, setup string) []string {
 	args := []string{"exec", "--detach"}
 	env := cleanEnv(s)
-	if settings != "" {
-		args = append(args, "--env-file", settings)
+	for _, file := range []string{settings, setup} {
+		if file != "" {
+			args = append(args, "--env-file", file)
+		}
+	}
+	if settings != "" || setup != "" {
 		env = append([]string{"-u", "HOSTNAME"}, env[1:]...)
 	}
 	args = append(append(args, name, "/usr/bin/env"), env...)
@@ -414,12 +419,16 @@ func (d *dockerRuntime) runtimeAvailable(ctx context.Context, name string) bool 
 	return ok
 }
 
-func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume, settings string) (_ *presentation, err error) {
+func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume, settings, setup string) (_ *presentation, err error) {
 	if !sha256Pattern.MatchString(id) || p.Validate() != nil || (p.dataService() >= 0) != (volume != "") {
 		return nil, ErrUnavailable
 	}
 	// A hosted start of a profile that takes settings names their file; a probe and every other start name none.
 	if (p.settingsService() >= 0 && !probe) != (settings != "") || settings != "" && !validSettingsFile(settings) {
+		return nil, ErrUnavailable
+	}
+	// A hosted start names its setup token's file, for the presented service; a probe and every preview name none.
+	if (p.Hosted && !probe) != (setup != "") || setup != "" && !validSettingsFile(setup) {
 		return nil, ErrUnavailable
 	}
 	if path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n") {
@@ -484,13 +493,18 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 				return nil, err
 			}
 		}
-		start, serviceSettings := s.StartArgv, ""
+		start, serviceSettings, serviceSetup := s.StartArgv, "", ""
 		if probe {
 			start = []string{"/bin/busybox", "httpd", "-f", "-p", strconv.Itoa(s.Port), "-h", "/scratch"}
-		} else if len(s.Settings) > 0 {
-			serviceSettings = settings
+		} else {
+			if len(s.Settings) > 0 {
+				serviceSettings = settings
+			}
+			if s.Presented {
+				serviceSetup = setup
+			}
 		}
-		if _, err := d.run(ctx, serviceStart(name, s, start, egress, serviceSettings)...); err != nil {
+		if _, err := d.run(ctx, serviceStart(name, s, start, egress, serviceSettings, serviceSetup)...); err != nil {
 			return nil, err
 		}
 		endpoint, err := d.endpoint(ctx, id, p, s, i, volume)
@@ -596,12 +610,12 @@ func (d *dockerRuntime) Start(ctx context.Context, id, path string, p PreviewPro
 	if p.Hosted {
 		return "", ErrUnavailable
 	}
-	return d.start(ctx, id, path, p, "", "")
+	return d.start(ctx, id, path, p, "", "", "")
 }
 
 // StartHosted starts a hosted instance with the hosting key's data volume (B9.2.1) and, for a profile that takes
 // settings, the file that holds them (A5.2b).
-func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest, settings string) (string, error) {
+func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest, settings, setup string) (string, error) {
 	if !p.Hosted || !sha256Pattern.MatchString(keyDigest) {
 		return "", ErrUnavailable
 	}
@@ -609,7 +623,7 @@ func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p Prev
 	if p.dataService() >= 0 {
 		volume = d.volume(keyDigest)
 	}
-	return d.start(ctx, id, path, p, volume, settings)
+	return d.start(ctx, id, path, p, volume, settings, setup)
 }
 
 // validSettingsFile accepts an absolute, clean path to a regular file only its owner can read or write.
@@ -620,14 +634,14 @@ func validSettingsFile(path string) bool {
 	info, err := os.Lstat(path)
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0077 == 0
 }
-func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume, settings string) (string, error) {
+func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume, settings, setup string) (string, error) {
 	if !sha256Pattern.MatchString(id) || path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n") {
 		return "", ErrUnavailable
 	}
 	if !d.Available(p) {
 		return "", ErrUnavailable
 	}
-	g, err := d.startGroup(ctx, id, path, p, false, volume, settings)
+	g, err := d.startGroup(ctx, id, path, p, false, volume, settings, setup)
 	if err != nil {
 		_ = d.Stop(context.Background(), id)
 		return "", err
@@ -817,7 +831,7 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 			break
 		}
 	}
-	g, err := d.startGroup(ctx, id, path, p, true, volume, "")
+	g, err := d.startGroup(ctx, id, path, p, true, volume, "", "")
 	if err != nil {
 		return false
 	}
