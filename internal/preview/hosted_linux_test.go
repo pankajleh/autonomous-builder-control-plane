@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ type hostedMemory struct {
 	started, stopped    []string
 	keys                []string
 	settings            []string // the settings file each start named, "" for none
+	setups              []string // the setup token's file each start named
 	dump                string
 	loaded              []string
 	removed             []string
@@ -34,7 +36,7 @@ func (r *hostedMemory) Available(PreviewProfileV1) bool {
 	defer r.mu.Unlock()
 	return r.available
 }
-func (r *hostedMemory) StartHosted(_ context.Context, id, _ string, p PreviewProfileV1, keyDigest, settings string) (string, error) {
+func (r *hostedMemory) StartHosted(_ context.Context, id, _ string, p PreviewProfileV1, keyDigest, settings, setup string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !p.Hosted {
@@ -43,6 +45,7 @@ func (r *hostedMemory) StartHosted(_ context.Context, id, _ string, p PreviewPro
 	r.started = append(r.started, id)
 	r.keys = append(r.keys, keyDigest)
 	r.settings = append(r.settings, settings)
+	r.setups = append(r.setups, setup)
 	return strings.Repeat("d", 64), r.startErr
 }
 func (r *hostedMemory) Healthy(context.Context, string, PreviewProfileV1) (bool, error) {
@@ -488,5 +491,88 @@ func TestHostedProfileValidation(t *testing.T) {
 	plain.Hosted = false
 	if plain.Digest() != before {
 		t.Fatal("the new optional fields changed an existing profile's digest")
+	}
+}
+
+// H6 (Repo C design note H6_FIRST_ADMIN_ON_HOSTING.md): each hosted app's own setup token, made at its first start and
+// named to the runtime from a 0600 file, kept by stops, starts and the controller's own restart, removed by a purge.
+func TestEachHostedAppKeepsItsOwnSetupTokenUntilItsDataIsPurged(t *testing.T) {
+	h, rt, _, clock, root := newHostedFixture(t)
+	ctx := context.Background()
+	if _, err := h.ReadHostedSetup(ctx, principal(), "app-1"); !errors.Is(err, serviceapi.ErrDependencyNotFound) {
+		t.Fatal("a token for a key never started", err)
+	}
+	if _, err := h.StartHosted(ctx, principal(), testAuthorityDigest, "app-1", startCommand("start-1")); err != nil {
+		t.Fatal(err)
+	}
+	awaitHosted(t, h, "app-1", "READY")
+	file := filepath.Join(root, hostedKeyDigest("app-1"), "setup.env")
+	rt.mu.Lock()
+	setups := append([]string(nil), rt.setups...)
+	rt.mu.Unlock()
+	if len(setups) != 1 || setups[0] != file {
+		t.Fatal("the start did not name the setup token's file", setups)
+	}
+	if info, err := os.Lstat(file); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatal("the setup token's file", info, err)
+	}
+	first, err := h.ReadHostedSetup(ctx, principal(), "app-1")
+	if err != nil || serviceapi.ValidateHostedSetupV1(first, "app-1") != nil {
+		t.Fatal(first, err)
+	}
+	if data, _ := os.ReadFile(file); string(data) != "BOOTSTRAP_TOKEN="+first.Token+"\n" {
+		t.Fatal("the file holds", string(data))
+	}
+	if v, _ := h.ReadHosted(ctx, principal(), "app-1"); strings.Contains(fmt.Sprintf("%+v", v), first.Token) {
+		t.Fatal("the token is in the hosted view")
+	}
+	// Every key has its own; another principal reads none.
+	if _, err := h.StartHosted(ctx, principal(), testAuthorityDigest, "app-2", startCommand("start-2")); err != nil {
+		t.Fatal(err)
+	}
+	awaitHosted(t, h, "app-2", "READY")
+	if second, err := h.ReadHostedSetup(ctx, principal(), "app-2"); err != nil || second.Token == first.Token || second.HostingKey != "app-2" {
+		t.Fatal("the second key's token", second, err)
+	}
+	other := serviceapi.Principal{PrincipalID: "other", PrincipalType: serviceapi.PrincipalService, AuthnMethod: "bearer-token-v1"}
+	if _, err := h.ReadHostedSetup(ctx, other, "app-1"); !errors.Is(err, serviceapi.ErrDependencyNotFound) {
+		t.Fatal("another principal read the token", err)
+	}
+	// A stop and a start keep it, and so does the controller's own restart, which starts the app again with it.
+	if _, err := h.StopHosted(ctx, principal(), testAuthorityDigest, "app-1", stopCommand("stop-1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.StartHosted(ctx, principal(), testAuthorityDigest, "app-1", startCommand("start-3")); err != nil {
+		t.Fatal(err)
+	}
+	awaitHosted(t, h, "app-1", "READY")
+	if again, err := h.ReadHostedSetup(ctx, principal(), "app-1"); err != nil || again != first {
+		t.Fatal("a start changed the token", again, err)
+	}
+	h.Close()
+	restarted, _ := hostingAt(t, root, rt, clock)
+	awaitHosted(t, restarted, "app-1", "READY")
+	if again, err := restarted.ReadHostedSetup(ctx, principal(), "app-1"); err != nil || again != first {
+		t.Fatal("the controller's restart changed the token", again, err)
+	}
+	// A purge removes it with the data; the next start makes a new one.
+	if _, err := restarted.StopHosted(ctx, principal(), testAuthorityDigest, "app-1", stopCommand("stop-2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.PurgeHosted(ctx, principal(), testAuthorityDigest, "app-1", stopCommand("purge-1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(file); !os.IsNotExist(err) {
+		t.Fatal("a purge kept the setup token", err)
+	}
+	if _, err := restarted.ReadHostedSetup(ctx, principal(), "app-1"); !errors.Is(err, serviceapi.ErrSetupPending) {
+		t.Fatal("a purged key's token", err)
+	}
+	if _, err := restarted.StartHosted(ctx, principal(), testAuthorityDigest, "app-1", startCommand("start-4")); err != nil {
+		t.Fatal(err)
+	}
+	awaitHosted(t, restarted, "app-1", "READY")
+	if fresh, err := restarted.ReadHostedSetup(ctx, principal(), "app-1"); err != nil || fresh.Token == first.Token || serviceapi.ValidateHostedSetupV1(fresh, "app-1") != nil {
+		t.Fatal("the start after a purge", fresh, err)
 	}
 }

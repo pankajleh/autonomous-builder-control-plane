@@ -33,6 +33,9 @@ type HostingController interface {
 	ListHostedBackups(ctx context.Context, principal Principal, key string) (HostedBackupListV1, error)
 	RestoreHosted(ctx context.Context, principal Principal, authorityDigest, key string, request HostedRestoreRequestV1) (HostedV1, error)
 	PurgeHosted(ctx context.Context, principal Principal, authorityDigest, key string, request HostedCommandRequestV1) (HostedV1, error)
+	// ReadHostedSetup answers the app's setup token, made at its first start since the controller keeps them, or
+	// ErrSetupPending before that start.
+	ReadHostedSetup(ctx context.Context, principal Principal, key string) (HostedSetupV1, error)
 }
 
 type HostedStartRequestV1 struct {
@@ -118,6 +121,25 @@ type HostedRouteV1 struct {
 	HostingKey    string `json:"hosting_key"`
 	RouteHandle   string `json:"route_handle"`
 	TargetURL     string `json:"target_url"`
+}
+
+// HostedSetupV1 is a hosted app's setup token (Repo C design note H6_FIRST_ADMIN_ON_HOSTING.md): the token with which
+// the app's first administrator is made, which the controller keeps for the key and gives the app as BOOTSTRAP_TOKEN on
+// every start. Only the service principal that controls hosting reads it; it is in no other answer, receipt or log.
+type HostedSetupV1 struct {
+	SchemaVersion string `json:"schema_version"`
+	HostingKey    string `json:"hosting_key"`
+	Token         string `json:"token"`
+}
+
+// hostedSetupToken is a setup token's shape: 32 lowercase hex characters, as on a server of its own (BF-14.2c).
+var hostedSetupToken = regexp.MustCompile(`^[a-f0-9]{32}$`)
+
+func ValidateHostedSetupV1(v HostedSetupV1, key string) error {
+	if v.SchemaVersion != "HostedSetupV1" || v.HostingKey != key || ValidateHostingKey(key) != nil || !hostedSetupToken.MatchString(v.Token) {
+		return errors.New("invalid hosted setup")
+	}
+	return nil
 }
 
 // ValidateHostingKey accepts the product's identifier for one hosted app.
@@ -223,7 +245,7 @@ func (s *Server) mayControlHosting(principal Principal) bool {
 	return principal.PrincipalType == PrincipalService && s.authority.Match(principal, "hosting.control") == nil
 }
 
-// /v1/hosted/{key} and /v1/hosted/{key}/{start|stop|route|backups|restore|purge}
+// /v1/hosted/{key} and /v1/hosted/{key}/{start|stop|route|setup|backups|restore|purge}
 func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal Principal, id string) {
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid hosted request", RequestID: id})
@@ -250,10 +272,10 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 		return
 	}
 	h := s.reserved.Hosting
-	read := r.Method == http.MethodGet && (op == "" || op == "route" || op == "backups")
+	read := r.Method == http.MethodGet && (op == "" || op == "route" || op == "setup" || op == "backups")
 	write := r.Method == http.MethodPost && (op == "start" || op == "stop" || op == "backups" || op == "restore" || op == "purge")
 	if !read && !write {
-		if op != "" && op != "start" && op != "stop" && op != "route" && op != "backups" && op != "restore" && op != "purge" {
+		if op != "" && op != "start" && op != "stop" && op != "route" && op != "setup" && op != "backups" && op != "restore" && op != "purge" {
 			s.writeDependencyError(w, id, ErrDependencyNotFound)
 			return
 		}
@@ -276,6 +298,17 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 				return
 			}
 			if ValidateHostedRouteV1(v, key) != nil {
+				s.writeDependencyError(w, id, ErrInternalDurableSubstrate)
+				return
+			}
+			s.writeJSON(w, http.StatusOK, v)
+		case "setup":
+			v, err := h.ReadHostedSetup(r.Context(), principal, key)
+			if err != nil {
+				s.writeDependencyError(w, id, err)
+				return
+			}
+			if ValidateHostedSetupV1(v, key) != nil {
 				s.writeDependencyError(w, id, ErrInternalDurableSubstrate)
 				return
 			}

@@ -916,6 +916,8 @@ func (s *Server) writeDependencyError(writer http.ResponseWriter, requestID stri
 		status, apiError.Code, apiError.Message = http.StatusConflict, "hosted_state_conflict", "hosted instance is not in a state for this command"
 	case errors.Is(err, ErrHostedCapacity):
 		status, apiError.Code, apiError.Message = http.StatusConflict, "hosted_capacity", "the limit of running hosted instances is reached"
+	case errors.Is(err, ErrSetupPending):
+		status, apiError.Code, apiError.Message = http.StatusConflict, "setup_pending", "the app has no setup token yet: start it again"
 	case errors.Is(err, ErrRunNotFinished):
 		status, apiError.Code, apiError.Message = http.StatusConflict, "run_not_finished", "run is not finished"
 	case errors.Is(err, ErrPreviewProfile):
