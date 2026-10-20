@@ -86,6 +86,11 @@ type RecognizedSummaryV1 struct {
 type TerminalStatusV1 struct {
 	Terminal bool   `json:"terminal"`
 	State    string `json:"state,omitempty"`
+	// FailureClass and Retryability: for a FAILED run whose failing transition
+	// recorded them, the classifier's fixed class and retryability (never the
+	// diagnostics they came from); absent otherwise.
+	FailureClass string `json:"failure_class,omitempty"`
+	Retryability string `json:"retryability,omitempty"`
 }
 
 type RunProjectionV1 struct {

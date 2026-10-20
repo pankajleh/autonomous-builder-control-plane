@@ -95,6 +95,7 @@ func projectRun(records []record, registration runtimecatalog.RunRegistrationV1,
 	initialized := false
 	current := domain.State("")
 	observedProjectID, observedPlanID := "", ""
+	failureClass, retryability := "", ""
 	for index := range records {
 		event := records[index].event
 		ordinal := uint64(index + 1)
@@ -131,6 +132,9 @@ func projectRun(records []record, registration runtimecatalog.RunRegistrationV1,
 				return RunProjectionV1{}, integrityError()
 			}
 			current = event.StateTo
+			if current == domain.StateFailed {
+				failureClass, retryability = payloadIdentifier(event.Payload, "failure_class"), payloadIdentifier(event.Payload, "retryability")
+			}
 			result.StateTransitions = append(result.StateTransitions, StateTransitionSummaryV1{
 				EventIdentityV1: identity(event, ordinal, registration),
 				StateFrom:       string(event.StateFrom), StateTo: string(event.StateTo),
@@ -146,7 +150,26 @@ func projectRun(records []record, registration runtimecatalog.RunRegistrationV1,
 	if result.TerminalStatus.Terminal {
 		result.TerminalStatus.State = string(current)
 	}
+	if current == domain.StateFailed {
+		result.TerminalStatus.FailureClass, result.TerminalStatus.Retryability = failureClass, retryability
+	}
 	return result, nil
+}
+
+// payloadIdentifier: a payload value that is a fixed upper-case identifier, such
+// as a failure class; anything else reads as absent, so no free text reaches a
+// reader through it.
+func payloadIdentifier(payload map[string]any, key string) string {
+	value, ok := payload[key].(string)
+	if !ok || len(value) == 0 || len(value) > 64 {
+		return ""
+	}
+	for _, r := range value {
+		if (r < 'A' || r > 'Z') && r != '_' {
+			return ""
+		}
+	}
+	return value
 }
 
 func projectionRevision(physicalDigest, snapshotDigest string, snapshotLength uint64, records []record) string {

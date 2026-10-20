@@ -134,6 +134,38 @@ func decodePage(t *testing.T, data json.RawMessage) EventProjectionPageV1 {
 	return value
 }
 
+func TestTerminalStatusCarriesTheFailureClassItsFailingTransitionRecorded(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		payload             map[string]any
+		class, retryability string
+	}{
+		{"a classified stop", map[string]any{"outcome": "exited", "failure_class": "TASK_NOT_COMPLETED", "retryability": "RETRYABLE_AFTER_CONDITION_CHANGE"},
+			"TASK_NOT_COMPLETED", "RETRYABLE_AFTER_CONDITION_CHANGE"},
+		{"an older stop without one", map[string]any{"outcome": "exited"}, "", ""},
+		{"free text never passes", map[string]any{"failure_class": "task failed: see /private/log", "retryability": 3}, "", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runID := "failure-class-run"
+			failed := transition(runID, "event-5", domain.StateImplementing, domain.StateFailed, 4)
+			failed.Payload = test.payload
+			ledgerValue, path := makeLedger(t, runID, created(runID, "event-1"),
+				transition(runID, "event-2", domain.StateRunCreated, domain.StateAuthorityValidated, 1),
+				transition(runID, "event-3", domain.StateAuthorityValidated, domain.StateExecutionStarting, 2),
+				transition(runID, "event-4", domain.StateExecutionStarting, domain.StateImplementing, 3), failed)
+			defer ledgerValue.Close()
+			raw, err := testService(t, testRegistration(runID, path, "/private/evidence")).ReadRunProjection(context.Background(), runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := decodeRun(t, raw).TerminalStatus
+			if !got.Terminal || got.State != string(domain.StateFailed) || got.FailureClass != test.class || got.Retryability != test.retryability {
+				t.Fatalf("terminal status = %+v, want class %q and retryability %q", got, test.class, test.retryability)
+			}
+		})
+	}
+}
+
 func TestProjectionPreservesHistoryAndDerivesStateOnlyFromEdges(t *testing.T) {
 	runID := "projection-run"
 	events := []ledger.Event{created(runID, "event-1")}

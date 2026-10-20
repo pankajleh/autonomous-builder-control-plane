@@ -28,6 +28,9 @@ const (
 	ClassHumanDecision         FailureClass = "HUMAN_DECISION_REQUIRED"
 	ClassUnrecoverable         FailureClass = "UNRECOVERABLE_FAILURE"
 	ClassUnknownAmbiguous      FailureClass = "UNKNOWN_AMBIGUOUS"
+	// ClassTaskNotCompleted: the implementer ran, tried again, and its task or its
+	// checks still did not pass. Running the same request again ends the same way.
+	ClassTaskNotCompleted FailureClass = "TASK_NOT_COMPLETED"
 )
 
 // Confidence describes how directly the available evidence supports a class.
@@ -67,6 +70,7 @@ const (
 	ActionRequestHumanDecision RecommendedAction = "REQUEST_HUMAN_DECISION"
 	ActionTerminateAttempt     RecommendedAction = "TERMINATE_ATTEMPT"
 	ActionInspectAndAuthorize  RecommendedAction = "INSPECT_AND_AUTHORIZE"
+	ActionRequestChange        RecommendedAction = "REQUEST_CHANGE"
 )
 
 // FailurePhase identifies the controller-owned operation that failed.
@@ -109,7 +113,21 @@ type diagnosticRule struct {
 	phrases []string
 }
 
+// supersedes: for a class, the classes whose match it replaces rather than
+// conflicts with, because the implementer's own output passes through them on
+// the way to this end (a retry announced, then the retry failing too).
+var supersedes = map[FailureClass][]FailureClass{
+	ClassTaskNotCompleted: {ClassTransientExecution},
+}
+
 var diagnosticRules = []diagnosticRule{
+	// Ralphex's own last words when its task, its validation or its review still
+	// failed after the retry it is allowed ("task failed, retrying..." comes
+	// first, so this supersedes the transient match).
+	{ClassTaskNotCompleted, "diagnostic:task-not-completed", []string{
+		"task execution failed after retry", "validation still failing after one repair turn",
+		"review failed (failed signal received)",
+	}},
 	{ClassTransientExecution, "diagnostic:transient-execution", []string{
 		"transient failure", "temporary failure", "task failed, retrying",
 		"connection reset", "connection timed out", "network timeout",
@@ -205,6 +223,7 @@ func Classify(input FailureInput) Classification {
 			matches = append(matches, rule)
 		}
 	}
+	matches = withoutSuperseded(matches)
 	if len(matches) > 1 {
 		result.EvidenceBasis = make([]string, 0, len(matches)+1)
 		for _, match := range matches {
@@ -238,6 +257,23 @@ func Classify(input FailureInput) Classification {
 
 	result.EvidenceBasis = []string{"classifier:no-specific-rule-matched"}
 	return applyRecommendation(result, ClassUnknownAmbiguous, ConfidenceAmbiguous)
+}
+
+// withoutSuperseded drops the matches another match supersedes.
+func withoutSuperseded(matches []diagnosticRule) []diagnosticRule {
+	superseded := map[FailureClass]bool{}
+	for _, match := range matches {
+		for _, class := range supersedes[match.class] {
+			superseded[class] = true
+		}
+	}
+	kept := matches[:0:0]
+	for _, match := range matches {
+		if !superseded[match.class] {
+			kept = append(kept, match)
+		}
+	}
+	return kept
 }
 
 func applyRecommendation(result Classification, class FailureClass, confidence Confidence) Classification {
@@ -288,6 +324,10 @@ func applyRecommendation(result Classification, class FailureClass, confidence C
 		result.Retryability = RetryRequiresAuthority
 		result.RecommendedState = domain.StateHumanDecisionRequired
 		result.RecommendedAction = ActionRequestHumanDecision
+	case ClassTaskNotCompleted:
+		result.Retryability = RetryableAfterChange
+		result.RecommendedState = domain.StateFailed
+		result.RecommendedAction = ActionRequestChange
 	case ClassUnrecoverable:
 		result.Retryability = NotRetryable
 		result.RecommendedState = domain.StateFailed
