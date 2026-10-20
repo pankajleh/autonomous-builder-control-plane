@@ -28,6 +28,30 @@ func TestClassifyFailureTaxonomy(t *testing.T) {
 			action: ActionRetryExecution, retryability: RetryableNow, automatic: true,
 		},
 		{
+			// Ralphex's progress log of a store change that asked for more products
+			// than the store holds (2026-10-19): it retried once, then stopped.
+			name: "task not completed after its retry supersedes the retry it announced",
+			input: FailureInput{Phase: PhaseExecution, Outcome: supervisor.OutcomeExited, ExitCode: 1,
+				Diagnostics: "<<<RALPHEX:TASK_FAILED>>>\ntask failed, retrying...\n<<<RALPHEX:TASK_FAILED>>>\n" +
+					"Failed: 2026-10-19 16:57:29 (12m47s) - runner: task phase: task execution failed after retry (FAILED signal received)"},
+			class: ClassTaskNotCompleted, state: domain.StateFailed,
+			action: ActionRequestChange, retryability: RetryableAfterChange,
+		},
+		{
+			name: "validation still failing after its repair turn",
+			input: FailureInput{Phase: PhaseExecution, Outcome: supervisor.OutcomeExited, ExitCode: 1,
+				Diagnostics: "runner: first review: validation still failing after one repair turn: validation node-app-check exit 1"},
+			class: ClassTaskNotCompleted, state: domain.StateFailed,
+			action: ActionRequestChange, retryability: RetryableAfterChange,
+		},
+		{
+			name: "final review failed",
+			input: FailureInput{Phase: PhaseExecution, Outcome: supervisor.OutcomeExited, ExitCode: 1,
+				Diagnostics: "runner: final review: review failed (FAILED signal received)"},
+			class: ClassTaskNotCompleted, state: domain.StateFailed,
+			action: ActionRequestChange, retryability: RetryableAfterChange,
+		},
+		{
 			name: "EXP-06 capacity wait",
 			input: FailureInput{Phase: PhaseExecution, Outcome: supervisor.OutcomeExited, ExitCode: 1,
 				Diagnostics: `detected limit pattern: "Selected model is at capacity"`},
@@ -261,5 +285,13 @@ func TestClassifyChecksSignalsBeyondPersistedDiagnosticLimit(t *testing.T) {
 	}
 	if !got.DiagnosticsTruncated || strings.Contains(got.Diagnostics, "billing account") {
 		t.Fatal("persisted diagnostic was not independently bounded")
+	}
+}
+
+func TestTaskNotCompletedStillConflictsWithAnotherCause(t *testing.T) {
+	got := Classify(FailureInput{Phase: PhaseExecution, Outcome: supervisor.OutcomeExited, ExitCode: 1,
+		Diagnostics: "rate limit reached\nrunner: task phase: task execution failed after retry (FAILED signal received)"})
+	if got.Class != ClassUnknownAmbiguous || got.Confidence != ConfidenceAmbiguous {
+		t.Fatalf("classification = %s/%s, want a capacity signal beside it to fail closed", got.Class, got.Confidence)
 	}
 }

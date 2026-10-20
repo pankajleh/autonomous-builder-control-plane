@@ -23,6 +23,7 @@ import (
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/acceptance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/blocker"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/enginelane"
@@ -740,6 +741,14 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		payload := map[string]any{
 			"outcome": process.Outcome, "exit_code": process.ExitCode, "signal": process.TerminatingSignal,
 		}
+		if terminal == domain.StateFailed {
+			// Why it failed, from the implementer's own output (the classifier's
+			// fixed class, never the matched text), so a reader can tell a stop
+			// that running again would get past from one it would not.
+			classification := classificationOfRalphexFailure(process, nil)
+			payload["failure_class"] = string(classification.Class)
+			payload["retryability"] = string(classification.Retryability)
+		}
 		if err := r.transition(ctx, domain.StateImplementing, terminal, "ralphex-adapter", payload, implementationRefs); err != nil {
 			return result, err
 		}
@@ -834,8 +843,11 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if !accepted.Passed() {
 		result.State = domain.StateFailed
 		result.FailureReason = accepted.FailureReason()
+		// The built branch did not pass its acceptance checks: the request was
+		// built and checked, and building it again the same way ends the same.
 		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateFailed, "acceptance-controller", map[string]any{
 			"status": accepted.Status(), "reason": result.FailureReason,
+			"failure_class": string(blocker.ClassTaskNotCompleted), "retryability": string(blocker.RetryableAfterChange),
 		}, acceptanceRefs); err != nil {
 			return result, err
 		}
