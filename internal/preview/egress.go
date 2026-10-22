@@ -2,12 +2,16 @@ package preview
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +32,39 @@ const (
 	egressMaxConcurrent = 32
 	egressMaxLifetime   = 30 * time.Minute
 )
+
+// The app relay (Repo C design note BF08_NO_PAGE_OPEN §14, BF-08b): with EgressAutobuildRelay, the proxy also takes a
+// plain GET or POST for a path under /__autobuild/ and sends it to the app relay ABCP is started with, saying which group
+// asks. The listener is the group's own, on its own network's gateway, so the caller is always that group; the app holds
+// no secret, and every header that could claim another identity is dropped.
+const (
+	relayBodyLimit   = 64 << 10
+	relayAnswerLimit = 256 << 10
+	relayTimeout     = 35 * time.Second
+)
+
+// relayPath is a path the relay passes on: under /__autobuild/, plain characters only.
+var relayPath = regexp.MustCompile(`^/__autobuild/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+){0,7}$`)
+
+// relayToken is the token the app relay knows ABCP by.
+var relayToken = regexp.MustCompile(`^[A-Za-z0-9_-]{32,128}$`)
+
+// relayContentType is a content type passed on either way.
+var relayContentType = regexp.MustCompile(`^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+(?:; ?[A-Za-z0-9_-]+=[A-Za-z0-9_.-]+)?$`)
+
+// AppRelay is where the proxy sends an app's relay requests: an http origin on loopback (the preview gateway), and the
+// token that gateway knows ABCP by.
+type AppRelay struct{ URL, Token string }
+
+// Valid reports whether the relay is a plain loopback origin with a token.
+func (r AppRelay) Valid() bool {
+	u, err := url.Parse(r.URL)
+	if err != nil || u.Scheme != "http" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" || u.Port() == "" {
+		return false
+	}
+	ip, err := netip.ParseAddr(u.Hostname())
+	return err == nil && ip.IsLoopback() && relayToken.MatchString(r.Token)
+}
 
 // shopifyStore is one DNS label under myshopify.com, as Shopify names stores.
 var shopifyStore = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.myshopify\.com$`)
@@ -69,8 +106,8 @@ func publicAddress(ip netip.Addr) bool {
 	return true
 }
 
-// EgressCounts is what one proxy has done: tunnels opened, and requests refused.
-type EgressCounts struct{ Opened, Refused int64 }
+// EgressCounts is what one proxy has done: tunnels opened, requests refused, and requests passed to the app relay.
+type EgressCounts struct{ Opened, Refused, Relayed int64 }
 
 type egressProxy struct {
 	listener net.Listener
@@ -80,11 +117,17 @@ type egressProxy struct {
 	slots    chan struct{}
 	opened   atomic.Int64
 	refused  atomic.Int64
+	relayed  atomic.Int64
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	mu       sync.Mutex
 	conns    map[net.Conn]struct{}
+
+	// relay and caller are set by relayTo for a group whose profile names EgressAutobuildRelay.
+	relay  *AppRelay
+	caller string
+	client *http.Client
 }
 
 // newEgressProxy serves rules on listener until Close.
@@ -104,13 +147,24 @@ func newEgressProxy(listener net.Listener, rules []string) *egressProxy {
 	return e
 }
 
+// relayTo sends the group's relay requests to relay as caller ("preview <id>"); before start only.
+func (e *egressProxy) relayTo(relay AppRelay, caller string) {
+	e.relay, e.caller = &relay, caller
+	e.client = &http.Client{
+		Timeout: relayTimeout,
+		// Never the controller's own proxy settings, never a kept connection, never a redirect.
+		Transport:     &http.Transport{Proxy: nil, DisableKeepAlives: true, ResponseHeaderTimeout: relayTimeout, MaxResponseHeaderBytes: 16 << 10},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
 func (e *egressProxy) start() {
 	e.wg.Add(1)
 	go e.serve()
 }
 
 func (e *egressProxy) Counts() EgressCounts {
-	return EgressCounts{Opened: e.opened.Load(), Refused: e.refused.Load()}
+	return EgressCounts{Opened: e.opened.Load(), Refused: e.refused.Load(), Relayed: e.relayed.Load()}
 }
 
 // Close stops listening and ends every tunnel.
@@ -190,6 +244,10 @@ func (e *egressProxy) handle(c net.Conn) {
 		return
 	}
 	if request.Method != http.MethodConnect {
+		if e.relay != nil && slices.Contains(e.rules, EgressAutobuildRelay) {
+			e.forward(c, reader, request)
+			return
+		}
 		e.refuse(c, http.StatusMethodNotAllowed)
 		return
 	}
@@ -240,4 +298,68 @@ func (e *egressProxy) handle(c net.Conn) {
 	go func() { io.Copy(c, upstream); c.Close(); done <- struct{}{} }()
 	<-done
 	<-done
+}
+
+// forward passes one plain request for a path under /__autobuild/ to the app relay and writes its answer back. Only the
+// method, the path, the body and its content type go on; the relay token and the caller are the proxy's own.
+func (e *egressProxy) forward(c net.Conn, reader *bufio.Reader, request *http.Request) {
+	switch {
+	case request.Method != http.MethodGet && request.Method != http.MethodPost:
+		e.refuse(c, http.StatusMethodNotAllowed)
+		return
+	case request.URL.IsAbs() || request.URL.RawQuery != "" || request.URL.Fragment != "" || !relayPath.MatchString(request.URL.Path):
+		e.refuse(c, http.StatusNotFound)
+		return
+	case len(request.TransferEncoding) > 0 || request.Method == http.MethodPost && request.ContentLength < 0:
+		e.refuse(c, http.StatusLengthRequired)
+		return
+	case request.ContentLength > relayBodyLimit:
+		e.refuse(c, http.StatusRequestEntityTooLarge)
+		return
+	}
+	c.SetDeadline(time.Now().Add(relayTimeout + 5*time.Second))
+	var body []byte
+	if request.ContentLength > 0 {
+		// What the head's reader already holds comes first; the rest is read from the connection itself, past the
+		// head's limit, up to the declared length.
+		body = make([]byte, request.ContentLength)
+		held := min(reader.Buffered(), len(body))
+		head, _ := reader.Peek(held)
+		copy(body, head)
+		if _, err := io.ReadFull(c, body[held:]); err != nil {
+			e.refuse(c, http.StatusBadRequest)
+			return
+		}
+	}
+	ctx, cancel := context.WithTimeout(e.ctx, relayTimeout)
+	defer cancel()
+	out, err := http.NewRequestWithContext(ctx, request.Method, e.relay.URL+request.URL.Path, bytes.NewReader(body))
+	if err != nil {
+		e.refuse(c, http.StatusBadRequest)
+		return
+	}
+	if kind := request.Header.Get("Content-Type"); relayContentType.MatchString(kind) {
+		out.Header.Set("Content-Type", kind)
+	}
+	out.Header.Set("Accept", "application/json")
+	out.Header.Set("X-Autobuild-Relay-Token", e.relay.Token)
+	out.Header.Set("X-Autobuild-Caller", e.caller)
+	answer, err := e.client.Do(out)
+	if err != nil {
+		e.refuse(c, http.StatusBadGateway)
+		return
+	}
+	defer answer.Body.Close()
+	text, err := io.ReadAll(io.LimitReader(answer.Body, relayAnswerLimit+1))
+	if err != nil || len(text) > relayAnswerLimit || answer.StatusCode < 200 || answer.StatusCode > 599 {
+		e.refuse(c, http.StatusBadGateway)
+		return
+	}
+	kind := answer.Header.Get("Content-Type")
+	if !relayContentType.MatchString(kind) {
+		kind = "application/octet-stream"
+	}
+	e.relayed.Add(1)
+	fmt.Fprintf(c, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", answer.StatusCode, http.StatusText(answer.StatusCode), kind, len(text))
+	c.Write(text)
 }

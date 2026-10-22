@@ -158,3 +158,23 @@ func writeProtectedTestFile(t *testing.T, directory, name, contents string) stri
 	}
 	return path
 }
+
+func TestAProtectedTokenIsOneLineFromAnOwnerOnlyFile(t *testing.T) {
+	directory := t.TempDir()
+	token := strings.Repeat("relay-token-", 4)
+	if got, err := ReadProtectedToken(writeProtectedTestFile(t, directory, "relay", token+"\n")); err != nil || got != token {
+		t.Fatalf("token %q, err %v", got, err)
+	}
+	for name, content := range map[string]string{"short": "short\n", "space": strings.Repeat("x", 20) + " " + strings.Repeat("y", 20), "two-lines": token + "\n" + token + "\n"} {
+		if _, err := ReadProtectedToken(writeProtectedTestFile(t, directory, name, content)); err == nil {
+			t.Error("accepted:", name)
+		}
+	}
+	open := filepath.Join(directory, "open")
+	if err := os.WriteFile(open, []byte(token), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadProtectedToken(open); err == nil {
+		t.Fatal("a token others can read was accepted")
+	}
+}

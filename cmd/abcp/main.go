@@ -794,6 +794,8 @@ func serveCommand(args []string, stderr io.Writer) int {
 	accountLanesFile := flags.String("account-lanes-file", "", "optional protected account lanes file (administrators' own Codex and Claude accounts)")
 	targetsDir := flags.String("targets-dir", "", "optional private folder (mode 0700) for remote targets: their SSH keys and preflights")
 	siteRelayHost := flags.String("site-relay-host", "", "optional host that remote sites with a relay credential send Autobuild's paths (/__autobuild/*) to (BF-08a)")
+	appRelayURL := flags.String("app-relay-url", "", "optional loopback http origin of the app relay (the preview gateway) that previews' apps ask Autobuild through (BF-08b)")
+	appRelayTokenFile := flags.String("app-relay-token-file", "", "protected file holding the token the app relay knows this controller by (BF-08b)")
 	evictionInterval := flags.Duration("worktree-eviction-interval", eviction.DefaultInterval, "how often to evict retained governed worktrees (0 disables eviction)")
 	evictionIdle := flags.Duration("worktree-eviction-idle", eviction.DefaultIdle, "evict a finished run's worktree after this long without a live activity stream (0 disables the rule)")
 	evictionMaxAge := flags.Duration("worktree-eviction-max-age", eviction.DefaultMaxAge, "evict a finished run's worktree this long after it finished (0 disables the rule)")
@@ -807,7 +809,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
@@ -902,7 +904,17 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	activityService.SetEvictions(evictions.Fact)
-	previewService, err := preview.New(ctx, *serviceRoot, *previewProfileFile, catalog, activityService, evictions)
+	var previewOptions []preview.Option
+	if *appRelayURL != "" || *appRelayTokenFile != "" {
+		token, tokenErr := serviceapi.ReadProtectedToken(*appRelayTokenFile)
+		relay := preview.AppRelay{URL: *appRelayURL, Token: token}
+		if tokenErr != nil || !relay.Valid() {
+			fmt.Fprintln(stderr, "app relay: needs a loopback http origin and a protected token file")
+			return 1
+		}
+		previewOptions = append(previewOptions, preview.WithAppRelay(relay))
+	}
+	previewService, err := preview.New(ctx, *serviceRoot, *previewProfileFile, catalog, activityService, evictions, previewOptions...)
 	if err != nil {
 		fmt.Fprintln(stderr, "construct preview extension")
 		return 1
