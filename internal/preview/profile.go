@@ -60,9 +60,9 @@ type PreviewProfileV1 struct {
 	// default runtime. Omitted when empty, so profiles without it keep their digests.
 	Runtime string `json:"runtime,omitempty"`
 	// Egress names the only places a profile's services may reach, through the filtering proxy ABCP serves on the group
-	// network's gateway (egress.go; Repo C design notes A5 §8 and BF08_NO_PAGE_OPEN §14): EgressShopifyStores on a
-	// hosted profile, EgressAutobuildRelay on a preview's, each at most once. Omitted when empty, so profiles without it
-	// keep their digests.
+	// network's gateway (egress.go; Repo C design notes A5 §8 and BF08_NO_PAGE_OPEN §14 and §15): EgressShopifyStores
+	// on a hosted profile, EgressAutobuildRelay on any profile, each at most once. Omitted when empty, so profiles
+	// without it keep their digests.
 	Egress []string `json:"egress,omitempty"`
 }
 
@@ -72,9 +72,9 @@ const RuntimeGVisor = "runsc"
 // EgressShopifyStores is the one egress entry v1 accepts: HTTPS to any single-label name under myshopify.com.
 const EgressShopifyStores = "*.myshopify.com:443"
 
-// EgressAutobuildRelay lets a preview's app ask Autobuild through the proxy (Repo C design note BF08_NO_PAGE_OPEN §14,
-// BF-08b): a plain request for a path under /__autobuild/ goes to the app relay ABCP is started with, saying which
-// preview asks; never a tunnel. Previews only for now; hosted profiles name it with BF-08b2.
+// EgressAutobuildRelay lets a preview's or hosted app's server ask Autobuild through the proxy (Repo C design note
+// BF08_NO_PAGE_OPEN §14 and §15): a plain request for a path under /__autobuild/ goes to the app relay ABCP is started
+// with, saying which preview or hosted app asks; never a tunnel.
 const EgressAutobuildRelay = "autobuild-relay"
 
 // EgressPort is the port the egress proxy listens on, on the group network's gateway. The owner's host rule accepts new
@@ -325,9 +325,6 @@ func validEgress(p PreviewProfileV1) bool {
 				return false
 			}
 		case EgressAutobuildRelay:
-			if p.Hosted {
-				return false
-			}
 		default:
 			return false
 		}

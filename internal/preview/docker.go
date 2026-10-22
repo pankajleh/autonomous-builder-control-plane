@@ -423,7 +423,8 @@ func (d *dockerRuntime) runtimeAvailable(ctx context.Context, name string) bool 
 	return ok
 }
 
-func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume, settings, setup string) (_ *presentation, err error) {
+// caller is who the group's app relay says is asking (BF-08b): "preview <id>" or "hosted <hosting key>".
+func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume, settings, setup, caller string) (_ *presentation, err error) {
 	if !sha256Pattern.MatchString(id) || p.Validate() != nil || (p.dataService() >= 0) != (volume != "") {
 		return nil, ErrUnavailable
 	}
@@ -463,7 +464,7 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 	}
 	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, appAuthorization: p.AppAuthorization, volume: volume, gateway: gateway}
 	relay := slices.Contains(p.Egress, EgressAutobuildRelay)
-	if relay && (d.relay == nil || p.Hosted) {
+	if relay && (d.relay == nil || !relayCaller.MatchString(caller)) {
 		return nil, ErrUnavailable
 	}
 	if len(p.Egress) > 0 {
@@ -473,8 +474,8 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 		}
 		g.egress = newEgressProxy(listener, p.Egress)
 		if relay {
-			// A preview's caller is its own ID, which the product knows it by.
-			g.egress.relayTo(*d.relay, "preview "+id)
+			// A preview's caller is its own ID and a hosted app's its hosting key, which the product knows them by.
+			g.egress.relayTo(*d.relay, caller)
 		}
 		g.egress.start()
 		// Until the group is handed back, a failed start must end its proxy here: Stop sees only registered groups.
@@ -627,20 +628,20 @@ func (d *dockerRuntime) Start(ctx context.Context, id, path string, p PreviewPro
 	if p.Hosted {
 		return "", ErrUnavailable
 	}
-	return d.start(ctx, id, path, p, "", "", "")
+	return d.start(ctx, id, path, p, "", "", "", "preview "+id)
 }
 
 // StartHosted starts a hosted instance with the hosting key's data volume (B9.2.1) and, for a profile that takes
-// settings, the file that holds them (A5.2b).
-func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest, settings, setup string) (string, error) {
-	if !p.Hosted || !sha256Pattern.MatchString(keyDigest) {
+// settings, the file that holds them (A5.2b). The key itself is the app relay's caller (BF-08b2).
+func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, key, keyDigest, settings, setup string) (string, error) {
+	if !p.Hosted || !sha256Pattern.MatchString(keyDigest) || serviceapi.ValidateHostingKey(key) != nil || hostedKeyDigest(key) != keyDigest {
 		return "", ErrUnavailable
 	}
 	volume := ""
 	if p.dataService() >= 0 {
 		volume = d.volume(keyDigest)
 	}
-	return d.start(ctx, id, path, p, volume, settings, setup)
+	return d.start(ctx, id, path, p, volume, settings, setup, "hosted "+key)
 }
 
 // validSettingsFile accepts an absolute, clean path to a regular file only its owner can read or write.
@@ -651,14 +652,14 @@ func validSettingsFile(path string) bool {
 	info, err := os.Lstat(path)
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0077 == 0
 }
-func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume, settings, setup string) (string, error) {
+func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume, settings, setup, caller string) (string, error) {
 	if !sha256Pattern.MatchString(id) || path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n") {
 		return "", ErrUnavailable
 	}
 	if !d.Available(p) {
 		return "", ErrUnavailable
 	}
-	g, err := d.startGroup(ctx, id, path, p, false, volume, settings, setup)
+	g, err := d.startGroup(ctx, id, path, p, false, volume, settings, setup, caller)
 	if err != nil {
 		_ = d.Stop(context.Background(), id)
 		return "", err
@@ -848,7 +849,7 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 			break
 		}
 	}
-	g, err := d.startGroup(ctx, id, path, p, true, volume, "", "")
+	g, err := d.startGroup(ctx, id, path, p, true, volume, "", "", "preview "+id)
 	if err != nil {
 		return false
 	}

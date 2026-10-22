@@ -49,6 +49,9 @@ var relayPath = regexp.MustCompile(`^/__autobuild/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-
 // relayToken is the token the app relay knows ABCP by.
 var relayToken = regexp.MustCompile(`^[A-Za-z0-9_-]{32,128}$`)
 
+// relayCaller is who a group's app says is asking: a preview by its ID, a hosted app by its hosting key (BF-08b2).
+var relayCaller = regexp.MustCompile(`^(?:preview [a-f0-9]{64}|hosted [A-Za-z0-9][A-Za-z0-9._-]{0,127})$`)
+
 // relayContentType is a content type passed on either way.
 var relayContentType = regexp.MustCompile(`^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+(?:; ?[A-Za-z0-9_-]+=[A-Za-z0-9_.-]+)?$`)
 

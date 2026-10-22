@@ -222,11 +222,14 @@ func TestHostedDockerStartsOnlyHostedProfilesWithAVolume(t *testing.T) {
 	if _, err := d.Start(context.Background(), id, "/private/previews/sources/"+id, p); err == nil || called {
 		t.Fatal("a hosted profile started as a preview")
 	}
-	if _, err := d.StartHosted(context.Background(), id, "/private/previews/sources/"+id, testProfile(), strings.Repeat("7", 64), "", ""); err == nil || called {
+	if _, err := d.StartHosted(context.Background(), id, "/private/previews/sources/"+id, testProfile(), "app-1", hostedKeyDigest("app-1"), "", ""); err == nil || called {
 		t.Fatal("a preview profile started as hosted")
 	}
-	if _, err := d.StartHosted(context.Background(), id, "/private/previews/sources/"+id, p, "not-a-digest", "", ""); err == nil || called {
+	if _, err := d.StartHosted(context.Background(), id, "/private/previews/sources/"+id, p, "app-1", "not-a-digest", "", ""); err == nil || called {
 		t.Fatal("a hosted start without a key digest was accepted")
+	}
+	if _, err := d.StartHosted(context.Background(), id, "/private/previews/sources/"+id, p, "app-2", hostedKeyDigest("app-1"), "", ""); err == nil || called {
+		t.Fatal("a hosted start whose key and digest differ was accepted")
 	}
 }
 

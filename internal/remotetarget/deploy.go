@@ -642,7 +642,7 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 			}
 		case "write_site":
 			err = m.step(rec, s.Name, func() (string, error) {
-				return run(ctx, session, writeSiteScript, strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
+				return run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
 			})
 		case "start_frontdoor", "reload_frontdoor":
 			err = m.step(rec, s.Name, func() (string, error) {
@@ -717,7 +717,7 @@ func (m *Manager) runRemove(ctx context.Context, rec *operationRecord, r record,
 		{"stop_app", func() (string, error) { return run(ctx, session, fill(stopAppScript, "N", site), nil) }},
 		{"unlink_site", func() (string, error) { return run(ctx, session, fill(unlinkScript, "N", site), nil) }},
 		{"write_site", func() (string, error) {
-			return run(ctx, session, writeSiteScript, strings.NewReader(m.caddyfile(r.Key, site, "")))
+			return run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, site, "")))
 		}},
 		{"reload_frontdoor", func() (string, error) {
 			if m.liveSitesExcept(r.Key, site) == 0 {
@@ -906,13 +906,19 @@ const (
 // to that host instead of serving them (BF-08a): with the credential, the host
 // the visitor used and the visitor's address, and without the visitor's
 // cookies or credentials; the same headers sent by anyone else are removed.
+// Such a running Node app's own server reaches the same host on the inside
+// listener (BF-08b2), known by its network's range in inside/<site>.caddy,
+// for a connection's status read alone, marked as the server asking.
 func caddyfileFor(r record, site, host, relayHost string) string {
 	hosts, kinds, paused, relays := map[string]string{}, map[string]string{}, map[string]bool{}, map[string]string{}
+	inside := map[string]bool{}
 	for _, s := range r.Sites {
 		kinds[s.Name] = siteKind(s)
 		paused[s.Name] = s.State == siteStopped
 		if served(s) {
 			hosts[s.Name] = s.Host
+			// Exactly the sites whose matcher insideScript writes (nodeNetworks).
+			inside[s.Name] = siteKind(s) == kindNode && siteNamePattern.MatchString(s.Name)
 		}
 		if relayHost != "" && relayCredentialPattern.MatchString(s.Relay) {
 			relays[s.Name] = s.Relay
@@ -938,7 +944,7 @@ func caddyfileFor(r record, site, host, relayHost string) string {
 			serve = "\treverse_proxy autobuild-app-" + name + ":8080 {\n\t\theader_up Origin " + originFrom + " " + originTo + "\n\t}\n"
 		}
 		if credential, ok := relays[name]; ok && !paused[name] {
-			serve = "\trequest_header -X-Autobuild-Site\n\trequest_header -X-Autobuild-Host\n\trequest_header -X-Autobuild-Client\n" +
+			serve = "\trequest_header -X-Autobuild-Site\n\trequest_header -X-Autobuild-Host\n\trequest_header -X-Autobuild-Client\n\trequest_header -X-Autobuild-Caller\n" +
 				"\thandle /__autobuild/* {\n\t\treverse_proxy https://" + relayHost + " {\n\t\t\theader_up Host " + relayHost +
 				"\n\t\t\theader_up X-Autobuild-Site " + credential + "\n\t\t\theader_up X-Autobuild-Host {host}\n" +
 				"\t\t\theader_up X-Autobuild-Client {remote_host}\n\t\t\theader_up -Cookie\n\t\t\theader_up -Authorization\n\t\t}\n\t}\n" +
@@ -946,8 +952,31 @@ func caddyfileFor(r record, site, host, relayHost string) string {
 		}
 		fmt.Fprintf(&b, "\n%s {\n%s\tencode zstd gzip\n\theader {\n\t\tX-Content-Type-Options nosniff\n\t\tReferrer-Policy strict-origin-when-cross-origin\n\t\t-Server\n\t}\n}\n", hosts[name], serve)
 	}
+	var servers strings.Builder
+	for _, name := range names {
+		credential, ok := relays[name]
+		if !ok || paused[name] || !inside[name] {
+			continue
+		}
+		fmt.Fprintf(&servers, "\timport inside/%s.caddy\n\thandle @from_%s {\n\t\treverse_proxy https://%s {\n\t\t\theader_up Host %s\n"+
+			"\t\t\theader_up X-Autobuild-Site %s\n\t\t\theader_up X-Autobuild-Host %s\n\t\t\theader_up X-Autobuild-Client {remote_host}\n"+
+			"\t\t\theader_up X-Autobuild-Caller server\n\t\t\theader_up -Cookie\n\t\t\theader_up -Authorization\n\t\t}\n\t}\n",
+			name, name, relayHost, relayHost, credential, hosts[name])
+	}
+	if servers.Len() > 0 {
+		fmt.Fprintf(&b, "\n# The inside listener (BF-08b2): an app's own server asks Autobuild here, known by its network's range.\nhttp://:%d {\n"+
+			"\trequest_header -X-Autobuild-Site\n\trequest_header -X-Autobuild-Host\n\trequest_header -X-Autobuild-Client\n"+
+			"\trequest_header -X-Autobuild-Caller\n\trequest_header -X-Autobuild-Relay-Token\n%s\trespond 404\n}\n", insidePort, servers.String())
+	}
 	return b.String()
 }
+
+// The front door's inside listener (BF-08b2): plain http on a port never
+// published, which a Node app reaches on its own network.
+const (
+	insidePort  = 8089
+	insideRelay = "http://autobuild-frontdoor:8089"
+)
 
 // indent puts one more tab before each line of a site block's body.
 func indent(block string) string {
@@ -1301,15 +1330,31 @@ mv -T "$S/.@N@.next" "$S/@N@"
 rm -f "$HOME/autobuild/sites/@N@"
 `
 	writeSiteScript = `set -eu
+` + dockerHost + `
 C="$HOME/autobuild/frontdoor/config"
 mkdir -p "$C"
-cat > "$C/Caddyfile.next"
+` + insideScript + `cat > "$C/Caddyfile.next"
 mv "$C/Caddyfile.next" "$C/Caddyfile"
+`
+	// insideScript writes, for each Node site (@NETS@), the matcher the front
+	// door's inside listener knows its app's server by (BF-08b2): its
+	// network's range, and only a connection's status read. A site whose
+	// network is not found gets a range nothing comes from. Both front-door
+	// scripts run it before Caddy reads the Caddyfile that imports these.
+	insideScript = `I="$HOME/autobuild/frontdoor/config/inside"
+mkdir -p "$I"
+for n in @NETS@; do
+  range=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "autobuild-net-$n" </dev/null 2>/dev/null | tr -s ' ' '\n' |
+    grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$' | head -n 1 || true)
+  [ -n "$range" ] || range=255.255.255.255/32
+  printf '@from_%s {\n\tremote_ip %s\n\tmethod GET\n\tpath_regexp ^/__autobuild/connect/[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9_-]+$\n}\n' "$n" "$range" > "$I/.$n.caddy.next"
+  mv "$I/.$n.caddy.next" "$I/$n.caddy"
+done
 `
 	frontDoorScript = `set -eu
 ` + dockerHost + `
 A="$HOME/autobuild"
-state=started
+` + insideScript + `state=started
 if [ "$(docker inspect -f '{{.State.Running}}' autobuild-frontdoor 2>/dev/null || true)" = "true" ]; then
   state=reloaded
 else

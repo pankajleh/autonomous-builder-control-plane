@@ -424,9 +424,9 @@ func runtimeFlag(sandbox string) string {
 // its heap from that.
 //
 // The Node scripts. Each value in them (@N@ a site name, @DB@ its database,
-// @ID@ a backup id, @LIST@ backup ids, @RUNTIME@ the sandbox flag, @WAIT@ a
-// number of seconds) is checked by ABCP against a narrow pattern or fixed
-// before it is put in.
+// @ID@ a backup id, @LIST@ backup ids, @RUNTIME@ the sandbox flag, @RELAY@
+// the inside listener's address or nothing, @WAIT@ a number of seconds) is
+// checked by ABCP against a narrow pattern or fixed before it is put in.
 const (
 	psqlBin = `/usr/lib/postgresql/17/bin/psql -h /scratch -U postgres`
 	psql    = psqlBin + ` -d postgres`
@@ -541,7 +541,7 @@ docker run -d --name autobuild-app-@N@ --restart unless-stopped --network autobu
   --pids-limit 256 --ulimit nofile=1024:1024 --tmpfs /scratch:rw,nosuid,nodev,noexec,size=67108864,mode=700,uid=65534,gid=65534 \
   --workdir /scratch --mount type=bind,src="$src",dst=/source,readonly --env-file "$A/apps/@N@/database.env" \
   --env-file "$A/apps/@N@/setup.env" -e HOME=/scratch -e TMPDIR=/scratch -e NODE_OPTIONS=--max-old-space-size=160 \
-  --label autobuild.site=@N@ --entrypoint /usr/local/bin/node \
+  @RELAY@--label autobuild.site=@N@ --entrypoint /usr/local/bin/node \
   ` + NodeRuntimeImage + ` /opt/autobuild/start.mjs >/dev/null
 echo started
 `
