@@ -342,3 +342,50 @@ func TestTheProbeProvesAnEgressProfileOnlyWhenTheProxyIsReachableAndRefusesOther
 		}
 	}
 }
+
+func TestAPreviewNamingTheAppRelayTellsItsAppWhereToAskAndNeedsTheRelay(t *testing.T) {
+	p := testProfile()
+	p.ProfileID, p.Egress = "node-relay-v1", []string{EgressAutobuildRelay}
+	db := p.Services[0]
+	db.Name, db.Presented, db.MountSource, db.StartArgv = "db", false, false, []string{"/usr/local/bin/postgres"}
+	p.Services = append(p.Services, db)
+	path := func(f *dockerFixture) string { return filepath.Join(f.d.root, "sources", f.id) }
+
+	// Without a relay to send to, the profile gives its app no address that answers nothing.
+	without := newDockerFixture(t, p)
+	without.d.approved[p.Digest()] = true
+	if route, err := without.d.Start(context.Background(), without.id, path(without), p); err == nil || route != "" {
+		t.Fatal("a relay profile started without the app relay")
+	}
+
+	f := newDockerFixture(t, p)
+	f.d.approved[p.Digest()] = true
+	f.d.relay = &AppRelay{URL: "http://127.0.0.1:18093", Token: testRelayToken}
+	if _, err := f.d.Start(context.Background(), f.id, path(f), p); err != nil {
+		t.Fatal(err)
+	}
+	f.d.mu.Lock()
+	g := f.d.groups[f.id]
+	f.d.mu.Unlock()
+	if g == nil || g.egress == nil || g.egress.relay == nil || g.egress.caller != "preview "+f.id {
+		t.Fatal("the group's proxy does not relay as the preview")
+	}
+	told := map[string]bool{}
+	for _, args := range f.commands {
+		if args[0] != "exec" || !slices.Contains(args, "--detach") {
+			continue
+		}
+		joined := strings.Join(args, " ")
+		name := args[len(args)-1]
+		told[name] = strings.Contains(joined, "AUTOBUILD_RELAY=http://"+g.gateway.String()+":3129 ")
+		if strings.Contains(joined, testRelayToken) {
+			t.Fatal("the relay token reached a service", joined)
+		}
+	}
+	if !told["/source/server.js"] || told["/usr/local/bin/postgres"] {
+		t.Fatalf("which services were told: %v", told)
+	}
+	if err := f.d.Stop(context.Background(), f.id); err != nil {
+		t.Fatal(err)
+	}
+}

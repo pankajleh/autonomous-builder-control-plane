@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,6 +91,9 @@ type dockerRuntime struct {
 	stream func(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error
 	// listen opens the probe's listener on a group network's gateway, to prove that no service reaches the host.
 	listen func(network, address string) (net.Listener, error)
+	// relay is where a preview's relay requests go (BF-08b), or nil: a profile naming EgressAutobuildRelay is then
+	// unavailable rather than handing its app an address that answers nothing.
+	relay *AppRelay
 }
 
 // hostedSleepSeconds keeps a hosted instance's containers alive until they are stopped: ten years.
@@ -458,12 +462,20 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 		}
 	}
 	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, appAuthorization: p.AppAuthorization, volume: volume, gateway: gateway}
+	relay := slices.Contains(p.Egress, EgressAutobuildRelay)
+	if relay && (d.relay == nil || p.Hosted) {
+		return nil, ErrUnavailable
+	}
 	if len(p.Egress) > 0 {
 		listener, listenErr := d.listen("tcp4", netip.AddrPortFrom(gateway, EgressPort).String())
 		if listenErr != nil {
 			return nil, ErrUnavailable
 		}
 		g.egress = newEgressProxy(listener, p.Egress)
+		if relay {
+			// A preview's caller is its own ID, which the product knows it by.
+			g.egress.relayTo(*d.relay, "preview "+id)
+		}
 		g.egress.start()
 		// Until the group is handed back, a failed start must end its proxy here: Stop sees only registered groups.
 		defer func() {
@@ -502,6 +514,11 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 			}
 			if s.Presented {
 				serviceSetup = setup
+			}
+			// The presented service, the app's own server, is told where it asks Autobuild (BF-08b): env reads the
+			// assignment before the command.
+			if relay && s.Presented {
+				start = append([]string{"AUTOBUILD_RELAY=http://" + netip.AddrPortFrom(gateway, EgressPort).String()}, start...)
 			}
 		}
 		if _, err := d.run(ctx, serviceStart(name, s, start, egress, serviceSettings, serviceSetup)...); err != nil {

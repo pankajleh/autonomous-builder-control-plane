@@ -59,9 +59,10 @@ type PreviewProfileV1 struct {
 	// note A4 decision 4) is accepted: a second wall between an untrusted app and the host kernel. Empty is Docker's
 	// default runtime. Omitted when empty, so profiles without it keep their digests.
 	Runtime string `json:"runtime,omitempty"`
-	// Egress names the only places a hosted profile's services may reach, through the filtering proxy ABCP serves on
-	// the group network's gateway (egress.go; Repo C design note A5 §8). v1 accepts exactly one entry,
-	// EgressShopifyStores, and only on a hosted profile. Omitted when empty, so profiles without it keep their digests.
+	// Egress names the only places a profile's services may reach, through the filtering proxy ABCP serves on the group
+	// network's gateway (egress.go; Repo C design notes A5 §8 and BF08_NO_PAGE_OPEN §14): EgressShopifyStores on a
+	// hosted profile, EgressAutobuildRelay on a preview's, each at most once. Omitted when empty, so profiles without it
+	// keep their digests.
 	Egress []string `json:"egress,omitempty"`
 }
 
@@ -70,6 +71,11 @@ const RuntimeGVisor = "runsc"
 
 // EgressShopifyStores is the one egress entry v1 accepts: HTTPS to any single-label name under myshopify.com.
 const EgressShopifyStores = "*.myshopify.com:443"
+
+// EgressAutobuildRelay lets a preview's app ask Autobuild through the proxy (Repo C design note BF08_NO_PAGE_OPEN §14,
+// BF-08b): a plain request for a path under /__autobuild/ goes to the app relay ABCP is started with, saying which
+// preview asks; never a tunnel. Previews only for now; hosted profiles name it with BF-08b2.
+const EgressAutobuildRelay = "autobuild-relay"
 
 // EgressPort is the port the egress proxy listens on, on the group network's gateway. The owner's host rule accepts new
 // connections from the preview range to this port only; every other host port stays dropped.
@@ -240,7 +246,7 @@ func (p PreviewProfileV1) Validate() error {
 	if volumes > 1 {
 		return ErrUnavailable
 	}
-	if len(p.Egress) > 0 && (!p.Hosted || len(p.Egress) != 1 || p.Egress[0] != EgressShopifyStores) {
+	if !validEgress(p) {
 		return ErrUnavailable
 	}
 	if p.AppAuthorization && !p.Hosted {
@@ -303,4 +309,28 @@ func environmentValues(env map[string]string) []string {
 		out = append(out, k+"="+env[k])
 	}
 	return out
+}
+
+// validEgress reports whether every egress entry is one the profile may name, each once.
+func validEgress(p PreviewProfileV1) bool {
+	seen := map[string]bool{}
+	for _, rule := range p.Egress {
+		if seen[rule] {
+			return false
+		}
+		seen[rule] = true
+		switch rule {
+		case EgressShopifyStores:
+			if !p.Hosted {
+				return false
+			}
+		case EgressAutobuildRelay:
+			if p.Hosted {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }

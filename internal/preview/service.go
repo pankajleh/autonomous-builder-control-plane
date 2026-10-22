@@ -38,7 +38,16 @@ type Service struct {
 
 // New wires only read interfaces to existing controller substrates. Missing
 // host isolation leaves history/stop usable while capability remains false.
-func New(parent context.Context, root, profileFile string, catalog activity.Catalog, events ActivityReader, evictions EvictionReader) (*Service, error) {
+// Option changes how New builds the preview runtime.
+type Option func(*dockerRuntime)
+
+// WithAppRelay sends previews' relay requests to relay (BF-08b). A profile naming EgressAutobuildRelay is unavailable
+// without it.
+func WithAppRelay(relay AppRelay) Option {
+	return func(d *dockerRuntime) { d.relay = &relay }
+}
+
+func New(parent context.Context, root, profileFile string, catalog activity.Catalog, events ActivityReader, evictions EvictionReader, options ...Option) (*Service, error) {
 	profiles, err := LoadProfiles(profileFile)
 	if err != nil {
 		return nil, ErrUnavailable
@@ -50,6 +59,9 @@ func New(parent context.Context, root, profileFile string, catalog activity.Cata
 	private.Close()
 	previewRoot := filepath.Join(root, "previews")
 	runtime := newDocker(previewRoot)
+	for _, option := range options {
+		option(runtime)
+	}
 	s, err := newService(parent, previewRoot, profiles, Resolver{root, catalog, events, evictions}, Checkout{filepath.Join(previewRoot, "sources")}, runtime, time.Now)
 	if err == nil && !s.unavailable {
 		runtime.proveProfiles(parent, profiles)

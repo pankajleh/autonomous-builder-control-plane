@@ -98,6 +98,27 @@ func LoadBearerAuthenticator(tokenFile, principalID string) (*BearerAuthenticato
 	return &BearerAuthenticator{token: append([]byte(nil), data...), principal: Principal{PrincipalID: principalID, PrincipalType: PrincipalService, AuthnMethod: "bearer-token-v1"}}, nil
 }
 
+// ReadProtectedToken reads a one-line token from a protected file, as the bearer token file is read: 32 to 512 bytes
+// with no spaces or control characters, one trailing newline allowed.
+func ReadProtectedToken(file string) (string, error) {
+	data, err := readProtectedFile(file, MaxTokenFileBytes)
+	if err != nil {
+		return "", ErrUnsafeConfig
+	}
+	if len(data) > 0 && data[len(data)-1] == '\n' {
+		data = data[:len(data)-1]
+	}
+	if len(data) < 32 || len(data) > 512 {
+		return "", errors.New("token length is outside bounds")
+	}
+	for _, value := range data {
+		if value <= ' ' || value == 0x7f {
+			return "", errors.New("token contains forbidden bytes")
+		}
+	}
+	return string(data), nil
+}
+
 func (a *BearerAuthenticator) Authenticate(request *http.Request) (Principal, error) {
 	if a == nil || request == nil {
 		return Principal{}, ErrUnauthenticated
