@@ -48,7 +48,7 @@ var (
 // HostedRuntime is the part of the governed runtime a hosted instance uses. The Docker runtime provides it.
 type HostedRuntime interface {
 	Available(PreviewProfileV1) bool
-	StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest, settings, setup string) (string, error)
+	StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, key, keyDigest, settings, setup string) (string, error)
 	Healthy(ctx context.Context, id string, p PreviewProfileV1) (bool, error)
 	ResolveRoute(ctx context.Context, id, handle string) (string, error)
 	Stop(ctx context.Context, id string) error
@@ -937,7 +937,7 @@ func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedStat
 	if err != nil {
 		return
 	}
-	route, err := h.runtime.StartHosted(ctx, id, path, profile, k.digest, settings, setup)
+	route, err := h.runtime.StartHosted(ctx, id, path, profile, st.Key, k.digest, settings, setup)
 	if err != nil || !sha256Pattern.MatchString(route) {
 		return
 	}

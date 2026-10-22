@@ -15,16 +15,25 @@ import (
 
 const testRelayToken = "relay-token-0123456789abcdefghijklmnop"
 
-func TestPreviewsMayNameTheAppRelayOnceAndHostedProfilesNotYet(t *testing.T) {
+func TestProfilesMayNameTheAppRelayOnce(t *testing.T) {
 	preview := testProfile()
 	preview.Egress = []string{EgressAutobuildRelay}
 	if err := preview.Validate(); err != nil {
 		t.Fatal("a preview naming the app relay was refused:", err)
 	}
+	// A hosted profile names it too (BF-08b2), with Shopify stores or alone.
+	hosted := cloneProfile(preview)
+	hosted.Hosted = true
+	if !validEgress(hosted) {
+		t.Fatal("a hosted profile naming the app relay was refused")
+	}
+	hosted.Egress = []string{EgressShopifyStores, EgressAutobuildRelay}
+	if !validEgress(hosted) {
+		t.Fatal("a hosted profile naming Shopify stores and the app relay was refused")
+	}
 	cases := map[string]func(*PreviewProfileV1){
 		"twice":              func(p *PreviewProfileV1) { p.Egress = []string{EgressAutobuildRelay, EgressAutobuildRelay} },
 		"shopify-on-preview": func(p *PreviewProfileV1) { p.Egress = []string{EgressAutobuildRelay, EgressShopifyStores} },
-		"on-a-hosted-one":    func(p *PreviewProfileV1) { p.Hosted = true },
 		"unknown":            func(p *PreviewProfileV1) { p.Egress = []string{"autobuild-relay:443"} },
 	}
 	for name, change := range cases {
@@ -32,6 +41,19 @@ func TestPreviewsMayNameTheAppRelayOnceAndHostedProfilesNotYet(t *testing.T) {
 		change(&p)
 		if validEgress(p) {
 			t.Error("accepted:", name)
+		}
+	}
+}
+
+func TestTheRelayCallerIsAPreviewOrAHostedApp(t *testing.T) {
+	for _, ok := range []string{"preview " + strings.Repeat("ab", 32), "hosted 82daed69-2b7e-4d0a-afd5-b3fe79738de1", "hosted app-1"} {
+		if !relayCaller.MatchString(ok) {
+			t.Error("refused:", ok)
+		}
+	}
+	for _, bad := range []string{"", "preview abc", "hosted ", "hosted -x", "hosted a b", "site team-kudos", "preview " + strings.Repeat("AB", 32), "hosted a\r\nX: y"} {
+		if relayCaller.MatchString(bad) {
+			t.Error("accepted:", bad)
 		}
 	}
 }

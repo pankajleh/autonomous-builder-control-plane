@@ -129,7 +129,7 @@ func TestOnlyANodeAppHasASetupTokenAndOneStartedBeforeTokensGetsItsOnNextStart(t
 func TestTheStartScriptRefusesAnythingButASetupToken(t *testing.T) {
 	f := newDeployFixture(t)
 	f.deploy(f.putNode("one"), "crm", testHost, "req-crm-first")
-	script := fill(startAppScript, "N", "crm", "RUNTIME", "")
+	script := fill(startAppScript, "N", "crm", "RUNTIME", "", "RELAY", "")
 	for _, input := range []string{"", "\n", strings.Repeat("a", 31) + "\n", strings.Repeat("A", 32) + "\n", "$(id)" + strings.Repeat("a", 27) + "\n"} {
 		if _, err := run(context.Background(), f.remote, script, strings.NewReader(input)); err == nil {
 			t.Errorf("%q started the app", input)

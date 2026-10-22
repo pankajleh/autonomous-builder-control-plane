@@ -51,13 +51,21 @@ func (m *Manager) setupToken(key, site string) (string, error) {
 	return d.SetupToken, nil
 }
 
-// startApp starts a site's app with its database and its setup token.
+// startApp starts a site's app with its database and its setup token, and,
+// while relays are on, the address of the front door's inside listener
+// (BF-08b2), where its own server asks Autobuild.
 func (m *Manager) startApp(ctx context.Context, session remote, key, site, sandbox string) (string, error) {
 	token, err := m.setupToken(key, site)
 	if err != nil {
 		return "", errStep("no setup token could be kept")
 	}
-	return run(ctx, session, fill(startAppScript, "N", site, "RUNTIME", runtimeFlag(sandbox)), strings.NewReader(token+"\n"))
+	m.mu.Lock()
+	relay := ""
+	if m.relayHost != "" {
+		relay = "-e AUTOBUILD_RELAY=" + insideRelay + " "
+	}
+	m.mu.Unlock()
+	return run(ctx, session, fill(startAppScript, "N", site, "RUNTIME", runtimeFlag(sandbox), "RELAY", relay), strings.NewReader(token+"\n"))
 }
 
 // SiteSetup answers a Node app's setup token and the host its first-admin

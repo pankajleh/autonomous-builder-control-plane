@@ -36,7 +36,7 @@ func (r *hostedMemory) Available(PreviewProfileV1) bool {
 	defer r.mu.Unlock()
 	return r.available
 }
-func (r *hostedMemory) StartHosted(_ context.Context, id, _ string, p PreviewProfileV1, keyDigest, settings, setup string) (string, error) {
+func (r *hostedMemory) StartHosted(_ context.Context, id, _ string, p PreviewProfileV1, _, keyDigest, settings, setup string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !p.Hosted {

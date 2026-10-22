@@ -144,7 +144,7 @@ func (m *Manager) runStop(ctx context.Context, rec *operationRecord, r record, s
 	}{
 		{"stop_app", func() (string, error) { return run(ctx, session, fill(stopAppOnlyScript, "N", site), nil) }},
 		{"write_site", func() (string, error) {
-			return run(ctx, session, writeSiteScript, strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
+			return run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
 		}},
 		{"reload_frontdoor", func() (string, error) {
 			return run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
@@ -171,7 +171,7 @@ func (m *Manager) runStart(ctx context.Context, rec *operationRecord, r record, 
 			}
 		}
 		m.mu.Unlock()
-		if _, err := run(ctx, session, writeSiteScript, strings.NewReader(m.caddyfile(r.Key, site, rec.Host))); err != nil {
+		if _, err := run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, site, rec.Host))); err != nil {
 			return "the app is stopped again"
 		}
 		_, _ = run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
@@ -191,7 +191,7 @@ func (m *Manager) runStart(ctx context.Context, rec *operationRecord, r record, 
 			return out, nil
 		}},
 		{"write_site", func() (string, error) {
-			return run(ctx, session, writeSiteScript, strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
+			return run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
 		}},
 		{"reload_frontdoor", func() (string, error) {
 			return run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
