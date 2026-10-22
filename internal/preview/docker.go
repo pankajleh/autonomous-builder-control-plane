@@ -242,8 +242,8 @@ func (d *dockerRuntime) imageSafe(ctx context.Context, s ServiceProfileV1) bool 
 				return false
 			}
 		default:
-			// An image never brings a setup token of its own: only a preview profile names one.
-			if !validEnvironment(map[string]string{key: v}, true) {
+			// An image never brings a setup token or a timetable of its own: only a profile names them.
+			if key == "AUTOBUILD_JOBS" || !validEnvironment(map[string]string{key: v}, true) {
 				return false
 			}
 		}

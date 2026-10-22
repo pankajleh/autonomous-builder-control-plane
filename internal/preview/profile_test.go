@@ -81,6 +81,37 @@ func TestAppCookiesIsOptInAndLeavesOtherProfilesDigestsAlone(t *testing.T) {
 	}
 }
 
+// A hosted app runs its own timetable (Repo C design note BF08_NO_PAGE_OPEN §19): only a hosted profile may say so, only
+// as "run", and an image never brings it.
+func TestOnlyAHostedProfileRunsTheAppsTimetable(t *testing.T) {
+	hosted := testProfile()
+	hosted.Hosted = true
+	before := hosted.Digest()
+	hosted.Services[0].Environment["AUTOBUILD_JOBS"] = "run"
+	if hosted.Validate() != nil {
+		t.Fatal("a hosted profile may run the app's timetable")
+	}
+	if hosted.Digest() == before {
+		t.Fatal("the timetable switch is part of the profile's digest")
+	}
+	if got := strings.Join(cleanEnv(hosted.Services[0]), " "); !strings.Contains(got, "AUTOBUILD_JOBS=run") {
+		t.Fatal("the switch reaches the service's environment", got)
+	}
+	preview := testProfile()
+	preview.Services[0].Environment["AUTOBUILD_JOBS"] = "run"
+	if preview.Validate() == nil {
+		t.Fatal("a preview ran the app's timetable")
+	}
+	for _, value := range []string{"", "yes", "RUN", "run ", "1"} {
+		bad := testProfile()
+		bad.Hosted = true
+		bad.Services[0].Environment["AUTOBUILD_JOBS"] = value
+		if bad.Validate() == nil {
+			t.Fatalf("AUTOBUILD_JOBS=%q accepted", value)
+		}
+	}
+}
+
 // A preview may hand the app a sample first-administrator token (Repo C design note TRYING_APPS.md); a hosted profile may
 // not, and the value must look like a sample token, never anything that could carry a secret, a URL or an argument.
 func TestOnlyAPreviewTakesASampleSetupToken(t *testing.T) {

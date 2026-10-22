@@ -31,11 +31,12 @@ import (
 
 // The kit's images, by digest: Node format 1's runtime, and the Postgres with
 // its server mode (Repo C tools/node-kit, published by node-runtime.yml: the
-// runtime of Repo C d398f99, #571, whose launcher also gives the app's setup
-// token from setup.env under the other names apps read it by, and the Postgres
+// runtime of Repo C ebd8e11, #690, whose kit adds autobuild-db/jobs, the app's
+// timetable, to the launcher of d398f99, #571, that also gives the app's setup
+// token from setup.env under the other names apps read it by; and the Postgres
 // of Repo C ea389f4, #494).
 const (
-	NodeRuntimeImage  = "ghcr.io/pankajleh/autobuild-node-app-runtime@sha256:884ef27a28f2973e7d8d96a52be6c1d5818328e3843cfde047d9cac67ac5f866"
+	NodeRuntimeImage  = "ghcr.io/pankajleh/autobuild-node-app-runtime@sha256:60ae5a6823680f76776397ae126f625057d67c7bc75814215a896502a30d1e98"
 	NodePostgresImage = "ghcr.io/pankajleh/autobuild-node-app-postgres@sha256:1059b7d7f68e8ce1af825107c373b6a5dc2acb7f44bc15c5d6bfbe82456a62c9"
 )
 
@@ -521,7 +522,9 @@ cd "$HOME/autobuild/backups/@N@"
 for b in @LIST@; do rm -f "./$b.dump"; done
 `
 	// startAppScript reads the app's setup token on its input, so no command
-	// line and no script holds it, and keeps it beside database.env.
+	// line and no script holds it, and keeps it beside database.env. An app on
+	// a server runs all the time, so it runs its own timetable
+	// (AUTOBUILD_JOBS=run, Repo C design note BF08_NO_PAGE_OPEN §19).
 	startAppScript = `set -eu
 ` + dockerHost + `
 A="$HOME/autobuild"
@@ -540,7 +543,7 @@ docker run -d --name autobuild-app-@N@ --restart unless-stopped --network autobu
   --user 65534:65534 --read-only --cap-drop ALL --security-opt no-new-privileges --memory 256m --memory-swap 256m \
   --pids-limit 256 --ulimit nofile=1024:1024 --tmpfs /scratch:rw,nosuid,nodev,noexec,size=67108864,mode=700,uid=65534,gid=65534 \
   --workdir /scratch --mount type=bind,src="$src",dst=/source,readonly --env-file "$A/apps/@N@/database.env" \
-  --env-file "$A/apps/@N@/setup.env" -e HOME=/scratch -e TMPDIR=/scratch -e NODE_OPTIONS=--max-old-space-size=160 \
+  --env-file "$A/apps/@N@/setup.env" -e AUTOBUILD_JOBS=run -e HOME=/scratch -e TMPDIR=/scratch -e NODE_OPTIONS=--max-old-space-size=160 \
   @RELAY@--label autobuild.site=@N@ --entrypoint /usr/local/bin/node \
   ` + NodeRuntimeImage + ` /opt/autobuild/start.mjs >/dev/null
 echo started

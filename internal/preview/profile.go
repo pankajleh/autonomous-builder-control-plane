@@ -147,6 +147,8 @@ var sampleSetupToken = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{7,39}$`)
 // This small semantic allowlist deliberately excludes arbitrary values, URLs,
 // credentials, runtime injection variables and inherited image environments.
 // Only a preview (not hosted) profile may name BOOTSTRAP_TOKEN, and only with a sample token's shape.
+// Only a hosted profile may name AUTOBUILD_JOBS, and only as "run": a shared app runs all the time, so it runs its own
+// timetable; a preview never does (Repo C design note BF08_NO_PAGE_OPEN §19).
 func validEnvironment(env map[string]string, hosted bool) bool {
 	if len(env) > 4 {
 		return false
@@ -167,6 +169,10 @@ func validEnvironment(env map[string]string, hosted bool) bool {
 			}
 		case "BOOTSTRAP_TOKEN":
 			if hosted || !sampleSetupToken.MatchString(v) {
+				return false
+			}
+		case "AUTOBUILD_JOBS":
+			if !hosted || v != "run" {
 				return false
 			}
 		default:
