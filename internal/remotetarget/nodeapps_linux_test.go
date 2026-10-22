@@ -359,3 +359,13 @@ func TestStartAppCapsTheHeap(t *testing.T) {
 		t.Fatal("the app's start has no heap cap under its memory limit")
 	}
 }
+
+// An app on a server runs all the time, so it runs its own timetable, with or
+// without relays (Repo C design note BF08_NO_PAGE_OPEN §19).
+func TestStartAppRunsTheAppsTimetable(t *testing.T) {
+	for _, relay := range []string{"", "-e AUTOBUILD_RELAY=" + insideRelay + " "} {
+		if script := fill(startAppScript, "N", "crm", "RUNTIME", "", "RELAY", relay); strings.Count(script, " -e AUTOBUILD_JOBS=run ") != 1 {
+			t.Fatalf("the app's timetable does not run on its own (relay %q):\n%s", relay, script)
+		}
+	}
+}
