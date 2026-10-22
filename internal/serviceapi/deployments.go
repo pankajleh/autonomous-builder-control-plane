@@ -327,6 +327,13 @@ type NameV1 struct {
 	CheckedAt     string   `json:"checked_at"`
 }
 
+// SiteRelayV1 gives a site the relay credential its front-door block sends
+// with Autobuild's paths (BF-08a): 32 random bytes, base64url without padding.
+// ABCP keeps it with the site and never answers it.
+type SiteRelayV1 struct {
+	Credential string `json:"credential"`
+}
+
 // SiteSetupV1 is a Node app's setup token and the host its first-admin form
 // is on (BF-14.2c). Only the service principal reads it.
 type SiteSetupV1 struct {
@@ -381,6 +388,10 @@ type DeploymentController interface {
 	// SiteSetup answers a Node app's setup token, with which its first
 	// administrator is made (BF-14.2c).
 	SiteSetup(ctx context.Context, target, site string) (SiteSetupV1, error)
+	// SetSiteRelay keeps a site's relay credential and rewrites its target's
+	// front door as an operation, so the site's block sends Autobuild's paths
+	// on to the relay (BF-08a).
+	SetSiteRelay(ctx context.Context, target, site string, relay SiteRelayV1) (OperationV1, error)
 }
 
 var (
@@ -577,6 +588,14 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 			return
 		}
 		s.writeJSON(w, http.StatusOK, setup)
+	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "relay" && r.Method == http.MethodPut:
+		var relay SiteRelayV1
+		if !body(&relay) {
+			bad()
+			return
+		}
+		op, err := s.reserved.Deployments.SetSiteRelay(r.Context(), key, parts[2], relay)
+		operation(op, err, http.StatusAccepted)
 	case len(parts) == 3 && parts[1] == "names" && r.Method == http.MethodGet:
 		if !requestBodyEmpty(r) {
 			bad()

@@ -793,6 +793,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	admissionProfileFile := flags.String("admission-profile-file", "", "optional protected run admission profile file")
 	accountLanesFile := flags.String("account-lanes-file", "", "optional protected account lanes file (administrators' own Codex and Claude accounts)")
 	targetsDir := flags.String("targets-dir", "", "optional private folder (mode 0700) for remote targets: their SSH keys and preflights")
+	siteRelayHost := flags.String("site-relay-host", "", "optional host that remote sites with a relay credential send Autobuild's paths (/__autobuild/*) to (BF-08a)")
 	evictionInterval := flags.Duration("worktree-eviction-interval", eviction.DefaultInterval, "how often to evict retained governed worktrees (0 disables eviction)")
 	evictionIdle := flags.Duration("worktree-eviction-idle", eviction.DefaultIdle, "evict a finished run's worktree after this long without a live activity stream (0 disables the rule)")
 	evictionMaxAge := flags.Duration("worktree-eviction-max-age", eviction.DefaultMaxAge, "evict a finished run's worktree this long after it finished (0 disables the rule)")
@@ -806,7 +807,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
@@ -962,6 +963,10 @@ func serveCommand(args []string, stderr io.Writer) int {
 		manager, err := remotetarget.New(*targetsDir, time.Now)
 		if err != nil {
 			fmt.Fprintln(stderr, "load remote targets:", err)
+			return 1
+		}
+		if err := manager.SetRelayHost(*siteRelayHost); err != nil {
+			fmt.Fprintln(stderr, "site relay host: not a host name")
 			return 1
 		}
 		targets, deployments = manager, manager

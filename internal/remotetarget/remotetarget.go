@@ -129,6 +129,10 @@ type Manager struct {
 	// place of the bucket's own.
 	metadataURL string
 	s3Endpoint  string
+
+	// relayHost is where sites' front-door blocks send Autobuild's paths
+	// (BF-08a); empty, they send nothing on.
+	relayHost string
 }
 
 // New keeps targets in dir, a folder open to the controller's user alone.
