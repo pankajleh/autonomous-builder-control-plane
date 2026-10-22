@@ -88,6 +88,9 @@ type siteRecord struct {
 	UpdatedAt string                  `json:"updated_at"`
 	LastCheck *serviceapi.SiteCheckV1 `json:"last_check,omitempty"`
 	Operation string                  `json:"operation,omitempty"`
+	// Relay is the credential the site's front-door block sends with
+	// Autobuild's paths (BF-08a); never answered, never logged.
+	Relay string `json:"relay,omitempty"`
 }
 
 func (s siteRecord) view() serviceapi.SiteV1 {
@@ -521,6 +524,8 @@ func (m *Manager) run(rec operationRecord) {
 		failed = m.runDrift(ctx, &rec, r, session)
 	case "isolation":
 		failed = m.runIsolation(ctx, &rec, r, session)
+	case "relay":
+		failed = m.runRelay(ctx, &rec, r, session)
 	default:
 		failed = m.runApply(ctx, &rec, r, session)
 	}
@@ -880,8 +885,9 @@ func served(s siteRecord) bool { return s.Release != "" && s.State != siteRemovi
 func (m *Manager) caddyfile(key, site, host string) string {
 	m.mu.Lock()
 	r, _ := m.read(key)
+	relay := m.relayHost
 	m.mu.Unlock()
-	return caddyfileFor(r, site, host)
+	return caddyfileFor(r, site, host, relay)
 }
 
 // A Node app refuses a write whose Origin is not its own address, which it
@@ -895,14 +901,21 @@ const (
 )
 
 // caddyfileFor is caddyfile for a record already read. A stopped Node app's
-// host answers a plain 503 saying it is paused (BF-14.5a).
-func caddyfileFor(r record, site, host string) string {
-	hosts, kinds, paused := map[string]string{}, map[string]string{}, map[string]bool{}
+// host answers a plain 503 saying it is paused (BF-14.5a). With relayHost set,
+// a site that has a relay credential sends Autobuild's paths (/__autobuild/*)
+// to that host instead of serving them (BF-08a): with the credential, the host
+// the visitor used and the visitor's address, and without the visitor's
+// cookies or credentials; the same headers sent by anyone else are removed.
+func caddyfileFor(r record, site, host, relayHost string) string {
+	hosts, kinds, paused, relays := map[string]string{}, map[string]string{}, map[string]bool{}, map[string]string{}
 	for _, s := range r.Sites {
 		kinds[s.Name] = siteKind(s)
 		paused[s.Name] = s.State == siteStopped
 		if served(s) {
 			hosts[s.Name] = s.Host
+		}
+		if relayHost != "" && relayCredentialPattern.MatchString(s.Relay) {
+			relays[s.Name] = s.Relay
 		}
 	}
 	delete(hosts, site)
@@ -924,9 +937,27 @@ func caddyfileFor(r record, site, host string) string {
 		case kinds[name] == kindNode:
 			serve = "\treverse_proxy autobuild-app-" + name + ":8080 {\n\t\theader_up Origin " + originFrom + " " + originTo + "\n\t}\n"
 		}
+		if credential, ok := relays[name]; ok && !paused[name] {
+			serve = "\trequest_header -X-Autobuild-Site\n\trequest_header -X-Autobuild-Host\n\trequest_header -X-Autobuild-Client\n" +
+				"\thandle /__autobuild/* {\n\t\treverse_proxy https://" + relayHost + " {\n\t\t\theader_up Host " + relayHost +
+				"\n\t\t\theader_up X-Autobuild-Site " + credential + "\n\t\t\theader_up X-Autobuild-Host {host}\n" +
+				"\t\t\theader_up X-Autobuild-Client {remote_host}\n\t\t\theader_up -Cookie\n\t\t\theader_up -Authorization\n\t\t}\n\t}\n" +
+				"\thandle {\n" + indent(serve) + "\t}\n"
+		}
 		fmt.Fprintf(&b, "\n%s {\n%s\tencode zstd gzip\n\theader {\n\t\tX-Content-Type-Options nosniff\n\t\tReferrer-Policy strict-origin-when-cross-origin\n\t\t-Server\n\t}\n}\n", hosts[name], serve)
 	}
 	return b.String()
+}
+
+// indent puts one more tab before each line of a site block's body.
+func indent(block string) string {
+	lines := strings.SplitAfter(block, "\n")
+	for i, line := range lines {
+		if line != "" {
+			lines[i] = "\t" + line
+		}
+	}
+	return strings.Join(lines, "")
 }
 
 func (m *Manager) liveSitesExcept(key, site string) int {

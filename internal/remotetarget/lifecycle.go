@@ -623,7 +623,7 @@ func (m *Manager) compare(r *record, seen serverState) serviceapi.DriftV1 {
 	// The front door's Caddyfile is the one ABCP would write now (a target
 	// whose last site went keeps an empty one, or none).
 	if anyServed {
-		sum := sha256.Sum256([]byte(caddyfileFor(*r, "", "")))
+		sum := sha256.Sum256([]byte(caddyfileFor(*r, "", "", m.relayHost)))
 		if seen.caddyfile != hex.EncodeToString(sum[:]) {
 			add("frontdoor_config", "", "")
 		}

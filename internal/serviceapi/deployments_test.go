@@ -122,6 +122,11 @@ func (d *testDeployments) SiteSetup(_ context.Context, target, site string) (Sit
 	return SiteSetupV1{SchemaVersion: SiteSetupSchemaV1, Target: target, Site: site, Host: "crm.example.com", Token: strings.Repeat("ab", 16)}, d.err
 }
 
+func (d *testDeployments) SetSiteRelay(_ context.Context, target, site string, relay SiteRelayV1) (OperationV1, error) {
+	d.calls = append(d.calls, "relay:"+target+":"+site+":"+fmt.Sprint(len(relay.Credential)))
+	return sampleOperation, d.err
+}
+
 func deploymentServer(t *testing.T, grant bool) (*Server, *testDeployments) {
 	s, _ := targetServer(t, grant)
 	backend := &testDeployments{}
@@ -352,5 +357,33 @@ func TestDeploymentsNeedTheGrantAndMapErrorsToStableCodes(t *testing.T) {
 	}
 	if r := call(s, http.MethodGet, "/v1/releases/"+digest, ""); r.Code != http.StatusNotImplemented {
 		t.Fatalf("releases without deployments = %d", r.Code)
+	}
+}
+
+// TestSiteRelayIsAPutWithTheCredentialAloneAndAnswersAnOperation: BF-08a's
+// route takes exactly {"credential"} and never echoes it.
+func TestSiteRelayIsAPutWithTheCredentialAloneAndAnswersAnOperation(t *testing.T) {
+	s, backend := deploymentServer(t, true)
+	credential := strings.Repeat("c", 43)
+	r := call(s, http.MethodPut, "/v1/targets/srv-0123456789ab/sites/shop/relay", `{"credential":"`+credential+`"}`)
+	if r.Code != http.StatusAccepted || strings.Contains(r.Body.String(), credential) {
+		t.Fatalf("relay = %d %s", r.Code, r.Body.String())
+	}
+	if strings.Join(backend.calls, ",") != "relay:srv-0123456789ab:shop:43" {
+		t.Fatalf("calls = %v", backend.calls)
+	}
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/shop/relay", `{"credential":"` + credential + `"}`},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/shop/relay", ""},
+		{http.MethodPut, "/v1/targets/srv-0123456789ab/sites/Shop/relay", `{"credential":"` + credential + `"}`},
+		{http.MethodPut, "/v1/targets/srv-0123456789ab/sites/shop/relay", `{"credential":"` + credential + `","extra":1}`},
+		{http.MethodPut, "/v1/targets/srv-0123456789ab/sites/shop/relay", ""},
+	} {
+		if r := call(s, c.method, c.path, c.body); r.Code != http.StatusBadRequest {
+			t.Fatalf("%s %s %s = %d", c.method, c.path, c.body, r.Code)
+		}
+	}
+	if len(backend.calls) != 1 {
+		t.Fatalf("a refused request reached the controller: %v", backend.calls)
 	}
 }
