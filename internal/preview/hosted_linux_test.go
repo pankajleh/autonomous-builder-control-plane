@@ -28,6 +28,7 @@ type hostedMemory struct {
 	setups              []string // the setup token's file each start named
 	dump                string
 	loaded              []string
+	loadErr             error
 	removed             []string
 }
 
@@ -77,6 +78,9 @@ func (r *hostedMemory) Load(_ context.Context, _ string, _ PreviewProfileV1, rd 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.loaded = append(r.loaded, string(data))
+	if err == nil {
+		err = r.loadErr
+	}
 	return err
 }
 func (r *hostedMemory) RemoveVolume(_ context.Context, keyDigest string) error {

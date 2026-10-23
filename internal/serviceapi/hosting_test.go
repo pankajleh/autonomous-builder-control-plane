@@ -3,6 +3,7 @@ package serviceapi
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +19,7 @@ type testHosting struct {
 	backup  HostedBackupV1
 	route   HostedRouteV1
 	setup   HostedSetupV1
+	file    string
 	err     error
 	calls   []string
 	lastKey string
@@ -51,6 +53,13 @@ func (t *testHosting) ListHostedBackups(_ context.Context, _ Principal, key stri
 func (t *testHosting) RestoreHosted(_ context.Context, _ Principal, _ string, key string, _ HostedRestoreRequestV1) (HostedV1, error) {
 	t.record("restore", key)
 	return t.hosted, t.err
+}
+func (t *testHosting) OpenHostedBackup(_ context.Context, _ Principal, key, _ string) (io.ReadCloser, int64, error) {
+	t.record("backup-file", key)
+	if t.err != nil {
+		return nil, 0, t.err
+	}
+	return io.NopCloser(strings.NewReader(t.file)), int64(len(t.file)), nil
 }
 func (t *testHosting) PurgeHosted(_ context.Context, _ Principal, _ string, key string, _ HostedCommandRequestV1) (HostedV1, error) {
 	t.record("purge", key)
@@ -195,6 +204,40 @@ func TestTheHostedSetupTokenIsReadOnlyPendingUntilMadeAndNeverServedMalformed(t 
 	s2, _ := hostingServer(t, false, true, PrincipalService)
 	if w := get(s2, "/v1/hosted/app-1/setup"); w.Code != 403 {
 		t.Fatal("the token without the hosting grant", w.Code)
+	}
+}
+
+// Repo C BF-10c: one backup's file, as it is, for the product to hand to the app's owner; read through the hosting grant.
+func TestAHostedBackupFileIsServedAsItIs(t *testing.T) {
+	s, backend := hostingServer(t, true, true, PrincipalService)
+	backend.file = "backup-bytes"
+	path := "/v1/hosted/app-1/backups/" + strings.Repeat("f", 64)
+	w := get(s, path)
+	if w.Code != 200 || w.Body.String() != "backup-bytes" || w.Header().Get("Content-Type") != "application/octet-stream" || w.Header().Get("Content-Length") != "12" ||
+		w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("X-Content-Type-Options") != "nosniff" || len(backend.calls) != 1 || backend.calls[0] != "backup-file" || backend.lastKey != "app-1" {
+		t.Fatalf("file = %d %q %v calls %v", w.Code, w.Body.String(), w.Header(), backend.calls)
+	}
+	for _, bad := range []string{"/v1/hosted/app-1/backups/not-an-id", "/v1/hosted/app-1/backups/" + strings.Repeat("F", 64), path + "/more", "/v1/hosted/app-1/route/" + strings.Repeat("f", 64)} {
+		backend.calls = nil
+		if w := get(s, bad); w.Code != 400 || len(backend.calls) != 0 {
+			t.Fatalf("%s: %d calls %v", bad, w.Code, backend.calls)
+		}
+	}
+	backend.calls = nil
+	if w := post(s, path, commandBody); w.Code != 400 || len(backend.calls) != 0 {
+		t.Fatalf("a write to a backup file: %d calls %v", w.Code, backend.calls)
+	}
+	backend.err = ErrDependencyNotFound
+	if w := get(s, path); w.Code != 404 {
+		t.Fatal("an unknown backup file", w.Code)
+	}
+	backend.err, backend.file = nil, ""
+	if w := get(s, path); w.Code != 500 {
+		t.Fatal("an empty backup file was served", w.Code)
+	}
+	denied, deniedBackend := hostingServer(t, false, true, PrincipalService)
+	if w := get(denied, path); w.Code != 403 || len(deniedBackend.calls) != 0 {
+		t.Fatal("a backup file without the hosting grant", w.Code, deniedBackend.calls)
 	}
 }
 
