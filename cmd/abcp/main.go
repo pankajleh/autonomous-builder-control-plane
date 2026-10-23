@@ -796,6 +796,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	siteRelayHost := flags.String("site-relay-host", "", "optional host that remote sites with a relay credential send Autobuild's paths (/__autobuild/*) to (BF-08a)")
 	appRelayURL := flags.String("app-relay-url", "", "optional loopback http origin of the app relay (the preview gateway) that previews' apps ask Autobuild through (BF-08b)")
 	appRelayTokenFile := flags.String("app-relay-token-file", "", "protected file holding the token the app relay knows this controller by (BF-08b)")
+	hostedOffsiteFile := flags.String("hosted-offsite-file", "", "optional private file (mode 0600) naming the bucket and the key that copy each hosted backup off the host (BF-10b)")
 	evictionInterval := flags.Duration("worktree-eviction-interval", eviction.DefaultInterval, "how often to evict retained governed worktrees (0 disables eviction)")
 	evictionIdle := flags.Duration("worktree-eviction-idle", eviction.DefaultIdle, "evict a finished run's worktree after this long without a live activity stream (0 disables the rule)")
 	evictionMaxAge := flags.Duration("worktree-eviction-max-age", eviction.DefaultMaxAge, "evict a finished run's worktree this long after it finished (0 disables the rule)")
@@ -809,7 +810,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
@@ -937,6 +938,8 @@ func serveCommand(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "hosted instances unavailable")
 	} else {
 		defer h.Close()
+		// Read afresh at each backup; one that cannot be read copies nothing and never stops a backup.
+		h.SetOffsiteFile(*hostedOffsiteFile)
 		hosting = h
 	}
 	// The sweeper also serves product-requested releases, so it exists even when
