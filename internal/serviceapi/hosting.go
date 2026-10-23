@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -32,6 +33,9 @@ type HostingController interface {
 	BackupHosted(ctx context.Context, principal Principal, authorityDigest, key string, request HostedBackupRequestV1) (HostedBackupV1, error)
 	ListHostedBackups(ctx context.Context, principal Principal, key string) (HostedBackupListV1, error)
 	RestoreHosted(ctx context.Context, principal Principal, authorityDigest, key string, request HostedRestoreRequestV1) (HostedV1, error)
+	// OpenHostedBackup opens one listed backup's file for reading, with its size, for the product to hand to the app's
+	// owner (Repo C BF-10c); the caller closes it.
+	OpenHostedBackup(ctx context.Context, principal Principal, key, backupID string) (io.ReadCloser, int64, error)
 	PurgeHosted(ctx context.Context, principal Principal, authorityDigest, key string, request HostedCommandRequestV1) (HostedV1, error)
 	// ReadHostedSetup answers the app's setup token, made at its first start since the controller keeps them, or
 	// ErrSetupPending before that start.
@@ -211,7 +215,7 @@ func validStamp(v string) bool {
 }
 
 func ValidateHostedBackupV1(v HostedBackupV1, key string) error {
-	if v.SchemaVersion != "HostedBackupV1" || v.HostingKey != key || ValidateHostingKey(key) != nil || !isLowerSHA256(v.BackupID) || (v.Reason != "manual" && v.Reason != "pre-update" && v.Reason != "nightly") || !validStamp(v.TakenAt) || v.Bytes < 0 || v.Generation == 0 || !isLowerGitObjectID(v.SourceSHA) {
+	if v.SchemaVersion != "HostedBackupV1" || v.HostingKey != key || ValidateHostingKey(key) != nil || !isLowerSHA256(v.BackupID) || (v.Reason != "manual" && v.Reason != "pre-update" && v.Reason != "nightly" && v.Reason != "pre-restore") || !validStamp(v.TakenAt) || v.Bytes < 0 || v.Generation == 0 || !isLowerGitObjectID(v.SourceSHA) {
 		return errors.New("invalid hosted backup")
 	}
 	if v.Offsite != nil && (!validStamp(v.Offsite.At) || v.Offsite.Detail == "" || len(v.Offsite.Detail) > 512) {
@@ -269,13 +273,16 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 		return
 	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/hosted/"), "/")
-	if len(parts) < 1 || len(parts) > 2 || ValidateHostingKey(parts[0]) != nil {
+	if len(parts) < 1 || len(parts) > 3 || ValidateHostingKey(parts[0]) != nil || (len(parts) == 3 && (parts[1] != "backups" || !isLowerSHA256(parts[2]))) {
 		bad()
 		return
 	}
-	key, op := parts[0], ""
-	if len(parts) == 2 {
+	key, op, backupID := parts[0], "", ""
+	if len(parts) >= 2 {
 		op = parts[1]
+	}
+	if len(parts) == 3 {
+		op, backupID = "backup", parts[2]
 	}
 	if !s.mayControlHosting(principal) {
 		s.writeDependencyError(w, id, ErrAuthorityDenied)
@@ -286,10 +293,10 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 		return
 	}
 	h := s.reserved.Hosting
-	read := r.Method == http.MethodGet && (op == "" || op == "route" || op == "setup" || op == "backups")
+	read := r.Method == http.MethodGet && (op == "" || op == "route" || op == "setup" || op == "backups" || op == "backup")
 	write := r.Method == http.MethodPost && (op == "start" || op == "stop" || op == "backups" || op == "restore" || op == "purge")
 	if !read && !write {
-		if op != "" && op != "start" && op != "stop" && op != "route" && op != "setup" && op != "backups" && op != "restore" && op != "purge" {
+		if op != "" && op != "start" && op != "stop" && op != "route" && op != "setup" && op != "backups" && op != "backup" && op != "restore" && op != "purge" {
 			s.writeDependencyError(w, id, ErrDependencyNotFound)
 			return
 		}
@@ -327,6 +334,8 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 				return
 			}
 			s.writeJSON(w, http.StatusOK, v)
+		case "backup":
+			s.writeHostedBackupFile(w, r, principal, id, key, backupID)
 		case "backups":
 			v, err := h.ListHostedBackups(r.Context(), principal, key)
 			if err != nil {
@@ -407,6 +416,28 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 		v, err := h.RestoreHosted(r.Context(), principal, digest, key, c)
 		s.writeHosted(w, id, key, v, err, http.StatusOK)
 	}
+}
+
+// writeHostedBackupFile answers one backup's file as it is, never parsed or logged: the product hands it to the app's
+// owner (Repo C BF-10c). A short copy after the headers ends the response early, so the receiver sees fewer bytes than
+// its Content-Length.
+func (s *Server) writeHostedBackupFile(w http.ResponseWriter, r *http.Request, principal Principal, id, key, backupID string) {
+	f, size, err := s.reserved.Hosting.OpenHostedBackup(r.Context(), principal, key, backupID)
+	if err != nil {
+		s.writeDependencyError(w, id, err)
+		return
+	}
+	defer f.Close()
+	if size <= 0 {
+		s.writeDependencyError(w, id, ErrInternalDurableSubstrate)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.CopyN(w, f, size)
 }
 
 func (s *Server) writeHosted(w http.ResponseWriter, id, key string, v HostedV1, err error, status int) {

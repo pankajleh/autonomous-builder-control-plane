@@ -621,11 +621,65 @@ func (h *Hosting) RestoreHosted(ctx context.Context, p serviceapi.Principal, aut
 			return st, serviceapi.ErrPreviewUnavailable
 		}
 		defer f.Close()
+		// The data as it is now is backed up first (Repo C BF-10c), and kept even if the restore then fails; without
+		// that backup nothing is restored.
+		if st, err = h.backupBeforeRestore(ctx, k, st, c); err != nil {
+			return st, err
+		}
 		if err = h.runtime.Load(ctx, st.InstanceID, profile, f); err != nil {
 			return st, serviceapi.ErrPreviewUnavailable
 		}
 		return st, nil
 	})
+}
+
+// backupBeforeRestore takes a pre-restore backup of the ready instance, copies it off the host like any other, and saves
+// it in the key's state before the restore begins. Older backups are pruned by the next backup, not here, so the one
+// being restored is never removed while it is read. The key's command lock is held.
+func (h *Hosting) backupBeforeRestore(ctx context.Context, k *hostedKey, st hostedState, c serviceapi.HostedRestoreRequestV1) (hostedState, error) {
+	before, err := h.backup(ctx, k, st, "pre-restore", jsonDigest([]string{"hosted-pre-restore-v1", k.digest, c.RequestID, c.BackupID}))
+	if err != nil {
+		return st, err
+	}
+	before, again := h.withOffsite(ctx, k, st.Backups, before)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	next := k.state
+	next.Backups = append(withCopies(append([]serviceapi.HostedBackupV1(nil), next.Backups...), again), before)
+	next.UpdatedAt = stamp(h.now())
+	if err = h.save(k, next); err != nil {
+		return st, err
+	}
+	return next, nil
+}
+
+// OpenHostedBackup opens one listed backup's file for reading, with its size. A file already open stays readable even
+// if a later backup prunes it.
+func (h *Hosting) OpenHostedBackup(_ context.Context, p serviceapi.Principal, key, backupID string) (io.ReadCloser, int64, error) {
+	k, err := h.key(p, key, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	h.mu.Lock()
+	st := k.state
+	h.mu.Unlock()
+	found := false
+	for _, b := range st.Backups {
+		found = found || b.BackupID == backupID
+	}
+	if st.Key == "" || !found {
+		return nil, 0, serviceapi.ErrDependencyNotFound
+	}
+	f, err := openRegular(h.backupPath(k.digest, backupID), os.O_RDONLY, true)
+	if err != nil {
+		return nil, 0, serviceapi.ErrPreviewUnavailable
+	}
+	info, err := f.Stat()
+	if err != nil || info.Size() <= 0 {
+		f.Close()
+		return nil, 0, serviceapi.ErrPreviewUnavailable
+	}
+	return f, info.Size(), nil
 }
 
 // command runs one state-changing command on an existing key, idempotently by its request ID.
