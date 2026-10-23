@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -325,6 +326,7 @@ git add candidate.txt && git commit -qm 'candidate after recovery' || exit 26
 	if err := lease.Close(); err != nil {
 		t.Fatal(err)
 	}
+	releaseAbandonedHandoffLocks(t, lease.ownersDir)
 	if _, err := os.Stat(stalePath); err != nil {
 		t.Fatalf("simulated interrupted handoff is absent: %v", err)
 	}
@@ -339,6 +341,32 @@ git add candidate.txt && git commit -qm 'candidate after recovery' || exit 26
 	if status := runGit(t, fixture.authority.Repository().Path, "status", "--porcelain=v1", "--untracked-files=all"); status != "" {
 		t.Fatalf("recovered run left source checkout dirty: %q", status)
 	}
+}
+
+// releaseAbandonedHandoffLocks stands for an interrupted run's process ending,
+// when the kernel releases its handoff lock. Here the run's lock file is left
+// unreachable, and the collector closes it; until then the recovery rightly
+// treats the handoff as another live run's.
+func releaseAbandonedHandoffLocks(t *testing.T, ownersDir string) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		runtime.GC()
+		locks, err := filepath.Glob(filepath.Join(ownersDir, "*.lock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		held := false
+		for _, lock := range locks {
+			if live, err := executionPlanHandoffLive(lock); err != nil || live {
+				held = true
+			}
+		}
+		if !held {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the interrupted run's handoff lock is still held")
 }
 
 func TestRunnerRejectsTamperedInterruptedExecutionPlan(t *testing.T) {
