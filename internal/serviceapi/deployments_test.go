@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ type testDeployments struct {
 	got        int64
 	conversion int
 	err        error
+	file       string
 }
 
 var sampleOperation = OperationV1{SchemaVersion: OperationSchemaV1, OperationID: "op-0123456789abcdef", Target: "srv-0123456789ab", Kind: "apply",
@@ -72,6 +74,11 @@ func (d *testDeployments) BackUp(_ context.Context, target, site string, c Backu
 func (d *testDeployments) CheckBackup(_ context.Context, target, site, backup string, c BackupCreateV1) (OperationV1, error) {
 	d.calls = append(d.calls, "check:"+target+":"+site+":"+backup+":"+c.RequestID)
 	return sampleOperation, d.err
+}
+
+func (d *testDeployments) OpenBackup(_ context.Context, target, site, backup string) (io.ReadCloser, int64, error) {
+	d.calls = append(d.calls, "file:"+target+":"+site+":"+backup)
+	return io.NopCloser(strings.NewReader(d.file)), int64(len(d.file)), d.err
 }
 
 func (d *testDeployments) StopSite(_ context.Context, target, site string, r OperationRequestV1) (OperationV1, error) {
@@ -281,6 +288,46 @@ func TestReleasesPlansAndOperationsAreRoutedWithTheTargetsGrant(t *testing.T) {
 	}
 	if len(backend.calls) != 0 {
 		t.Fatalf("calls = %v", backend.calls)
+	}
+}
+
+func TestASiteBackupFileIsServedAsItIs(t *testing.T) {
+	s, backend := deploymentServer(t, true)
+	backend.file = "backup-bytes"
+	path := "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b"
+	r := call(s, http.MethodGet, path, "")
+	if r.Code != http.StatusOK || r.Body.String() != "backup-bytes" || r.Header().Get("Content-Type") != "application/octet-stream" || r.Header().Get("Content-Length") != "12" ||
+		r.Header().Get("Cache-Control") != "no-store" || r.Header().Get("X-Content-Type-Options") != "nosniff" ||
+		len(backend.calls) != 1 || backend.calls[0] != "file:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b" {
+		t.Fatalf("file = %d %q %v calls %v", r.Code, r.Body.String(), r.Header(), backend.calls)
+	}
+	for _, c := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/shop/backups/not-a-backup"},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/shop/backups/BK-20261014T013000Z-0a1b"},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/Shop/backups/bk-20261014T013000Z-0a1b"},
+		{http.MethodGet, path + "/more"},
+		{http.MethodPost, path},
+		{http.MethodPut, path},
+	} {
+		backend.calls = nil
+		if r := call(s, c.method, c.path, ""); r.Code != http.StatusBadRequest || len(backend.calls) != 0 {
+			t.Fatalf("%s %s = %d calls %v", c.method, c.path, r.Code, backend.calls)
+		}
+	}
+	for err, want := range map[error]int{ErrBackupUnknown: http.StatusNotFound, ErrSiteUnknown: http.StatusNotFound,
+		ErrTargetNotReady: http.StatusConflict, ErrTargetUnknown: http.StatusNotFound, errors.New("unreachable"): http.StatusServiceUnavailable} {
+		backend.err = err
+		if r := call(s, http.MethodGet, path, ""); r.Code != want || r.Header().Get("Content-Type") == "application/octet-stream" {
+			t.Fatalf("%v = %d %v", err, r.Code, r.Header())
+		}
+	}
+	backend.err, backend.file = nil, ""
+	if r := call(s, http.MethodGet, path, ""); r.Code != http.StatusServiceUnavailable {
+		t.Fatal("an empty backup file was served", r.Code)
+	}
+	denied, deniedBackend := deploymentServer(t, false)
+	if r := call(denied, http.MethodGet, path, ""); r.Code != http.StatusForbidden || len(deniedBackend.calls) != 0 {
+		t.Fatal("a backup file without targets.control", r.Code, deniedBackend.calls)
 	}
 }
 

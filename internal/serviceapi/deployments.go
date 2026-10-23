@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -372,6 +373,9 @@ type DeploymentController interface {
 	Backups(ctx context.Context, target, site string) (BackupsV1, error)
 	BackUp(ctx context.Context, target, site string, create BackupCreateV1) (OperationV1, error)
 	CheckBackup(ctx context.Context, target, site, backup string, create BackupCreateV1) (OperationV1, error)
+	// OpenBackup opens one listed backup's file as it is on the target, with
+	// its size, for the app's owner to download (BF-10c2).
+	OpenBackup(ctx context.Context, target, site, backup string) (io.ReadCloser, int64, error)
 	StopSite(ctx context.Context, target, site string, request OperationRequestV1) (OperationV1, error)
 	StartSite(ctx context.Context, target, site string, request OperationRequestV1) (OperationV1, error)
 	Databases(ctx context.Context, target string) (DatabasesV1, error)
@@ -474,8 +478,8 @@ func (s *Server) releases(w http.ResponseWriter, r *http.Request, principal Prin
 }
 
 // /v1/targets/{key}/plans, /apply, /operations/{id}, /sites, /sites/{name}/remove, /sites/{name}/backups,
-// /sites/{name}/backups/{backup}/check, /sites/{name}/stop and /start, /databases, /databases/{name}/remove, /clean,
-// /drift and /isolation
+// /sites/{name}/backups/{backup} (its file), /sites/{name}/backups/{backup}/check, /sites/{name}/stop and /start,
+// /databases, /databases/{name}/remove, /clean, /drift and /isolation
 func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id string, parts []string, body func(any) bool) {
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid deployment request", RequestID: id})
@@ -560,6 +564,13 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 		}
 		op, err := s.reserved.Deployments.BackUp(r.Context(), key, parts[2], create)
 		operation(op, err, http.StatusAccepted)
+	case len(parts) == 5 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "backups" &&
+		backupIDPattern.MatchString(parts[4]) && r.Method == http.MethodGet:
+		if !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		s.writeSiteBackupFile(w, r, id, key, parts[2], parts[4])
 	case len(parts) == 6 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "backups" &&
 		backupIDPattern.MatchString(parts[4]) && parts[5] == "check" && r.Method == http.MethodPost:
 		var create BackupCreateV1
@@ -679,6 +690,28 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 	default:
 		bad()
 	}
+}
+
+// writeSiteBackupFile answers one backup of an app on a server as it is, never parsed or logged: the product hands it
+// to the app's owner (Repo C BF-10c2). A short copy after the headers ends the response early, so the receiver sees
+// fewer bytes than its Content-Length.
+func (s *Server) writeSiteBackupFile(w http.ResponseWriter, r *http.Request, id, key, site, backup string) {
+	f, size, err := s.reserved.Deployments.OpenBackup(r.Context(), key, site, backup)
+	if err != nil {
+		s.writeDeploymentError(w, id, err)
+		return
+	}
+	defer f.Close()
+	if size <= 0 {
+		s.writeError(w, http.StatusServiceUnavailable, ErrorV1{Code: "target_unavailable", Message: "targets are unavailable", RequestID: id, Retryable: true})
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.CopyN(w, f, size)
 }
 
 func (s *Server) writeDeploymentError(w http.ResponseWriter, id string, err error) {
