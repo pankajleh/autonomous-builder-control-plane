@@ -59,6 +59,13 @@ type PlanCreateV1 struct {
 	// stopped and backed up. At most MaxConversionBytes of UTF-8 text with no
 	// backslash, so psql runs no command of its own.
 	Conversion string `json:"conversion,omitempty"`
+	// StartFrom is one of the app's backups, by id, for the release that
+	// replaces the one it runs to start on, instead of today's data (Repo C
+	// design note BF10_GOING_BACK_SAFELY.md §10.2, BF-10d2b: going back to an
+	// earlier version with its data as it was). The backup's rows were counted
+	// and it was taken while that same release ran; today's data is backed up
+	// first. Not with a conversion.
+	StartFrom string `json:"start_from,omitempty"`
 }
 
 // MaxConversionBytes bounds a plan's conversion.
@@ -100,13 +107,16 @@ type PlanV1 struct {
 	// start_database, make_database, back_up (when it replaces a release),
 	// switch_site, start_app, wait_health, write_site, start_frontdoor (or
 	// reload_frontdoor), check. A Node app replaced with a conversion: the same
-	// with stop_app, back_up, convert before switch_site. A restore: back_up,
-	// restore_copy, stop_app, switch_database, start_app, wait_health, check,
-	// clean_up.
+	// with stop_app, back_up, convert before switch_site. A Node app updated
+	// onto a backup: the same with stop_app, back_up, restore_data before
+	// switch_site, and clean_up after check. A restore: back_up, restore_copy,
+	// stop_app, switch_database, start_app, wait_health, check, clean_up.
 	Steps []string `json:"steps"`
 	// Conversion is the SQL a plan runs on the app's data before the release
 	// starts, when it has one.
 	Conversion *PlanConversionV1 `json:"conversion,omitempty"`
+	// StartFrom is the backup the release starts on, when it starts on one.
+	StartFrom *BackupV1 `json:"start_from,omitempty"`
 	// Images are what a Node app runs, by digest; Database is its database and
 	// login, made on the server the first time; Sandbox is "gvisor" or
 	// "standard". All three are empty for a static site.
