@@ -50,6 +50,7 @@ const (
 	maxSites          = 50
 	operationLimit    = 15 * time.Minute
 	stepTimeout       = 5 * time.Minute
+	downloadLimit     = 30 * time.Minute
 	checkWindow       = 3 * time.Minute
 	defaultCheckEvery = 5 * time.Second
 	maxCheckBody      = 64 << 20
@@ -132,6 +133,9 @@ type operationRecord struct {
 // remote runs scripts on a target.
 type remote interface {
 	Run(ctx context.Context, script string, stdin io.Reader) (string, error)
+	// Stream runs a script whose output is a file, writing it to out as it
+	// comes, neither held nor bounded (BF-10c2: a backup downloaded).
+	Stream(ctx context.Context, script string, out io.Writer) error
 	Close() error
 }
 
@@ -1113,6 +1117,32 @@ func (s sshRemote) Run(ctx context.Context, script string, stdin io.Reader) (str
 		return out.String(), errStep(lastLine(errOut.String()))
 	}
 	return out.String(), nil
+}
+
+// Stream runs a script through `sh -c`, writing its output to out as it
+// comes; a failure carries the last line it printed on stderr. Ending ctx, or
+// downloadLimit passing, ends it and the session.
+func (s sshRemote) Stream(ctx context.Context, script string, out io.Writer) error {
+	session, err := s.client.NewSession()
+	if err != nil {
+		return errStep("failed")
+	}
+	defer session.Close()
+	var errOut limitedBuffer
+	session.Stdout, session.Stderr = out, &errOut
+	done := make(chan error, 1)
+	go func() { done <- session.Run("sh -c " + shellQuote(script)) }()
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		return errStep("timeout")
+	case <-time.After(downloadLimit):
+		return errStep("timeout")
+	}
+	if err != nil {
+		return errStep(lastLine(errOut.String()))
+	}
+	return nil
 }
 
 // run runs one script on a target.

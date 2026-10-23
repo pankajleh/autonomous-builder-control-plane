@@ -251,6 +251,20 @@ func (l *localRemote) Run(ctx context.Context, script string, stdin io.Reader) (
 	return out.String(), nil
 }
 
+func (l *localRemote) Stream(ctx context.Context, script string, out io.Writer) error {
+	l.mu.Lock()
+	l.scripts = append(l.scripts, script)
+	l.mu.Unlock()
+	cmd := exec.CommandContext(ctx, "sh", "-c", script)
+	cmd.Env = []string{"HOME=" + l.home, "PATH=" + l.bin + ":" + os.Getenv("PATH")}
+	var errOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = out, &errOut
+	if err := cmd.Run(); err != nil {
+		return errStep(lastLine(errOut.String()))
+	}
+	return nil
+}
+
 func (l *localRemote) Close() error { return nil }
 
 func (l *localRemote) docker() string {
