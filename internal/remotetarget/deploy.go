@@ -122,6 +122,8 @@ type operationRecord struct {
 	// backup taken just before it, which puts the data back when the new
 	// release never answers.
 	Conversion string `json:"conversion,omitempty"`
+	// StartFrom is the backup an update starts its release on (startfrom.go).
+	StartFrom string `json:"start_from,omitempty"`
 	// Paused is a start whose app never answered and was stopped again (BF-14.5a).
 	Paused bool `json:"paused,omitempty"`
 	// Other and Crash are an isolation check's (P1b): the app the site is
@@ -168,9 +170,10 @@ func planHash(p serviceapi.PlanV1) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// CreatePlan says what putting a release on a target as a site would do, or
-// restoring one of a Node app's backups (restore.go). Nothing on the target
-// changes.
+// CreatePlan says what putting a release on a target as a site would do (a
+// Node app's data converted, convert.go, or started on one of its backups,
+// startfrom.go), or restoring one of a Node app's backups (restore.go).
+// Nothing on the target changes.
 func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.PlanCreateV1) (serviceapi.PlanV1, error) {
 	if create.Restore != nil {
 		return m.createRestorePlan(key, create)
@@ -242,6 +245,26 @@ func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.Pl
 		}
 		steps = convertSteps(steps[0], frontdoor)
 	}
+	var startFrom *serviceapi.BackupV1
+	if create.StartFrom != "" {
+		// Starting on a backup is for a Node app that runs, with its data, and
+		// is replaced by the release the backup was taken under.
+		site, _ := findSite(r, name)
+		d, kept := findDatabase(r, name)
+		if !backupIDPattern.MatchString(create.StartFrom) || create.Conversion != "" || release.Release.Kind != kindNode || replaces == "" || !kept {
+			return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
+		}
+		if site.State == siteStopped {
+			return serviceapi.PlanV1{}, serviceapi.ErrSiteStopped
+		}
+		b, err := startFromBackup(d, create.StartFrom, release.Release.Digest)
+		if err != nil {
+			return serviceapi.PlanV1{}, err
+		}
+		shown := b.BackupV1
+		startFrom = &shown
+		steps = startFromSteps(steps[0], frontdoor)
+	}
 	now := m.now().UTC()
 	plan := serviceapi.PlanV1{
 		SchemaVersion: serviceapi.PlanSchemaV1, PlanID: newID("pln-"), Target: key, Release: release.Release,
@@ -254,6 +277,7 @@ func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.Pl
 	if create.Conversion != "" {
 		plan.Conversion = &serviceapi.PlanConversionV1{Digest: conversionDigest(create.Conversion), Bytes: len(create.Conversion)}
 	}
+	plan.StartFrom = startFrom
 	plan.Hash = planHash(plan)
 	if err := m.writeJSON(filepath.Join(m.dir, "plans"), plan.PlanID, planRecord{SchemaVersion: planSchema, Plan: plan, Conversion: create.Conversion}); err != nil {
 		return serviceapi.PlanV1{}, err
@@ -322,6 +346,14 @@ func (m *Manager) Apply(_ context.Context, key string, apply serviceapi.ApplyV1)
 		}
 		conversion = pr.Conversion
 	}
+	startFrom := ""
+	if plan.StartFrom != nil {
+		// The backup is still kept and the app still runs.
+		if startFromStale(r, plan) {
+			return serviceapi.OperationV1{}, serviceapi.ErrPlanStale
+		}
+		startFrom = plan.StartFrom.BackupID
+	}
 	op := serviceapi.OperationV1{
 		SchemaVersion: serviceapi.OperationSchemaV1, OperationID: newID("op-"), Target: key, Kind: kind,
 		Site: plan.Site.Name, PlanID: plan.PlanID, RequestID: apply.RequestID, State: opQueued, StartedAt: m.stamp(),
@@ -330,7 +362,7 @@ func (m *Manager) Apply(_ context.Context, key string, apply serviceapi.ApplyV1)
 		op.Steps = append(op.Steps, serviceapi.OperationStepV1{Name: step, State: "pending"})
 	}
 	rec := operationRecord{SchemaVersion: operationSchema, Operation: op, Host: plan.Site.Host, Release: plan.Release.Digest,
-		Replaces: plan.Replaces, Sandbox: plan.Sandbox, Backup: backup, Conversion: conversion}
+		Replaces: plan.Replaces, Sandbox: plan.Sandbox, Backup: backup, Conversion: conversion, StartFrom: startFrom}
 	if err := m.writeJSON(filepath.Join(m.dir, "operations"), op.OperationID, rec); err != nil {
 		return serviceapi.OperationV1{}, err
 	}
@@ -580,18 +612,28 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 		return "release_missing"
 	}
 	site := op.Site
-	converting := rec.Conversion != ""
-	// again starts the app that ran before on the data it had: a conversion
-	// stopped before it changed anything.
+	// converting or starting on a backup (startfrom.go), the app is stopped
+	// before its data changes.
+	starting := rec.StartFrom != ""
+	converting := rec.Conversion != "" || starting
+	// again starts the app that ran before on the data it had: a conversion,
+	// or a start on a backup, stopped before it changed anything.
 	again := func(err error) error {
 		if _, startErr := m.startApp(ctx, session, r.Key, site, rec.Sandbox); startErr != nil {
 			return errStep(stepDetail(err) + "; nothing changed but the app did not start again")
 		}
 		return errStep(stepDetail(err) + "; nothing changed and the app is started again")
 	}
-	// undo puts back the data a conversion changed and the release it replaced.
+	// undo puts back the data a conversion changed, or a backup replaced, and
+	// the release it replaced.
 	undo := func(err error) error {
-		return errStep(stepDetail(err) + "; " + m.unConvert(ctx, rec, r.Key, session) + "; " + m.rollBack(ctx, rec, r.Key, session))
+		putBack := ""
+		if starting {
+			putBack = m.unStartFrom(ctx, session, site)
+		} else {
+			putBack = m.unConvert(ctx, rec, r.Key, session)
+		}
+		return errStep(stepDetail(err) + "; " + putBack + "; " + m.rollBack(ctx, rec, r.Key, session))
 	}
 	for _, s := range op.Steps {
 		var err error
@@ -611,6 +653,18 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 					return "", again(err)
 				}
 				return out, nil
+			})
+		case "restore_data":
+			err = m.step(rec, s.Name, func() (string, error) {
+				out, err := m.restoreData(ctx, session, r.Key, site, rec.StartFrom)
+				if err != nil {
+					return "", again(err)
+				}
+				return out, nil
+			})
+		case "clean_up":
+			err = m.step(rec, s.Name, func() (string, error) {
+				return run(ctx, session, fill(dropDatabaseScript, "COPY", "previous_"+databaseName(site)), nil)
 			})
 		case "send_files", "reuse_files":
 			err = m.step(rec, s.Name, func() (string, error) { return m.sendRelease(ctx, session, release) })

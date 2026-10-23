@@ -17,6 +17,7 @@ type testDeployments struct {
 	calls      []string
 	got        int64
 	conversion int
+	startFrom  string
 	err        error
 	file       string
 }
@@ -36,7 +37,7 @@ func (d *testDeployments) Release(_ context.Context, digest string) (ReleaseV1, 
 	return ReleaseV1{SchemaVersion: ReleaseSchemaV1, Digest: digest}, d.err
 }
 func (d *testDeployments) CreatePlan(_ context.Context, target string, c PlanCreateV1) (PlanV1, error) {
-	d.conversion = len(c.Conversion)
+	d.conversion, d.startFrom = len(c.Conversion), c.StartFrom
 	if c.Restore != nil {
 		d.calls = append(d.calls, "restore:"+target+":"+c.Restore.Site+":"+c.Restore.Backup)
 	} else {
@@ -345,6 +346,11 @@ func TestAPlanMayCarryAConversionLargerThanAnyOtherTargetRequest(t *testing.T) {
 	}
 	if r := plan(strings.Repeat("SELECT 1;\n", 6000)); r.Code != http.StatusCreated || backend.conversion != 60000 {
 		t.Fatalf("plan with a conversion = %d %s", r.Code, r.Body.String())
+	}
+	// An update may name the backup its release starts on (BF-10d2b).
+	if r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/plans", `{"release":"`+digest+`","site":{"name":"shop","host":"shop.example.com"},"start_from":"bk-20261014T010000Z-ffff"}`); r.Code != http.StatusCreated ||
+		backend.startFrom != "bk-20261014T010000Z-ffff" {
+		t.Fatalf("plan starting on a backup = %d %s", r.Code, r.Body.String())
 	}
 	backend.calls = nil
 	// Past its own bound a plan is refused before the backend sees it (here a valid plan padded with spaces); every
