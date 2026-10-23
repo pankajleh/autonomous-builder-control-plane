@@ -107,6 +107,17 @@ type HostedBackupV1 struct {
 	Bytes      int64  `json:"bytes"`
 	Generation uint64 `json:"generation"`
 	SourceSHA  string `json:"source_sha"`
+	// Offsite is the backup's copy off the host, when the controller copies them (Repo C BF-10b): absent before a
+	// copy was tried.
+	Offsite *HostedBackupOffsiteV1 `json:"offsite,omitempty"`
+}
+
+// HostedBackupOffsiteV1 says whether a hosted backup was copied off the host: when, and where to (the s3:// address)
+// or why not.
+type HostedBackupOffsiteV1 struct {
+	At     string `json:"at"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail"`
 }
 
 type HostedBackupListV1 struct {
@@ -202,6 +213,9 @@ func validStamp(v string) bool {
 func ValidateHostedBackupV1(v HostedBackupV1, key string) error {
 	if v.SchemaVersion != "HostedBackupV1" || v.HostingKey != key || ValidateHostingKey(key) != nil || !isLowerSHA256(v.BackupID) || (v.Reason != "manual" && v.Reason != "pre-update" && v.Reason != "nightly") || !validStamp(v.TakenAt) || v.Bytes < 0 || v.Generation == 0 || !isLowerGitObjectID(v.SourceSHA) {
 		return errors.New("invalid hosted backup")
+	}
+	if v.Offsite != nil && (!validStamp(v.Offsite.At) || v.Offsite.Detail == "" || len(v.Offsite.Detail) > 512) {
+		return errors.New("invalid hosted backup copy")
 	}
 	return nil
 }

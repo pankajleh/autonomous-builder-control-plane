@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -107,6 +108,10 @@ type Hosting struct {
 	keys        map[string]*hostedKey
 	closed      bool
 	unavailable bool
+	// offsiteFile, when set, is the private settings file that copies each backup off the host (hosted_offsite.go).
+	offsiteFile     string
+	offsiteEndpoint func(bucket, region string) string
+	offsiteClient   *http.Client
 }
 
 // NewHosting starts the hosted instances of a preview service's runtime. It runs after the preview service has
@@ -140,7 +145,8 @@ func newHosting(parent context.Context, root string, profiles map[string]Preview
 		return nil, ErrIntegrity
 	}
 	ctx, cancel := context.WithCancel(parent)
-	h := &Hosting{root: root, profiles: profiles, resolver: resolver, checkout: checkout, runtime: runtime, now: now, ctx: ctx, cancel: cancel, keys: map[string]*hostedKey{}}
+	h := &Hosting{root: root, profiles: profiles, resolver: resolver, checkout: checkout, runtime: runtime, now: now, ctx: ctx, cancel: cancel, keys: map[string]*hostedKey{},
+		offsiteEndpoint: s3Endpoint, offsiteClient: &http.Client{}}
 	for _, e := range entries {
 		if !sha256Pattern.MatchString(e.Name()) {
 			cancel()
@@ -719,10 +725,11 @@ func (h *Hosting) BackupHosted(ctx context.Context, p serviceapi.Principal, auth
 	if err != nil {
 		return empty, err
 	}
+	result, again := h.withOffsite(ctx, k, st.Backups, result)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	st = k.state
-	st.Backups = append(append([]serviceapi.HostedBackupV1(nil), st.Backups...), result)
+	st.Backups = append(withCopies(append([]serviceapi.HostedBackupV1(nil), st.Backups...), again), result)
 	st = pruneBackups(st, h.now())
 	st.UpdatedAt = stamp(h.now())
 	if err = h.save(k, withReceipt(st, cmd, result)); err != nil {
@@ -1032,10 +1039,11 @@ func (h *Hosting) nightlyBackup(k *hostedKey) {
 	if err != nil {
 		return
 	}
+	b, again := h.withOffsite(h.ctx, k, st.Backups, b)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	st = k.state
-	st.Backups = append(append([]serviceapi.HostedBackupV1(nil), st.Backups...), b)
+	st.Backups = append(withCopies(append([]serviceapi.HostedBackupV1(nil), st.Backups...), again), b)
 	st = pruneBackups(st, now)
 	st.LastNightly, st.UpdatedAt = stamp(now), stamp(now)
 	if h.save(k, st) == nil {
