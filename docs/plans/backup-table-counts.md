@@ -1,8 +1,9 @@
 # A backup says what the app's database held, table by table (Repo C BF-06a)
 
-Status: **built**, not live yet. Repo C's design note `BF06_YOUR_APPS_DATA.md` §4.1 (the owner, 2026-10-24: "all as
-recommended, go ahead", every §7 answer A). Repo C lists the tables and their records on the app's card and the Servers
-page from the newest backup, and leaves out the tables the app's platform keeps for itself (`autobuild_*`).
+Status: **live** on ABCP since 2026-10-24 17:11 UTC (`cb7bd74`, #141; recorded in #142). Repo C's design note
+`BF06_YOUR_APPS_DATA.md` §4.1 (the owner, 2026-10-24: "all as recommended, go ahead", every §7 answer A). Repo C lists the
+tables and their records on the app's card and the Servers page from the newest backup, and leaves out empty tables and the
+tables the app's platform keeps for itself (`autobuild_*`).
 
 ## What changes
 
