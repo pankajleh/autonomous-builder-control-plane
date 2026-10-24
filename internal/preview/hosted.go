@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/appwatch"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/pgcount"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/strictjson"
 )
@@ -885,7 +886,21 @@ func (h *Hosting) backup(ctx context.Context, k *hostedKey, st hostedState, reas
 		_ = os.Remove(tmp)
 		return empty, serviceapi.ErrPreviewUnavailable
 	}
-	return serviceapi.HostedBackupV1{SchemaVersion: "HostedBackupV1", HostingKey: st.Key, BackupID: id, Reason: reason, TakenAt: stamp(h.now()), Bytes: w.written, Generation: st.Generation, SourceSHA: st.Version.SourceSHA}, nil
+	b := serviceapi.HostedBackupV1{SchemaVersion: "HostedBackupV1", HostingKey: st.Key, BackupID: id, Reason: reason, TakenAt: stamp(h.now()), Bytes: w.written, Generation: st.Generation, SourceSHA: st.Version.SourceSHA}
+	// What the database holds, counted read-only just after the dump (Repo C BF-06a); a count that fails leaves the
+	// backup as it is.
+	if c, ok := h.runtime.(hostedCounter); ok {
+		if counts, err := c.Count(ctx, st.InstanceID, profile); err == nil {
+			tables, rows := pgcount.Totals(counts)
+			b.Tables, b.Rows, b.Counts = &tables, &rows, pgcount.Top(counts)
+		}
+	}
+	return b, nil
+}
+
+// hostedCounter counts the rows of each table in a hosted instance's data. The Docker runtime provides it.
+type hostedCounter interface {
+	Count(ctx context.Context, id string, p PreviewProfileV1) (map[string]int64, error)
 }
 
 // pruneBackups keeps backups for 7 days, and at most hostedBackupLimit, but always the newest.

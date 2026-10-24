@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/pgcount"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
@@ -1113,6 +1114,75 @@ func (d *dockerRuntime) Dump(ctx context.Context, id string, p PreviewProfileV1,
 		return err
 	}
 	return d.stream(ctx, nil, w, args...)
+}
+
+// Count answers each table's rows in a hosted instance's data (Repo C BF-06a): pgcount.Query in one read-only
+// REPEATABLE READ transaction, run by the psql beside the profile's pg_dump backup command, as its user, in its
+// database. A profile whose backup command is not pg_dump has no count.
+func (d *dockerRuntime) Count(ctx context.Context, id string, p PreviewProfileV1) (map[string]int64, error) {
+	i := p.dataService()
+	if i < 0 {
+		return nil, ErrUnavailable
+	}
+	argv := countArgv(p.Services[i].BackupArgv)
+	if argv == nil {
+		return nil, ErrUnavailable
+	}
+	args, err := d.dataExec(ctx, id, p, argv, false)
+	if err != nil {
+		return nil, err
+	}
+	out := &cappedBuffer{limit: countAnswerBytes}
+	if err := d.stream(ctx, nil, out, args...); err != nil {
+		return nil, err
+	}
+	return pgcount.Parse(lastLine(out.String()))
+}
+
+// countAnswerBytes bounds a count's answer: 2000 tables of names up to 260 bytes.
+const countAnswerBytes = 1 << 20
+
+// countArgv turns a pg_dump backup command into a count: its own psql, host, user and database, and the fixed query.
+func countArgv(backup []string) []string {
+	if len(backup) < 2 || filepath.Base(backup[0]) != "pg_dump" {
+		return nil
+	}
+	var host, user string
+	for i := 1; i < len(backup)-1; i++ {
+		switch backup[i] {
+		case "-h":
+			host = backup[i+1]
+			i++
+		case "-U":
+			user = backup[i+1]
+			i++
+		}
+	}
+	db := backup[len(backup)-1]
+	if host == "" || user == "" || db == "" || strings.HasPrefix(db, "-") {
+		return nil
+	}
+	return []string{filepath.Join(filepath.Dir(backup[0]), "psql"), "-h", host, "-U", user, "-d", db, "-qAtX", "-v", "ON_ERROR_STOP=1",
+		"-c", "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", "-c", pgcount.Query, "-c", "COMMIT"}
+}
+
+// lastLine is the last line of text that is not blank.
+func lastLine(text string) string {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	return lines[len(lines)-1]
+}
+
+// cappedBuffer keeps what is written up to limit, and refuses more.
+type cappedBuffer struct {
+	strings.Builder
+	limit int
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if b.Len()+len(p) > b.limit {
+		return 0, ErrUnavailable
+	}
+	return b.Builder.Write(p)
 }
 
 // Load restores a backup read from r into a hosted instance with the profile's restore command.

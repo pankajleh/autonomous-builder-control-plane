@@ -225,6 +225,41 @@ type BackupV1 struct {
 	// Offsite is the backup's copy off the server (BF-14.2b-2), when the target
 	// has a bucket: where it went, or why it did not.
 	Offsite *BackupOffsiteV1 `json:"offsite,omitempty"`
+	// Counts names the tables with the most rows when it was taken, at most
+	// BackupCountLimit, in name order (Repo C BF-06a); a listing gives them.
+	// Tables and Rows count every table.
+	Counts []TableRowsV1 `json:"counts,omitempty"`
+}
+
+// TableRowsV1 is one table's rows when a backup was taken (Repo C design note
+// BF06_YOUR_APPS_DATA §4.1): the table by schema and name as the database
+// quotes them, such as public.orders.
+type TableRowsV1 struct {
+	Table string `json:"table"`
+	Rows  int64  `json:"rows"`
+}
+
+// BackupCountLimit bounds the tables a backup's answer names: the ones with
+// the most rows, among those whose name is at most BackupCountNameBytes long,
+// so a listing of every backup stays a few tens of kilobytes.
+const (
+	BackupCountLimit     = 20
+	BackupCountNameBytes = 64
+)
+
+// ValidateTableRows checks a backup's counts: at most BackupCountLimit tables,
+// each named once in order, none empty, longer than BackupCountNameBytes or
+// negative.
+func ValidateTableRows(counts []TableRowsV1) error {
+	if len(counts) > BackupCountLimit {
+		return errors.New("too many table counts")
+	}
+	for i, c := range counts {
+		if c.Table == "" || len(c.Table) > BackupCountNameBytes || c.Rows < 0 || (i > 0 && counts[i-1].Table >= c.Table) {
+			return errors.New("invalid table count")
+		}
+	}
+	return nil
 }
 
 // BackupOffsiteV1 is whether a backup was copied off its server: Detail is the

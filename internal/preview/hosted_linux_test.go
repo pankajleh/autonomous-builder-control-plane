@@ -10,11 +10,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/pgcount"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
@@ -31,6 +33,15 @@ type hostedMemory struct {
 	loadErr             error
 	removed             []string
 	outputs             []HostedOutput // the output each start was given
+	counts              map[string]int64
+	countErr            error
+}
+
+// Count answers the tables the memory was given (BF-06a).
+func (r *hostedMemory) Count(context.Context, string, PreviewProfileV1) (map[string]int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.counts, r.countErr
 }
 
 func (r *hostedMemory) Available(PreviewProfileV1) bool {
@@ -360,14 +371,14 @@ func TestHostedBackupRestoreAndPurge(t *testing.T) {
 	if info, err := os.Stat(file); err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("backup file mode = %v, %v", info, err)
 	}
-	if again, err := h.BackupHosted(ctx, principal(), testAuthorityDigest, "app-1", backupCommand("backup-1", "pre-update")); err != nil || again != b {
+	if again, err := h.BackupHosted(ctx, principal(), testAuthorityDigest, "app-1", backupCommand("backup-1", "pre-update")); err != nil || !reflect.DeepEqual(again, b) {
 		t.Fatalf("replayed backup = %+v, %v", again, err)
 	}
 	list, err := h.ListHostedBackups(ctx, principal(), "app-1")
-	if err != nil || len(list.Backups) != 1 || list.Backups[0] != b {
+	if err != nil || len(list.Backups) != 1 || !reflect.DeepEqual(list.Backups[0], b) {
 		t.Fatalf("backups = %+v, %v", list, err)
 	}
-	if v, _ := h.ReadHosted(ctx, principal(), "app-1"); v.LastBackup == nil || *v.LastBackup != b {
+	if v, _ := h.ReadHosted(ctx, principal(), "app-1"); v.LastBackup == nil || !reflect.DeepEqual(*v.LastBackup, b) {
 		t.Fatalf("last backup = %+v", v.LastBackup)
 	}
 	restore := serviceapi.HostedRestoreRequestV1{SchemaVersion: 1, RequestID: "restore-1", BackupID: b.BackupID, DelegatedActor: serviceapi.DelegatedActorV1{SubjectID: "alice", SubjectType: serviceapi.PrincipalUser}}
@@ -580,5 +591,41 @@ func TestEachHostedAppKeepsItsOwnSetupTokenUntilItsDataIsPurged(t *testing.T) {
 	awaitHosted(t, restarted, "app-1", "READY")
 	if fresh, err := restarted.ReadHostedSetup(ctx, principal(), "app-1"); err != nil || fresh.Token == first.Token || serviceapi.ValidateHostedSetupV1(fresh, "app-1") != nil {
 		t.Fatal("the start after a purge", fresh, err)
+	}
+}
+
+// BF-06a: a hosted backup says what the database held, counted just after the dump; a count that fails leaves the
+// backup as it is; the count is the psql beside the profile's pg_dump, as its user, in its database.
+func TestAHostedBackupSaysWhatItsDatabaseHeld(t *testing.T) {
+	h, rt, _, _, _ := newHostedFixture(t)
+	ctx := context.Background()
+	if _, err := h.StartHosted(ctx, principal(), testAuthorityDigest, "app-1", startCommand("start-1")); err != nil {
+		t.Fatal(err)
+	}
+	awaitHosted(t, h, "app-1", "READY")
+	rt.set(func(r *hostedMemory) { r.counts = map[string]int64{"public.orders": 12, "public.customers": 3} })
+	b, err := h.BackupHosted(ctx, principal(), testAuthorityDigest, "app-1", backupCommand("backup-1", "manual"))
+	if err != nil || serviceapi.ValidateHostedBackupV1(b, "app-1") != nil || b.Tables == nil || *b.Tables != 2 || b.Rows == nil || *b.Rows != 15 ||
+		len(b.Counts) != 2 || b.Counts[0] != (serviceapi.TableRowsV1{Table: "public.customers", Rows: 3}) {
+		t.Fatalf("backup = %+v, %v", b, err)
+	}
+	rt.set(func(r *hostedMemory) { r.countErr = ErrUnavailable })
+	b, err = h.BackupHosted(ctx, principal(), testAuthorityDigest, "app-1", backupCommand("backup-2", "manual"))
+	if err != nil || serviceapi.ValidateHostedBackupV1(b, "app-1") != nil || b.Tables != nil || b.Rows != nil || b.Counts != nil {
+		t.Fatalf("a backup whose count failed = %+v, %v", b, err)
+	}
+
+	argv := countArgv([]string{"/usr/lib/postgresql/17/bin/pg_dump", "-Fc", "-h", "/scratch", "-U", "app", "app"})
+	if len(argv) != 16 || argv[0] != "/usr/lib/postgresql/17/bin/psql" || strings.Join(argv[1:7], " ") != "-h /scratch -U app -d app" ||
+		argv[11] != "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" || argv[13] != pgcount.Query || argv[15] != "COMMIT" {
+		t.Fatal(argv)
+	}
+	for _, other := range [][]string{nil, {"/bin/tar", "-c", "/data"}, {"/usr/bin/pg_dump", "-Fc", "app"}, {"/usr/bin/pg_dump", "-h", "/s", "-U", "app", "-v"}} {
+		if countArgv(other) != nil {
+			t.Fatal("counted with", other)
+		}
+	}
+	if lastLine("\n{\"a\":1}\n\n") != `{"a":1}` {
+		t.Fatal("last line")
 	}
 }
