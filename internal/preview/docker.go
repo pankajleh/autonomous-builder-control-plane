@@ -36,6 +36,10 @@ type presentation struct {
 	// egress is the group's filtering proxy on the gateway, for a profile with Egress (egress.go), or nil.
 	egress *egressProxy
 	closed atomic.Bool
+	// stopOutput ends the attached server of a hosted app (BF-07c2), and outputDone is closed once it has ended; both
+	// are nil for every other group.
+	stopOutput context.CancelFunc
+	outputDone chan struct{}
 }
 
 // Preview networks live only in previewSubnets. The host's own rule (the owner's abcp-preview-isolation unit, board #93,
@@ -89,6 +93,9 @@ type dockerRuntime struct {
 	groups          map[string]*presentation
 	// stream runs one Docker command with the given standard input and output, for hosted backups and restores.
 	stream func(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error
+	// attach runs one Docker command for as long as it lasts, its output and errors both to w, and answers its exit
+	// code: a hosted app's own server (BF-07c2). Without it, that server starts detached like every other.
+	attach func(ctx context.Context, w io.Writer, args ...string) (int, error)
 	// listen opens the probe's listener on a group network's gateway, to prove that no service reaches the host.
 	listen func(network, address string) (net.Listener, error)
 	// relay is where a preview's relay requests go (BF-08b), or nil: a profile naming EgressAutobuildRelay is then
@@ -115,6 +122,10 @@ func newDocker(root string) *dockerRuntime {
 	d.stream = func(ctx context.Context, stdin io.Reader, stdout io.Writer, args ...string) error {
 		env, global := dockerEnvironment(root)
 		return stream(ctx, "/usr/bin/docker", env, stdin, stdout, append(global, args...)...)
+	}
+	d.attach = func(ctx context.Context, w io.Writer, args ...string) (int, error) {
+		env, global := dockerEnvironment(root)
+		return follow(ctx, "/usr/bin/docker", env, w, append(global, args...)...)
 	}
 	return d
 }
@@ -424,7 +435,7 @@ func (d *dockerRuntime) runtimeAvailable(ctx context.Context, name string) bool 
 }
 
 // caller is who the group's app relay says is asking (BF-08b): "preview <id>" or "hosted <hosting key>".
-func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume, settings, setup, caller string) (_ *presentation, err error) {
+func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume, settings, setup, caller string, output HostedOutput) (_ *presentation, err error) {
 	if !sha256Pattern.MatchString(id) || p.Validate() != nil || (p.dataService() >= 0) != (volume != "") {
 		return nil, ErrUnavailable
 	}
@@ -463,6 +474,13 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 		}
 	}
 	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, appAuthorization: p.AppAuthorization, volume: volume, gateway: gateway}
+	// Until the group is handed back, a failed start must end its attached server here, as its proxy below.
+	defer func() {
+		if err != nil {
+			g.closed.Store(true)
+			g.endOutput()
+		}
+	}()
 	relay := slices.Contains(p.Egress, EgressAutobuildRelay)
 	if relay && (d.relay == nil || !relayCaller.MatchString(caller)) {
 		return nil, ErrUnavailable
@@ -522,7 +540,12 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 				start = append([]string{"AUTOBUILD_RELAY=http://" + netip.AddrPortFrom(gateway, EgressPort).String()}, start...)
 			}
 		}
-		if _, err := d.run(ctx, serviceStart(name, s, start, egress, serviceSettings, serviceSetup)...); err != nil {
+		args := serviceStart(name, s, start, egress, serviceSettings, serviceSetup)
+		if s.Presented && output != nil && d.attach != nil && !probe {
+			// A hosted app's own server runs attached, so its output reaches the key's errors and its end is heard
+			// (BF-07c2): the same exec, less --detach.
+			g.follow(d.attach, output, append([]string{"exec"}, args[2:]...))
+		} else if _, err := d.run(ctx, args...); err != nil {
 			return nil, err
 		}
 		endpoint, err := d.endpoint(ctx, id, p, s, i, volume)
@@ -628,12 +651,13 @@ func (d *dockerRuntime) Start(ctx context.Context, id, path string, p PreviewPro
 	if p.Hosted {
 		return "", ErrUnavailable
 	}
-	return d.start(ctx, id, path, p, "", "", "", "preview "+id)
+	return d.start(ctx, id, path, p, "", "", "", "preview "+id, nil)
 }
 
 // StartHosted starts a hosted instance with the hosting key's data volume (B9.2.1) and, for a profile that takes
-// settings, the file that holds them (A5.2b). The key itself is the app relay's caller (BF-08b2).
-func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, key, keyDigest, settings, setup string) (string, error) {
+// settings, the file that holds them (A5.2b). The key itself is the app relay's caller (BF-08b2). Its own server's
+// output goes to output, when given (BF-07c2).
+func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, key, keyDigest, settings, setup string, output HostedOutput) (string, error) {
 	if !p.Hosted || !sha256Pattern.MatchString(keyDigest) || serviceapi.ValidateHostingKey(key) != nil || hostedKeyDigest(key) != keyDigest {
 		return "", ErrUnavailable
 	}
@@ -641,7 +665,7 @@ func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p Prev
 	if p.dataService() >= 0 {
 		volume = d.volume(keyDigest)
 	}
-	return d.start(ctx, id, path, p, volume, settings, setup, "hosted "+key)
+	return d.start(ctx, id, path, p, volume, settings, setup, "hosted "+key, output)
 }
 
 // validSettingsFile accepts an absolute, clean path to a regular file only its owner can read or write.
@@ -652,14 +676,14 @@ func validSettingsFile(path string) bool {
 	info, err := os.Lstat(path)
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0077 == 0
 }
-func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume, settings, setup, caller string) (string, error) {
+func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume, settings, setup, caller string, output HostedOutput) (string, error) {
 	if !sha256Pattern.MatchString(id) || path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n") {
 		return "", ErrUnavailable
 	}
 	if !d.Available(p) {
 		return "", ErrUnavailable
 	}
-	g, err := d.startGroup(ctx, id, path, p, false, volume, settings, setup, caller)
+	g, err := d.startGroup(ctx, id, path, p, false, volume, settings, setup, caller, output)
 	if err != nil {
 		_ = d.Stop(context.Background(), id)
 		return "", err
@@ -743,8 +767,32 @@ func (d *dockerRuntime) Stop(ctx context.Context, id string) error {
 		if g.egress != nil {
 			_ = g.egress.Close()
 		}
+		g.endOutput()
 	}
 	return d.removeObjects(ctx, "abcp.preview.id="+id)
+}
+
+// follow runs a hosted app's attached server until it ends or the group stops, and tells output when it ended on its
+// own. Call before the group is handed back.
+func (g *presentation) follow(attach func(context.Context, io.Writer, ...string) (int, error), output HostedOutput, args []string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	g.stopOutput, g.outputDone = cancel, done
+	go func() {
+		defer close(done)
+		code, err := attach(ctx, output, args...)
+		if err == nil && ctx.Err() == nil && !g.closed.Load() {
+			output.Ended(code)
+		}
+	}()
+}
+
+// endOutput ends the attached server, if any, and waits for it.
+func (g *presentation) endOutput() {
+	if g.stopOutput != nil {
+		g.stopOutput()
+		<-g.outputDone
+	}
 }
 func (d *dockerRuntime) removeObjects(ctx context.Context, extra string) error {
 	filters := []string{"--filter", "label=" + d.label()}
@@ -849,7 +897,7 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 			break
 		}
 	}
-	g, err := d.startGroup(ctx, id, path, p, true, volume, "", "", "preview "+id)
+	g, err := d.startGroup(ctx, id, path, p, true, volume, "", "", "preview "+id, nil)
 	if err != nil {
 		return false
 	}

@@ -3,6 +3,7 @@ package preview
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -66,6 +67,30 @@ func stream(ctx context.Context, binary string, env []string, stdin io.Reader, s
 		return ErrUnavailable
 	}
 	return nil
+}
+
+// follow runs a command until it ends or ctx ends, with no time limit, its standard output and error both to w, and
+// answers the exit code it ended with: a hosted app's own server, attached so the controller keeps its errors
+// (BF-07c2). A command ended by a signal, or that could not run, answers an error.
+func follow(ctx context.Context, binary string, env []string, w io.Writer, args ...string) (int, error) {
+	cmd := exec.CommandContext(ctx, binary, args...)
+	if configureProcess(cmd) != nil {
+		return 0, ErrUnavailable
+	}
+	cmd.Cancel = func() error { return cancelProcess(cmd) }
+	cmd.WaitDelay = time.Second
+	defer cancelProcess(cmd)
+	cmd.Env = env
+	cmd.Stdout, cmd.Stderr = w, w
+	err := cmd.Run()
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.Exited() {
+		return exit.ExitCode(), nil
+	}
+	if err != nil {
+		return 0, ErrUnavailable
+	}
+	return 0, nil
 }
 func git(ctx context.Context, path string, args ...string) (string, error) {
 	return execute(ctx, "git", gitexec.Environment(), append([]string{"-C", path}, args...)...)

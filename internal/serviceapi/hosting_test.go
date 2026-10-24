@@ -19,6 +19,7 @@ type testHosting struct {
 	backup  HostedBackupV1
 	route   HostedRouteV1
 	setup   HostedSetupV1
+	errors  HostedErrorsV1
 	file    string
 	err     error
 	calls   []string
@@ -69,6 +70,10 @@ func (t *testHosting) ReadHostedSetup(_ context.Context, _ Principal, key string
 	t.record("setup", key)
 	return t.setup, t.err
 }
+func (t *testHosting) HostedErrors(_ context.Context, _ Principal, key string) (HostedErrorsV1, error) {
+	t.record("errors", key)
+	return t.errors, t.err
+}
 
 func readyHosted() HostedV1 {
 	return HostedV1{SchemaVersion: "HostedV1", HostingKey: "app-1", Desired: "RUNNING", Status: "READY", Health: "HEALTHY", Generation: 1,
@@ -91,6 +96,7 @@ func hostingServer(t *testing.T, grant, delegate bool, kind PrincipalType) (*Ser
 		backup: HostedBackupV1{SchemaVersion: "HostedBackupV1", HostingKey: "app-1", BackupID: strings.Repeat("f", 64), Reason: "manual", TakenAt: "2026-09-30T10:02:00Z", Bytes: 10, Generation: 1, SourceSHA: strings.Repeat("c", 40)},
 		route:  HostedRouteV1{SchemaVersion: "HostedRouteV1", HostingKey: "app-1", RouteHandle: strings.Repeat("e", 64), TargetURL: "http://127.0.0.1:4321"},
 		setup:  HostedSetupV1{SchemaVersion: "HostedSetupV1", HostingKey: "app-1", Token: strings.Repeat("0a", 16)},
+		errors: HostedErrorsV1{SchemaVersion: "HostedErrorsV1", HostingKey: "app-1", ReadAt: "2026-09-30T10:03:00Z", Since: "2026-09-30T09:00:00Z", Running: true, Restarts: 1, Lines: []string{"Error: one"}},
 	}
 	s.reserved.Hosting = backend
 	return s, backend
@@ -175,6 +181,53 @@ func TestHostedRoutesServeEveryOperation(t *testing.T) {
 	var setup HostedSetupV1
 	if json.Unmarshal(get(s, "/v1/hosted/app-1/setup").Body.Bytes(), &setup) != nil || setup != backend.setup {
 		t.Fatal("setup body", setup)
+	}
+}
+
+// BF-07c2 (Repo C design note BF07_WHEN_A_RUNNING_APP_GOES_WRONG §13): a hosted app's recent errors are read, never
+// written, through the hosting grant, never kept by a cache, and never served past their bounds.
+func TestAHostedAppsRecentErrorsAreReadOnlyAndBounded(t *testing.T) {
+	s, backend := hostingServer(t, true, true, PrincipalService)
+	w := get(s, "/v1/hosted/app-1/errors")
+	if w.Code != 200 || w.Header().Get("Cache-Control") != "no-store" || backend.lastKey != "app-1" {
+		t.Fatal("errors", w.Code, w.Header(), w.Body.String())
+	}
+	var got HostedErrorsV1
+	if json.Unmarshal(w.Body.Bytes(), &got) != nil || got.Restarts != 1 || !got.Running || len(got.Lines) != 1 || got.ExitCode != nil || got.Since != backend.errors.Since {
+		t.Fatal("errors body", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "exit_code") {
+		t.Fatal("no end, no exit code", w.Body.String())
+	}
+	backend.calls = nil
+	if w := post(s, "/v1/hosted/app-1/errors", commandBody); w.Code != 400 || len(backend.calls) != 0 {
+		t.Fatal("a write to the errors", w.Code, backend.calls)
+	}
+	many := make([]string, SiteErrorLines+1)
+	for i := range many {
+		many[i] = "Error"
+	}
+	for name, bad := range map[string]HostedErrorsV1{
+		"other key":     {SchemaVersion: "HostedErrorsV1", HostingKey: "app-2", ReadAt: "2026-09-30T10:03:00Z", Lines: []string{}},
+		"no lines":      {SchemaVersion: "HostedErrorsV1", HostingKey: "app-1", ReadAt: "2026-09-30T10:03:00Z"},
+		"too many":      {SchemaVersion: "HostedErrorsV1", HostingKey: "app-1", ReadAt: "2026-09-30T10:03:00Z", Lines: many},
+		"long line":     {SchemaVersion: "HostedErrorsV1", HostingKey: "app-1", ReadAt: "2026-09-30T10:03:00Z", Lines: []string{strings.Repeat("x", HostedErrorLineBytes+1)}},
+		"two lines":     {SchemaVersion: "HostedErrorsV1", HostingKey: "app-1", ReadAt: "2026-09-30T10:03:00Z", Lines: []string{"Error: a\nsecond"}},
+		"bad since":     {SchemaVersion: "HostedErrorsV1", HostingKey: "app-1", ReadAt: "2026-09-30T10:03:00Z", Since: "yesterday", Lines: []string{}},
+		"less restarts": {SchemaVersion: "HostedErrorsV1", HostingKey: "app-1", ReadAt: "2026-09-30T10:03:00Z", Restarts: -1, Lines: []string{}},
+	} {
+		backend.errors = bad
+		if w := get(s, "/v1/hosted/app-1/errors"); w.Code != 500 {
+			t.Fatal(name, w.Code, w.Body.String())
+		}
+	}
+	backend.err = ErrDependencyNotFound
+	if w := get(s, "/v1/hosted/app-1/errors"); w.Code != 404 {
+		t.Fatal("unknown key", w.Code)
+	}
+	s2, _ := hostingServer(t, false, true, PrincipalService)
+	if w := get(s2, "/v1/hosted/app-1/errors"); w.Code != 403 {
+		t.Fatal("without the hosting grant", w.Code)
 	}
 }
 

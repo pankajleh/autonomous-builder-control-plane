@@ -49,7 +49,7 @@ var (
 // HostedRuntime is the part of the governed runtime a hosted instance uses. The Docker runtime provides it.
 type HostedRuntime interface {
 	Available(PreviewProfileV1) bool
-	StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, key, keyDigest, settings, setup string) (string, error)
+	StartHosted(ctx context.Context, id, path string, p PreviewProfileV1, key, keyDigest, settings, setup string, output HostedOutput) (string, error)
 	Healthy(ctx context.Context, id string, p PreviewProfileV1) (bool, error)
 	ResolveRoute(ctx context.Context, id, handle string) (string, error)
 	Stop(ctx context.Context, id string) error
@@ -92,6 +92,8 @@ type hostedKey struct {
 	state  hostedState // guarded by Hosting.mu
 	cancel context.CancelFunc
 	done   chan struct{}
+	// output keeps the app's recent errors from its first start since the controller's own (BF-07c2), or is nil.
+	output *appOutput
 }
 
 type Hosting struct {
@@ -340,6 +342,27 @@ func (h *Hosting) ReadHosted(_ context.Context, p serviceapi.Principal, key stri
 		return serviceapi.HostedV1{}, serviceapi.ErrDependencyNotFound
 	}
 	return view(k.state), nil
+}
+
+// HostedErrors answers the app's recent errors as the controller kept them from its own server's output (BF-07c2):
+// nothing from before its first start since the controller's own.
+func (h *Hosting) HostedErrors(_ context.Context, p serviceapi.Principal, key string) (serviceapi.HostedErrorsV1, error) {
+	k, err := h.key(p, key, false)
+	if err != nil {
+		return serviceapi.HostedErrorsV1{}, err
+	}
+	h.mu.Lock()
+	st, output := k.state, k.output
+	h.mu.Unlock()
+	if st.Key == "" {
+		return serviceapi.HostedErrorsV1{}, serviceapi.ErrDependencyNotFound
+	}
+	v := serviceapi.HostedErrorsV1{ReadAt: stamp(h.now()), Lines: []string{}}
+	if output != nil {
+		v = output.read()
+	}
+	v.SchemaVersion, v.HostingKey, v.Running = "HostedErrorsV1", key, st.Status == "READY"
+	return v, nil
 }
 
 func (h *Hosting) StartHosted(ctx context.Context, p serviceapi.Principal, authorityDigest, key string, c serviceapi.HostedStartRequestV1) (serviceapi.HostedV1, error) {
@@ -890,6 +913,9 @@ func (h *Hosting) running(except *hostedKey) int {
 
 // launch starts the key's supervisor. Call with h.mu held and the key's state STARTING.
 func (h *Hosting) launch(k *hostedKey) {
+	if k.output == nil {
+		k.output = newAppOutput(h.now)
+	}
 	ctx, cancel := context.WithCancel(h.ctx)
 	done := make(chan struct{})
 	k.cancel, k.done = cancel, done
@@ -939,6 +965,7 @@ func (h *Hosting) supervise(ctx context.Context, k *hostedKey, done chan struct{
 			return
 		}
 		st.Restarts = append(recent, stamp(now))
+		k.output.restarted()
 		st.Status, st.Generation, st.UpdatedAt = "STARTING", st.Generation+1, stamp(now)
 		st.InstanceID = hostedInstance(k.digest, st.Generation)
 		err := h.save(k, st)
@@ -998,7 +1025,11 @@ func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedStat
 	if err != nil {
 		return
 	}
-	route, err := h.runtime.StartHosted(ctx, id, path, profile, st.Key, k.digest, settings, setup)
+	var output HostedOutput
+	if k.output != nil {
+		output = k.output
+	}
+	route, err := h.runtime.StartHosted(ctx, id, path, profile, st.Key, k.digest, settings, setup, output)
 	if err != nil || !sha256Pattern.MatchString(route) {
 		return
 	}
