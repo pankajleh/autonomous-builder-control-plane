@@ -3,6 +3,7 @@
 package preview
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"errors"
@@ -35,6 +36,22 @@ type hostedMemory struct {
 	outputs             []HostedOutput // the output each start was given
 	counts              map[string]int64
 	countErr            error
+	data                string // what pg_restore writes for any backup (BF-06b)
+	extracted           []string
+	extractErr          error
+}
+
+// Extract answers the data the memory was given, as pg_restore writes it, after reading the whole backup (BF-06b).
+func (r *hostedMemory) Extract(_ context.Context, _ string, _ PreviewProfileV1, in io.Reader, w io.Writer) error {
+	backup, _ := io.ReadAll(in)
+	r.mu.Lock()
+	data, err := r.data, r.extractErr
+	r.extracted = append(r.extracted, string(backup))
+	r.mu.Unlock()
+	if _, werr := io.WriteString(w, data); werr != nil {
+		return werr
+	}
+	return err
 }
 
 // Count answers the tables the memory was given (BF-06a).
@@ -627,5 +644,69 @@ func TestAHostedBackupSaysWhatItsDatabaseHeld(t *testing.T) {
 	}
 	if lastLine("\n{\"a\":1}\n\n") != `{"a":1}` {
 		t.Fatal("last line")
+	}
+}
+
+// BF-06b: a backup's spreadsheets are its data, as the profile's own pg_restore writes it, in a zip of one CSV per table;
+// nothing is restored and nothing changes.
+func TestAHostedBackupIsTakenOutAsSpreadsheets(t *testing.T) {
+	h, rt, _, _, _ := newHostedFixture(t)
+	ctx := context.Background()
+	if _, err := h.StartHosted(ctx, principal(), testAuthorityDigest, "app-1", startCommand("start-1")); err != nil {
+		t.Fatal(err)
+	}
+	awaitHosted(t, h, "app-1", "READY")
+	rt.set(func(r *hostedMemory) {
+		r.dump = "backup-bytes"
+		r.data = "SET x = 1;\nCOPY public.orders (id, item) FROM stdin;\n1\tTea\n2\t\\N\n\\.\nCOPY public.autobuild_jobs (id) FROM stdin;\n1\n\\.\n"
+	})
+	b, err := h.BackupHosted(ctx, principal(), testAuthorityDigest, "app-1", backupCommand("backup-1", "manual"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := h.OpenHostedSpreadsheets(ctx, principal(), "app-1", b.BackupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zipped, err := io.ReadAll(f)
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(zipped), int64(len(zipped)))
+	if err != nil || len(zr.File) != 1 || zr.File[0].Name != "orders.csv" {
+		t.Fatalf("zip = %v %v", zr, err)
+	}
+	r, _ := zr.File[0].Open()
+	csv, _ := io.ReadAll(r)
+	if string(csv) != "\ufeffid,item\r\n1,Tea\r\n2,\r\n" {
+		t.Fatalf("orders.csv = %q", csv)
+	}
+	rt.mu.Lock()
+	extracted := append([]string(nil), rt.extracted...)
+	rt.mu.Unlock()
+	if len(extracted) != 1 || extracted[0] != "backup-bytes" {
+		t.Fatalf("pg_restore read %q", extracted)
+	}
+
+	if _, err := h.OpenHostedSpreadsheets(ctx, principal(), "app-1", strings.Repeat("0", 64)); !errors.Is(err, serviceapi.ErrDependencyNotFound) {
+		t.Fatal("an unlisted backup:", err)
+	}
+	if _, err := h.OpenHostedSpreadsheets(ctx, serviceapi.Principal{PrincipalID: "someone-else", PrincipalType: serviceapi.PrincipalService}, "app-1", b.BackupID); err == nil {
+		t.Fatal("another principal's backup")
+	}
+	rt.set(func(r *hostedMemory) { r.extractErr = ErrUnavailable })
+	f, err = h.OpenHostedSpreadsheets(ctx, principal(), "app-1", b.BackupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(f); err == nil {
+		t.Fatal("a pg_restore that failed read as a whole zip")
+	}
+	f.Close()
+
+	argv := extractArgv([]string{"/usr/lib/postgresql/17/bin/pg_dump", "-Fc", "-h", "/scratch", "-U", "app", "app"})
+	if strings.Join(argv, " ") != "/usr/lib/postgresql/17/bin/pg_restore --data-only --no-owner --no-privileges -f -" || extractArgv([]string{"/bin/tar", "-c"}) != nil {
+		t.Fatal(argv)
 	}
 }

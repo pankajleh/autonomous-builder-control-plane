@@ -17,6 +17,7 @@ import (
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/appwatch"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/pgcount"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/pgcsv"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/strictjson"
 )
@@ -729,6 +730,79 @@ func (h *Hosting) OpenHostedBackup(_ context.Context, p serviceapi.Principal, ke
 		return nil, 0, serviceapi.ErrPreviewUnavailable
 	}
 	return f, info.Size(), nil
+}
+
+// OpenHostedSpreadsheets opens one listed backup as spreadsheets (Repo C BF-06b): a zip with one CSV file per table. The
+// pg_restore beside the profile's pg_dump, in the ready instance's data container, writes the backup's data as text from
+// its file, with no database; pgcsv turns it into the zip. Nothing changes. Closing it ends the read; a read that ends in
+// an error is an unfinished zip.
+func (h *Hosting) OpenHostedSpreadsheets(ctx context.Context, p serviceapi.Principal, key, backupID string) (io.ReadCloser, error) {
+	k, err := h.key(p, key, false)
+	if err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	st := k.state
+	h.mu.Unlock()
+	var taken time.Time
+	found := false
+	for _, b := range st.Backups {
+		if b.BackupID == backupID {
+			found = true
+			taken, err = time.Parse(time.RFC3339Nano, b.TakenAt)
+		}
+	}
+	if st.Key == "" || !found || err != nil {
+		return nil, serviceapi.ErrDependencyNotFound
+	}
+	extractor, can := h.runtime.(hostedExtractor)
+	profile, ok := h.profiles[st.Version.ProfileID]
+	if !can || !ok || st.Status != "READY" || profile.Digest() != st.Version.ProfileDigest || profile.dataService() < 0 {
+		return nil, serviceapi.ErrHostedConflict
+	}
+	f, err := openRegular(h.backupPath(k.digest, backupID), os.O_RDONLY, true)
+	if err != nil {
+		return nil, serviceapi.ErrPreviewUnavailable
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	data, dataW := io.Pipe()
+	zr, zw := io.Pipe()
+	done := make(chan struct{}, 2)
+	go func() {
+		defer func() { done <- struct{}{} }()
+		_ = dataW.CloseWithError(extractor.Extract(streamCtx, st.InstanceID, profile, f, dataW))
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		_, err := pgcsv.Convert(data, zw, taken)
+		_ = data.CloseWithError(io.ErrClosedPipe)
+		_ = zw.CloseWithError(err)
+	}()
+	return &spreadsheets{PipeReader: zr, end: func() {
+		cancel()
+		_ = zr.Close()
+		_ = data.Close()
+		<-done
+		<-done
+		_ = f.Close()
+	}}, nil
+}
+
+// spreadsheets is a backup's zip read as it is made; closing it, once, ends the making.
+type spreadsheets struct {
+	*io.PipeReader
+	end  func()
+	once sync.Once
+}
+
+func (s *spreadsheets) Close() error {
+	s.once.Do(s.end)
+	return nil
+}
+
+// hostedExtractor writes a backup's data as text, with no database. The Docker runtime provides it.
+type hostedExtractor interface {
+	Extract(ctx context.Context, id string, p PreviewProfileV1, r io.Reader, w io.Writer) error
 }
 
 // command runs one state-changing command on an existing key, idempotently by its request ID.

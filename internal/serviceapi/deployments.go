@@ -445,6 +445,10 @@ type DeploymentController interface {
 	// OpenBackup opens one listed backup's file as it is on the target, with
 	// its size, for the app's owner to download (BF-10c2).
 	OpenBackup(ctx context.Context, target, site, backup string) (io.ReadCloser, int64, error)
+	// OpenSpreadsheets opens one listed backup as a zip of one CSV file per
+	// table, read as it is made (BF-06b); an error after it opens leaves the
+	// zip unfinished.
+	OpenSpreadsheets(ctx context.Context, target, site, backup string) (io.ReadCloser, error)
 	// SiteErrors reads a Node app's recent errors on its target, when asked
 	// (BF-07c); it changes nothing.
 	SiteErrors(ctx context.Context, target, site string) (SiteErrorsV1, error)
@@ -550,7 +554,7 @@ func (s *Server) releases(w http.ResponseWriter, r *http.Request, principal Prin
 }
 
 // /v1/targets/{key}/plans, /apply, /operations/{id}, /sites, /sites/{name}/remove, /sites/{name}/backups,
-// /sites/{name}/backups/{backup} (its file), /sites/{name}/backups/{backup}/check, /sites/{name}/errors, /sites/{name}/stop and /start,
+// /sites/{name}/backups/{backup} (its file), /sites/{name}/backups/{backup}/spreadsheets, /sites/{name}/backups/{backup}/check, /sites/{name}/errors, /sites/{name}/stop and /start,
 // /databases, /databases/{name}/remove, /clean, /drift and /isolation
 func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id string, parts []string, body func(any) bool) {
 	bad := func() {
@@ -655,6 +659,20 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 			return
 		}
 		s.writeSiteBackupFile(w, r, id, key, parts[2], parts[4])
+	case len(parts) == 6 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "backups" &&
+		backupIDPattern.MatchString(parts[4]) && parts[5] == "spreadsheets" && r.Method == http.MethodGet:
+		if !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		f, err := s.reserved.Deployments.OpenSpreadsheets(r.Context(), key, parts[2], parts[4])
+		if err != nil {
+			s.writeDeploymentError(w, id, err)
+			return
+		}
+		s.writeSpreadsheets(w, f, func() {
+			s.writeError(w, http.StatusServiceUnavailable, ErrorV1{Code: "target_unavailable", Message: "targets are unavailable", RequestID: id, Retryable: true})
+		})
 	case len(parts) == 6 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "backups" &&
 		backupIDPattern.MatchString(parts[4]) && parts[5] == "check" && r.Method == http.MethodPost:
 		var create BackupCreateV1
@@ -773,6 +791,29 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 		s.writeJSON(w, http.StatusOK, drift)
 	default:
 		bad()
+	}
+}
+
+// writeSpreadsheets answers a backup's spreadsheets as they are made (Repo C BF-06b). Nothing is sent until the zip's first
+// bytes are, so a backup whose data cannot be read is an error answer; a failure after that aborts the response, so the
+// receiver never takes an unfinished zip for a whole one.
+func (s *Server) writeSpreadsheets(w http.ResponseWriter, f io.ReadCloser, unavailable func()) {
+	defer f.Close()
+	first := make([]byte, 32<<10)
+	n, _ := io.ReadAtLeast(f, first, 1)
+	if n == 0 {
+		unavailable()
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(first[:n]); err != nil {
+		panic(http.ErrAbortHandler)
+	}
+	if _, err := io.Copy(w, f); err != nil {
+		panic(http.ErrAbortHandler)
 	}
 }
 

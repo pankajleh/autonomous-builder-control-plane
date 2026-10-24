@@ -22,6 +22,7 @@ type testHosting struct {
 	setup   HostedSetupV1
 	errors  HostedErrorsV1
 	file    string
+	zip     string
 	err     error
 	calls   []string
 	lastKey string
@@ -62,6 +63,13 @@ func (t *testHosting) OpenHostedBackup(_ context.Context, _ Principal, key, _ st
 		return nil, 0, t.err
 	}
 	return io.NopCloser(strings.NewReader(t.file)), int64(len(t.file)), nil
+}
+func (t *testHosting) OpenHostedSpreadsheets(_ context.Context, _ Principal, key, _ string) (io.ReadCloser, error) {
+	t.record("spreadsheets", key)
+	if t.err != nil {
+		return nil, t.err
+	}
+	return io.NopCloser(strings.NewReader(t.zip)), nil
 }
 func (t *testHosting) PurgeHosted(_ context.Context, _ Principal, _ string, key string, _ HostedCommandRequestV1) (HostedV1, error) {
 	t.record("purge", key)
@@ -473,5 +481,37 @@ func TestAHostedBackupsCountsAreWholeAndBounded(t *testing.T) {
 	}
 	if ValidateTableRows(many) == nil {
 		t.Fatal("more than the limit")
+	}
+}
+
+// Repo C BF-06b: a backup's spreadsheets, as they are made, through the hosting grant; nothing is sent for one that
+// cannot be read.
+func TestAHostedBackupsSpreadsheetsAreAnsweredAsTheyAreMade(t *testing.T) {
+	s, backend := hostingServer(t, true, true, PrincipalService)
+	backend.zip = "PK\x03\x04zip-bytes"
+	path := "/v1/hosted/app-1/backups/" + strings.Repeat("f", 64) + "/spreadsheets"
+	w := get(s, path)
+	if w.Code != 200 || w.Body.String() != backend.zip || w.Header().Get("Content-Type") != "application/zip" || w.Header().Get("Cache-Control") != "no-store" ||
+		len(backend.calls) != 1 || backend.calls[0] != "spreadsheets" || backend.lastKey != "app-1" {
+		t.Fatalf("spreadsheets = %d %q %v calls %v", w.Code, w.Body.String(), w.Header(), backend.calls)
+	}
+	for _, bad := range []string{path + "/more", strings.TrimSuffix(path, "spreadsheets") + "sheets", "/v1/hosted/app-1/backups/not-an-id/spreadsheets",
+		"/v1/hosted/app-1/route/" + strings.Repeat("f", 64) + "/spreadsheets"} {
+		backend.calls = nil
+		if w := get(s, bad); w.Code != 400 || len(backend.calls) != 0 {
+			t.Fatalf("%s: %d calls %v", bad, w.Code, backend.calls)
+		}
+	}
+	backend.calls = nil
+	if w := post(s, path, commandBody); w.Code != 400 || len(backend.calls) != 0 {
+		t.Fatalf("a write to a backup's spreadsheets: %d calls %v", w.Code, backend.calls)
+	}
+	backend.err = ErrDependencyNotFound
+	if w := get(s, path); w.Code != 404 {
+		t.Fatal("an unknown backup's spreadsheets", w.Code)
+	}
+	backend.err, backend.zip = nil, ""
+	if w := get(s, path); w.Code != 503 || w.Header().Get("Content-Type") == "application/zip" {
+		t.Fatal("a backup whose data cannot be read was answered", w.Code)
 	}
 }
