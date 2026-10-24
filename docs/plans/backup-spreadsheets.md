@@ -1,6 +1,6 @@
 # A backup taken out as spreadsheets (Repo C BF-06b)
 
-Status: **built**, not live yet. Repo C's design note `BF06_YOUR_APPS_DATA.md` §4.2 (the owner, 2026-10-24: "all as
+Status: **live** since 2026-10-24 17:45 UTC (`72ebdb2`, ABCP PID 1220291; checked on QA's Crew Access Desk, #144). Repo C's design note `BF06_YOUR_APPS_DATA.md` §4.2 (the owner, 2026-10-24: "all as
 recommended, go ahead", every §7 answer A). Repo C offers **Download as spreadsheets** beside **Download** on each backup,
 for the app's owner and administrators, after the same personal-data warning.
 
