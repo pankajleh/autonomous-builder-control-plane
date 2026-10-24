@@ -31,12 +31,13 @@ import (
 
 // The kit's images, by digest: Node format 1's runtime, and the Postgres with
 // its server mode (Repo C tools/node-kit, published by node-runtime.yml: the
-// runtime of Repo C ebd8e11, #690, whose kit adds autobuild-db/jobs, the app's
-// timetable, to the launcher of d398f99, #571, that also gives the app's setup
-// token from setup.env under the other names apps read it by; and the Postgres
-// of Repo C ea389f4, #494).
+// runtime of Repo C b0200c6, #753, whose kit adds autobuild-db/data, the
+// administrators' Data screen, to autobuild-db/jobs, the app's timetable of
+// ebd8e11, #690, and the launcher of d398f99, #571, that also gives the app's
+// setup token from setup.env under the other names apps read it by; and the
+// Postgres of Repo C ea389f4, #494).
 const (
-	NodeRuntimeImage  = "ghcr.io/pankajleh/autobuild-node-app-runtime@sha256:60ae5a6823680f76776397ae126f625057d67c7bc75814215a896502a30d1e98"
+	NodeRuntimeImage  = "ghcr.io/pankajleh/autobuild-node-app-runtime@sha256:85179e3b84ace667ad4e0ceadee32ff70c782b0c7e6d287ec4ffe28cdd609b1d"
 	NodePostgresImage = "ghcr.io/pankajleh/autobuild-node-app-postgres@sha256:1059b7d7f68e8ce1af825107c373b6a5dc2acb7f44bc15c5d6bfbe82456a62c9"
 )
 
