@@ -89,7 +89,8 @@ func newLocalRemote(t *testing.T) *localRemote {
 	// as the backup and restore scripts count them, which a dump carries after
 	// its first line. A Node app answers /health unless $HOME/app.fails-once
 	// was there when it started; $HOME/restore.loses-rows makes a restore
-	// lose every row.
+	// lose every row. An app container's state for inspect is in
+	// $S/c-<name>.state when a test sets one, and its output in $S/c-<name>.log.
 	fake := `#!/bin/sh
 echo "$@" >> "$HOME/docker.log"
 S="$HOME/.docker"
@@ -106,8 +107,12 @@ case "$1" in
           ip="10.$(( $(printf '%s' "$n ${f##*/}" | cksum | cut -d' ' -f1) % 250 )).0.2"; echo "$n" > "$S/ip-$ip"
           printf '"%s":{"IPAddress":"%s"},' "${f##*/}" "$ip"
         done; echo '}' ;;
+      *State.Status*)
+        [ -f "$S/c-$n" ] || exit 1
+        if [ -f "$S/c-$n.state" ]; then cat "$S/c-$n.state"; elif [ -f "$S/c-$n.down" ]; then echo "exited 0 0 false"; else echo "running 0 0 false"; fi ;;
       *) if [ -f "$S/c-$n" ] && [ ! -f "$S/c-$n.down" ]; then echo true; else echo false; fi ;;
     esac ;;
+  logs) n=$(last "$@"); [ -f "$S/c-$n" ] || { echo "Error response from daemon: No such container: $n" >&2; exit 1; }; cat "$S/c-$n.log" 2>/dev/null || true ;;
   run)
     n=""; net=""; prev=""
     for a; do [ "$prev" = "--name" ] && n=$a; [ "$prev" = "--network" ] && net=$a; prev=$a; done

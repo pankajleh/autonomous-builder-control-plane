@@ -252,6 +252,26 @@ type BackupsV1 struct {
 	Backups       []BackupV1 `json:"backups"`
 }
 
+// SiteErrorsV1 is a Node app's recent errors on its target, read when asked
+// (Repo C design note BF07_WHEN_A_RUNNING_APP_GOES_WRONG §4.3, 7c): at most the
+// last SiteErrorLines error lines of the app's own output from the last day,
+// SiteErrorBytes in all, with what looks like a secret, a sign-in token, an
+// email address or a phone number replaced by fixed words before it leaves
+// ABCP; how many times the app restarted, and how it last exited. Running is
+// false when the app's container is not running (stopped or gone).
+type SiteErrorsV1 struct {
+	SchemaVersion string   `json:"schema_version"`
+	Target        string   `json:"target"`
+	Site          string   `json:"site"`
+	ReadAt        string   `json:"read_at"`
+	Running       bool     `json:"running"`
+	Restarts      int      `json:"restarts"`
+	ExitCode      *int     `json:"exit_code,omitempty"`
+	OutOfMemory   bool     `json:"out_of_memory"`
+	Lines         []string `json:"lines"`
+	Truncated     bool     `json:"truncated"`
+}
+
 // BackupCreateV1 takes a backup now, or checks one. RequestID makes a
 // repeated request answer the same operation.
 type BackupCreateV1 struct {
@@ -356,11 +376,15 @@ type SiteSetupV1 struct {
 }
 
 const (
-	SiteSetupSchemaV1 = "SiteSetupV1"
-	NameSchemaV1      = "NameV1"
-	DatabasesSchemaV1 = "DatabasesV1"
-	DriftSchemaV1     = "DriftV1"
-	BackupsSchemaV1   = "BackupsV1"
+	SiteSetupSchemaV1  = "SiteSetupV1"
+	NameSchemaV1       = "NameV1"
+	DatabasesSchemaV1  = "DatabasesV1"
+	DriftSchemaV1      = "DriftV1"
+	BackupsSchemaV1    = "BackupsV1"
+	SiteErrorsSchemaV1 = "SiteErrorsV1"
+	// SiteErrorLines and SiteErrorBytes bound a site's recent errors.
+	SiteErrorLines    = 50
+	SiteErrorBytes    = 16 * 1024
 	ReleaseSchemaV1   = "ReleaseV1"
 	PlanSchemaV1      = "PlanV1"
 	OperationSchemaV1 = "OperationV1"
@@ -386,6 +410,9 @@ type DeploymentController interface {
 	// OpenBackup opens one listed backup's file as it is on the target, with
 	// its size, for the app's owner to download (BF-10c2).
 	OpenBackup(ctx context.Context, target, site, backup string) (io.ReadCloser, int64, error)
+	// SiteErrors reads a Node app's recent errors on its target, when asked
+	// (BF-07c); it changes nothing.
+	SiteErrors(ctx context.Context, target, site string) (SiteErrorsV1, error)
 	StopSite(ctx context.Context, target, site string, request OperationRequestV1) (OperationV1, error)
 	StartSite(ctx context.Context, target, site string, request OperationRequestV1) (OperationV1, error)
 	Databases(ctx context.Context, target string) (DatabasesV1, error)
@@ -488,7 +515,7 @@ func (s *Server) releases(w http.ResponseWriter, r *http.Request, principal Prin
 }
 
 // /v1/targets/{key}/plans, /apply, /operations/{id}, /sites, /sites/{name}/remove, /sites/{name}/backups,
-// /sites/{name}/backups/{backup} (its file), /sites/{name}/backups/{backup}/check, /sites/{name}/stop and /start,
+// /sites/{name}/backups/{backup} (its file), /sites/{name}/backups/{backup}/check, /sites/{name}/errors, /sites/{name}/stop and /start,
 // /databases, /databases/{name}/remove, /clean, /drift and /isolation
 func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id string, parts []string, body func(any) bool) {
 	bad := func() {
@@ -566,6 +593,18 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 			return
 		}
 		s.writeJSON(w, http.StatusOK, backups)
+	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "errors" && r.Method == http.MethodGet:
+		if !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		errs, err := s.reserved.Deployments.SiteErrors(r.Context(), key, parts[2])
+		if err != nil {
+			s.writeDeploymentError(w, id, err)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		s.writeJSON(w, http.StatusOK, errs)
 	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "backups" && r.Method == http.MethodPost:
 		var create BackupCreateV1
 		if !body(&create) {

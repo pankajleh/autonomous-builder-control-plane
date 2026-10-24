@@ -524,7 +524,9 @@ for b in @LIST@; do rm -f "./$b.dump"; done
 	// startAppScript reads the app's setup token on its input, so no command
 	// line and no script holds it, and keeps it beside database.env. An app on
 	// a server runs all the time, so it runs its own timetable
-	// (AUTOBUILD_JOBS=run, Repo C design note BF08_NO_PAGE_OPEN §19).
+	// (AUTOBUILD_JOBS=run, Repo C design note BF08_NO_PAGE_OPEN §19). Its own
+	// output is kept by Docker in at most two files of 1 MB, which
+	// SiteErrors reads when asked (BF-07c).
 	startAppScript = `set -eu
 ` + dockerHost + `
 A="$HOME/autobuild"
@@ -541,7 +543,7 @@ case "$src" in "$R"/*) ;; *) echo "the site's link is not a release" >&2; exit 3
 docker rm -f autobuild-app-@N@ >/dev/null 2>&1 || true
 docker run -d --name autobuild-app-@N@ --restart unless-stopped --network autobuild-net-@N@ --network-alias app @RUNTIME@ \
   --user 65534:65534 --read-only --cap-drop ALL --security-opt no-new-privileges --memory 256m --memory-swap 256m \
-  --pids-limit 256 --ulimit nofile=1024:1024 --tmpfs /scratch:rw,nosuid,nodev,noexec,size=67108864,mode=700,uid=65534,gid=65534 \
+  --pids-limit 256 --ulimit nofile=1024:1024 --log-driver json-file --log-opt max-size=1m --log-opt max-file=2 --tmpfs /scratch:rw,nosuid,nodev,noexec,size=67108864,mode=700,uid=65534,gid=65534 \
   --workdir /scratch --mount type=bind,src="$src",dst=/source,readonly --env-file "$A/apps/@N@/database.env" \
   --env-file "$A/apps/@N@/setup.env" -e AUTOBUILD_JOBS=run -e HOME=/scratch -e TMPDIR=/scratch -e NODE_OPTIONS=--max-old-space-size=160 \
   @RELAY@--label autobuild.site=@N@ --entrypoint /usr/local/bin/node \
