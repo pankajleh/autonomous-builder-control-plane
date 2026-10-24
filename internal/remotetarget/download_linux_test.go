@@ -1,6 +1,7 @@
 package remotetarget
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"errors"
@@ -103,5 +104,78 @@ func TestABackupIsReadAsItIsOnTheServer(t *testing.T) {
 		if strings.Contains(s, "exec cat") && !strings.Contains(s, "/autobuild/backups/crm/"+b.BackupID+".dump") {
 			t.Fatalf("read another file: %s", s)
 		}
+	}
+}
+
+// A backup is taken out as spreadsheets (BF-06b): the server's own pg_restore
+// writes its data as text and ABCP makes a zip of one CSV per table; nothing is
+// restored and only a listed backup with its kept size is read.
+func TestABackupIsTakenOutAsSpreadsheets(t *testing.T) {
+	f := newDeployFixture(t)
+	f.deploy(f.putNode("one"), "crm", testHost, "req-crm-first")
+	if _, err := f.m.BackUp(context.Background(), f.key, "crm", serviceapi.BackupCreateV1{RequestID: "req-backup-1"}); err != nil {
+		t.Fatal(err)
+	}
+	f.m.Wait()
+	backups, _ := f.m.Backups(context.Background(), f.key, "crm")
+	b := backups.Backups[0]
+	body, err := f.m.OpenSpreadsheets(context.Background(), f.key, "crm", b.BackupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zipped, err := io.ReadAll(body)
+	if err != nil || body.Close() != nil {
+		t.Fatalf("read %v", err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(zipped), int64(len(zipped)))
+	if err != nil || len(zr.File) != 1 || zr.File[0].Name != "people.csv" {
+		t.Fatalf("zip %v %v", zr, err)
+	}
+	r, _ := zr.File[0].Open()
+	csv, _ := io.ReadAll(r)
+	if string(csv) != "\ufeffid,name\r\n1,Asha\r\n2,\r\n" {
+		t.Fatalf("people.csv = %q", csv)
+	}
+	read, _ := os.ReadFile(filepath.Join(f.remote.home, ".docker/data.read"))
+	kept, _ := os.ReadFile(filepath.Join(f.remote.home, "autobuild/backups/crm", b.BackupID+".dump"))
+	if !bytes.Equal(read, kept) {
+		t.Fatal("pg_restore did not read the backup's own file")
+	}
+	for _, s := range f.remote.scripts {
+		if strings.Contains(s, "--data-only") && !strings.Contains(s, "< \"$HOME/autobuild/backups/crm/"+b.BackupID+".dump\"") {
+			t.Fatalf("read another file: %s", s)
+		}
+	}
+
+	// A pg_restore that fails is an unfinished read, never a whole zip.
+	if err := os.WriteFile(filepath.Join(f.remote.home, "data.fails"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body, err = f.m.OpenSpreadsheets(context.Background(), f.key, "crm", b.BackupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(body); err == nil {
+		t.Fatal("a failed pg_restore read as a whole zip")
+	}
+	_ = body.Close()
+
+	for _, c := range []struct {
+		site, backup string
+		want         error
+	}{
+		{"crm", "bk-20200101T000000Z-0000", serviceapi.ErrBackupUnknown},
+		{"crm", "../../etc/passwd", serviceapi.ErrBackupUnknown},
+		{"blog", b.BackupID, serviceapi.ErrSiteUnknown},
+	} {
+		if _, err := f.m.OpenSpreadsheets(context.Background(), f.key, c.site, c.backup); !errors.Is(err, c.want) {
+			t.Fatalf("%s/%s = %v, want %v", c.site, c.backup, err, c.want)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(f.remote.home, "autobuild/backups/crm", b.BackupID+".dump"), []byte("short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.m.OpenSpreadsheets(context.Background(), f.key, "crm", b.BackupID); !errors.Is(err, serviceapi.ErrBackupUnknown) {
+		t.Fatalf("a changed file = %v", err)
 	}
 }

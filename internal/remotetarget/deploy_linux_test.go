@@ -157,6 +157,12 @@ case "$1" in
         d=$(echo "$*" | sed -n "s/.*has_database_privilege('\([a-z0-9_]*\)', '\([a-z0-9_]*\)'.*/\2/p")
         if [ "$r" = "$d" ] || [ -f "$HOME/connect.open" ]; then echo t; else echo f; fi ;;
       "/bin/sh -c "*) shift 2; sh -c "$(printf '%s' "$1" | sed "s|/scratch|$S/scratch|g")" ;;
+      *"pg_restore --data-only"*)
+        # A backup's data as text (BF-06b): one table, or a failure when
+        # $HOME/data.fails is there.
+        cat > "$S/data.read"
+        if [ -f "$HOME/data.fails" ]; then echo "pg_restore: error: could not read input file" >&2; exit 1; fi
+        printf 'SET x = 1;\nCOPY public.people (id, name) FROM stdin;\n1\tAsha\n2\t\\N\n\\.\n' ;;
       *pg_restore*)
         [ -f "$S/db-$db" ] || exit 1
         tail -n +2 > "$S/db-$db"

@@ -20,6 +20,9 @@ type testDeployments struct {
 	startFrom  string
 	err        error
 	file       string
+	// zip is a backup's spreadsheets as made; zipErr ends them after it.
+	zip    string
+	zipErr error
 }
 
 var sampleOperation = OperationV1{SchemaVersion: OperationSchemaV1, OperationID: "op-0123456789abcdef", Target: "srv-0123456789ab", Kind: "apply",
@@ -80,6 +83,24 @@ func (d *testDeployments) CheckBackup(_ context.Context, target, site, backup st
 func (d *testDeployments) OpenBackup(_ context.Context, target, site, backup string) (io.ReadCloser, int64, error) {
 	d.calls = append(d.calls, "file:"+target+":"+site+":"+backup)
 	return io.NopCloser(strings.NewReader(d.file)), int64(len(d.file)), d.err
+}
+
+func (d *testDeployments) OpenSpreadsheets(_ context.Context, target, site, backup string) (io.ReadCloser, error) {
+	d.calls = append(d.calls, "spreadsheets:"+target+":"+site+":"+backup)
+	if d.err != nil {
+		return nil, d.err
+	}
+	return io.NopCloser(io.MultiReader(strings.NewReader(d.zip), &failing{err: d.zipErr})), nil
+}
+
+// failing reads as the end, or as its error.
+type failing struct{ err error }
+
+func (f *failing) Read([]byte) (int, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
+	return 0, io.EOF
 }
 
 func (d *testDeployments) SiteErrors(_ context.Context, target, site string) (SiteErrorsV1, error) {
@@ -478,5 +499,52 @@ func TestSiteRelayIsAPutWithTheCredentialAloneAndAnswersAnOperation(t *testing.T
 	}
 	if len(backend.calls) != 1 {
 		t.Fatalf("a refused request reached the controller: %v", backend.calls)
+	}
+}
+
+// Repo C BF-06b: a backup's spreadsheets are answered as they are made; one that cannot be read is an error answer, and
+// one that fails once it has started ends the response unfinished.
+func TestASiteBackupsSpreadsheetsAreAnsweredAsTheyAreMade(t *testing.T) {
+	s, backend := deploymentServer(t, true)
+	backend.zip = "PK\x03\x04zip-bytes"
+	path := "/v1/targets/srv-0123456789ab/sites/shop/backups/bk-20261014T013000Z-0a1b/spreadsheets"
+	r := call(s, http.MethodGet, path, "")
+	if r.Code != http.StatusOK || r.Body.String() != backend.zip || r.Header().Get("Content-Type") != "application/zip" || r.Header().Get("Content-Length") != "" ||
+		r.Header().Get("Cache-Control") != "no-store" || r.Header().Get("X-Content-Type-Options") != "nosniff" ||
+		len(backend.calls) != 1 || backend.calls[0] != "spreadsheets:srv-0123456789ab:shop:bk-20261014T013000Z-0a1b" {
+		t.Fatalf("spreadsheets = %d %q %v calls %v", r.Code, r.Body.String(), r.Header(), backend.calls)
+	}
+	for _, c := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/shop/backups/not-a-backup/spreadsheets"},
+		{http.MethodGet, path + "/more"},
+		{http.MethodGet, strings.TrimSuffix(path, "spreadsheets") + "sheets"},
+		{http.MethodPost, path},
+	} {
+		backend.calls = nil
+		if r := call(s, c.method, c.path, ""); r.Code != http.StatusBadRequest || len(backend.calls) != 0 {
+			t.Fatalf("%s %s = %d calls %v", c.method, c.path, r.Code, backend.calls)
+		}
+	}
+	for err, want := range map[error]int{ErrBackupUnknown: http.StatusNotFound, ErrTargetNotReady: http.StatusConflict, errors.New("unreachable"): http.StatusServiceUnavailable} {
+		backend.err = err
+		if r := call(s, http.MethodGet, path, ""); r.Code != want || r.Header().Get("Content-Type") == "application/zip" {
+			t.Fatalf("%v = %d %v", err, r.Code, r.Header())
+		}
+	}
+	backend.err, backend.zip, backend.zipErr = nil, "", errors.New("the backup's data could not be read")
+	if r := call(s, http.MethodGet, path, ""); r.Code != http.StatusServiceUnavailable || !strings.Contains(r.Body.String(), "target_unavailable") {
+		t.Fatalf("a backup whose data cannot be read = %d %s", r.Code, r.Body.String())
+	}
+	backend.zip = "PK\x03\x04part"
+	server := httptest.NewServer(s.Handler())
+	defer server.Close()
+	request, _ := http.NewRequest(http.MethodGet, server.URL+path, nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	// The receiver sees the connection end, before or after the headers; never a whole answer.
+	if response, err := server.Client().Do(request); err == nil {
+		defer response.Body.Close()
+		if body, err := io.ReadAll(response.Body); err == nil {
+			t.Fatalf("a zip that failed part way was answered whole: %d %q", response.StatusCode, body)
+		}
 	}
 }

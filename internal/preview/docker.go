@@ -1185,6 +1185,33 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	return b.Builder.Write(p)
 }
 
+// Extract writes the data of a backup read from r as text (Repo C BF-06b): the pg_restore beside the profile's pg_dump
+// backup command, in the instance's data container, with no database. A profile whose backup command is not pg_dump has
+// none.
+func (d *dockerRuntime) Extract(ctx context.Context, id string, p PreviewProfileV1, r io.Reader, w io.Writer) error {
+	i := p.dataService()
+	if i < 0 {
+		return ErrUnavailable
+	}
+	argv := extractArgv(p.Services[i].BackupArgv)
+	if argv == nil {
+		return ErrUnavailable
+	}
+	args, err := d.dataExec(ctx, id, p, argv, true)
+	if err != nil {
+		return err
+	}
+	return d.stream(ctx, r, w, args...)
+}
+
+// extractArgv turns a pg_dump backup command into its own pg_restore writing a backup's data as text.
+func extractArgv(backup []string) []string {
+	if len(backup) < 2 || filepath.Base(backup[0]) != "pg_dump" {
+		return nil
+	}
+	return []string{filepath.Join(filepath.Dir(backup[0]), "pg_restore"), "--data-only", "--no-owner", "--no-privileges", "-f", "-"}
+}
+
 // Load restores a backup read from r into a hosted instance with the profile's restore command.
 func (d *dockerRuntime) Load(ctx context.Context, id string, p PreviewProfileV1, r io.Reader) error {
 	i := p.dataService()

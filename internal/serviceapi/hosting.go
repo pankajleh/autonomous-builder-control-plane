@@ -36,6 +36,9 @@ type HostingController interface {
 	// OpenHostedBackup opens one listed backup's file for reading, with its size, for the product to hand to the app's
 	// owner (Repo C BF-10c); the caller closes it.
 	OpenHostedBackup(ctx context.Context, principal Principal, key, backupID string) (io.ReadCloser, int64, error)
+	// OpenHostedSpreadsheets opens one listed backup as a zip of one CSV file per table, read as it is made (Repo C
+	// BF-06b); an error after it opens leaves the zip unfinished.
+	OpenHostedSpreadsheets(ctx context.Context, principal Principal, key, backupID string) (io.ReadCloser, error)
 	PurgeHosted(ctx context.Context, principal Principal, authorityDigest, key string, request HostedCommandRequestV1) (HostedV1, error)
 	// ReadHostedSetup answers the app's setup token, made at its first start since the controller keeps them, or
 	// ErrSetupPending before that start.
@@ -311,7 +314,8 @@ func (s *Server) mayControlHosting(principal Principal) bool {
 	return principal.PrincipalType == PrincipalService && s.authority.Match(principal, "hosting.control") == nil
 }
 
-// /v1/hosted/{key} and /v1/hosted/{key}/{start|stop|route|setup|backups|restore|purge|errors}
+// /v1/hosted/{key}, /v1/hosted/{key}/{start|stop|route|setup|backups|restore|purge|errors}, and a backup's file and
+// spreadsheets at /v1/hosted/{key}/backups/{id} and /v1/hosted/{key}/backups/{id}/spreadsheets
 func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal Principal, id string) {
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid hosted request", RequestID: id})
@@ -321,7 +325,8 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 		return
 	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/hosted/"), "/")
-	if len(parts) < 1 || len(parts) > 3 || ValidateHostingKey(parts[0]) != nil || (len(parts) == 3 && (parts[1] != "backups" || !isLowerSHA256(parts[2]))) {
+	if len(parts) < 1 || len(parts) > 4 || ValidateHostingKey(parts[0]) != nil || (len(parts) >= 3 && (parts[1] != "backups" || !isLowerSHA256(parts[2]))) ||
+		(len(parts) == 4 && parts[3] != "spreadsheets") {
 		bad()
 		return
 	}
@@ -332,6 +337,9 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 	if len(parts) == 3 {
 		op, backupID = "backup", parts[2]
 	}
+	if len(parts) == 4 {
+		op, backupID = "spreadsheets", parts[2]
+	}
 	if !s.mayControlHosting(principal) {
 		s.writeDependencyError(w, id, ErrAuthorityDenied)
 		return
@@ -341,10 +349,11 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 		return
 	}
 	h := s.reserved.Hosting
-	read := r.Method == http.MethodGet && (op == "" || op == "route" || op == "setup" || op == "backups" || op == "backup" || op == "errors")
+	read := r.Method == http.MethodGet && (op == "" || op == "route" || op == "setup" || op == "backups" || op == "backup" || op == "spreadsheets" || op == "errors")
 	write := r.Method == http.MethodPost && (op == "start" || op == "stop" || op == "backups" || op == "restore" || op == "purge")
 	if !read && !write {
-		if op != "" && op != "start" && op != "stop" && op != "route" && op != "setup" && op != "backups" && op != "backup" && op != "restore" && op != "purge" && op != "errors" {
+		if op != "" && op != "start" && op != "stop" && op != "route" && op != "setup" && op != "backups" && op != "backup" && op != "spreadsheets" && op != "restore" &&
+			op != "purge" && op != "errors" {
 			s.writeDependencyError(w, id, ErrDependencyNotFound)
 			return
 		}
@@ -384,6 +393,13 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 			s.writeJSON(w, http.StatusOK, v)
 		case "backup":
 			s.writeHostedBackupFile(w, r, principal, id, key, backupID)
+		case "spreadsheets":
+			f, err := h.OpenHostedSpreadsheets(r.Context(), principal, key, backupID)
+			if err != nil {
+				s.writeDependencyError(w, id, err)
+				return
+			}
+			s.writeSpreadsheets(w, f, func() { s.writeDependencyError(w, id, ErrPreviewUnavailable) })
 		case "errors":
 			v, err := h.HostedErrors(r.Context(), principal, key)
 			if err != nil {
