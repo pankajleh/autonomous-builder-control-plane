@@ -240,22 +240,22 @@ func TestAnEgressGroupRunsItsProxyWithTheSettingsFileUntilItStops(t *testing.T) 
 	}
 	path := filepath.Join(f.d.root, "sources", f.id)
 	// Only a private settings file, and only for a start that names one.
-	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, "app-1", hostedKeyDigest("app-1"), settings, setup); err == nil {
+	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, "app-1", hostedKeyDigest("app-1"), settings, setup, nil); err == nil {
 		t.Fatal("a settings file others can read was accepted")
 	}
-	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, "app-1", hostedKeyDigest("app-1"), "", setup); err == nil {
+	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, "app-1", hostedKeyDigest("app-1"), "", setup, nil); err == nil {
 		t.Fatal("a start without the settings the profile takes was accepted")
 	}
 	os.Chmod(settings, 0600)
 	// Likewise the setup token's file (H6): private, and named by every hosted start.
-	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, "app-1", hostedKeyDigest("app-1"), settings, setup); err == nil {
+	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, "app-1", hostedKeyDigest("app-1"), settings, setup, nil); err == nil {
 		t.Fatal("a setup token's file others can read was accepted")
 	}
-	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, "app-1", hostedKeyDigest("app-1"), settings, ""); err == nil {
+	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, "app-1", hostedKeyDigest("app-1"), settings, "", nil); err == nil {
 		t.Fatal("a hosted start without its setup token's file was accepted")
 	}
 	os.Chmod(setup, 0600)
-	route, err := f.d.StartHosted(context.Background(), f.id, path, p, "app-1", hostedKeyDigest("app-1"), settings, setup)
+	route, err := f.d.StartHosted(context.Background(), f.id, path, p, "app-1", hostedKeyDigest("app-1"), settings, setup, nil)
 	if err != nil || !sha256Pattern.MatchString(route) {
 		t.Fatal(route, err)
 	}
@@ -307,7 +307,7 @@ func TestAnEgressGroupRunsItsProxyWithTheSettingsFileUntilItStops(t *testing.T) 
 		}
 		return l, err
 	}
-	if _, err := q.d.StartHosted(context.Background(), q.id, filepath.Join(q.d.root, "sources", q.id), p, "app-1", hostedKeyDigest("app-1"), settings, setup); err == nil {
+	if _, err := q.d.StartHosted(context.Background(), q.id, filepath.Join(q.d.root, "sources", q.id), p, "app-1", hostedKeyDigest("app-1"), settings, setup, nil); err == nil {
 		t.Fatal("the failed start succeeded")
 	}
 	if addr == "" {
@@ -402,7 +402,7 @@ func TestAHostedAppNamingTheAppRelayAsksAsItsHostingKey(t *testing.T) {
 	}
 	path := filepath.Join(f.d.root, "sources", f.id)
 	key := "82daed69-2b7e-4d0a-afd5-b3fe79738de1"
-	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, key, hostedKeyDigest(key), "", setup); err != nil {
+	if _, err := f.d.StartHosted(context.Background(), f.id, path, p, key, hostedKeyDigest(key), "", setup, nil); err != nil {
 		t.Fatal(err)
 	}
 	f.d.mu.Lock()

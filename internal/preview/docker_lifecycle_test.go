@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -39,6 +40,30 @@ type dockerFixture struct {
 	egressRule bool         // whether the owner's rule lets a service reach the egress port on the gateway
 	reject     func(context.Context, []string) error
 	external   func()
+	// attach stands in for a hosted app's attached server (BF-07c2), so no test runs Docker: it records the command,
+	// writes attachOutput, and lasts until attachEnd gives its exit code or the group stops it.
+	attachMu     sync.Mutex
+	attached     [][]string
+	attachOutput string
+	attachEnd    chan int
+	attachStops  int
+}
+
+func (f *dockerFixture) attach(ctx context.Context, w io.Writer, args ...string) (int, error) {
+	f.attachMu.Lock()
+	f.attached = append(f.attached, append([]string(nil), args...))
+	output, end := f.attachOutput, f.attachEnd
+	f.attachMu.Unlock()
+	_, _ = io.WriteString(w, output)
+	select {
+	case code := <-end:
+		return code, nil
+	case <-ctx.Done():
+		f.attachMu.Lock()
+		f.attachStops++
+		f.attachMu.Unlock()
+		return 0, ErrUnavailable
+	}
 }
 
 func newDockerFixture(t *testing.T, p PreviewProfileV1) *dockerFixture {
@@ -46,6 +71,8 @@ func newDockerFixture(t *testing.T, p PreviewProfileV1) *dockerFixture {
 	f := &dockerFixture{d: newDocker(t.TempDir()), p: p, id: strings.Repeat("c", 64), containers: map[string]string{}, created: map[string][]string{},
 		runtimes: `{"io.containerd.runc.v2":{},"runc":{}}`}
 	f.d.run = f.run
+	f.d.attach = f.attach
+	f.attachEnd = make(chan int, 1)
 	f.subnet = previewSubnet(f.id, 0)
 	// The gateway address exists only on a Docker host; the listener is loopback here, and the fixture's services
 	// reach it only when reachHost says so.

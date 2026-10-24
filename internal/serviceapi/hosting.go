@@ -40,6 +40,46 @@ type HostingController interface {
 	// ReadHostedSetup answers the app's setup token, made at its first start since the controller keeps them, or
 	// ErrSetupPending before that start.
 	ReadHostedSetup(ctx context.Context, principal Principal, key string) (HostedSetupV1, error)
+	// HostedErrors answers the app's recent errors, kept from its own output as it ran (Repo C BF-07c2).
+	HostedErrors(ctx context.Context, principal Principal, key string) (HostedErrorsV1, error)
+}
+
+// HostedErrorsV1 is a hosted app's recent errors (Repo C design note BF07_WHEN_A_RUNNING_APP_GOES_WRONG §13, 7c2): at
+// most the last SiteErrorLines lines of its own server's output from the last day that read as errors, SiteErrorBytes
+// in all, with what looks like a secret, a sign-in token, an email address or a phone number replaced by fixed words as
+// the controller kept them; how many times the controller started it again in the last day, and the exit code its
+// server last ended with on its own. The controller keeps them in memory from Since, the app's first start after the
+// controller's own (absent when it has not run since). Running is true while the app is ready.
+type HostedErrorsV1 struct {
+	SchemaVersion string   `json:"schema_version"`
+	HostingKey    string   `json:"hosting_key"`
+	ReadAt        string   `json:"read_at"`
+	Since         string   `json:"since,omitempty"`
+	Running       bool     `json:"running"`
+	Restarts      int      `json:"restarts"`
+	ExitCode      *int     `json:"exit_code,omitempty"`
+	Lines         []string `json:"lines"`
+	Truncated     bool     `json:"truncated"`
+}
+
+// HostedErrorLineBytes bounds one kept line of a hosted app's output.
+const HostedErrorLineBytes = 400
+
+func ValidateHostedErrorsV1(v HostedErrorsV1, key string) error {
+	if v.SchemaVersion != "HostedErrorsV1" || v.HostingKey != key || ValidateHostingKey(key) != nil || !validStamp(v.ReadAt) || (v.Since != "" && !validStamp(v.Since)) || v.Restarts < 0 || v.Lines == nil || len(v.Lines) > SiteErrorLines {
+		return errors.New("invalid hosted errors")
+	}
+	total := 0
+	for _, line := range v.Lines {
+		total += len(line) + 1
+		if len(line) > HostedErrorLineBytes || strings.ContainsAny(line, "\r\n") {
+			return errors.New("invalid hosted error line")
+		}
+	}
+	if total > SiteErrorBytes {
+		return errors.New("invalid hosted errors")
+	}
+	return nil
 }
 
 type HostedStartRequestV1 struct {
@@ -263,7 +303,7 @@ func (s *Server) mayControlHosting(principal Principal) bool {
 	return principal.PrincipalType == PrincipalService && s.authority.Match(principal, "hosting.control") == nil
 }
 
-// /v1/hosted/{key} and /v1/hosted/{key}/{start|stop|route|setup|backups|restore|purge}
+// /v1/hosted/{key} and /v1/hosted/{key}/{start|stop|route|setup|backups|restore|purge|errors}
 func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal Principal, id string) {
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid hosted request", RequestID: id})
@@ -293,10 +333,10 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 		return
 	}
 	h := s.reserved.Hosting
-	read := r.Method == http.MethodGet && (op == "" || op == "route" || op == "setup" || op == "backups" || op == "backup")
+	read := r.Method == http.MethodGet && (op == "" || op == "route" || op == "setup" || op == "backups" || op == "backup" || op == "errors")
 	write := r.Method == http.MethodPost && (op == "start" || op == "stop" || op == "backups" || op == "restore" || op == "purge")
 	if !read && !write {
-		if op != "" && op != "start" && op != "stop" && op != "route" && op != "setup" && op != "backups" && op != "backup" && op != "restore" && op != "purge" {
+		if op != "" && op != "start" && op != "stop" && op != "route" && op != "setup" && op != "backups" && op != "backup" && op != "restore" && op != "purge" && op != "errors" {
 			s.writeDependencyError(w, id, ErrDependencyNotFound)
 			return
 		}
@@ -336,6 +376,18 @@ func (s *Server) hostedRoute(w http.ResponseWriter, r *http.Request, principal P
 			s.writeJSON(w, http.StatusOK, v)
 		case "backup":
 			s.writeHostedBackupFile(w, r, principal, id, key, backupID)
+		case "errors":
+			v, err := h.HostedErrors(r.Context(), principal, key)
+			if err != nil {
+				s.writeDependencyError(w, id, err)
+				return
+			}
+			if ValidateHostedErrorsV1(v, key) != nil {
+				s.writeDependencyError(w, id, ErrInternalDurableSubstrate)
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			s.writeJSON(w, http.StatusOK, v)
 		case "backups":
 			v, err := h.ListHostedBackups(r.Context(), principal, key)
 			if err != nil {
