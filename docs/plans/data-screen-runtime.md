@@ -1,6 +1,6 @@
 # The Data screen's runtime where apps run (Repo C BF-06c)
 
-Status: **merged, not live yet**. Repo C's design note `BF06_YOUR_APPS_DATA.md` §11 (the owner, 2026-10-24: "all as
+Status: **live** since 2026-10-24 18:44 UTC (`7be3c35`, ABCP PID 1576827; `node-pg-v1` and `node-pg-hosted-v4` on the new runtime; #146). Repo C's design note `BF06_YOUR_APPS_DATA.md` §11 (the owner, 2026-10-24: "all as
 recommended, go ahead", every §7 answer A). An app with administrators gets a read-only Data screen of its tables from the
 Node kit's `autobuild-db/data` (Repo C P0740, `b0200c6`, #753), so the runtime that starts a Node app must carry it.
 
