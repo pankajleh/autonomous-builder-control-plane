@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -54,17 +55,17 @@ func TestARestoreBacksUpTheDataAsItIsNowFirst(t *testing.T) {
 		t.Fatalf("restore = %v, loaded %v", err, rt.loaded)
 	}
 	list, _ := h.ListHostedBackups(ctx, principal(), "app-1")
-	if len(list.Backups) != 2 || list.Backups[0] != b {
+	if len(list.Backups) != 2 || !reflect.DeepEqual(list.Backups[0], b) {
 		t.Fatalf("backups = %+v", list)
 	}
 	before := list.Backups[1]
-	if serviceapi.ValidateHostedBackupV1(before, "app-1") != nil || before.Reason != "pre-restore" || before.Bytes != int64(len("data-now")) || v.LastBackup == nil || *v.LastBackup != before {
+	if serviceapi.ValidateHostedBackupV1(before, "app-1") != nil || before.Reason != "pre-restore" || before.Bytes != int64(len("data-now")) || v.LastBackup == nil || !reflect.DeepEqual(*v.LastBackup, before) {
 		t.Fatalf("backup before the restore = %+v, last %+v", before, v.LastBackup)
 	}
 	if got := readBackup(t, h, before.BackupID); got != "data-now" {
 		t.Fatalf("the backup before the restore holds %q", got)
 	}
-	if again, err := h.RestoreHosted(ctx, principal(), testAuthorityDigest, "app-1", restoreCommand("restore-1", b.BackupID)); err != nil || again.UpdatedAt != v.UpdatedAt || again.LastBackup == nil || *again.LastBackup != before || len(rt.loaded) != 1 {
+	if again, err := h.RestoreHosted(ctx, principal(), testAuthorityDigest, "app-1", restoreCommand("restore-1", b.BackupID)); err != nil || again.UpdatedAt != v.UpdatedAt || again.LastBackup == nil || !reflect.DeepEqual(*again.LastBackup, before) || len(rt.loaded) != 1 {
 		t.Fatalf("a replayed restore ran again: %v, loaded %v", err, rt.loaded)
 	}
 	if list, _ := h.ListHostedBackups(ctx, principal(), "app-1"); len(list.Backups) != 2 {

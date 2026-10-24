@@ -86,6 +86,11 @@ func TestABackupCountsItsRowsAndACheckRestoresItIntoADatabaseOfItsOwn(t *testing
 	if taken.Tables == nil || *taken.Tables != 2 || taken.Rows == nil || *taken.Rows != 5 || taken.Check != nil {
 		t.Fatalf("backup = %+v", taken)
 	}
+	// BF-06a: the listing names each table with its rows, in name order.
+	if len(taken.Counts) != 2 || taken.Counts[0] != (serviceapi.TableRowsV1{Table: "public.members", Rows: 3}) ||
+		taken.Counts[1] != (serviceapi.TableRowsV1{Table: "public.notes", Rows: 2}) || serviceapi.ValidateTableRows(taken.Counts) != nil {
+		t.Fatalf("counts = %+v", taken.Counts)
+	}
 	f.rows("app_crm", `{"public.members":9}`)
 
 	check := f.finished(f.m.CheckBackup(context.Background(), f.key, "crm", taken.BackupID, serviceapi.BackupCreateV1{RequestID: "req-check-1"}))

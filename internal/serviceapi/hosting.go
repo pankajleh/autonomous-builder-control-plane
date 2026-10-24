@@ -154,6 +154,11 @@ type HostedBackupV1 struct {
 	// Offsite is the backup's copy off the host, when the controller copies them (Repo C BF-10b): absent before a
 	// copy was tried.
 	Offsite *HostedBackupOffsiteV1 `json:"offsite,omitempty"`
+	// Tables, Rows and Counts are what the app's database held, counted read-only just after the dump (Repo C
+	// BF-06a); absent when they could not be counted, and for backups taken before.
+	Tables *int          `json:"tables,omitempty"`
+	Rows   *int64        `json:"rows,omitempty"`
+	Counts []TableRowsV1 `json:"counts,omitempty"`
 }
 
 // HostedBackupOffsiteV1 says whether a hosted backup was copied off the host: when, and where to (the s3:// address)
@@ -260,6 +265,9 @@ func ValidateHostedBackupV1(v HostedBackupV1, key string) error {
 	}
 	if v.Offsite != nil && (!validStamp(v.Offsite.At) || v.Offsite.Detail == "" || len(v.Offsite.Detail) > 512) {
 		return errors.New("invalid hosted backup copy")
+	}
+	if (v.Tables == nil) != (v.Rows == nil) || (v.Tables != nil && (*v.Tables < len(v.Counts) || *v.Rows < 0)) || (v.Tables == nil && len(v.Counts) > 0) || ValidateTableRows(v.Counts) != nil {
+		return errors.New("invalid hosted backup counts")
 	}
 	return nil
 }

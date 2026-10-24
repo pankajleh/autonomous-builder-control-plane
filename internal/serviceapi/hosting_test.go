@@ -3,6 +3,7 @@ package serviceapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -432,5 +433,45 @@ func TestAppHealthEventsAreReadAfterACursorByTheHostingPrincipal(t *testing.T) {
 	s3, _ := hostingServer(t, true, true, PrincipalService)
 	if w := get(s3, "/v1/app-health/events"); w.Code == 200 {
 		t.Fatal("no watch, no events", w.Code)
+	}
+}
+
+// BF-06a: a hosted backup's counts are whole or absent, bounded and in name order.
+func TestAHostedBackupsCountsAreWholeAndBounded(t *testing.T) {
+	two, five := 2, int64(5)
+	b := HostedBackupV1{SchemaVersion: "HostedBackupV1", HostingKey: "app-1", BackupID: strings.Repeat("a", 64), Reason: "manual", TakenAt: "2026-10-24T17:00:00Z",
+		Bytes: 10, Generation: 1, SourceSHA: strings.Repeat("b", 40), Tables: &two, Rows: &five,
+		Counts: []TableRowsV1{{Table: "public.a", Rows: 2}, {Table: "public.b", Rows: 3}}}
+	if err := ValidateHostedBackupV1(b, "app-1"); err != nil {
+		t.Fatal(err)
+	}
+	none := b
+	none.Tables, none.Rows, none.Counts = nil, nil, nil
+	if err := ValidateHostedBackupV1(none, "app-1"); err != nil {
+		t.Fatal("a backup without counts", err)
+	}
+	one := 1
+	for name, bad := range map[string]func(*HostedBackupV1){
+		"tables without rows":     func(v *HostedBackupV1) { v.Rows = nil },
+		"counts without totals":   func(v *HostedBackupV1) { v.Tables, v.Rows = nil, nil },
+		"fewer tables than named": func(v *HostedBackupV1) { v.Tables = &one },
+		"out of order": func(v *HostedBackupV1) {
+			v.Counts = []TableRowsV1{{Table: "public.b", Rows: 3}, {Table: "public.a", Rows: 2}}
+		},
+		"negative": func(v *HostedBackupV1) { v.Counts = []TableRowsV1{{Table: "public.a", Rows: -1}} },
+		"unnamed":  func(v *HostedBackupV1) { v.Counts = []TableRowsV1{{Table: "", Rows: 1}} },
+	} {
+		v := b
+		bad(&v)
+		if ValidateHostedBackupV1(v, "app-1") == nil {
+			t.Fatal("taken:", name)
+		}
+	}
+	many := make([]TableRowsV1, BackupCountLimit+1)
+	for i := range many {
+		many[i] = TableRowsV1{Table: fmt.Sprintf("public.t%03d", i), Rows: 1}
+	}
+	if ValidateTableRows(many) == nil {
+		t.Fatal("more than the limit")
 	}
 }

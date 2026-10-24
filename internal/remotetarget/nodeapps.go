@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -12,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/pgcount"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
@@ -55,10 +55,6 @@ const (
 	// Backups are kept 7 days and at most 14, and the newest always.
 	backupKeep  = 7 * 24 * time.Hour
 	backupLimit = 14
-	// A database's tables, as a backup counts them, and the length of a
-	// table's name as quote_ident gives it with its schema.
-	maxTables    = 2000
-	maxTableName = 260
 	// defaultHealthWait bounds how long a new version may take to answer
 	// /health, migrations first.
 	defaultHealthWait = 120
@@ -102,26 +98,15 @@ func findBackup(d databaseRecord, id string) (backupRecord, bool) {
 // parseCounts reads the rows of each table as a backup or a restore counted
 // them: a JSON object of table names and counts.
 func parseCounts(text string) (map[string]int64, error) {
-	counts := map[string]int64{}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &counts); err != nil || len(counts) > maxTables {
+	counts, err := pgcount.Parse(text)
+	if err != nil {
 		return nil, errStep("the rows could not be counted")
-	}
-	for name, n := range counts {
-		if name == "" || len(name) > maxTableName || n < 0 {
-			return nil, errStep("the rows could not be counted")
-		}
 	}
 	return counts, nil
 }
 
 // countTotals is a database's tables and rows.
-func countTotals(counts map[string]int64) (int, int64) {
-	var rows int64
-	for _, n := range counts {
-		rows += n
-	}
-	return len(counts), rows
-}
+func countTotals(counts map[string]int64) (int, int64) { return pgcount.Totals(counts) }
 
 // databaseName is a site's database and login: app_ and its name, hyphens as
 // underscores.
@@ -323,7 +308,10 @@ func (m *Manager) Backups(_ context.Context, key, site string) (serviceapi.Backu
 	}
 	out := serviceapi.BackupsV1{SchemaVersion: serviceapi.BackupsSchemaV1, Target: key, Site: site, Database: d.Name, Backups: []serviceapi.BackupV1{}}
 	for _, b := range d.Backups {
-		out.Backups = append(out.Backups, b.BackupV1)
+		// Each backup names its biggest tables from the counts it was taken with (Repo C BF-06a).
+		shown := b.BackupV1
+		shown.Counts = pgcount.Top(b.Counts)
+		out.Backups = append(out.Backups, shown)
 	}
 	return out, nil
 }
@@ -433,11 +421,8 @@ const (
 	psql    = psqlBin + ` -d postgres`
 
 	// countRows answers each ordinary table's rows, by schema and name, as one
-	// JSON object (query_to_xml counts each table in the same transaction).
-	countRows = `SELECT coalesce(json_object_agg(t.name, t.n ORDER BY t.name), '{}') FROM (SELECT quote_ident(s.nspname) || '.' || ` +
-		`quote_ident(c.relname) AS name, (xpath('/row/n/text()', query_to_xml(format('SELECT count(*) AS n FROM %I.%I', s.nspname, ` +
-		`c.relname), false, true, '')))[1]::text::bigint AS n FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace ` +
-		`WHERE c.relkind = 'r' AND s.nspname <> 'information_schema' AND s.nspname NOT LIKE 'pg\_%') t`
+	// JSON object (pgcount.Query).
+	countRows = pgcount.Query
 
 	getImagesScript = `set -eu
 ` + dockerHost + `
