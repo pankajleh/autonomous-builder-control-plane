@@ -1,6 +1,6 @@
 # Apps that stop answering: told once, and once again when back (Repo C BF-07e)
 
-Status: **built**, not live yet. Repo C's design note `BF07_WHEN_A_RUNNING_APP_GOES_WRONG.md` §4.5 (the owner, 2026-10-24:
+Status: **live** since 16:26:27 UTC on 2026-10-24 (`9049cd7`, #139; records #140). Repo C's design note `BF07_WHEN_A_RUNNING_APP_GOES_WRONG.md` §4.5 (the owner, 2026-10-24:
 "all as recommended, go ahead"; §7 question 4, A: an email and a WhatsApp message once when an app stops answering for 10
 minutes, and once when it is back). This is ABCP's half: it notices, and keeps events for Repo C to read. Repo C sends the
 messages.
