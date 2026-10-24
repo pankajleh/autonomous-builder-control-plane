@@ -21,6 +21,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/actionapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/actioncontrol"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/activity"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/appwatch"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
@@ -974,6 +975,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	// backed up and their backups checked every night at 02:30 India time (docs/plans/remote-restore.md).
 	var targets serviceapi.TargetController
 	var deployments serviceapi.DeploymentController
+	var targetManager *remotetarget.Manager
 	if *targetsDir != "" {
 		manager, err := remotetarget.New(*targetsDir, time.Now)
 		if err != nil {
@@ -984,8 +986,24 @@ func serveCommand(args []string, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "site relay host: not a host name")
 			return 1
 		}
-		targets, deployments = manager, manager
+		targets, deployments, targetManager = manager, manager, manager
 		go manager.Nightly(ctx)
+	}
+	// App health (Repo C BF-07e, docs/plans/app-health-events.md): share links and apps on servers that stop answering
+	// for ten minutes, and answer again, as events Repo C reads. Without the watch the route says it is unsupported.
+	var appHealth serviceapi.AppHealthFeed
+	if watch, err := appwatch.Open(filepath.Join(*serviceRoot, "appwatch"), time.Now); err != nil {
+		fmt.Fprintln(stderr, "app health watch unavailable")
+	} else {
+		var sources []appwatch.Source
+		if h, ok := hosting.(*preview.Hosting); ok {
+			sources = append(sources, appwatch.Source{Kind: appwatch.KindHosted, Every: 30 * time.Second, Look: h.HealthObservations})
+		}
+		if targetManager != nil {
+			sources = append(sources, appwatch.Source{Kind: appwatch.KindSite, Every: 2 * time.Minute, Look: targetManager.HealthObservations})
+		}
+		go watch.Run(ctx, sources...)
+		appHealth = watch
 	}
 	// Only a controller with its profiles answers GET /v1/engines; without one the route says it is unsupported.
 	var engines serviceapi.EngineCatalog
@@ -1001,7 +1019,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
 		RunAdmission: admissions, DevelopmentRunAdmission: admissions, Engines: engines, AccountLanes: accountLanes, Targets: targets,
-		Deployments: deployments,
+		Deployments: deployments, AppHealth: appHealth,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "construct service API")
