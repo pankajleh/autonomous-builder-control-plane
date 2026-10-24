@@ -82,6 +82,13 @@ func (d *testDeployments) OpenBackup(_ context.Context, target, site, backup str
 	return io.NopCloser(strings.NewReader(d.file)), int64(len(d.file)), d.err
 }
 
+func (d *testDeployments) SiteErrors(_ context.Context, target, site string) (SiteErrorsV1, error) {
+	d.calls = append(d.calls, "errors:"+target+":"+site)
+	code := 1
+	return SiteErrorsV1{SchemaVersion: SiteErrorsSchemaV1, Target: target, Site: site, ReadAt: "2026-10-24T15:00:00Z", Restarts: 3, ExitCode: &code,
+		Lines: []string{"Error: connect ECONNREFUSED [hidden]@db:5432"}}, d.err
+}
+
 func (d *testDeployments) StopSite(_ context.Context, target, site string, r OperationRequestV1) (OperationV1, error) {
 	d.calls = append(d.calls, "stop:"+target+":"+site+":"+r.RequestID)
 	return sampleOperation, d.err
@@ -329,6 +336,39 @@ func TestASiteBackupFileIsServedAsItIs(t *testing.T) {
 	denied, deniedBackend := deploymentServer(t, false)
 	if r := call(denied, http.MethodGet, path, ""); r.Code != http.StatusForbidden || len(deniedBackend.calls) != 0 {
 		t.Fatal("a backup file without targets.control", r.Code, deniedBackend.calls)
+	}
+}
+
+func TestASiteRecentErrorsAreReadOnlyWhenAskedAndNeverCached(t *testing.T) {
+	s, backend := deploymentServer(t, true)
+	path := "/v1/targets/srv-0123456789ab/sites/shop/errors"
+	r := call(s, http.MethodGet, path, "")
+	if r.Code != http.StatusOK || r.Header().Get("Cache-Control") != "no-store" || len(backend.calls) != 1 || backend.calls[0] != "errors:srv-0123456789ab:shop" ||
+		!strings.Contains(r.Body.String(), `"schema_version":"SiteErrorsV1"`) || !strings.Contains(r.Body.String(), `"restarts":3`) ||
+		!strings.Contains(r.Body.String(), `"exit_code":1`) || !strings.Contains(r.Body.String(), `"running":false`) {
+		t.Fatalf("errors = %d %s %v calls %v", r.Code, r.Body.String(), r.Header(), backend.calls)
+	}
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodPost, path, ""},
+		{http.MethodGet, path, `{"x":1}`},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/Shop/errors", ""},
+		{http.MethodGet, path + "/more", ""},
+	} {
+		backend.calls = nil
+		if r := call(s, c.method, c.path, c.body); r.Code != http.StatusBadRequest || len(backend.calls) != 0 {
+			t.Fatalf("%s %s = %d calls %v", c.method, c.path, r.Code, backend.calls)
+		}
+	}
+	for err, want := range map[error]int{ErrSiteUnknown: http.StatusNotFound, ErrTargetNotReady: http.StatusConflict, ErrTargetUnknown: http.StatusNotFound,
+		errors.New("unreachable"): http.StatusServiceUnavailable} {
+		backend.err = err
+		if r := call(s, http.MethodGet, path, ""); r.Code != want {
+			t.Fatalf("%v = %d", err, r.Code)
+		}
+	}
+	denied, deniedBackend := deploymentServer(t, false)
+	if r := call(denied, http.MethodGet, path, ""); r.Code != http.StatusForbidden || len(deniedBackend.calls) != 0 {
+		t.Fatal("errors without targets.control", r.Code, deniedBackend.calls)
 	}
 }
 
