@@ -1,6 +1,6 @@
 # A share link's app: its recent errors, kept as it runs (Repo C BF-07c2)
 
-Status: **built**, not live yet. Repo C's design note `BF07_WHEN_A_RUNNING_APP_GOES_WRONG.md` §13 (the owner, 2026-10-24: "all as
+Status: **live** since 16:02:15 UTC on 2026-10-24 (`c445809`, #137; records #138). Repo C's design note `BF07_WHEN_A_RUNNING_APP_GOES_WRONG.md` §13 (the owner, 2026-10-24: "all as
 recommended, go ahead", every §7 answer A; the queue: "please continue building as per queue"). The same for an app on a
 server is live (`docs/plans/server-site-errors.md`, #135).
 
