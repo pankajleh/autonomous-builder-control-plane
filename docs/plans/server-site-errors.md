@@ -1,6 +1,6 @@
 # An app on a server: its recent errors, when asked (Repo C BF-07c1)
 
-Status: **built.** Repo C's design note `BF07_WHEN_A_RUNNING_APP_GOES_WRONG.md` §4.3 (the owner, 2026-10-24: "all as
+Status: **live** since 15:17:27 UTC on 2026-10-24 (`944ac0b`, #135; records #136). Repo C's design note `BF07_WHEN_A_RUNNING_APP_GOES_WRONG.md` §4.3 (the owner, 2026-10-24: "all as
 recommended, go ahead", every §7 answer A; the queue: "please continue building as per queue"). The same for a share link
 (7c2) waits: a hosted app is started with `docker exec --detach` in a container that runs `/bin/sleep` with
 `--log-driver=none`, so its output is not kept anywhere ABCP can read; keeping it, bounded, is designed first.
