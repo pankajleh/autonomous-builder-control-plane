@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/appwatch"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
@@ -173,5 +174,40 @@ func TestAHostedKeysErrorsAreReadFromItsOutputAcrossGenerations(t *testing.T) {
 	}
 	if v, err := h.HostedErrors(ctx, principal(), "app-1"); err != nil || v.Running || len(v.Lines) != 1 {
 		t.Fatalf("errors after a stop = %+v, %v", v, err)
+	}
+}
+
+// BF-07e: the health sweep sees every key its owner keeps running, healthy only while ready and healthy, and never a
+// stopped key.
+func TestTheHealthSweepSeesEveryRunningKeyAndNoStoppedOne(t *testing.T) {
+	h, rt, _, _, _ := newHostedFixture(t)
+	ctx := context.Background()
+	if got, ok := h.HealthObservations(ctx); !ok || len(got) != 0 {
+		t.Fatal("no keys", got, ok)
+	}
+	if _, err := h.StartHosted(ctx, principal(), testAuthorityDigest, "app-1", startCommand("start-1")); err != nil {
+		t.Fatal(err)
+	}
+	awaitHosted(t, h, "app-1", "READY")
+	got, ok := h.HealthObservations(ctx)
+	if !ok || len(got) != 1 || got[0].App.Kind != appwatch.KindHosted || got[0].App.HostingKey != "app-1" || got[0].State != appwatch.Healthy {
+		t.Fatal("ready", got)
+	}
+	rt.mu.Lock()
+	rt.healthy = false
+	rt.mu.Unlock()
+	eventually(t, "not degraded", func() bool { v, _ := h.ReadHosted(ctx, principal(), "app-1"); return v.Health == "DEGRADED" })
+	if got, _ := h.HealthObservations(ctx); len(got) != 1 || got[0].State != appwatch.Unwell {
+		t.Fatal("degraded", got)
+	}
+	if _, err := h.StopHosted(ctx, principal(), testAuthorityDigest, "app-1", stopCommand("stop-1")); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := h.HealthObservations(ctx); !ok || len(got) != 0 {
+		t.Fatal("stopped", got)
+	}
+	h.Close()
+	if _, ok := h.HealthObservations(ctx); ok {
+		t.Fatal("a closed hosting answered a sweep")
 	}
 }

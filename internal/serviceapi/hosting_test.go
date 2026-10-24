@@ -391,3 +391,46 @@ func TestHostedV1Validation(t *testing.T) {
 		}
 	}
 }
+
+type testFeed struct{ after, limit []uint64 }
+
+func (f *testFeed) Events(after uint64, limit int) AppHealthEventsV1 {
+	f.after, f.limit = append(f.after, after), append(f.limit, uint64(limit))
+	return AppHealthEventsV1{SchemaVersion: AppHealthEventsSchemaV1, LastSeq: 3, Events: []AppHealthEventV1{
+		{Seq: 3, At: "2026-10-24T16:10:00Z", Kind: "hosted", HostingKey: "app-1", State: "down", Since: "2026-10-24T16:00:00Z"}}}
+}
+
+// BF-07e: the app health events are read with a cursor, by the principal that controls hosting only, never cached; a
+// bad cursor, limit or parameter and any write are refused.
+func TestAppHealthEventsAreReadAfterACursorByTheHostingPrincipal(t *testing.T) {
+	s, _ := hostingServer(t, true, true, PrincipalService)
+	feed := &testFeed{}
+	s.reserved.AppHealth = feed
+	w := get(s, "/v1/app-health/events?after=2&limit=10")
+	if w.Code != 200 || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Body.String(), `"state":"down"`) || strings.Contains(w.Body.String(), `"target"`) {
+		t.Fatal("events", w.Code, w.Header(), w.Body.String())
+	}
+	if w := get(s, "/v1/app-health/events"); w.Code != 200 || feed.after[1] != 0 || feed.limit[1] != AppHealthEventLimit {
+		t.Fatal("defaults", w.Code, feed.after, feed.limit)
+	}
+	if feed.after[0] != 2 || feed.limit[0] != 10 {
+		t.Fatal("cursor", feed.after, feed.limit)
+	}
+	for _, bad := range []string{"?after=-1", "?after=x", "?limit=0", "?limit=101", "?other=1", "?after=1&after=2"} {
+		if w := get(s, "/v1/app-health/events"+bad); w.Code != 400 {
+			t.Fatal(bad, w.Code)
+		}
+	}
+	if w := post(s, "/v1/app-health/events", "{}"); w.Code != 400 {
+		t.Fatal("a write", w.Code)
+	}
+	s2, _ := hostingServer(t, false, true, PrincipalService)
+	s2.reserved.AppHealth = feed
+	if w := get(s2, "/v1/app-health/events"); w.Code != 403 {
+		t.Fatal("without the hosting grant", w.Code)
+	}
+	s3, _ := hostingServer(t, true, true, PrincipalService)
+	if w := get(s3, "/v1/app-health/events"); w.Code == 200 {
+		t.Fatal("no watch, no events", w.Code)
+	}
+}

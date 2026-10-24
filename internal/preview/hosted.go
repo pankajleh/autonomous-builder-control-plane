@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/appwatch"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/strictjson"
 )
@@ -342,6 +343,30 @@ func (h *Hosting) ReadHosted(_ context.Context, p serviceapi.Principal, key stri
 		return serviceapi.HostedV1{}, serviceapi.ErrDependencyNotFound
 	}
 	return view(k.state), nil
+}
+
+// HealthObservations looks at every key its owner keeps running (Repo C BF-07e): ready and healthy, or not. A key being
+// started again after a failure, or failed for good, is unwell; a stopped key is not looked at. False while the hosted
+// instances are unavailable.
+func (h *Hosting) HealthObservations(context.Context) ([]appwatch.Observation, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.unavailable || h.ctx.Err() != nil {
+		return nil, false
+	}
+	out := []appwatch.Observation{}
+	for _, k := range h.keys {
+		st := k.state
+		if st.Key == "" || st.Desired != "RUNNING" {
+			continue
+		}
+		state := appwatch.Unwell
+		if st.Status == "READY" && st.Health == "HEALTHY" {
+			state = appwatch.Healthy
+		}
+		out = append(out, appwatch.Observation{App: appwatch.App{Kind: appwatch.KindHosted, HostingKey: st.Key}, State: state})
+	}
+	return out, true
 }
 
 // HostedErrors answers the app's recent errors as the controller kept them from its own server's output (BF-07c2):

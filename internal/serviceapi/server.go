@@ -177,6 +177,8 @@ type ServerConfig struct {
 	// Deployments, when set, answers /v1/releases and a target's plans,
 	// apply, operations and sites (BF-14.2a) for the same principal.
 	Deployments DeploymentController
+	// AppHealth, when set, answers /v1/app-health/events (Repo C BF-07e) for the principal that controls hosting.
+	AppHealth AppHealthFeed
 	// RequestLog, when set, gets one line per request with its X-Request-ID (Repo C design note REQUEST_IDS.md).
 	RequestLog io.Writer
 }
@@ -393,6 +395,8 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.accountLanes(writer, request, principal, requestID)
 	case "/v1/targets":
 		s.targets(writer, request, principal, requestID)
+	case "/v1/app-health/events":
+		s.appHealthEvents(writer, request, principal, requestID)
 	case "/v1/runs":
 		s.runs(writer, request, principal, requestID)
 	case "/v1/development-runs":
