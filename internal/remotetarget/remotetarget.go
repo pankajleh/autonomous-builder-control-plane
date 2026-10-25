@@ -523,6 +523,11 @@ func parse(output string) map[string]string {
 	return values
 }
 
+// supportedSystems are the systems whose setup lines Repo C shows and tried on a fresh server (its design note
+// BF14_4_YOUR_OWN_CLOUD_ACCOUNT.md §16), by os-release's ID and VERSION_ID: Ubuntu 24.04 and 26.04, Debian 12 and 13.
+// Nothing else ABCP runs on a server depends on the system: the apps, their databases and the front door run in containers.
+var supportedSystems = map[string]bool{"ubuntu 24.04": true, "ubuntu 26.04": true, "debian 12": true, "debian 13": true}
+
 // Evaluate turns what PreflightScript printed into facts and checks.
 func Evaluate(v map[string]string) (*serviceapi.TargetFactsV1, []serviceapi.TargetCheckV1) {
 	number := func(key string) int {
@@ -570,7 +575,7 @@ func Evaluate(v map[string]string) (*serviceapi.TargetFactsV1, []serviceapi.Targ
 	}
 	registry := v["registry"]
 	checks := []serviceapi.TargetCheckV1{
-		{Name: "os_supported", Required: true, OK: facts.OSID == "ubuntu" && facts.OSVersion == "24.04", Value: facts.OS},
+		{Name: "os_supported", Required: true, OK: supportedSystems[facts.OSID+" "+facts.OSVersion], Value: facts.OS},
 		{Name: "arch", Required: true, OK: facts.Arch == "x86_64", Value: facts.Arch},
 		{Name: "memory", Required: true, OK: facts.MemoryMB >= 1800, Value: fmt.Sprintf("%d MB", facts.MemoryMB)},
 		{Name: "disk", Required: true, OK: facts.DiskFreeMB >= 10240, Value: fmt.Sprintf("%d MB free", facts.DiskFreeMB)},

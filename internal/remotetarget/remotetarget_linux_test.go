@@ -277,7 +277,7 @@ func TestRefusedLoginsUnreachableServersAndFailedChecksAreReportedNotHidden(t *t
 	// A server without Docker, as root, with port 80 taken: checked, not ready.
 	target, _ := m.Target(ctx, "host-1")
 	server.allowed = publicKeyOf(t, target.PublicKey)
-	server.output = "uid=0\narch=aarch64\nos_id=debian\nos_version=12\nmem_kb=1000000\ndisk_free_kb=1000\nlistening=0.0.0.0:80\nntp=no\n"
+	server.output = "uid=0\narch=aarch64\nos_id=debian\nos_version=11\nmem_kb=1000000\ndisk_free_kb=1000\nlistening=0.0.0.0:80\nntp=no\n"
 	poor, err := m.PreflightTarget(ctx, "host-1")
 	if err != nil || poor.Preflight.Outcome != "checked" || poor.Preflight.Ready {
 		t.Fatalf("poor host = %+v %v", poor.Preflight, err)
@@ -403,6 +403,33 @@ func TestEvaluatePortsHeldByTheFrontDoor(t *testing.T) {
 	for name, c := range ports(goodOutput + "frontdoor=0123456789ab\n") {
 		if (name == "port_80_free" || name == "port_443_free") && (!c.OK || c.Value != "yes") {
 			t.Errorf("%s free = %+v", name, c)
+		}
+	}
+}
+
+// The systems whose setup lines were tried pass the system's check, by os-release's ID and VERSION_ID, whatever their
+// point release; others, older releases and look-alikes do not (Repo C BF14_4_YOUR_OWN_CLOUD_ACCOUNT.md §16).
+func TestEvaluateSupportedSystems(t *testing.T) {
+	system := func(id, version, name string) serviceapi.TargetCheckV1 {
+		output := strings.NewReplacer("os_id=ubuntu", "os_id="+id, "os_version=24.04", "os_version="+version,
+			"os_name=Ubuntu 24.04.1 LTS", "os_name="+name).Replace(goodOutput)
+		facts, checks := Evaluate(parse(output))
+		if facts.OS != name {
+			t.Fatalf("facts.OS = %q, want %q", facts.OS, name)
+		}
+		return checks[0]
+	}
+	for _, s := range [][3]string{{"ubuntu", "24.04", "Ubuntu 24.04.1 LTS"}, {"ubuntu", "26.04", "Ubuntu 26.04.1 LTS"},
+		{"debian", "12", "Debian GNU/Linux 12 (bookworm)"}, {"debian", "13", "Debian GNU/Linux 13 (trixie)"}} {
+		if c := system(s[0], s[1], s[2]); c.Name != "os_supported" || !c.OK || !c.Required || c.Value != s[2] {
+			t.Errorf("%s %s = %+v, want a passed os_supported", s[0], s[1], c)
+		}
+	}
+	for _, s := range [][3]string{{"ubuntu", "22.04", "Ubuntu 22.04.5 LTS"}, {"debian", "11", "Debian GNU/Linux 11 (bullseye)"},
+		{"rocky", "9.4", "Rocky Linux 9.4"}, {"linuxmint", "22", "Linux Mint 22"}, {"ubuntu", "24.04.1", "Ubuntu"}, {"", "", ""},
+		{"Debian", "12", "x"}, {"debian", "12.7", "x"}} {
+		if c := system(s[0], s[1], s[2]); c.OK {
+			t.Errorf("%q %q passed the system's check", s[0], s[1])
 		}
 	}
 }
