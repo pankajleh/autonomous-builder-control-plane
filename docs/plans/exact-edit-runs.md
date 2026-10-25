@@ -1,6 +1,6 @@
 # Runs that change exact words with no builder (Repo C BF-01d)
 
-Status: **built** (this PR), not yet live. Repo C's design note `BF01D_QUICK_EDIT.md` §4.5 (the owner, 2026-10-25: "all as
+Status: **live** since 2026-10-25 03:14 UTC (`c6c5241`, ABCP PID 3722116; #148) and proved on QA's cake shop with direct admissions (§ Proof). Repo C's design note `BF01D_QUICK_EDIT.md` §4.5 (the owner, 2026-10-25: "all as
 recommended, go ahead with BF-01d except 4, build for everyone"). A person picks words on their app's preview and types
 new ones; Repo C finds them exactly once in the version's files and asks ABCP for a run that changes only them, with no
 builder and no model, and runs every check as for any build.
@@ -62,3 +62,20 @@ ref; an undeclared change beside the edit is refused; the worktree is where the 
 `internal/runadmission/exactedit_linux_test.go`: admission refuses each case with `exact_edit_not_accepted` and starts
 nothing, binds the edit into the run's manifest, replays the same request and refuses the same request id with other
 words. Request validation, the authority's checks and the 422 mapping have their own cases.
+
+## Proof (2026-10-25, `a-bf01d-d1-prove.py` and `a-bf01d-d1-preview.py` on the host)
+
+On QA's cake shop (task `f4dc7767`, its newest version `8088966` on its run's branch, profile `local-p02`), with
+direct admissions under Repo C's service principal:
+
+- **Refused before anything was written:** `index.html` named with README's blob → `422 exact_edit_not_accepted`;
+  "Our cakes", found twice → `422 exact_edit_not_accepted`; a path in `migrations/` → `400 invalid_request`. No branch.
+- **Accepted:** "What’s your happy flavour?" → "Which flavour makes you smile?" in `index.html`: `BRANCH_ACCEPTED` 5 s
+  after admission (the first try's run reached it in 0.44 s), through `AUTHORITY_VALIDATED`, `EXECUTION_STARTING`,
+  `IMPLEMENTING`, `IMPLEMENTATION_COMPLETED`, `BRANCH_ACCEPTANCE_PENDING`; no agent session; two commits on
+  `abcp/<run>` (the copy holds the version's tree exactly; the edit changes only `index.html`); the worktree kept;
+  the activity reads "Source checkpoint available" and no marker.
+- **Stopped by its check:** `href="styles.css"` → `href="missing.css"` ended `FAILED` at the acceptance
+  (`product-verification`: the page loads a file not in the repository).
+- **The preview:** a `demo-v1` preview of the accepted run's checkpoint went `READY` and served the new words, not the
+  old; it was stopped after.
