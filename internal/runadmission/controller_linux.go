@@ -53,6 +53,8 @@ type admissionAuthority struct {
 	template *serviceapi.RunTemplateV1
 	// executor is the model and reasoning level a product build asked for, if any.
 	executor *serviceapi.RunExecutorV1
+	// exactEdit is the exact replacements a product run makes with no builder, if any.
+	exactEdit *serviceapi.RunExactEditV1
 }
 
 func productAdmissionAuthority(request serviceapi.RunAdmissionRequestV1) admissionAuthority {
@@ -68,8 +70,9 @@ func productAdmissionAuthority(request serviceapi.RunAdmissionRequestV1) admissi
 		capsuleSpec: func(repositoryIdentity, planRelative string) contextcapsule.Spec {
 			return admissionCapsuleSpecForIdentity(repositoryIdentity, request, planRelative)
 		},
-		template: request.Template,
-		executor: request.Executor,
+		template:  request.Template,
+		executor:  request.Executor,
+		exactEdit: request.ExactEdit,
 	}
 }
 
@@ -445,6 +448,19 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 		}
 		if admission.executor != nil && !acceptsExecutor(profile.configuration.ExecutorChoices, *admission.executor) {
 			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrExecutorChoiceNotAccepted
+		}
+		if admission.exactEdit != nil {
+			// The edit is checked against the version it changes before anything is
+			// written (Repo C design note BF01D_QUICK_EDIT.md §4.5); Git is only read.
+			if profile.template.Ralphex.Mode == ralphex.ModeReview {
+				return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrExactEditNotAccepted
+			}
+			if err := runctl.CheckExactEdit(ctx, profile.configuration.RepositoryPath, exactEditManifest(*admission.exactEdit)); err != nil {
+				if errors.Is(err, runctl.ErrExactEditDoesNotApply) {
+					return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrExactEditNotAccepted
+				}
+				return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
+			}
 		}
 		manifestPath, materialized, materializeErr := materialize(profile, principal, admission, runID)
 		if materializeErr != nil {
@@ -922,7 +938,7 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, admissio
 		return "", runBinding{}, err
 	}
 	capsulePath := filepath.Join(runDirectory, "context-capsule.json")
-	manifestData, err := derivedManifestData(profile, admission.repositoryBaseSHA, runID, planPath, capsulePath, plan, capsuleData, admission.template, admission.executor)
+	manifestData, err := derivedManifestData(profile, admission.repositoryBaseSHA, runID, planPath, capsulePath, plan, capsuleData, admission.template, admission.executor, admission.exactEdit)
 	if err != nil || len(manifestData) > MaxManifestTemplateBytes {
 		return "", runBinding{}, errors.New("derived manifest exceeds bounds")
 	}
@@ -1120,7 +1136,7 @@ func developmentAdmissionCapsuleSpecForIdentity(repositoryIdentity string, reque
 	}
 }
 
-func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPath, capsulePath string, plan, capsuleData []byte, template *serviceapi.RunTemplateV1, executor *serviceapi.RunExecutorV1) ([]byte, error) {
+func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPath, capsulePath string, plan, capsuleData []byte, template *serviceapi.RunTemplateV1, executor *serviceapi.RunExecutorV1, exactEdit *serviceapi.RunExactEditV1) ([]byte, error) {
 	manifest, err := cloneManifest(profile.template)
 	if err != nil {
 		return nil, err
@@ -1150,7 +1166,25 @@ func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPa
 			manifest.Executor.TaskEffort = executor.Effort
 		}
 	}
+	if exactEdit != nil {
+		if template != nil || executor != nil {
+			return nil, errors.New("an exact edit names no template and no executor choice")
+		}
+		edit := exactEditManifest(*exactEdit)
+		manifest.ExactEdit = &edit
+	}
 	return json.Marshal(manifest)
+}
+
+// exactEditManifest is the run authority's copy of a request's exact edit.
+func exactEditManifest(edit serviceapi.RunExactEditV1) authority.ExactEditManifest {
+	manifest := authority.ExactEditManifest{SourceSHA: edit.SourceSHA, Replacements: make([]authority.ExactEditReplacement, 0, len(edit.Replacements))}
+	for _, replacement := range edit.Replacements {
+		manifest.Replacements = append(manifest.Replacements, authority.ExactEditReplacement{
+			Path: replacement.Path, BaseBlob: replacement.BaseBlob, Find: replacement.Find, Replace: replacement.Replace,
+		})
+	}
+	return manifest
 }
 
 // validateExecutorChoices checks a profile's allowlist at load: known

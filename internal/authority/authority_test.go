@@ -950,3 +950,56 @@ func fileHash(t *testing.T, path string) string {
 	digest := sha256.Sum256(contents)
 	return hex.EncodeToString(digest[:])
 }
+
+func TestNewValidatesTheExactEdit(t *testing.T) {
+	plain, err := New(fixtureManifest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain.CanonicalJSON()), "exact_edit") {
+		t.Fatal("a build keeps its canonical form")
+	}
+	if _, ok := plain.ExactEdit(); ok {
+		t.Fatal("a build names no exact edit")
+	}
+	edit := func() *ExactEditManifest {
+		return &ExactEditManifest{SourceSHA: strings.Repeat("a", 40), Replacements: []ExactEditReplacement{{
+			Path: "public/index.html", BaseBlob: strings.Repeat("b", 40), Find: "Book now", Replace: "Reserve a table",
+		}}}
+	}
+	manifest := fixtureManifest(t)
+	manifest.Worktree = WorktreePolicy{Enabled: true, Branch: "abcp/exact-edit"}
+	manifest.ExactEdit = edit()
+	governed, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := governed.ExactEdit()
+	if !ok || got.SourceSHA != strings.Repeat("a", 40) || len(got.Replacements) != 1 || got.Replacements[0].Replace != "Reserve a table" {
+		t.Fatalf("exact edit %+v", got)
+	}
+	got.Replacements[0].Replace = "changed"
+	manifest.ExactEdit.Replacements[0].Find = "changed"
+	if again, _ := governed.ExactEdit(); again.Replacements[0].Replace != "Reserve a table" || again.Replacements[0].Find != "Book now" {
+		t.Fatal("the authority keeps its own copy of the exact edit")
+	}
+	for name, change := range map[string]func(*Manifest){
+		"no worktree": func(m *Manifest) { m.Worktree = WorktreePolicy{} },
+		"a template": func(m *Manifest) {
+			m.TemplateCopy = &TemplateCopyManifest{MirrorPath: t.TempDir(), TemplateID: "booking", Version: "1.0.0", CommitSHA: strings.Repeat("c", 40), TreeSHA: strings.Repeat("d", 40)}
+		},
+		"a migration":   func(m *Manifest) { m.ExactEdit.Replacements[0].Path = "migrations/001.sql" },
+		"a builder dir": func(m *Manifest) { m.ExactEdit.Replacements[0].Path = ".ralphex/progress.md" },
+		"no source":     func(m *Manifest) { m.ExactEdit.SourceSHA = "" },
+		"same words":    func(m *Manifest) { m.ExactEdit.Replacements[0].Replace = "Book now" },
+		"nothing":       func(m *Manifest) { m.ExactEdit.Replacements = nil },
+	} {
+		invalid := fixtureManifest(t)
+		invalid.Worktree = WorktreePolicy{Enabled: true, Branch: "abcp/exact-edit"}
+		invalid.ExactEdit = edit()
+		change(&invalid)
+		if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "exact edit") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}

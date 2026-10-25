@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/enginelane"
@@ -35,6 +36,7 @@ type Manifest struct {
 	Plan           PlanManifest            `json:"plan"`
 	ContextCapsule *ContextCapsuleManifest `json:"context_capsule,omitempty"`
 	TemplateCopy   *TemplateCopyManifest   `json:"template_copy,omitempty"`
+	ExactEdit      *ExactEditManifest      `json:"exact_edit,omitempty"`
 	MergeReview    *ReviewPolicy           `json:"merge_review,omitempty"`
 	Governance     *GovernanceManifest     `json:"governance,omitempty"`
 	Ralphex        RalphexManifest         `json:"ralphex"`
@@ -106,6 +108,79 @@ func validateTemplateCopy(template TemplateCopyManifest) error {
 	if !templateCopyIDPattern.MatchString(template.TemplateID) || !templateCopyVersionPattern.MatchString(template.Version) ||
 		!templateCopyObjectPattern.MatchString(template.CommitSHA) || !templateCopyObjectPattern.MatchString(template.TreeSHA) {
 		return errors.New("template copy: invalid template identity")
+	}
+	return nil
+}
+
+// ExactEditManifest binds a run to exact replacements in the files of one
+// version (Repo C design note BF01D_QUICK_EDIT.md §4.5): ABCP copies the
+// version's commit SourceSHA onto the run's branch, as a change build's first
+// commit does, applies the replacements in one commit with no builder and no
+// model, checks that commit changes exactly them, and runs the acceptance
+// commands. It is omitted for every build and every manifest created before
+// exact edits.
+type ExactEditManifest struct {
+	SourceSHA    string                 `json:"source_sha"`
+	Replacements []ExactEditReplacement `json:"replacements"`
+}
+
+// ExactEditReplacement replaces Find, which occurs exactly once in the file at
+// Path as the source commit holds it (blob BaseBlob), with Replace.
+type ExactEditReplacement struct {
+	Path     string `json:"path"`
+	BaseBlob string `json:"base_blob"`
+	Find     string `json:"find"`
+	Replace  string `json:"replace"`
+}
+
+const (
+	maxExactEditReplacements = 10
+	maxExactEditTextBytes    = 1 << 10
+	maxExactEditPathBytes    = 512
+)
+
+// ValidExactEditPath accepts a relative, slash-separated path inside the
+// repository: no empty, "." or ".." segment, no backslash or control
+// character, never under .git or .ralphex, and never in a migrations folder.
+func ValidExactEditPath(path string) bool {
+	if path == "" || len(path) > maxExactEditPathBytes || !utf8.ValidString(path) || strings.Contains(path, "\\") {
+		return false
+	}
+	for _, r := range path {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	for _, segment := range strings.Split(path, "/") {
+		switch strings.ToLower(segment) {
+		case "", ".", "..", ".git", ".ralphex", "migrations", "migration":
+			return false
+		}
+	}
+	return true
+}
+
+func validateExactEdit(edit ExactEditManifest) error {
+	if !templateCopyObjectPattern.MatchString(edit.SourceSHA) {
+		return errors.New("exact edit: invalid source commit")
+	}
+	if len(edit.Replacements) == 0 || len(edit.Replacements) > maxExactEditReplacements {
+		return errors.New("exact edit: one to ten replacements are required")
+	}
+	seen := map[string]bool{}
+	for _, replacement := range edit.Replacements {
+		if !ValidExactEditPath(replacement.Path) || seen[replacement.Path] {
+			return errors.New("exact edit: invalid or repeated path")
+		}
+		seen[replacement.Path] = true
+		if !templateCopyObjectPattern.MatchString(replacement.BaseBlob) {
+			return errors.New("exact edit: invalid base blob")
+		}
+		if replacement.Find == "" || len(replacement.Find) > maxExactEditTextBytes || len(replacement.Replace) > maxExactEditTextBytes ||
+			!utf8.ValidString(replacement.Find) || !utf8.ValidString(replacement.Replace) ||
+			strings.ContainsRune(replacement.Find, 0) || strings.ContainsRune(replacement.Replace, 0) || replacement.Find == replacement.Replace {
+			return errors.New("exact edit: invalid text")
+		}
 	}
 	return nil
 }
@@ -272,6 +347,17 @@ func newAuthority(input Manifest, controller *governancev3.ControllerV1) (Author
 		manifest.TemplateCopy.MirrorPath = mirrorPath
 	}
 
+	if manifest.ExactEdit != nil {
+		if err := validateExactEdit(*manifest.ExactEdit); err != nil {
+			return Authority{}, err
+		}
+		// The edit is the whole implementation: never with a template copy, a
+		// governed workflow or a read-only review, and always in its own worktree.
+		if manifest.TemplateCopy != nil || manifest.Governance != nil || !manifest.Worktree.Enabled || manifest.Ralphex.Mode == ralphex.ModeReview {
+			return Authority{}, errors.New("exact edit: requires a worktree run without a template, governance or review")
+		}
+	}
+
 	binaryPath, err := canonicalFile(manifest.Ralphex.BinaryPath)
 	if err != nil {
 		return Authority{}, fmt.Errorf("ralphex binary path: %w", err)
@@ -412,7 +498,6 @@ func (a Authority) Executor() ExecutorPolicy {
 	return a.manifest.Executor
 }
 
-// Worktree returns the configured worktree policy.
 // TemplateCopy returns the template the run must start from, if it names one.
 func (a Authority) TemplateCopy() (TemplateCopyManifest, bool) {
 	if a.manifest.TemplateCopy == nil {
@@ -421,6 +506,15 @@ func (a Authority) TemplateCopy() (TemplateCopyManifest, bool) {
 	return *a.manifest.TemplateCopy, true
 }
 
+// ExactEdit returns a deep copy of the run's exact replacements, if it names any.
+func (a Authority) ExactEdit() (ExactEditManifest, bool) {
+	if a.manifest.ExactEdit == nil {
+		return ExactEditManifest{}, false
+	}
+	return ExactEditManifest{SourceSHA: a.manifest.ExactEdit.SourceSHA, Replacements: append([]ExactEditReplacement(nil), a.manifest.ExactEdit.Replacements...)}, true
+}
+
+// Worktree returns the configured worktree policy.
 func (a Authority) Worktree() WorktreePolicy {
 	return a.manifest.Worktree
 }
@@ -1005,6 +1099,9 @@ func cloneManifest(input Manifest) Manifest {
 	if input.TemplateCopy != nil {
 		template := *input.TemplateCopy
 		clone.TemplateCopy = &template
+	}
+	if input.ExactEdit != nil {
+		clone.ExactEdit = &ExactEditManifest{SourceSHA: input.ExactEdit.SourceSHA, Replacements: append([]ExactEditReplacement(nil), input.ExactEdit.Replacements...)}
 	}
 	if input.MergeReview != nil {
 		policy := cloneReviewPolicy(*input.MergeReview)

@@ -711,7 +711,9 @@ func (s *Service) collect(run, registration string, w *worker) {
 		if err != nil && !transientReadError(err) {
 			return
 		}
-		if err == nil && scope.RunID != "" && !providerFailed {
+		// An exact edit starts no builder, so there is no provider detail to read;
+		// its checkpoint comes from its worktree like any run's.
+		if err == nil && scope.RunID != "" && !providerFailed && !scope.ExactEdit {
 			if shared == nil {
 				shared, key = s.acquireSidecar(scope)
 				freshSidecar, initialUnavailableMisses = true, 0
