@@ -2,11 +2,19 @@ package remotetarget
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
@@ -54,10 +62,10 @@ func (m *Manager) offsiteFor(key string) (offsiteTarget, bool) {
 	return t, true
 }
 
-// copyBackups copies a site's new backup off the server, and up to offsiteRetries earlier ones not copied yet; it
-// answers the new backup's words for the step.
-func (m *Manager) copyBackups(ctx context.Context, session remote, key, site, id string, t offsiteTarget) string {
-	said := m.copyOffsite(ctx, session, key, site, id, t)
+// copyBackups copies a site's new backup off the server with copy, and up to offsiteRetries earlier ones not copied
+// yet; it answers the new backup's words for the step.
+func (m *Manager) copyBackups(key, site, id string, copy func(backup string) string) string {
+	said := copy(id)
 	m.mu.Lock()
 	var again []string
 	if r, err := m.read(key); err == nil {
@@ -72,7 +80,7 @@ func (m *Manager) copyBackups(ctx context.Context, session remote, key, site, id
 	}
 	m.mu.Unlock()
 	for _, earlier := range again {
-		m.copyOffsite(ctx, session, key, site, earlier, t)
+		copy(earlier)
 	}
 	return said
 }
@@ -90,12 +98,18 @@ func (m *Manager) copyOffsite(ctx context.Context, session remote, key, site, id
 	out, err := run(ctx, session, fill(offsiteScript, "N", site, "ID", id, "BUCKET", t.Bucket, "REGION", t.Region, "KEY", object,
 		"IMDS", m.metadataURL, "S3", s3), nil)
 	copied := serviceapi.BackupOffsiteV1{At: m.stamp(), OK: err == nil, Detail: "s3://" + t.Bucket + "/" + object}
-	said := "copied off the server"
 	if err != nil {
 		copied.Detail = stepDetail(err)
-		said = "kept on the server only: " + copied.Detail
 	} else if !strings.HasPrefix(lastLine(out), "copied ") {
 		copied.OK, copied.Detail = false, "the copy said nothing"
+	}
+	return m.noteOffsite(key, site, id, copied)
+}
+
+// noteOffsite records a copy's outcome on its backup and answers it in words for the step.
+func (m *Manager) noteOffsite(key, site, id string, copied serviceapi.BackupOffsiteV1) string {
+	said := "copied off the server"
+	if !copied.OK {
 		said = "kept on the server only: " + copied.Detail
 	}
 	m.mu.Lock()
@@ -180,5 +194,192 @@ status, said = call("HEAD")
 if status != 200 or said != str(size):
     fail("the copy could not be read back (%s)" % status)
 print("copied %d bytes" % size)
+PY
+`
+
+// Backups copied off a server Autobuild bought for a person (Repo C BF14_4_YOUR_OWN_CLOUD_ACCOUNT.md §17.1, BF-14.4d d1).
+// A target created with backups_off_server has each backup also copied to
+// s3://<bucket>/hosted/servers/<target>/<site>/<backup>.dump, in the hosted backups' bucket, with the key of their
+// settings file (--hosted-offsite-file, BF-10b), which may write and read under hosted/ and nothing else. ABCP signs an
+// upload address for that one object (Signature Version 4 in the query, uploadExpiry) and the server uploads the backup
+// to it itself; ABCP then reads the copy's size back with the key. No key reaches the server, and the address can put
+// that one object until it expires. A bought server never gets the instance role: the role may read every backup in the
+// bucket, other people's included.
+
+// uploadSettings is the hosted backups' settings file: the bucket and the key that may write under hosted/.
+type uploadSettings struct {
+	Bucket          string `json:"bucket"`
+	Region          string `json:"region"`
+	AccessKeyID     string `json:"access_key_id"`
+	SecretAccessKey string `json:"secret_access_key"`
+}
+
+const (
+	// uploadExpiry bounds an upload address's life: long enough for a backup to upload from India to Mumbai's S3.
+	uploadExpiry = 15 * time.Minute
+	// uploadsMaxBytes bounds the settings file.
+	uploadsMaxBytes = 4096
+)
+
+var (
+	uploadKeyID  = regexp.MustCompile(`^(AKIA|ASIA)[A-Z0-9]{16}$`)
+	uploadSecret = regexp.MustCompile(`^[A-Za-z0-9/+=]{40}$`)
+	uploadURL    = regexp.MustCompile(`^https?://[A-Za-z0-9.:-]+/hosted/servers/[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9-]+\.dump\?[A-Za-z0-9%&=._-]+$`)
+)
+
+// SetUploadsFile names the hosted backups' private settings file (mode 0600), whose key signs the upload addresses of the
+// targets whose backups are copied off them; empty, none is copied.
+func (m *Manager) SetUploadsFile(path string) {
+	m.mu.Lock()
+	m.uploadsFile = path
+	m.mu.Unlock()
+}
+
+// uploadsFor answers the settings to copy a target's backups off it with, when the target asked for that and the settings
+// file is valid; the file is read afresh each time, so a change needs no restart.
+func (m *Manager) uploadsFor(key string) (uploadSettings, bool) {
+	m.mu.Lock()
+	path := m.uploadsFile
+	r, err := m.read(key)
+	m.mu.Unlock()
+	if path == "" || err != nil || !r.BackupsOffServer {
+		return uploadSettings{}, false
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > uploadsMaxBytes {
+		return uploadSettings{}, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return uploadSettings{}, false
+	}
+	var s uploadSettings
+	if json.Unmarshal(data, &s) != nil || !bucketPattern.MatchString(s.Bucket) || strings.Contains(s.Bucket, "..") ||
+		!regionPattern.MatchString(s.Region) || !uploadKeyID.MatchString(s.AccessKeyID) || !uploadSecret.MatchString(s.SecretAccessKey) {
+		return uploadSettings{}, false
+	}
+	return s, true
+}
+
+// copyUploaded copies one backup off the server through an upload address, reads the copy's size back, and records the
+// outcome on the backup.
+func (m *Manager) copyUploaded(ctx context.Context, session remote, key, site, id string, s uploadSettings) string {
+	if !keyPattern.MatchString(key) || !siteNamePattern.MatchString(site) || !backupIDPattern.MatchString(id) {
+		return "kept on the server only"
+	}
+	endpoint := m.s3Endpoint
+	if endpoint == "" {
+		endpoint = "https://" + s.Bucket + ".s3." + s.Region + ".amazonaws.com"
+	}
+	object := "hosted/servers/" + key + "/" + site + "/" + id + ".dump"
+	copied := serviceapi.BackupOffsiteV1{At: m.stamp(), Detail: "s3://" + s.Bucket + "/" + object}
+	address := presignPut(endpoint, object, s, m.now(), uploadExpiry)
+	if !uploadURL.MatchString(address) {
+		copied.Detail = "the upload address could not be made"
+		return m.noteOffsite(key, site, id, copied)
+	}
+	out, err := run(ctx, session, fill(uploadScript, "N", site, "ID", id, "URL", address), nil)
+	size, said := strings.CutPrefix(lastLine(out), "uploaded ")
+	switch {
+	case err != nil:
+		copied.Detail = stepDetail(err)
+	case !said || size == "":
+		copied.Detail = "the copy said nothing"
+	default:
+		if status, length := headObject(ctx, endpoint, object, s, m.now()); status != http.StatusOK || length != size {
+			copied.Detail = fmt.Sprintf("the copy could not be read back (%d)", status)
+		} else {
+			copied.OK = true
+		}
+	}
+	return m.noteOffsite(key, site, id, copied)
+}
+
+// presignPut is an address that may put one object until it expires (Signature Version 4 in the query, the payload
+// unsigned, only the host header signed).
+func presignPut(endpoint, object string, s uploadSettings, now time.Time, expiry time.Duration) string {
+	u, err := url.Parse(endpoint + "/" + object)
+	if err != nil {
+		return ""
+	}
+	amz := now.UTC().Format("20060102T150405Z")
+	scope := amz[:8] + "/" + s.Region + "/s3/aws4_request"
+	query := url.Values{}
+	query.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+	query.Set("X-Amz-Credential", s.AccessKeyID+"/"+scope)
+	query.Set("X-Amz-Date", amz)
+	query.Set("X-Amz-Expires", strconv.Itoa(int(expiry/time.Second)))
+	query.Set("X-Amz-SignedHeaders", "host")
+	canonicalQuery := query.Encode()
+	canonical := strings.Join([]string{http.MethodPut, u.EscapedPath(), canonicalQuery, "host:" + u.Host + "\n", "host", "UNSIGNED-PAYLOAD"}, "\n")
+	return u.Scheme + "://" + u.Host + u.EscapedPath() + "?" + canonicalQuery + "&X-Amz-Signature=" + signature(s, amz, scope, canonical)
+}
+
+// headObject reads one object's size with the key (Signature Version 4 in the headers); a failure answers status 0.
+func headObject(ctx context.Context, endpoint, object string, s uploadSettings, now time.Time) (int, string) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	r, err := http.NewRequestWithContext(ctx, http.MethodHead, endpoint+"/"+object, nil)
+	if err != nil {
+		return 0, ""
+	}
+	empty := sha256.Sum256(nil)
+	payload := hex.EncodeToString(empty[:])
+	amz := now.UTC().Format("20060102T150405Z")
+	scope := amz[:8] + "/" + s.Region + "/s3/aws4_request"
+	r.Header.Set("X-Amz-Date", amz)
+	r.Header.Set("X-Amz-Content-Sha256", payload)
+	canonical := strings.Join([]string{r.Method, r.URL.EscapedPath(), "", "host:" + r.URL.Host + "\nx-amz-content-sha256:" + payload + "\nx-amz-date:" + amz + "\n",
+		"host;x-amz-content-sha256;x-amz-date", payload}, "\n")
+	r.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+s.AccessKeyID+"/"+scope+
+		", SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="+signature(s, amz, scope, canonical))
+	answer, err := (&http.Client{Timeout: 30 * time.Second}).Do(r)
+	if err != nil {
+		return 0, ""
+	}
+	defer answer.Body.Close()
+	return answer.StatusCode, answer.Header.Get("Content-Length")
+}
+
+// signature signs a canonical request with the key (Signature Version 4).
+func signature(s uploadSettings, amz, scope, canonical string) string {
+	hashed := sha256.Sum256([]byte(canonical))
+	toSign := strings.Join([]string{"AWS4-HMAC-SHA256", amz, scope, hex.EncodeToString(hashed[:])}, "\n")
+	key := []byte("AWS4" + s.SecretAccessKey)
+	for _, part := range []string{amz[:8], s.Region, "s3", "aws4_request"} {
+		mac := hmac.New(sha256.New, key)
+		mac.Write([]byte(part))
+		key = mac.Sum(nil)
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(toSign))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// uploadScript runs on the server: it puts one backup at its upload address and says its size. The address is the only
+// thing it is given; it prints no address, and a failure names S3's status and error code only.
+const uploadScript = `set -eu
+f="$HOME/autobuild/backups/@N@/@ID@.dump"
+if [ ! -s "$f" ]; then echo "the backup is no longer on the server" >&2; exit 4; fi
+if ! command -v python3 >/dev/null 2>&1; then echo "the server has no python3 to copy with" >&2; exit 4; fi
+AB_FILE="$f" AB_URL='@URL@' python3 - <<'PY'
+import os, re, sys, urllib.error, urllib.request
+path, address = os.environ["AB_FILE"], os.environ["AB_URL"]
+size = os.path.getsize(path)
+try:
+    with open(path, "rb") as dump:
+        with urllib.request.urlopen(urllib.request.Request(address, data=dump, method="PUT", headers={"Content-Length": str(size)}), timeout=600) as r:
+            status = r.status
+except urllib.error.HTTPError as e:
+    code = re.search(r"<Code>([A-Za-z]+)</Code>", e.read(4000).decode("utf-8", "replace"))
+    print(("S3 refused the copy (%s %s)" % (e.code, code.group(1) if code else "")).replace(" )", ")"), file=sys.stderr)
+    sys.exit(4)
+except Exception as e:
+    print("the copy could not reach S3 (%s)" % type(e).__name__, file=sys.stderr)
+    sys.exit(4)
+if status != 200:
+    print("S3 answered %s" % status, file=sys.stderr)
+    sys.exit(4)
+print("uploaded %d" % size)
 PY
 `

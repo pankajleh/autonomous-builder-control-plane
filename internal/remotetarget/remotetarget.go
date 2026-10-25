@@ -104,6 +104,8 @@ type record struct {
 	Databases []databaseRecord `json:"databases,omitempty"`
 	// The last check of the target against this record (BF-14.5a).
 	Drift *serviceapi.DriftV1 `json:"drift,omitempty"`
+	// Each backup is also copied off the target, through a one-object upload address (offsite.go, BF-14.4d d1).
+	BackupsOffServer bool `json:"backups_off_server,omitempty"`
 }
 
 // Manager keeps the targets in one private folder.
@@ -129,6 +131,9 @@ type Manager struct {
 	// place of the bucket's own.
 	metadataURL string
 	s3Endpoint  string
+	// uploadsFile is the hosted backups' settings (bucket and key), whose key signs the upload addresses of the targets
+	// whose backups are copied off them; empty, none is copied.
+	uploadsFile string
 
 	// relayHost is where sites' front-door blocks send Autobuild's paths
 	// (BF-08a); empty, they send nothing on.
@@ -289,7 +294,7 @@ func (m *Manager) CreateTarget(ctx context.Context, key string, create serviceap
 	r := record{
 		SchemaVersion: recordSchema, Key: key, Address: address, Port: port, User: user,
 		PublicKey: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPublic))) + " " + comment,
-		State:     stateNew, CreatedAt: m.now().UTC().Format(time.RFC3339),
+		State:     stateNew, CreatedAt: m.now().UTC().Format(time.RFC3339), BackupsOffServer: create.BackupsOffServer,
 	}
 	if err := writePrivate(filepath.Join(m.dir, key+".key"), pem.EncodeToMemory(block)); err != nil {
 		return serviceapi.TargetV1{}, serviceapi.ErrTargetUnavailable
@@ -612,7 +617,7 @@ func ready(checks []serviceapi.TargetCheckV1) bool {
 func (r record) view() serviceapi.TargetV1 {
 	return serviceapi.TargetV1{
 		Key: r.Key, Address: r.Address, Port: r.Port, User: r.User, PublicKey: r.PublicKey, State: r.State,
-		HostKeyFingerprint: r.Fingerprint, CreatedAt: r.CreatedAt, Preflight: r.Preflight,
+		HostKeyFingerprint: r.Fingerprint, CreatedAt: r.CreatedAt, Preflight: r.Preflight, BackupsOffServer: r.BackupsOffServer,
 	}
 }
 

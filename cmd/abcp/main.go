@@ -986,6 +986,8 @@ func serveCommand(args []string, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "site relay host: not a host name")
 			return 1
 		}
+		// The hosted backups' key also signs the upload addresses of servers bought for people (Repo C BF-14.4d d1).
+		manager.SetUploadsFile(*hostedOffsiteFile)
 		targets, deployments, targetManager = manager, manager, manager
 		go manager.Nightly(ctx)
 	}

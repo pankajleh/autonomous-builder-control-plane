@@ -246,7 +246,9 @@ func (m *Manager) backUp(ctx context.Context, session remote, key, site, reason,
 	}
 	detail := fmt.Sprintf("%d bytes, %d tables, %d rows", size, tables, rows)
 	if t, ok := m.offsiteFor(key); ok {
-		detail += "; " + m.copyBackups(ctx, session, key, site, id, t)
+		detail += "; " + m.copyBackups(key, site, id, func(backup string) string { return m.copyOffsite(ctx, session, key, site, backup, t) })
+	} else if u, ok := m.uploadsFor(key); ok {
+		detail += "; " + m.copyBackups(key, site, id, func(backup string) string { return m.copyUploaded(ctx, session, key, site, backup, u) })
 	}
 	return id, detail, nil
 }
