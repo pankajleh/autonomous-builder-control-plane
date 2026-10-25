@@ -572,6 +572,26 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		result.State = domain.StateAuthorityValidated
 	}
 
+	// An exact edit (Repo C design note BF01D_QUICK_EDIT.md §4.5) starts no
+	// builder: it writes its branch itself, under the lease, then accepts it.
+	if edit, ok := r.governed.ExactEdit(); ok {
+		if r.resume {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "exact-edit", errors.New("an exact edit run is never resumed"), nil)
+		}
+		return r.runExactEdit(ctx, result, edit, func() error {
+			var err error
+			if repositoryLease != nil {
+				err = repositoryLease.Close()
+				repositoryLease = nil
+			}
+			if slots != nil {
+				err = errors.Join(err, slots.Close())
+				slots = nil
+			}
+			return err
+		})
+	}
+
 	configDir, err := os.MkdirTemp("", "abcp-ralphex-config-")
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("create isolated Ralphex config directory: %w", err), nil)
@@ -789,6 +809,14 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		// BRANCH_ACCEPTED-equivalent authority require a derived exact-head C.
 		return result, nil
 	}
+	return r.acceptBranch(ctx, result, implementationRefs)
+}
+
+// acceptBranch runs the branch acceptance of a run whose implementation has
+// completed: the candidate is checked out on its own, the acceptance commands
+// run on it, and the run ends BRANCH_ACCEPTED, FAILED, VALIDATION_UNAVAILABLE
+// or CANCELLED.
+func (r *Runner) acceptBranch(ctx context.Context, result Result, implementationRefs []ledger.EvidenceRef) (Result, error) {
 	target, cleanup, err := r.prepareAcceptanceTarget(ctx)
 	if err != nil {
 		if ctx.Err() != nil {

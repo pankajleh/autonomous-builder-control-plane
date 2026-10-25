@@ -33,6 +33,9 @@ type Scope struct {
 	Ralphex                                                                                 authority.RalphexManifest
 	// Retain reports the manifest's controller-owned worktree retention policy.
 	Retain bool
+	// ExactEdit reports a run that applies exact replacements with no builder
+	// (Repo C design note BF01D_QUICK_EDIT.md §4.5), so it has no provider detail.
+	ExactEdit bool
 }
 
 type Resolver struct {
@@ -156,7 +159,7 @@ func (r Resolver) resolveBinding(ctx context.Context, run string) (Scope, error)
 		}
 		break
 	}
-	return Scope{RunID: run, Repository: b.RepositoryPath, RepositoryIdentity: b.RepositoryIdentity, Project: project, Branch: manifest.Worktree.Branch, Base: manifest.Repository.StartSHA, AuthorityDigest: reg.AuthorityDigest, Ralphex: manifest.Ralphex, Retain: manifest.Worktree.Retain}, nil
+	return Scope{RunID: run, Repository: b.RepositoryPath, RepositoryIdentity: b.RepositoryIdentity, Project: project, Branch: manifest.Worktree.Branch, Base: manifest.Repository.StartSHA, AuthorityDigest: reg.AuthorityDigest, Ralphex: manifest.Ralphex, Retain: manifest.Worktree.Retain, ExactEdit: manifest.ExactEdit != nil}, nil
 }
 
 // WorktreePath returns the path of the run's governed worktree, or "" when no

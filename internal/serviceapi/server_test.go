@@ -354,6 +354,7 @@ func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
 		{ErrAdmissionUnavailable, http.StatusServiceUnavailable, "admission_unavailable"},
 		{ErrUnsafeAdmissionMaterialization, http.StatusInternalServerError, "unsafe_admission_materialization"},
 		{ErrExecutorChoiceNotAccepted, http.StatusUnprocessableEntity, "executor_choice_not_accepted"},
+		{ErrExactEditNotAccepted, http.StatusUnprocessableEntity, "exact_edit_not_accepted"},
 	} {
 		controller.err = test.err
 		response := httptest.NewRecorder()

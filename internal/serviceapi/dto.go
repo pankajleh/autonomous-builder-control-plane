@@ -79,6 +79,78 @@ type RunAdmissionRequestV1 struct {
 	// 4b). Omitted, the profile's own apply, so every request without it keeps
 	// its digest.
 	Executor *RunExecutorV1 `json:"executor,omitempty"`
+	// ExactEdit asks for a run that applies exact replacements to the files at
+	// the repository base with no builder and no model, then runs the profile's
+	// acceptance (Repo C design note BF01D_QUICK_EDIT.md §4.5). Omitted for every
+	// other build, so every request without it keeps its digest.
+	ExactEdit *RunExactEditV1 `json:"exact_edit,omitempty"`
+}
+
+// RunExactEditV1 starts from SourceSHA, the commit of the version being changed
+// (a commit an earlier run made), and makes at most MaxExactEditReplacements
+// replacements in it, each in a different file.
+type RunExactEditV1 struct {
+	SourceSHA    string             `json:"source_sha"`
+	Replacements []RunReplacementV1 `json:"replacements"`
+}
+
+// RunReplacementV1 replaces Find, which must occur exactly once in the file at
+// Path as the source commit holds it (blob BaseBlob), with Replace.
+type RunReplacementV1 struct {
+	Path     string `json:"path"`
+	BaseBlob string `json:"base_blob"`
+	Find     string `json:"find"`
+	Replace  string `json:"replace"`
+}
+
+const (
+	MaxExactEditReplacements = 10
+	MaxExactEditTextBytes    = 1 << 10
+	MaxExactEditPathBytes    = 512
+)
+
+// ValidExactEditPath accepts a relative, slash-separated path inside the
+// repository: no empty, "." or ".." segment, no leading slash or backslash, no
+// control character, never under .git or .ralphex, and never in a migrations
+// folder (a migration already applied doesn't change the data it made).
+func ValidExactEditPath(path string) bool {
+	if path == "" || len(path) > MaxExactEditPathBytes || !utf8.ValidString(path) || strings.ContainsAny(path, "\\") {
+		return false
+	}
+	for _, r := range path {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	for _, segment := range strings.Split(path, "/") {
+		switch strings.ToLower(segment) {
+		case "", ".", "..", ".git", ".ralphex", "migrations", "migration":
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateRunExactEditV1 checks an exact edit's shape: a lowercase source
+// commit ID and one to
+// MaxExactEditReplacements replacements in different files, each with a valid
+// path, a lowercase Git blob ID, a Find of 1 to MaxExactEditTextBytes bytes and a
+// Replace of at most that, both UTF-8 without NUL, and different.
+func ValidateRunExactEditV1(edit RunExactEditV1) error {
+	if !isLowerGitObjectID(edit.SourceSHA) || len(edit.Replacements) == 0 || len(edit.Replacements) > MaxExactEditReplacements {
+		return errors.New("invalid exact edit")
+	}
+	seen := map[string]bool{}
+	for _, replacement := range edit.Replacements {
+		if !ValidExactEditPath(replacement.Path) || seen[replacement.Path] || !isLowerGitObjectID(replacement.BaseBlob) ||
+			replacement.Find == "" || len(replacement.Find) > MaxExactEditTextBytes || len(replacement.Replace) > MaxExactEditTextBytes ||
+			!utf8.ValidString(replacement.Find) || !utf8.ValidString(replacement.Replace) ||
+			strings.ContainsRune(replacement.Find, 0) || strings.ContainsRune(replacement.Replace, 0) || replacement.Find == replacement.Replace {
+			return errors.New("invalid exact edit")
+		}
+		seen[replacement.Path] = true
+	}
+	return nil
 }
 
 // RunExecutorV1 names a model, a reasoning level, or both, for the build's
@@ -192,6 +264,14 @@ func ValidateRunAdmissionRequestV1(request RunAdmissionRequestV1) error {
 	}
 	if request.Executor != nil {
 		if err := ValidateRunExecutorV1(*request.Executor); err != nil {
+			return err
+		}
+	}
+	if request.ExactEdit != nil {
+		if request.Template != nil || request.Executor != nil {
+			return errors.New("invalid exact edit")
+		}
+		if err := ValidateRunExactEditV1(*request.ExactEdit); err != nil {
 			return err
 		}
 	}

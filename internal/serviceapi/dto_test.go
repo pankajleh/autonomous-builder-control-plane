@@ -209,3 +209,60 @@ func TestRunAdmissionExecutorIsOptionalAndFromKnownValues(t *testing.T) {
 		}
 	}
 }
+
+func TestRunAdmissionExactEditIsOptionalAndBounded(t *testing.T) {
+	valid := RunAdmissionRequestV1{
+		SchemaVersion: 1, RequestID: "request-1", ProfileID: "default",
+		ProductAuthorizationID: "authorization-1", ProductTaskID: "task-1", ProductVersionID: "version-1",
+		ProductManifestSHA256: strings.Repeat("a", 64), RepositoryBaseSHA: strings.Repeat("b", 40),
+		TaskMarkdown: "# Words changed\n", DelegatedActor: DelegatedActorV1{SubjectID: "user-1", SubjectType: PrincipalUser},
+	}
+	data, err := json.Marshal(valid)
+	if err != nil || strings.Contains(string(data), "exact_edit") {
+		t.Fatalf("a request without an exact edit keeps its shape and digest: %s %v", data, err)
+	}
+	replacement := RunReplacementV1{Path: "public/index.html", BaseBlob: strings.Repeat("c", 40), Find: "Book now", Replace: "Reserve a table"}
+	valid.ExactEdit = &RunExactEditV1{SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{replacement}}
+	if err := ValidateRunAdmissionRequestV1(valid); err != nil {
+		t.Fatalf("an exact edit is accepted: %v", err)
+	}
+	ten := make([]RunReplacementV1, MaxExactEditReplacements+1)
+	for i := range ten {
+		ten[i] = replacement
+		ten[i].Path = "page" + strings.Repeat("x", i) + ".html"
+	}
+	for name, edit := range map[string]RunExactEditV1{
+		"no source":       {Replacements: []RunReplacementV1{replacement}},
+		"short source":    {SourceSHA: "c0ffee", Replacements: []RunReplacementV1{replacement}},
+		"nothing":         {SourceSHA: strings.Repeat("d", 40)},
+		"eleven":          {SourceSHA: strings.Repeat("d", 40), Replacements: ten},
+		"same file twice": {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{replacement, replacement}},
+		"migration":       {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: "db/migrations/001.sql", BaseBlob: replacement.BaseBlob, Find: "a", Replace: "b"}}},
+		"git":             {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: ".git/config", BaseBlob: replacement.BaseBlob, Find: "a", Replace: "b"}}},
+		"parent":          {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: "../index.html", BaseBlob: replacement.BaseBlob, Find: "a", Replace: "b"}}},
+		"absolute":        {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: "/etc/passwd", BaseBlob: replacement.BaseBlob, Find: "a", Replace: "b"}}},
+		"backslash":       {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: "a\\b.html", BaseBlob: replacement.BaseBlob, Find: "a", Replace: "b"}}},
+		"short blob":      {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: "index.html", BaseBlob: "abc", Find: "a", Replace: "b"}}},
+		"empty find":      {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: "index.html", BaseBlob: replacement.BaseBlob, Replace: "b"}}},
+		"same words":      {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: "index.html", BaseBlob: replacement.BaseBlob, Find: "a", Replace: "a"}}},
+		"long words":      {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: "index.html", BaseBlob: replacement.BaseBlob, Find: "a", Replace: strings.Repeat("b", MaxExactEditTextBytes+1)}}},
+		"NUL":             {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: "index.html", BaseBlob: replacement.BaseBlob, Find: "a", Replace: "b\x00"}}},
+		"not UTF-8":       {SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{{Path: "index.html", BaseBlob: replacement.BaseBlob, Find: "\xff", Replace: "b"}}},
+	} {
+		invalid := valid
+		invalid.ExactEdit = &edit
+		if err := ValidateRunAdmissionRequestV1(invalid); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	withTemplate := valid
+	withTemplate.Template = &RunTemplateV1{TemplateID: "booking", Version: "1.0.0", CommitSHA: strings.Repeat("c", 40), TreeSHA: strings.Repeat("d", 40)}
+	if err := ValidateRunAdmissionRequestV1(withTemplate); err == nil {
+		t.Error("an exact edit with a template is accepted")
+	}
+	withExecutor := valid
+	withExecutor.Executor = &RunExecutorV1{Effort: "xhigh"}
+	if err := ValidateRunAdmissionRequestV1(withExecutor); err == nil {
+		t.Error("an exact edit with an executor choice is accepted")
+	}
+}
