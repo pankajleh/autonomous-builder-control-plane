@@ -30,7 +30,8 @@ checks it, reading only.
   - `GET /v1/targets/{key}` and `DELETE /v1/targets/{key}` (which deletes the private key; `204`).
 - **The preflight** reads the login's user id, the CPU architecture, the OS (`/etc/os-release`), cores, memory, free disk
   on `/`, Docker's version, whether it is rootless and its runtimes, `runsc` (gVisor), the listening ports, clock sync
-  and whether GitHub's registry answers. Required checks: Ubuntu 24.04, x86-64, at least 1.8 GB of memory and 10 GB
+  and whether GitHub's registry answers. Required checks: Ubuntu 24.04 or 26.04, or Debian 12 or 13 (by os-release's
+  `ID` and `VERSION_ID`, Repo C BF-14.4c), x86-64, at least 1.8 GB of memory and 10 GB
   free, not root, Docker present and rootless, ports 80 and 443 free, clock in sync, the registry reachable. gVisor is
   reported but not required here; the product requires it on servers shared by different customers.
 - **Outcomes** besides `checked`: `unreachable`, `timeout`, `refused_address` (the name now points somewhere not
