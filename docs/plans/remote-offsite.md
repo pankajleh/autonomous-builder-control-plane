@@ -29,6 +29,9 @@ server keeps its 7 days as before.
 
 ## Servers bought for people (Repo C BF-14.4d d1)
 
+Live since 15:17:23 UTC on 2026-10-25 (ABCP `aa6d10e`, recorded in #151); proved on a DigitalOcean server bought for a QA
+app, its backup copied and read back with its size.
+
 Repo C's design note `BF14_4_YOUR_OWN_CLOUD_ACCOUNT.md` §17.1 (the owner, 2026-10-25: "go ahead for BF-14.4"). A server
 Autobuild bought for a person, at AWS, DigitalOcean or Hostinger, is created with `PUT /v1/targets/{key}`
 `{"address": …, "backups_off_server": true}`; the target's record and its answers keep `backups_off_server`. A person's
