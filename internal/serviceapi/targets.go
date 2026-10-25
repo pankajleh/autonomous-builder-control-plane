@@ -34,6 +34,8 @@ type TargetV1 struct {
 	HostKeyFingerprint string             `json:"host_key_fingerprint,omitempty"`
 	CreatedAt          string             `json:"created_at"`
 	Preflight          *TargetPreflightV1 `json:"preflight,omitempty"`
+	// BackupsOffServer is true for a target whose backups are each also copied off it (Repo C BF-14.4d d1).
+	BackupsOffServer bool `json:"backups_off_server,omitempty"`
 }
 
 // TargetsV1 lists every target, oldest first.
@@ -47,6 +49,9 @@ type TargetCreateV1 struct {
 	Address string `json:"address"`
 	Port    int    `json:"port,omitempty"`
 	User    string `json:"user,omitempty"`
+	// BackupsOffServer copies each backup taken on the target off it too, to the hosted backups' bucket (Repo C
+	// BF14_4_YOUR_OWN_CLOUD_ACCOUNT.md §17.1: servers Autobuild bought for a person; never a person's own server).
+	BackupsOffServer bool `json:"backups_off_server,omitempty"`
 }
 
 // TargetConfirmV1 is the fingerprint the owner checked on the server.

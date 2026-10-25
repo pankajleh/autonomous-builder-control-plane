@@ -27,6 +27,25 @@ A copy that fails never fails the backup or the operation: the backup stays on t
 same app tries up to three earlier ones not yet copied again. The bucket's own rule removes copies after 30 days; the
 server keeps its 7 days as before.
 
+## Servers bought for people (Repo C BF-14.4d d1)
+
+Repo C's design note `BF14_4_YOUR_OWN_CLOUD_ACCOUNT.md` §17.1 (the owner, 2026-10-25: "go ahead for BF-14.4"). A server
+Autobuild bought for a person, at AWS, DigitalOcean or Hostinger, is created with `PUT /v1/targets/{key}`
+`{"address": …, "backups_off_server": true}`; the target's record and its answers keep `backups_off_server`. A person's
+own server never asks for it, and host 1 keeps `offsite.json` and its role. Each backup on such a target is also copied
+to `s3://<bucket>/hosted/servers/<target>/<site>/<backup>.dump`:
+
+- in the hosted backups' bucket, with the key of their settings file (`--hosted-offsite-file`, BF-10b): it may put and
+  get under `hosted/` and nothing else, and the bucket keeps every copy 30 days, so nothing new is asked of the owner;
+- ABCP signs an upload address for that one object (Signature Version 4 in the query, the host header alone signed, the
+  payload unsigned, 15 minutes) and the server puts the backup to it itself with `python3`; ABCP then reads the copy's
+  size back (`HEAD`, signed with the key) and compares it;
+- no key reaches the server, the address can put that one object until it expires, and the backup does not pass through
+  Autobuild's own server. A bought server never gets the instance role, which may read every backup in the bucket;
+- recorded and said as above, and tried again as above.
+
+The settings file is read afresh at each backup and used only while it is private (mode 0600) and valid.
+
 ## Also
 
 `MaxTargets` goes from 20 to 200: with BF-14 offered to everyone, each person may add two servers of their own while

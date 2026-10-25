@@ -3,6 +3,7 @@ package serviceapi
 import (
 	"context"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,12 @@ func (t *testTargets) Target(_ context.Context, key string) (TargetV1, error) {
 }
 func (t *testTargets) CreateTarget(_ context.Context, key string, c TargetCreateV1) (TargetV1, error) {
 	t.calls = append(t.calls, "create:"+key+":"+c.Address)
+	if c.BackupsOffServer {
+		t.calls = append(t.calls, "backups_off_server")
+		off := sampleTarget
+		off.BackupsOffServer = true
+		return off, t.err
+	}
 	return sampleTarget, t.err
 }
 func (t *testTargets) ConfirmTarget(_ context.Context, key string, c TargetConfirmV1) (TargetV1, error) {
@@ -67,8 +74,13 @@ func TestTargetsAreRegisteredConfirmedCheckedAndRemovedWithTheirGrant(t *testing
 	if r := call(s, http.MethodPut, "/v1/targets/host-1", `{"address":"13.232.1.2"}`); r.Code != http.StatusCreated || !strings.Contains(r.Body.String(), `"public_key":"ssh-ed25519 `) {
 		t.Fatalf("create = %d %s", r.Code, r.Body.String())
 	}
-	if r := call(s, http.MethodGet, "/v1/targets/host-1", ""); r.Code != http.StatusOK {
-		t.Fatalf("get = %d", r.Code)
+	if r := call(s, http.MethodGet, "/v1/targets/host-1", ""); r.Code != http.StatusOK || strings.Contains(r.Body.String(), "backups_off_server") {
+		t.Fatalf("get = %d %s", r.Code, r.Body.String())
+	}
+	// A server bought for a person (Repo C BF-14.4d d1): its backups are copied off it, and the answer says so.
+	if r := call(s, http.MethodPut, "/v1/targets/srv-0123456789ab", `{"address":"13.232.1.3","backups_off_server":true}`); r.Code != http.StatusCreated ||
+		!strings.Contains(r.Body.String(), `"backups_off_server":true`) || !slices.Contains(backend.calls, "backups_off_server") {
+		t.Fatalf("create a bought server = %d %s %v", r.Code, r.Body.String(), backend.calls)
 	}
 	if r := call(s, http.MethodPost, "/v1/targets/host-1/preflight", ""); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"outcome":"checked"`) {
 		t.Fatalf("preflight = %d %s", r.Code, r.Body.String())
@@ -79,7 +91,8 @@ func TestTargetsAreRegisteredConfirmedCheckedAndRemovedWithTheirGrant(t *testing
 	if r := call(s, http.MethodDelete, "/v1/targets/host-1", ""); r.Code != http.StatusNoContent {
 		t.Fatalf("delete = %d", r.Code)
 	}
-	want := []string{"list", "create:host-1:13.232.1.2", "get:host-1", "preflight:host-1", "confirm:host-1:SHA256:abc", "delete:host-1"}
+	want := []string{"list", "create:host-1:13.232.1.2", "get:host-1", "create:srv-0123456789ab:13.232.1.3", "backups_off_server", "preflight:host-1",
+		"confirm:host-1:SHA256:abc", "delete:host-1"}
 	if strings.Join(backend.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v", backend.calls)
 	}
