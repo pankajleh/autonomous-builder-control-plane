@@ -922,6 +922,11 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer previewService.Close()
+	// An app's kept Try it data goes after 90 days without a Try it of it (the owner, 2026-10-26): a first sweep after 15
+	// minutes, then every 6 hours, one line each.
+	previewService.SweepKeptDataEvery(preview.KeptDataIdle, 15*time.Minute, 6*time.Hour, func(format string, args ...any) {
+		fmt.Fprintf(stderr, format+"\n", args...)
+	})
 	// One line per preview profile, so a profile whose startup probe failed shows in the log, not only as refused previews.
 	availability := previewService.ProfileAvailability()
 	profileIDs := make([]string, 0, len(availability))

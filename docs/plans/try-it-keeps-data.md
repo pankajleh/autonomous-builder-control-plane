@@ -18,7 +18,11 @@ from the app's sample data, and what a person had entered there was gone.
 - **`POST /v1/runs/{run}/previews/{preview}/forget-data`** (a stop's body): for that preview's app, ends every live
   preview of the app, removes the app's volume (refused while a container mounts it) and answers the named preview,
   ended. It replays by request ID; the journal accepts its receipt as it accepts a stop's.
-- The volume is kept until forget-data. A plain profile never takes the kept path, and the preview controller's cleanup
+- The volume is kept until forget-data, or until 90 days pass without a Try it of the app (#153, the owner,
+  2026-10-26): `SweepKeptData`, run by `abcp serve` 15 minutes after start and then every 6 hours, removes the volume
+  of each app whose newest kept-data preview started 90 days ago or more and that has none running, checked again
+  under the app's lock; a volume in use or one whose app it cannot name stays. Repo C's archive forgets an app's data
+  at once (P0783). A plain profile never takes the kept path, and the preview controller's cleanup
   (containers, their anonymous volumes and networks) never removes a named volume.
 
 ## The profile Repo C uses
@@ -32,4 +36,6 @@ from the app's sample data, and what a person had entered there was gone.
 after it; forget-data ends every live preview, removes the data once, replays, and its receipt survives a restart),
 `TestAPlainPreviewNeverTakesAppData`, `TestKeptDataProfilesHaveOneVolumeAndAreNotHosted`,
 `TestKeptDataDockerVolumeIsTheAppsAndNeverShared` (the volume's name, and no start or removal while a container
-mounts it), and the HTTP route in `TestPreviewRoutesRequireAuthorityAndPreserveLegacyCapabilities`.
+mounts it), and the HTTP route in `TestPreviewRoutesRequireAuthorityAndPreserveLegacyCapabilities`;
+`TestKeptDataUnusedForNinetyDaysIsRemovedButNeverWhileATryItRuns` and `TestKeptKeysAreThisNamespacesTryItVolumesOnly`
+for the 90-day sweep (#153).

@@ -347,3 +347,27 @@ func TestKeptDataDockerVolumeIsTheAppsAndNeverShared(t *testing.T) {
 		t.Fatalf("removal ran %s", last)
 	}
 }
+
+// The 90-day sweep reads which apps have kept Try it data from this namespace's volume names alone (the owner,
+// 2026-10-26): another namespace's volumes, hosted volumes and odd names are not counted.
+func TestKeptKeysAreThisNamespacesTryItVolumesOnly(t *testing.T) {
+	d := newDocker("/private/previews")
+	key := keptKey("task-1")
+	var asked []string
+	d.run = func(_ context.Context, args ...string) (string, error) {
+		asked = args
+		return strings.Join([]string{d.keptVolume(key), "abcp-tryit-" + strings.Repeat("9", 16) + "-" + key[:24], d.volume(key),
+			"abcp-tryit-" + d.namespace[:16] + "-not-hex-at-all-xxxxxxxx", "abcp-tryit-" + d.namespace[:16] + "-abc"}, "\n") + "\n", nil
+	}
+	keys, err := d.KeptKeys(context.Background())
+	if err != nil || len(keys) != 1 || !keys[key[:24]] {
+		t.Fatal("kept keys", keys, err)
+	}
+	if strings.Join(asked, " ") != "volume ls -q --filter name=^abcp-tryit-"+d.namespace[:16]+"-" {
+		t.Fatal("asked docker", asked)
+	}
+	d.run = func(context.Context, ...string) (string, error) { return "", ErrUnavailable }
+	if _, err = d.KeptKeys(context.Background()); err == nil {
+		t.Fatal("a failed listing read as no volumes")
+	}
+}

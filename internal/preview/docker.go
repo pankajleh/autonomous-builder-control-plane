@@ -686,6 +686,23 @@ func (d *dockerRuntime) RemoveKept(ctx context.Context, keyDigest string) error 
 	return d.removeVolume(ctx, volume)
 }
 
+// KeptKeys lists the kept-data keys of this namespace whose volumes exist, by the 24 hex characters each volume's name
+// carries.
+func (d *dockerRuntime) KeptKeys(ctx context.Context) (map[string]bool, error) {
+	prefix := "abcp-tryit-" + d.namespace[:16] + "-"
+	raw, err := d.run(ctx, "volume", "ls", "-q", "--filter", "name=^"+prefix)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	out := map[string]bool{}
+	for _, name := range strings.Fields(raw) {
+		if key := strings.TrimPrefix(name, prefix); key != name && len(key) == 24 && sha256Pattern.MatchString(key+strings.Repeat("0", 40)) {
+			out[key] = true
+		}
+	}
+	return out, nil
+}
+
 // volumeInUse tells whether any container, running or not, mounts volume.
 func (d *dockerRuntime) volumeInUse(ctx context.Context, volume string) (bool, error) {
 	raw, err := d.run(ctx, "ps", "-aq", "--filter", "volume="+volume)
