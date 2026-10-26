@@ -58,6 +58,8 @@ type memoryRuntime struct {
 	keptBy                   map[string]string
 	keptStarted, keptRemoved []string
 	keptOverlap              bool
+	// keptVolumes is each kept-data key whose volume exists, by its first 24 hex characters, as Docker names it.
+	keptVolumes map[string]bool
 }
 
 func (r *memoryRuntime) Available(PreviewProfileV1) bool {
@@ -98,6 +100,10 @@ func (r *memoryRuntime) StartKept(_ context.Context, id, _ string, _ PreviewProf
 		return "", ErrUnavailable
 	}
 	r.keptBy[key] = id
+	if r.keptVolumes == nil {
+		r.keptVolumes = map[string]bool{}
+	}
+	r.keptVolumes[key[:24]] = true
 	r.keptStarted = append(r.keptStarted, id)
 	r.started = append(r.started, id)
 	return strings.Repeat("d", 64), r.startErr
@@ -109,7 +115,17 @@ func (r *memoryRuntime) RemoveKept(_ context.Context, key string) error {
 		return ErrUnavailable
 	}
 	r.keptRemoved = append(r.keptRemoved, key)
+	delete(r.keptVolumes, key[:24])
 	return nil
+}
+func (r *memoryRuntime) KeptKeys(context.Context) (map[string]bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := map[string]bool{}
+	for key := range r.keptVolumes {
+		out[key] = true
+	}
+	return out, nil
 }
 func (r *memoryRuntime) Reconcile(context.Context) error { r.reconciled = true; return r.reconcileErr }
 
@@ -797,5 +813,66 @@ func TestAPlainPreviewNeverTakesAppData(t *testing.T) {
 	defer rt.mu.Unlock()
 	if len(rt.keptStarted) != 0 || len(rt.keptBy) != 0 {
 		t.Fatal("a plain profile started with kept data")
+	}
+}
+
+// An app's kept Try it data goes once its newest Try it started KeptDataIdle ago, never while one runs, and never twice
+// (the owner, 2026-10-26: "90 days is fine").
+func TestKeptDataUnusedForNinetyDaysIsRemovedButNeverWhileATryItRuns(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "previews")
+	rt := &memoryRuntime{available: true, healthy: true}
+	var mu sync.Mutex
+	clock := time.Now()
+	now := func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
+	advance := func(d time.Duration) { mu.Lock(); clock = clock.Add(d); mu.Unlock() }
+	plain, kept := testProfile(), keptProfile()
+	source := Source{RunID: "run-1", CheckpointActivityID: strings.Repeat("b", 64), SHA: strings.Repeat("c", 40), Repository: "/private/repo", RepositoryIdentityDigest: plain.RepositoryIdentityDigest, ProductAuthorizationID: "auth-1", ProductTaskID: "task-1", ProductVersionID: "version-1", ValidationID: strings.Repeat("e", 64)}
+	s, err := newService(ctx, root, map[string]PreviewProfileV1{plain.ProfileID: plain, kept.ProfileID: kept}, staticResolver{source: source}, &memoryCheckout{}, rt, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	try := func(request string) {
+		t.Helper()
+		c := createCommand(request)
+		c.ProfileID = "kept-v1"
+		v, err := s.CreatePreview(ctx, principal(), testAuthorityDigest, "run-1", c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		awaitPreview(t, s, v.PreviewID, "READY", "HEALTHY")
+		if removed, err := s.SweepKeptData(ctx, time.Nanosecond); err != nil || removed != 0 {
+			t.Fatal("a running Try it's data was removed", removed, err)
+		}
+		stop := serviceapi.PreviewStopRequestV1{SchemaVersion: 1, RequestID: request + "-stop", ExpectedRunID: "run-1", ExpectedPreviewID: v.PreviewID, DelegatedActor: c.DelegatedActor}
+		if _, err = s.StopPreview(ctx, principal(), testAuthorityDigest, "run-1", v.PreviewID, stop); err != nil {
+			t.Fatal(err)
+		}
+		awaitCleanup(t, s)
+	}
+	try("kept-idle-1")
+	// 89 days on, another Try it: the 90 days start again from it.
+	advance(KeptDataIdle - 24*time.Hour)
+	if removed, err := s.SweepKeptData(ctx, KeptDataIdle); err != nil || removed != 0 {
+		t.Fatal("data removed before 90 days without a Try it", removed, err)
+	}
+	try("kept-idle-2")
+	advance(2 * 24 * time.Hour)
+	if removed, err := s.SweepKeptData(ctx, KeptDataIdle); err != nil || removed != 0 {
+		t.Fatal("a Try it 2 days ago did not keep the data", removed, err)
+	}
+	advance(KeptDataIdle)
+	if removed, err := s.SweepKeptData(ctx, KeptDataIdle); err != nil || removed != 1 {
+		t.Fatal("data kept after 90 days without a Try it", removed, err)
+	}
+	rt.mu.Lock()
+	gone, left := append([]string(nil), rt.keptRemoved...), len(rt.keptVolumes)
+	rt.mu.Unlock()
+	if len(gone) != 1 || gone[0] != keptKey("task-1") || left != 0 {
+		t.Fatal("not exactly the app's data", gone, left)
+	}
+	if removed, err := s.SweepKeptData(ctx, KeptDataIdle); err != nil || removed != 0 {
+		t.Fatal("removed twice", removed, err)
 	}
 }

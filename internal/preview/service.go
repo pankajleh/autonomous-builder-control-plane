@@ -26,7 +26,14 @@ type Runtime interface {
 type keptRuntime interface {
 	StartKept(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest string) (string, error)
 	RemoveKept(ctx context.Context, keyDigest string) error
+	// KeptKeys lists the kept-data keys whose volumes exist, each by its first 24 hex characters (the volume's name
+	// carries no more).
+	KeptKeys(ctx context.Context) (map[string]bool, error)
 }
+
+// KeptDataIdle is how long an app's kept Try it data stays without a Try it of the app (the owner, 2026-10-26: "90
+// days is fine, go ahead"; Repo C design note TRY_IT_KEEPS_DATA §4). Start fresh and archiving the app clear it sooner.
+const KeptDataIdle = 90 * 24 * time.Hour
 
 // keptKey is the digest that names an app's kept Try it data; only it reaches the runtime.
 func keptKey(task string) string { return jsonDigest([]string{"try-it-data", task}) }
@@ -616,6 +623,91 @@ func (s *Service) releaseApp(except, task string, all bool) bool {
 	}
 	return true
 }
+
+// SweepKeptData removes the kept Try it data of each app whose newest kept-data preview started at least idle ago and
+// that has no preview running, and returns how many apps' data it removed. A volume whose app it cannot name is left as
+// it is; a volume in use is never removed.
+func (s *Service) SweepKeptData(ctx context.Context, idle time.Duration) (int, error) {
+	kept, keeps := s.runtime.(keptRuntime)
+	if s == nil || !keeps || idle <= 0 {
+		return 0, nil
+	}
+	newest, running, err := s.keptUse()
+	if err != nil {
+		return 0, err
+	}
+	present, err := kept.KeptKeys(ctx)
+	if err != nil {
+		return 0, ErrUnavailable
+	}
+	removed := 0
+	for task, at := range newest {
+		key := keptKey(task)
+		if running[task] || s.now().Sub(at) < idle || !present[key[:24]] {
+			continue
+		}
+		lock := s.keptLock(task)
+		lock.Lock()
+		// A preview of the app may have started while the volumes were listed.
+		if _, now, err := s.keptUse(); err == nil && !now[task] && kept.RemoveKept(ctx, key) == nil {
+			removed++
+		}
+		lock.Unlock()
+	}
+	return removed, nil
+}
+
+// keptUse is, for each app with kept-data previews, when its newest one started and whether one is running.
+func (s *Service) keptUse() (map[string]time.Time, map[string]bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.store.broken || s.ctx.Err() != nil {
+		return nil, nil, ErrUnavailable
+	}
+	newest, running := map[string]time.Time{}, map[string]bool{}
+	for _, v := range s.store.records {
+		p, ok := s.profiles[v.ProfileID]
+		if !ok || !p.KeepData || v.ProductTaskID == "" {
+			continue
+		}
+		if at := parseTime(v.CreatedAt); at.After(newest[v.ProductTaskID]) {
+			newest[v.ProductTaskID] = at
+		}
+		if !terminal(v.Status) {
+			running[v.ProductTaskID] = true
+		}
+	}
+	return newest, running, nil
+}
+
+// SweepKeptDataEvery sweeps kept Try it data (SweepKeptData) a first time after first and then every every, until the
+// service closes, telling each sweep to logf.
+func (s *Service) SweepKeptDataEvery(idle, first, every time.Duration, logf func(format string, args ...any)) {
+	if s == nil || every <= 0 {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		timer := time.NewTimer(first)
+		defer timer.Stop()
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-timer.C:
+			}
+			removed, err := s.SweepKeptData(s.ctx, idle)
+			if err != nil {
+				logf("abcp kept try-it data sweep failed at=%s", s.now().UTC().Format(time.RFC3339))
+			} else {
+				logf("abcp kept try-it data sweep at=%s idle-days=%d removed=%d", s.now().UTC().Format(time.RFC3339), int(idle.Hours()/24), removed)
+			}
+			timer.Reset(every)
+		}
+	}()
+}
+
 func (s *Service) Close() error {
 	if s == nil {
 		return nil
