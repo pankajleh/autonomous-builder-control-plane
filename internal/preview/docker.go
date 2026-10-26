@@ -147,6 +147,12 @@ func (d *dockerRuntime) container(id string, i int) string {
 func (d *dockerRuntime) volume(keyDigest string) string {
 	return "abcp-hosted-" + d.namespace[:16] + "-" + keyDigest[:24]
 }
+
+// keptVolume names an app's kept Try it data volume (Repo C design note TRY_IT_KEEPS_DATA). Only a digest of the app
+// reaches it.
+func (d *dockerRuntime) keptVolume(keyDigest string) string {
+	return "abcp-tryit-" + d.namespace[:16] + "-" + keyDigest[:24]
+}
 func cleanEnv(s ServiceProfileV1) []string {
 	out := []string{"-i", "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/scratch", "TMPDIR=/scratch"}
 	return append(out, environmentValues(s.Environment)...)
@@ -653,6 +659,40 @@ func (d *dockerRuntime) Start(ctx context.Context, id, path string, p PreviewPro
 		return "", ErrUnavailable
 	}
 	return d.start(ctx, id, path, p, "", "", "", "preview "+id, nil)
+}
+
+// StartKept starts a kept-data preview with its app's volume. It refuses while any container still uses that volume,
+// so two databases never share one.
+func (d *dockerRuntime) StartKept(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest string) (string, error) {
+	if p.Hosted || !p.KeepData || p.dataService() < 0 || !sha256Pattern.MatchString(keyDigest) {
+		return "", ErrUnavailable
+	}
+	volume := d.keptVolume(keyDigest)
+	if used, err := d.volumeInUse(ctx, volume); err != nil || used {
+		return "", ErrUnavailable
+	}
+	return d.start(ctx, id, path, p, volume, "", "", "preview "+id, nil)
+}
+
+// RemoveKept removes an app's kept data volume, refused while a container still uses it. A volume never made is fine.
+func (d *dockerRuntime) RemoveKept(ctx context.Context, keyDigest string) error {
+	if !sha256Pattern.MatchString(keyDigest) {
+		return ErrIntegrity
+	}
+	volume := d.keptVolume(keyDigest)
+	if used, err := d.volumeInUse(ctx, volume); err != nil || used {
+		return ErrUnavailable
+	}
+	return d.removeVolume(ctx, volume)
+}
+
+// volumeInUse tells whether any container, running or not, mounts volume.
+func (d *dockerRuntime) volumeInUse(ctx context.Context, volume string) (bool, error) {
+	raw, err := d.run(ctx, "ps", "-aq", "--filter", "volume="+volume)
+	if err != nil {
+		return false, ErrUnavailable
+	}
+	return strings.TrimSpace(raw) != "", nil
 }
 
 // StartHosted starts a hosted instance with the hosting key's data volume (B9.2.1) and, for a profile that takes

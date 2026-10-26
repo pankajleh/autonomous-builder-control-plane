@@ -53,6 +53,11 @@ type memoryRuntime struct {
 	started, stopped                           []string
 	startErr, reconcileErr, stopErr, healthErr error
 	reconciled                                 bool
+	// keptBy is the preview holding each kept-data key; a second holder is an overlap, which a real Docker volume
+	// shared by two databases must never see.
+	keptBy                   map[string]string
+	keptStarted, keptRemoved []string
+	keptOverlap              bool
 }
 
 func (r *memoryRuntime) Available(PreviewProfileV1) bool {
@@ -75,7 +80,36 @@ func (r *memoryRuntime) Stop(_ context.Context, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stopped = append(r.stopped, id)
+	for key, holder := range r.keptBy {
+		if holder == id {
+			delete(r.keptBy, key)
+		}
+	}
 	return r.stopErr
+}
+func (r *memoryRuntime) StartKept(_ context.Context, id, _ string, _ PreviewProfileV1, key string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.keptBy == nil {
+		r.keptBy = map[string]string{}
+	}
+	if holder, held := r.keptBy[key]; held && holder != id {
+		r.keptOverlap = true
+		return "", ErrUnavailable
+	}
+	r.keptBy[key] = id
+	r.keptStarted = append(r.keptStarted, id)
+	r.started = append(r.started, id)
+	return strings.Repeat("d", 64), r.startErr
+}
+func (r *memoryRuntime) RemoveKept(_ context.Context, key string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, held := r.keptBy[key]; held {
+		return ErrUnavailable
+	}
+	r.keptRemoved = append(r.keptRemoved, key)
+	return nil
 }
 func (r *memoryRuntime) Reconcile(context.Context) error { r.reconciled = true; return r.reconcileErr }
 
@@ -660,5 +694,108 @@ func TestProfileAvailabilityReportsEachProfileAsTheRuntimeProvedIt(t *testing.T)
 	var none *Service
 	if got := none.ProfileAvailability(); len(got) != 0 {
 		t.Fatalf("nil service: %v", got)
+	}
+}
+
+// keptProfile is a web app beside its own database, whose data is kept for the app (Repo C design note
+// TRY_IT_KEEPS_DATA).
+func keptProfile() PreviewProfileV1 {
+	p := testProfile()
+	p.ProfileID, p.KeepData = "kept-v1", true
+	p.Services = append(p.Services, ServiceProfileV1{Name: "db", Image: "local/db@sha256:" + strings.Repeat("f", 64), User: "999:999", StartArgv: []string{"/usr/local/bin/autobuild-postgres", "hosted"}, Environment: map[string]string{}, Port: 5432, DataVolume: true})
+	return p
+}
+func keptServiceAt(t *testing.T, root string, rt *memoryRuntime) *Service {
+	t.Helper()
+	plain, kept := testProfile(), keptProfile()
+	source := Source{RunID: "run-1", CheckpointActivityID: strings.Repeat("b", 64), SHA: strings.Repeat("c", 40), Repository: "/private/repo", RepositoryIdentityDigest: plain.RepositoryIdentityDigest, ProductAuthorizationID: "auth-1", ProductTaskID: "task-1", ProductVersionID: "version-1", ValidationID: strings.Repeat("e", 64)}
+	s, err := newService(context.Background(), root, map[string]PreviewProfileV1{plain.ProfileID: plain, kept.ProfileID: kept}, staticResolver{source: source}, &memoryCheckout{}, rt, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func TestKeptDataPreviewsHoldTheAppsDataOneAtATimeAndForgetRemovesIt(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "previews")
+	rt := &memoryRuntime{available: true, healthy: true}
+	s := keptServiceAt(t, root, rt)
+	c := createCommand("kept-1")
+	c.ProfileID = "kept-v1"
+	first, err := s.CreatePreview(ctx, principal(), testAuthorityDigest, "run-1", c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitPreview(t, s, first.PreviewID, "READY", "HEALTHY")
+
+	// A second Try it of the same app ends the first, and starts only once the first's containers are gone.
+	c.RequestID = "kept-2"
+	second, err := s.CreatePreview(ctx, principal(), testAuthorityDigest, "run-1", c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitPreview(t, s, second.PreviewID, "READY", "HEALTHY")
+	if v, _ := s.ReadPreview(ctx, principal(), "run-1", first.PreviewID); v.Status != "STOPPED" {
+		t.Fatal("the first preview still holds the data", v.Status)
+	}
+	rt.mu.Lock()
+	overlap, started, holder := rt.keptOverlap, len(rt.keptStarted), rt.keptBy[keptKey("task-1")]
+	rt.mu.Unlock()
+	if overlap || started != 2 || holder != second.PreviewID {
+		t.Fatal("kept data shared or not held by the newest preview", overlap, started, holder)
+	}
+
+	// Start fresh: every live preview of the app ends and its data goes, answered with the preview named, ended.
+	forget := serviceapi.PreviewStopRequestV1{SchemaVersion: 1, RequestID: "forget-1", ExpectedRunID: "run-1", ExpectedPreviewID: first.PreviewID, DelegatedActor: c.DelegatedActor}
+	forgot, err := s.ForgetPreviewData(ctx, principal(), testAuthorityDigest, "run-1", first.PreviewID, forget)
+	if err != nil || forgot.Status != "STOPPED" || forgot.PreviewID != first.PreviewID {
+		t.Fatal(forgot, err)
+	}
+	if v, _ := s.ReadPreview(ctx, principal(), "run-1", second.PreviewID); v.Status != "STOPPED" {
+		t.Fatal("Start fresh left a preview running", v.Status)
+	}
+	again, err := s.ForgetPreviewData(ctx, principal(), testAuthorityDigest, "run-1", first.PreviewID, forget)
+	if err != nil || again != forgot {
+		t.Fatal("forget replay changed", err)
+	}
+	rt.mu.Lock()
+	removed := append([]string(nil), rt.keptRemoved...)
+	rt.mu.Unlock()
+	if len(removed) != 1 || removed[0] != keptKey("task-1") {
+		t.Fatal("the app's data was not removed exactly once", removed)
+	}
+	forget.RequestID = c.RequestID
+	if _, err = s.ForgetPreviewData(ctx, principal(), testAuthorityDigest, "run-1", first.PreviewID, forget); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
+		t.Fatal("cross-command conflict", err)
+	}
+	if _, err = s.ForgetPreviewData(ctx, principal(), testAuthorityDigest, "other", first.PreviewID, forget); err == nil {
+		t.Fatal("another run's preview named")
+	}
+
+	// The receipt is valid when the journal is read again.
+	awaitCleanup(t, s)
+	s.Close()
+	reopened := keptServiceAt(t, root, &memoryRuntime{available: true, healthy: true})
+	forget.RequestID = "forget-1"
+	replayed, err := reopened.ForgetPreviewData(ctx, principal(), testAuthorityDigest, "run-1", first.PreviewID, forget)
+	if err != nil || replayed != forgot {
+		t.Fatal("forget receipt lost on restart", replayed, err)
+	}
+}
+
+func TestAPlainPreviewNeverTakesAppData(t *testing.T) {
+	rt := &memoryRuntime{available: true, healthy: true}
+	s := keptServiceAt(t, filepath.Join(t.TempDir(), "previews"), rt)
+	v, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("plain-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitPreview(t, s, v.PreviewID, "READY", "HEALTHY")
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if len(rt.keptStarted) != 0 || len(rt.keptBy) != 0 {
+		t.Fatal("a plain profile started with kept data")
 	}
 }

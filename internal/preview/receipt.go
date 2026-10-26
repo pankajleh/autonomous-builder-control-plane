@@ -46,6 +46,10 @@ func stopReceipt(p serviceapi.Principal, authorityDigest, run, id string, c serv
 	return bindReceipt(commandBinding{owner(p), authorityDigest, "stop", run, id, c.RequestID, c.DelegatedActor, jsonDigest(c)})
 }
 
+func forgetReceipt(p serviceapi.Principal, authorityDigest, run, id string, c serviceapi.PreviewStopRequestV1) receipt {
+	return bindReceipt(commandBinding{owner(p), authorityDigest, "forget-data", run, id, c.RequestID, c.DelegatedActor, jsonDigest(c)})
+}
+
 func bindReceipt(b commandBinding) receipt {
 	return receipt{Key: receiptIdentity(b.Principal, b.RequestID), Digest: jsonDigest(b), Binding: b}
 }
@@ -62,6 +66,6 @@ func (r receipt) valid(v serviceapi.PreviewV1, o ownerIdentity, creating bool) b
 			b.BodyDigest == jsonDigest(c) && v.RequestID == b.RequestID && v.RequestDigest == r.Digest && v.PreviewID == jsonDigest([]string{r.Key, r.Digest})
 	}
 	c := serviceapi.PreviewStopRequestV1{SchemaVersion: 1, RequestID: b.RequestID, ExpectedRunID: b.RunID, ExpectedPreviewID: b.PreviewID, DelegatedActor: b.DelegatedActor}
-	return b.Operation == "stop" && b.PreviewID == v.PreviewID && terminal(v.Status) &&
+	return (b.Operation == "stop" || b.Operation == "forget-data") && b.PreviewID == v.PreviewID && terminal(v.Status) &&
 		serviceapi.ValidatePreviewStopRequestV1(c, b.RunID, b.PreviewID) == nil && b.BodyDigest == jsonDigest(c)
 }

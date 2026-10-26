@@ -285,3 +285,65 @@ func TestHostedProfileProbeWritesItsDataVolumeAndRemovesIt(t *testing.T) {
 		})
 	}
 }
+
+// Repo C design note TRY_IT_KEEPS_DATA: an app's kept Try it data has its own volume, which neither a start nor a
+// removal touches while any container still mounts it.
+func TestKeptDataDockerVolumeIsTheAppsAndNeverShared(t *testing.T) {
+	d := newDocker("/private/previews")
+	key := keptKey("task-1")
+	volume := d.keptVolume(key)
+	if !strings.HasPrefix(volume, "abcp-tryit-"+d.namespace[:16]+"-"+key[:8]) || volume == d.volume(key) {
+		t.Fatalf("kept volume name %s", volume)
+	}
+	id := strings.Repeat("c", 64)
+	path := "/private/previews/sources/" + id
+	called := false
+	d.run = func(context.Context, ...string) (string, error) { called = true; return "", ErrUnavailable }
+	if _, err := d.StartKept(context.Background(), id, path, testProfile(), key); err == nil || called {
+		t.Fatal("a profile without kept data started with the app's volume")
+	}
+	if _, err := d.StartKept(context.Background(), id, path, hostedProfile(), key); err == nil || called {
+		t.Fatal("a hosted profile started with the app's volume")
+	}
+	if _, err := d.StartKept(context.Background(), id, path, keptProfile(), "not-a-digest"); err == nil || called {
+		t.Fatal("a kept start without a key digest was accepted")
+	}
+	if _, err := d.Start(context.Background(), id, path, keptProfile()); err == nil {
+		t.Fatal("a kept-data profile started without its app's volume")
+	}
+
+	var ran [][]string
+	inUse := "0123456789ab\n"
+	d.run = func(_ context.Context, args ...string) (string, error) {
+		ran = append(ran, args)
+		if args[0] == "ps" {
+			return inUse, nil
+		}
+		if args[0] == "volume" && args[1] == "ls" {
+			return volume + "\n", nil
+		}
+		if args[0] == "volume" && args[1] == "inspect" {
+			raw, _ := json.Marshal([]any{map[string]any{"Name": volume, "Driver": "local", "Labels": map[string]string{"abcp.preview.owner": d.namespace, "abcp.hosted.volume": volume}, "Options": map[string]string{}}})
+			return string(raw), nil
+		}
+		return "", nil
+	}
+	if _, err := d.StartKept(context.Background(), id, path, keptProfile(), key); err == nil {
+		t.Fatal("a kept start while another container mounts the volume")
+	}
+	if err := d.RemoveKept(context.Background(), key); err == nil {
+		t.Fatal("a removal while a container mounts the volume")
+	}
+	for _, args := range ran {
+		if args[0] != "ps" || strings.Join(args, " ") != "ps -aq --filter volume="+volume {
+			t.Fatalf("ran %v while the volume was in use", args)
+		}
+	}
+	inUse, ran = "", nil
+	if err := d.RemoveKept(context.Background(), key); err != nil {
+		t.Fatal("removal of a free volume", err)
+	}
+	if last := strings.Join(ran[len(ran)-1], " "); last != "volume rm "+volume {
+		t.Fatalf("removal ran %s", last)
+	}
+}

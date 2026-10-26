@@ -55,6 +55,10 @@ type PreviewProfileV1 struct {
 	// Hosted marks a profile for hosted instances only (B9.2.1): no time limit, a named data volume and restarts by
 	// the controller. Preview requests refuse it; hosted requests refuse any other profile. Omitted when false.
 	Hosted bool `json:"hosted,omitempty"`
+	// KeepData keeps the one data service's volume for the preview's app across its previews (Repo C design note
+	// TRY_IT_KEEPS_DATA): named from the app's product task, not from the preview, started only through StartKept and
+	// removed only by forget-data. Not for hosted profiles, which keep theirs by hosting key. Omitted when false.
+	KeepData bool `json:"keep_data,omitempty"`
 	// Runtime runs every service under another OCI runtime registered with Docker. Only "runsc" (gVisor, Repo C design
 	// note A4 decision 4) is accepted: a second wall between an untrusted app and the host kernel. Empty is Docker's
 	// default runtime. Omitted when empty, so profiles without it keep their digests.
@@ -236,7 +240,10 @@ func (p PreviewProfileV1) Validate() error {
 	volumes := 0
 	for _, s := range p.Services {
 		backup := len(s.BackupArgv) > 0
-		if (s.DataVolume || backup || len(s.RestoreArgv) > 0) && !p.Hosted {
+		if (backup || len(s.RestoreArgv) > 0) && !p.Hosted {
+			return ErrUnavailable
+		}
+		if s.DataVolume && !p.Hosted && !p.KeepData {
 			return ErrUnavailable
 		}
 		if backup != (len(s.RestoreArgv) > 0) || backup && !s.DataVolume {
@@ -249,7 +256,7 @@ func (p PreviewProfileV1) Validate() error {
 			volumes++
 		}
 	}
-	if volumes > 1 {
+	if volumes > 1 || p.KeepData && (p.Hosted || volumes != 1) {
 		return ErrUnavailable
 	}
 	if !validEgress(p) {

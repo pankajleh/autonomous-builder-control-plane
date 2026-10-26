@@ -1282,6 +1282,7 @@ type testPreviewController struct {
 	route             PreviewRouteV1
 	routeRun, routeID string
 	calls             int
+	forgot            int
 	err               error
 }
 
@@ -1304,6 +1305,13 @@ func (p *testPreviewController) CreatePreview(_ context.Context, principal Princ
 }
 func (p *testPreviewController) StopPreview(_ context.Context, principal Principal, authorityDigest, _, _ string, _ PreviewStopRequestV1) (PreviewV1, error) {
 	p.calls++
+	p.principal = principal
+	p.authorityDigest = authorityDigest
+	return p.result, p.err
+}
+func (p *testPreviewController) ForgetPreviewData(_ context.Context, principal Principal, authorityDigest, _, _ string, _ PreviewStopRequestV1) (PreviewV1, error) {
+	p.calls++
+	p.forgot++
 	p.principal = principal
 	p.authorityDigest = authorityDigest
 	return p.result, p.err
@@ -1372,8 +1380,20 @@ func TestPreviewRoutesAreAdditiveStrictAndDelegated(t *testing.T) {
 	body, _ := json.Marshal(stop)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodPost, "/v1/runs/run-1/previews/"+stop.ExpectedPreviewID+"/stop", bytes.NewReader(body)))
-	if w.Code != 202 {
+	if w.Code != 202 || backend.forgot != 0 {
 		t.Fatal(w.Code, w.Body.String())
+	}
+	// Start fresh (Repo C design note TRY_IT_KEEPS_DATA) takes a stop's body on its own path; a GET of it is no route.
+	forget, _ := json.Marshal(PreviewStopRequestV1{SchemaVersion: 1, RequestID: "forget-1", ExpectedRunID: "run-1", ExpectedPreviewID: backend.result.PreviewID, DelegatedActor: c.DelegatedActor})
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodPost, "/v1/runs/run-1/previews/"+stop.ExpectedPreviewID+"/forget-data", bytes.NewReader(forget)))
+	if w.Code != 202 || backend.forgot != 1 {
+		t.Fatal("forget-data", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, authenticatedRequest(http.MethodPost, "/v1/runs/run-1/previews/"+stop.ExpectedPreviewID+"/forget-everything", bytes.NewReader(forget)))
+	if w.Code != 404 || backend.forgot != 1 {
+		t.Fatal("unknown preview action", w.Code, w.Body.String())
 	}
 	backend.available = false
 	backend.err = ErrPreviewUnavailable
