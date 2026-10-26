@@ -22,8 +22,9 @@ from the app's sample data, and what a person had entered there was gone.
   2026-10-26): `SweepKeptData`, run by `abcp serve` 15 minutes after start and then every 6 hours, removes the volume
   of each app whose newest kept-data preview started 90 days ago or more and that has none running, checked again
   under the app's lock; a volume in use or one whose app it cannot name stays. Repo C's archive forgets an app's data
-  at once (P0783). A plain profile never takes the kept path, and the preview controller's cleanup
-  (containers, their anonymous volumes and networks) never removes a named volume.
+  at once (P0783). Live since 2026-10-26 17:46:27 UTC; the first sweep, at 18:01:26, removed nothing (#154). A plain
+  profile never takes the kept path, and the preview controller's cleanup (containers, their anonymous volumes and
+  networks) never removes a named volume.
 
 ## The profile Repo C uses
 
