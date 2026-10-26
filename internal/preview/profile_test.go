@@ -147,3 +147,40 @@ func TestOnlyAPreviewTakesASampleSetupToken(t *testing.T) {
 		t.Fatal("the token reaches the service's environment", got)
 	}
 }
+
+func TestKeptDataProfilesHaveOneVolumeAndAreNotHosted(t *testing.T) {
+	kept := testProfile()
+	kept.ProfileID, kept.KeepData = "kept-v1", true
+	kept.Services = append(kept.Services, ServiceProfileV1{Name: "db", Image: "local/db@sha256:" + strings.Repeat("f", 64), User: "999:999", StartArgv: []string{"/usr/local/bin/autobuild-postgres", "hosted"}, Environment: map[string]string{}, Port: 5432, DataVolume: true})
+	if err := kept.Validate(); err != nil {
+		t.Fatal("a kept-data profile", err)
+	}
+	cases := map[string]func(*PreviewProfileV1){
+		"volume-without-keep-data": func(p *PreviewProfileV1) { p.KeepData = false },
+		"keep-data-without-volume": func(p *PreviewProfileV1) { p.Services[1].DataVolume = false },
+		"keep-data-hosted":         func(p *PreviewProfileV1) { p.Hosted = true },
+		"backup-not-hosted": func(p *PreviewProfileV1) {
+			p.Services[1].BackupArgv = []string{"/usr/bin/pg_dump"}
+			p.Services[1].RestoreArgv = []string{"/usr/bin/pg_restore"}
+		},
+	}
+	for name, change := range cases {
+		p := cloneProfile(kept)
+		change(&p)
+		if p.Validate() == nil {
+			t.Fatal(name)
+		}
+	}
+	// Profiles without it keep their digests: the field is omitted when false.
+	if strings.Contains(string(mustJSON(t, testProfile())), "keep_data") {
+		t.Fatal("keep_data written for a profile without it")
+	}
+}
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}

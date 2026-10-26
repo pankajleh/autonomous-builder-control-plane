@@ -147,6 +147,9 @@ type PreviewController interface {
 	ReadPreview(context.Context, Principal, string, string) (PreviewV1, error)
 	ResolvePreviewRoute(context.Context, Principal, string, string) (PreviewRouteV1, error)
 	StopPreview(context.Context, Principal, string, string, string, PreviewStopRequestV1) (PreviewV1, error)
+	// ForgetPreviewData ends the live previews of that preview's app and removes the app's kept Try it data (Repo C
+	// design note TRY_IT_KEEPS_DATA). Its body is a stop's.
+	ForgetPreviewData(context.Context, Principal, string, string, string, PreviewStopRequestV1) (PreviewV1, error)
 }
 
 type ServerConfig struct {
@@ -1154,7 +1157,7 @@ func (s *Server) runPreviews(w http.ResponseWriter, r *http.Request, principal P
 		bad()
 		return
 	}
-	if len(tail) == 2 && tail[1] != "stop" && tail[1] != "route" {
+	if len(tail) == 2 && tail[1] != "stop" && tail[1] != "route" && tail[1] != "forget-data" {
 		s.writeDependencyError(w, id, ErrDependencyNotFound)
 		return
 	}
@@ -1250,7 +1253,11 @@ func (s *Server) runPreviews(w http.ResponseWriter, r *http.Request, principal P
 			bad()
 			return
 		}
-		result, err = s.reserved.Preview.StopPreview(r.Context(), principal, s.authority.Digest(), run, tail[0], command)
+		if tail[1] == "forget-data" {
+			result, err = s.reserved.Preview.ForgetPreviewData(r.Context(), principal, s.authority.Digest(), run, tail[0], command)
+		} else {
+			result, err = s.reserved.Preview.StopPreview(r.Context(), principal, s.authority.Digest(), run, tail[0], command)
+		}
 	}
 	if err != nil {
 		s.writeDependencyError(w, id, err)

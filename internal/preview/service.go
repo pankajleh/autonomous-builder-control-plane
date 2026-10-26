@@ -21,6 +21,16 @@ type Runtime interface {
 	Stop(context.Context, string) error
 	Reconcile(context.Context) error
 }
+
+// keptRuntime starts a preview with its app's kept data and forgets that data (Repo C design note TRY_IT_KEEPS_DATA).
+type keptRuntime interface {
+	StartKept(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest string) (string, error)
+	RemoveKept(ctx context.Context, keyDigest string) error
+}
+
+// keptKey is the digest that names an app's kept Try it data; only it reaches the runtime.
+func keptKey(task string) string { return jsonDigest([]string{"try-it-data", task}) }
+
 type Service struct {
 	mu                  sync.Mutex
 	store               *store
@@ -31,6 +41,7 @@ type Service struct {
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	workers             map[string]context.CancelFunc
+	keptLocks           map[string]*sync.Mutex
 	wg                  sync.WaitGroup
 	now                 func() time.Time
 	closed, unavailable bool
@@ -77,7 +88,7 @@ func newService(parent context.Context, root string, profiles map[string]Preview
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
-	s := &Service{store: store, profiles: profiles, resolver: resolver, checkout: checkout, runtime: runtime, ctx: ctx, cancel: cancel, workers: map[string]context.CancelFunc{}, now: now}
+	s := &Service{store: store, profiles: profiles, resolver: resolver, checkout: checkout, runtime: runtime, ctx: ctx, cancel: cancel, workers: map[string]context.CancelFunc{}, keptLocks: map[string]*sync.Mutex{}, now: now}
 	// Restart never resumes candidate execution. Reconcile all objects carrying
 	// this private root's namespace, including objects created before a crash.
 	cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -286,7 +297,26 @@ func (s *Service) work(ctx context.Context, id string, source Source, p PreviewP
 		fail()
 		return
 	}
-	route, err := s.runtime.Start(ctx, id, path, p)
+	var route string
+	if p.KeepData {
+		// One preview of an app holds its kept data: the others end, and their containers are gone, first.
+		kept, ok := s.runtime.(keptRuntime)
+		if !ok || source.ProductTaskID == "" {
+			fail()
+			return
+		}
+		lock := s.keptLock(source.ProductTaskID)
+		lock.Lock()
+		if !s.releaseApp(id, source.ProductTaskID, false) || ctx.Err() != nil {
+			lock.Unlock()
+			fail()
+			return
+		}
+		route, err = kept.StartKept(ctx, id, path, p, keptKey(source.ProductTaskID))
+		lock.Unlock()
+	} else {
+		route, err = s.runtime.Start(ctx, id, path, p)
+	}
 	if err != nil || !sha256Pattern.MatchString(route) {
 		fail()
 		return
@@ -471,6 +501,120 @@ func (s *Service) StopPreview(ctx context.Context, p serviceapi.Principal, autho
 		cancel()
 	}
 	return v, nil
+}
+
+// ForgetPreviewData ends every live preview of the app that preview id belongs to and removes the app's kept Try it data
+// (Repo C design note TRY_IT_KEEPS_DATA), so its next kept-data preview starts from an empty database. It answers that
+// preview as it then is, always ended, and replays by request ID as a stop does.
+func (s *Service) ForgetPreviewData(ctx context.Context, p serviceapi.Principal, authorityDigest, run, id string, c serviceapi.PreviewStopRequestV1) (serviceapi.PreviewV1, error) {
+	empty := serviceapi.PreviewV1{}
+	if serviceapi.ValidatePreviewStopRequestV1(c, run, id) != nil || !owner(p).valid() || !sha256Pattern.MatchString(authorityDigest) {
+		return empty, serviceapi.ErrPreviewIneligible
+	}
+	kept, keeps := s.runtime.(keptRuntime)
+	receipt := forgetReceipt(p, authorityDigest, run, id, c)
+	s.mu.Lock()
+	if s.closed || s.store.broken || ctx.Err() != nil {
+		s.mu.Unlock()
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	if v, ok, err := s.replay(receipt.Key, receipt.Digest); ok {
+		s.mu.Unlock()
+		return v, err
+	}
+	v, found := s.store.records[id]
+	if !found || v.RunID != run || s.store.owners[id] != owner(p) {
+		s.mu.Unlock()
+		return empty, serviceapi.ErrDependencyNotFound
+	}
+	task := v.ProductTaskID
+	s.mu.Unlock()
+	if !keeps || task == "" {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	lock := s.keptLock(task)
+	lock.Lock()
+	defer lock.Unlock()
+	if !s.releaseApp("", task, true) {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	removeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	err := kept.RemoveKept(removeCtx, keptKey(task))
+	cancel()
+	if err != nil {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if v, ok, err := s.replay(receipt.Key, receipt.Digest); ok {
+		return v, err
+	}
+	if s.closed || s.store.broken {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	v = s.store.records[id]
+	if !terminal(v.Status) {
+		v = ended(v, "STOPPED", s.now())
+	}
+	receipt.Result = v
+	if s.store.append(v, &receipt) != nil {
+		return empty, serviceapi.ErrPreviewUnavailable
+	}
+	return v, nil
+}
+
+// keptLock serializes, for one app, starting a kept-data preview and forgetting its data.
+func (s *Service) keptLock(task string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.keptLocks[task]
+	if l == nil {
+		l = &sync.Mutex{}
+		s.keptLocks[task] = l
+	}
+	return l
+}
+
+// releaseApp ends the app's live previews but except (only kept-data ones unless all) and waits until each one's
+// worker has stopped its containers, so the app's data volume is free. It reports false when one did not stop in time.
+func (s *Service) releaseApp(except, task string, all bool) bool {
+	s.mu.Lock()
+	var held []string
+	for id, v := range s.store.records {
+		if id == except || terminal(v.Status) || v.ProductTaskID != task || !all && !s.profiles[v.ProfileID].KeepData {
+			continue
+		}
+		if s.store.append(ended(v, "STOPPED", s.now()), nil) != nil {
+			s.unavailable = true
+		}
+		if cancel := s.workers[id]; cancel != nil {
+			cancel()
+		}
+		held = append(held, id)
+	}
+	s.mu.Unlock()
+	deadline := time.Now().Add(60 * time.Second)
+	for _, id := range held {
+		for {
+			s.mu.Lock()
+			_, running := s.workers[id]
+			s.mu.Unlock()
+			if !running {
+				break
+			}
+			if time.Now().After(deadline) {
+				return false
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := s.runtime.Stop(stopCtx, id)
+		cancel()
+		if err != nil {
+			return false
+		}
+	}
+	return true
 }
 func (s *Service) Close() error {
 	if s == nil {
