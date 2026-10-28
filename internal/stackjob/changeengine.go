@@ -124,6 +124,9 @@ type claudeResult struct {
 		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
+	ModelUsage map[string]struct {
+		OutputTokens int64 `json:"outputTokens"`
+	} `json:"modelUsage"`
 }
 
 // Run runs one session in its own process group, ended with the context.
@@ -165,7 +168,15 @@ func parseClaude(data []byte, runErr error) (EngineResult, error) {
 		return EngineResult{}, errors.New("the engine's answer cannot be read")
 	}
 	result := EngineResult{Summary: r.Result, OutputTokens: r.Usage.OutputTokens, CostUSD: r.TotalCostUSD,
-		InputTokens: r.Usage.InputTokens + r.Usage.CacheReadInputTokens + r.Usage.CacheCreationInputTokens}
+		InputTokens:     r.Usage.InputTokens + r.Usage.CacheReadInputTokens + r.Usage.CacheCreationInputTokens,
+		CacheReadTokens: r.Usage.CacheReadInputTokens, CacheWriteTokens: r.Usage.CacheCreationInputTokens}
+	// The model that wrote the most; the names are the engine's, checked before they are kept.
+	var most int64 = -1
+	for name, used := range r.ModelUsage {
+		if modelPattern.MatchString(name) && (used.OutputTokens > most || (used.OutputTokens == most && name < result.Model)) {
+			result.Model, most = name, used.OutputTokens
+		}
+	}
 	if r.IsError && r.Subtype != "error_max_turns" {
 		return result, errors.New("the engine's session failed")
 	}

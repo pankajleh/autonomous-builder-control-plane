@@ -384,6 +384,8 @@ func TestForbiddenPaths(t *testing.T) {
 		".github/workflows/ci.yml": true, ".gitlab-ci.yml": true, "deploy/Jenkinsfile": true, ".env": true, "api/.env.production": true,
 		".env.example": false, "certs/server.pem": true, "config/app.key": true, ".gitmodules": true, ".npmrc": true,
 		"src/app.py": false, "tests/test_env.py": false, "docs/github.md": false, "keys.md": false,
+		"packages/x/.github/workflows/deploy.yml": true, "sub/.husky/pre-commit": true, "sub/.claude/settings.json": true, ".mcp.json": true,
+		"docs/my.github/notes.md": false,
 	} {
 		if forbidden(p) != want {
 			t.Errorf("%s: %v", p, !want)
@@ -397,6 +399,10 @@ func TestTheRunToolSpeaksMCPAndOnlyRunsInTheSandbox(t *testing.T) {
 	socket := filepath.Join(base, "b.sock")
 	box := &fakeSandbox{proveOK: true}
 	box.exec = func(_ context.Context, _, dir string, argv []string, out io.Writer) (int, error) {
+		if argv[2] == "flood" {
+			io.WriteString(out, strings.Repeat(strings.Repeat("\x01", 79)+"\n", 600))
+			return 0, nil
+		}
 		io.WriteString(out, "ran "+dir+" "+argv[2]+"\npassword=hunter2\n")
 		if argv[2] == "false" {
 			return 1, nil
@@ -457,6 +463,16 @@ func TestTheRunToolSpeaksMCPAndOnlyRunsInTheSandbox(t *testing.T) {
 	if out, isErr := text(call(`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run","arguments":{"command":"ls","dir":"/etc"}}}`)); !isErr || !strings.HasPrefix(out, "not run") {
 		t.Fatalf("outside = %q", out)
 	}
+	// Output that grows sixfold when escaped still comes back, and the tool goes on working.
+	if out, _ := text(call(`{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"run","arguments":{"command":"flood"}}}`)); !strings.Contains(out, "exit code 0") {
+		t.Fatalf("flood = %.80q", out)
+	}
+	if out, isErr := text(call(`{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"run","arguments":{"command":"ls","dir":".abcpx"}}}`)); isErr || !strings.Contains(out, "ran /work/.abcpx") {
+		t.Fatalf("after the flood = %q", out)
+	}
+	if out, isErr := text(call(`{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"run","arguments":{"command":"ls","dir":".abcp/x"}}}`)); !isErr || !strings.HasPrefix(out, "not run") {
+		t.Fatalf(".abcp = %q", out)
+	}
 	if reply := call(`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"shell","arguments":{"command":"ls"}}}`); reply["error"] == nil {
 		t.Fatalf("other tool = %v", reply)
 	}
@@ -467,7 +483,7 @@ func TestTheRunToolSpeaksMCPAndOnlyRunsInTheSandbox(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if opens != 1 || len(box.calls) != 2 || b.commands() != 2 {
+	if opens != 1 || len(box.calls) != 4 || b.commands() != 4 {
 		t.Fatalf("opens %d calls %d commands %d", opens, len(box.calls), b.commands())
 	}
 	// Once the job ends nothing more runs.
@@ -499,8 +515,9 @@ func TestClaudeIsRunWithItsToolsListedAndNothingFromTheRepository(t *testing.T) 
 		!strings.Contains(env, "HTTPS_PROXY=http://proxy:3128") {
 		t.Fatalf("env = %s", env)
 	}
-	r, err := parseClaude([]byte(`{"type":"result","subtype":"success","is_error":false,"result":"Fixed it.","total_cost_usd":0.4,"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}`), nil)
-	if err != nil || r.Summary != "Fixed it." || r.InputTokens != 115 || r.OutputTokens != 20 || r.CostUSD != 0.4 {
+	r, err := parseClaude([]byte(`{"type":"result","subtype":"success","is_error":false,"result":"Fixed it.","total_cost_usd":0.4,"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":100,"cache_creation_input_tokens":5},"modelUsage":{"claude-haiku-4-5":{"outputTokens":3},"claude-sonnet-4-6":{"outputTokens":17},"bad name!":{"outputTokens":99}}}`), nil)
+	if err != nil || r.Summary != "Fixed it." || r.InputTokens != 115 || r.CacheReadTokens != 100 || r.CacheWriteTokens != 5 || r.OutputTokens != 20 ||
+		r.CostUSD != 0.4 || r.Model != "claude-sonnet-4-6" {
 		t.Fatalf("parse = %+v %v", r, err)
 	}
 	if _, err := parseClaude([]byte(`{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}`), errors.New("exit 1")); err != nil {

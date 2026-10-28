@@ -63,11 +63,12 @@ type EngineRun struct {
 	MaxTurns                      int
 }
 
-// EngineResult is what a session said and used.
+// EngineResult is what a session said and used: the model that did most of the work and its tokens (input counts the
+// cache's reads and writes too).
 type EngineResult struct {
-	Summary                   string
-	InputTokens, OutputTokens int64
-	CostUSD                   float64
+	Summary, Model                                               string
+	InputTokens, CacheReadTokens, CacheWriteTokens, OutputTokens int64
+	CostUSD                                                      float64
 }
 
 type changeRecord struct {
@@ -412,8 +413,8 @@ func (m *ChangeManager) run(id string) {
 	m.mu.Unlock()
 }
 
-// socket is the job's broker socket: short, since a Unix socket's path is bounded.
-func (m *ChangeManager) socket(id string) string { return filepath.Join(m.root, "s", id[:16]+".sock") }
+// socket is the job's broker socket: 96 bits of the job's id, short since a Unix socket's path is bounded.
+func (m *ChangeManager) socket(id string) string { return filepath.Join(m.root, "s", id[:24]+".sock") }
 
 // stopped answers the end for a job whose context ended.
 func stopped(ctx context.Context) changeEnd {
@@ -602,7 +603,12 @@ func (m *ChangeManager) recordAgent(r *changeRecord, said EngineResult, review b
 			j.Agent.Summary = text
 		}
 		j.Agent.InputTokens += said.InputTokens
+		j.Agent.CacheReadTokens += said.CacheReadTokens
+		j.Agent.CacheWriteTokens += said.CacheWriteTokens
 		j.Agent.OutputTokens += said.OutputTokens
+		if said.Model != "" && (j.Agent.Model == "" || !review) {
+			j.Agent.Model = said.Model
+		}
 		j.Agent.CostUSD += said.CostUSD
 		j.Agent.Commands = commands
 		j.Agent.Seconds = float64(int(took.Seconds()*10)) / 10

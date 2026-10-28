@@ -23,13 +23,15 @@ import (
 // sandbox. The sandbox never sees the socket.
 
 const (
-	brokerCommands   = 200
-	commandTime      = 5 * time.Minute
-	commandTimeMax   = 10 * time.Minute
-	commandChars     = 4000
-	commandOutput    = 32 << 10
-	commandLines     = 400
-	brokerLine       = 16 << 10
+	brokerCommands = 200
+	commandTime    = 5 * time.Minute
+	commandTimeMax = 10 * time.Minute
+	commandChars   = 4000
+	commandOutput  = 32 << 10
+	commandLines   = 400
+	brokerLine     = 16 << 10
+	// answerLine bounds the broker's answer: the output escaped in JSON grows at most sixfold (\u0001 for a control byte).
+	answerLine       = commandOutput*6 + 4<<10
 	toolMessageBytes = 1 << 20
 )
 
@@ -162,7 +164,7 @@ func workPath(dir string) (string, bool) {
 		return "", false
 	}
 	clean := path.Clean(dir)
-	if clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, ".abcp") {
+	if clean == ".." || strings.HasPrefix(clean, "../") || clean == ".abcp" || strings.HasPrefix(clean, ".abcp/") {
 		return "", false
 	}
 	return "/work/" + clean, true
@@ -295,7 +297,7 @@ func ServeStackTool(in io.Reader, out io.Writer, socket string) error {
 		return fmt.Errorf("the job's broker cannot be reached")
 	}
 	defer conn.Close()
-	brokerIn := bufio.NewReaderSize(conn, commandOutput*2)
+	brokerIn := bufio.NewReaderSize(conn, 64<<10)
 	reader := bufio.NewReaderSize(in, 64<<10)
 	writer := bufio.NewWriter(out)
 	reply := func(r rpcReply) error {
@@ -389,7 +391,7 @@ func askBroker(conn net.Conn, in *bufio.Reader, req runRequest) (runAnswer, erro
 	if _, err := conn.Write(append(data, '\n')); err != nil {
 		return runAnswer{}, err
 	}
-	line, err := readLine(in, commandOutput*4)
+	line, err := readLine(in, answerLine)
 	if err != nil {
 		return runAnswer{}, err
 	}

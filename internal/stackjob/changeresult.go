@@ -271,7 +271,9 @@ func makeResult(gitDir, work, tree, home string, kept, tracked map[string]bool) 
 // looser shapes Mask hides (password=…) are left out, since tests carry them legitimately.
 var sureSecrets = secrets[:len(secrets)-2]
 
-// leaks reports text that carries a secret: one of those shapes, or one of the engine's own setting values.
+// leaks reports text that carries a secret: one of those shapes, or one of the engine's own setting values (those of 12
+// characters or more; a binary file's lines are base64 in the patch and are not searched). It is defence in depth: the
+// agent's tools cannot reach those values in the first place.
 func leaks(text []byte, values []string) bool {
 	for _, re := range sureSecrets {
 		if re.Match(text) {
@@ -294,8 +296,9 @@ func forbidden(p string) bool {
 	if i := strings.LastIndex(lower, "/"); i >= 0 {
 		base = lower[i+1:]
 	}
-	for _, prefix := range []string{".github/", ".gitlab/", ".circleci/", ".buildkite/", ".husky/", ".claude/"} {
-		if strings.HasPrefix(lower, prefix) {
+	// These folders, at the top or anywhere below it.
+	for _, dir := range []string{".github/", ".gitlab/", ".circleci/", ".buildkite/", ".husky/", ".claude/"} {
+		if strings.HasPrefix(lower, dir) || strings.Contains(lower, "/"+dir) {
 			return true
 		}
 	}

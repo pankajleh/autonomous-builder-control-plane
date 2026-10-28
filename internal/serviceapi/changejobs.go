@@ -43,15 +43,18 @@ type ChangeJobV1 struct {
 }
 
 // ChangeAgentV1 is what the agent said and used: its summary and its review's, the commands it ran in the sandbox, the
-// tokens and the cost its engine reported, and its time.
+// model and the tokens and cost its engine reported (input counts the cache's reads and writes too), and its time.
 type ChangeAgentV1 struct {
-	Summary      string  `json:"summary,omitempty"`
-	Review       string  `json:"review,omitempty"`
-	Commands     int     `json:"commands"`
-	InputTokens  int64   `json:"input_tokens"`
-	OutputTokens int64   `json:"output_tokens"`
-	CostUSD      float64 `json:"cost_usd"`
-	Seconds      float64 `json:"seconds"`
+	Summary          string  `json:"summary,omitempty"`
+	Review           string  `json:"review,omitempty"`
+	Commands         int     `json:"commands"`
+	Model            string  `json:"model,omitempty"`
+	InputTokens      int64   `json:"input_tokens"`
+	CacheReadTokens  int64   `json:"cache_read_tokens"`
+	CacheWriteTokens int64   `json:"cache_write_tokens"`
+	OutputTokens     int64   `json:"output_tokens"`
+	CostUSD          float64 `json:"cost_usd"`
+	Seconds          float64 `json:"seconds"`
 }
 
 // ChangeResultV1 is the change: the patch's SHA-256, the files it touches (added, modified or deleted) and its lines.
