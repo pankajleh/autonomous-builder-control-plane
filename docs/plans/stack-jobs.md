@@ -1,6 +1,6 @@
 # Stack jobs: a customer's code installed, built and tested in a sandbox
 
-Status: **planned** (F2a). Repo C design note `IMPROVE_EXISTING_PRODUCTS.md` §13 (F2; the owner, 2026-10-26: "All as
+Status: **planned** (F2a); scan jobs added for IX-3 (below). Repo C design note `IMPROVE_EXISTING_PRODUCTS.md` §13 (F2; the owner, 2026-10-26: "All as
 recommended", decision 3: JavaScript and TypeScript, Python and Java first). A person connects code Autobuild did not
 write and asks **Check it builds**: install what it needs, build it, run its own tests, and say what passed. Nothing is
 changed or committed and no model runs. The result is the baseline a change job (F3) starts from.
@@ -115,6 +115,48 @@ their longest tokens.
 - **Masking:** every kept step output, and every answer the change job's run tool gives the agent, has each token
   replaced with `[registry token]`: as given, URL-encoded, fully percent-encoded, base64, and in basic authentication's
   forms. The tokens join the values a change job's leak check looks for (`SECRET_IN_CHANGE`).
+
+## Scan jobs (IX-3)
+
+Repo C design note `SECURITY_AND_COMPLIANCE.md` §11.1 (the owner, 2026-10-28: all four checks together, open-source tools,
+no credits). A scan is a stack job with `"scan": true` in its request; `body_digest` then carries it, so a check's digest
+is what it was and a request ID names either a check or a scan, never both. The job answers `"scan": true`.
+
+- **Configured by** `--stack-osv-root`: a real folder (absolute, clean, not a link) of OSV's vulnerability data, which the
+  build host refreshes. Without it a scan is refused `503 stack_scans_unavailable`; checks are unaffected.
+- **The data:** bound read-only at `/osv` (`--mount type=bind,src=…,dst=/osv,readonly`) in a scan's parts only, never in
+  a check's or a change job's, and never in the probe.
+- **The steps:** **install** as a check's; **build** only for Java, whose classes SpotBugs reads (Python and Node:
+  `SKIPPED`, "not needed to scan"); **test** `SKIPPED` ("a scan runs no tests"); then **scan**: the image's own
+  `/opt/autobuild/scan --part <the part's folder> --index <n> --stack <python|java|node> --out /work/.abcp/scan-<n>.json`,
+  within 10 minutes. A failed install or build does not end a scan's part (the step says "the scan goes on with what
+  was installed"): lockfiles, the code and what was installed are still read. A scanner that exits non-zero fails the
+  part `SCAN_FAILED`; timeouts, the work's size and the sandbox fail it as a check's do.
+- **The result,** read once the part's container has ended, from the part's `scan-<n>.json` under the job's `.abcp`,
+  reached through real folders only and opened without following a link: a regular file of at most 1 MiB, one strict
+  JSON value (no unknown, duplicate or case-aliased fields), schema 1:
+
+  ```json
+  {"schema": 1,
+   "findings": [{"kind": "dependency|secret|code|licence", "tool": "[a-z0-9-]{1,40}", "rule": "…", "severity":
+     "critical|high|medium|low|info|unknown", "file": "relative/path", "line": 12, "package": "…", "version": "…",
+     "fixed": "…", "licence": "…", "ids": ["GHSA-…", "CVE-…"], "title": "…"}],
+   "more": 0,
+   "licences": {"MIT": 40, "UNKNOWN": 2},
+   "checks": {"dependencies": "done", "secrets": "skipped", "code": "failed", "licences": "done"}}
+  ```
+
+  At most 2,000 findings (`more` counts the rest, at most 1,000,000); `rule` at most 120 characters, `file` 300
+  (relative, clean, never above the code), `package` 200, `version`, `fixed` and `licence` 100, `title` 300, at most 10
+  `ids` of `[A-Za-z0-9._:-]{1,60}`, `line` 0 to 10,000,000; no control characters. `licences` maps at most 200 licence
+  names (at most 100 characters; `UNKNOWN` for packages without one) to how many installed packages each covers, 0 to
+  1,000,000; findings of kind `licence` are only the packages to review. `checks` says, for each of the four, `done`,
+  `failed` or `skipped` (secrets are looked for in part 0 only). A secret finding has no field for its value. Every text
+  is masked as a step's output is, with the job's registry tokens. A missing file, or one that breaks any of this, fails
+  the part `SCAN_FAILED` and keeps nothing of it.
+- **The evidence:** the part's `findings`, `findings_more`, `licences` and `checks` (each left out when empty, so a
+  check's parts are unchanged). The file comes from tools run in the customer's own container after their install, so
+  it is their data about their code: kept and shown to them, never executed or followed as instructions.
 
 ## The probe
 

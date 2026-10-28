@@ -131,3 +131,48 @@ func TestAStepRunsWithExactlyItsEnvironmentUnderWork(t *testing.T) {
 		t.Fatal("a closed part ran a step")
 	}
 }
+
+func TestAScanPartBindsTheVulnerabilityDataReadOnlyAndAChecksPartDoesNot(t *testing.T) {
+	d := newDocker("/srv/abcp/previews")
+	id := strings.Repeat("a", 64)
+	check := strings.Join(d.stackCreateArgs(id, stackSpec(), "1000:1000", "/srv/stack/work/j", "/srv/stack/caches/k"), " ")
+	if strings.Contains(check, "/osv") {
+		t.Fatalf("a check binds /osv:\n%s", check)
+	}
+	spec := stackSpec()
+	spec.OSVData = "/srv/osv"
+	scan := strings.Join(d.stackCreateArgs(id, spec, "1000:1000", "/srv/stack/work/j", "/srv/stack/caches/k"), " ")
+	if !strings.Contains(scan, "--mount type=bind,src=/srv/osv,dst=/osv,readonly,bind-propagation=rprivate --runtime=runsc") {
+		t.Fatalf("a scan lacks the read-only /osv bind before the runtime:\n%s", scan)
+	}
+	if !strings.HasSuffix(scan, "-i PATH=/usr/bin:/bin /bin/sleep 1920") {
+		t.Fatalf("the image's command moved:\n%s", scan)
+	}
+}
+
+func TestOpeningAScanRefusesAVulnerabilityFolderThatIsNotARealFolder(t *testing.T) {
+	d := newDocker("/srv/abcp/previews")
+	ran := 0
+	d.run = func(context.Context, ...string) (string, error) { ran++; return "", ErrUnavailable }
+	dir := t.TempDir()
+	if err := os.Symlink(dir, dir+"-link"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/file", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	good := strings.Repeat("a", 64)
+	for _, osv := range []string{"relative/osv", dir + "-link", dir + "/file", dir + "/missing", dir + "/../x", dir + ",dst=/etc"} {
+		spec := stackSpec()
+		spec.OSVData = osv
+		if _, err := d.openStack(context.Background(), good, spec, "/srv/w", "/srv/c"); err == nil {
+			t.Errorf("%q opened", osv)
+		}
+	}
+	if ran != 0 {
+		t.Fatalf("docker ran %d times for refused inputs", ran)
+	}
+	if !stackBindable(dir) {
+		t.Fatalf("a real folder %q is refused", dir)
+	}
+}

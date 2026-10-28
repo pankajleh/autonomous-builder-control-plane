@@ -64,6 +64,8 @@ const (
 	FailTooLarge    = "TOO_LARGE"
 	FailStopped     = "STOPPED"
 	FailSandbox     = "SANDBOX_UNAVAILABLE"
+	// FailScan: a scan's scanner failed, or its result is missing or does not check (SECURITY_AND_COMPLIANCE §11.1).
+	FailScan = "SCAN_FAILED"
 )
 
 const (
@@ -87,6 +89,7 @@ type record struct {
 	BodyDigest string                `json:"body_digest"`
 	Source     string                `json:"source"`
 	CacheKey   string                `json:"cache_key"`
+	Scan       bool                  `json:"scan,omitempty"`
 }
 
 type probe struct {
@@ -117,6 +120,8 @@ type Manager struct {
 
 	// registries are each job's private registries (§15.9), kept here only, never in its record.
 	registries map[string][]serviceapi.RegistryV1
+	// osv is the vulnerability data's folder scans bind read-only at /osv; "" refuses scans.
+	osv string
 }
 
 // New opens the jobs kept under root, marks any left running UNKNOWN, removes what they left, and starts the worker.
@@ -235,8 +240,26 @@ func copyJob(j serviceapi.StackJobV1) serviceapi.StackJobV1 {
 	return out
 }
 
+// EnableScans lets the manager run scan jobs, binding dir (an absolute, clean, real folder: the operator's vulnerability
+// data, --stack-osv-root) read-only at /osv in their parts.
+func (m *Manager) EnableScans(dir string) error {
+	info, err := os.Lstat(dir)
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || err != nil || !info.IsDir() {
+		return serviceapi.ErrStackScansUnavailable
+	}
+	m.mu.Lock()
+	m.osv = dir
+	m.mu.Unlock()
+	return nil
+}
+
 func bodyDigest(r serviceapi.StackJobCreateV1) string {
-	data, _ := json.Marshal(append([]string{r.Source, r.CacheKey}, serviceapi.RegistriesDigestPart(r.Registries)...))
+	fields := append([]string{r.Source, r.CacheKey}, serviceapi.RegistriesDigestPart(r.Registries)...)
+	if r.Scan {
+		// Only a scan says so, so a check's digest, kept with jobs from before scans, is what it was.
+		fields = append(fields, "scan")
+	}
+	data, _ := json.Marshal(fields)
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
@@ -259,6 +282,9 @@ func (m *Manager) StartStackJob(_ context.Context, req serviceapi.StackJobCreate
 	if info, err := os.Lstat(filepath.Join(m.sources, req.Source)); err != nil || !info.IsDir() {
 		return serviceapi.StackJobV1{}, serviceapi.ErrStackJobNotAccepted
 	}
+	if req.Scan && m.osv == "" {
+		return serviceapi.StackJobV1{}, serviceapi.ErrStackScansUnavailable
+	}
 	if len(m.queue) >= maxQueued {
 		return serviceapi.StackJobV1{}, serviceapi.ErrStackJobsBusy
 	}
@@ -266,9 +292,9 @@ func (m *Manager) StartStackJob(_ context.Context, req serviceapi.StackJobCreate
 	if _, err := rand.Read(raw); err != nil {
 		return serviceapi.StackJobV1{}, serviceapi.ErrStackJobsUnavailable
 	}
-	r := &record{BodyDigest: digest, Source: req.Source, CacheKey: req.CacheKey, Job: serviceapi.StackJobV1{
+	r := &record{BodyDigest: digest, Source: req.Source, CacheKey: req.CacheKey, Scan: req.Scan, Job: serviceapi.StackJobV1{
 		SchemaVersion: serviceapi.StackJobSchemaV1, ID: hex.EncodeToString(raw), RequestID: req.RequestID, State: Queued,
-		CreatedAt: m.stamp(), Parts: []serviceapi.StackPartV1{}}}
+		CreatedAt: m.stamp(), Parts: []serviceapi.StackPartV1{}, Scan: req.Scan}}
 	if err := m.save(r); err != nil {
 		return serviceapi.StackJobV1{}, err
 	}
@@ -415,7 +441,7 @@ func (m *Manager) runJob(ctx context.Context, r *record, work string) string {
 		for n, p := range parts {
 			part := serviceapi.StackPartV1{Path: p.Dir, Stack: p.Stack, Found: p.Found, Version: p.Version, VersionNote: p.VersionNote, Tool: p.Tool,
 				Steps: []serviceapi.StackStepV1{}}
-			for _, s := range Steps(p, n) {
+			for _, s := range partSteps(p, n, r.Scan) {
 				part.Steps = append(part.Steps, serviceapi.StackStepV1{Name: s.Name, State: StepWaiting, Command: s.Show})
 			}
 			j.Parts = append(j.Parts, part)
@@ -487,13 +513,30 @@ func (p *prober) proved(ctx context.Context, profile ProfileV1) bool {
 }
 
 // failureOf is the job's code for a step that failed.
-var failureOf = map[string]string{"install": FailInstall, "build": FailBuild, "test": FailTests}
+var failureOf = map[string]string{"install": FailInstall, "build": FailBuild, "test": FailTests, "scan": FailScan}
+
+// partSteps are a part's steps: a check's, or a scan's.
+func partSteps(p Part, n int, scan bool) []Step {
+	if scan {
+		return ScanSteps(p, n)
+	}
+	return Steps(p, n)
+}
 
 func (m *Manager) runPart(ctx context.Context, r *record, n int, p Part, work, cache string, registries []serviceapi.RegistryV1) string {
-	return runSteps(ctx, steps{sandbox: m.sandbox, profiles: m.profiles, probe: m.probe, session: partID(r.Job.ID, n, "part"), registries: registries,
+	x := steps{sandbox: m.sandbox, profiles: m.profiles, probe: m.probe, session: partID(r.Job.ID, n, "part"), registries: registries,
 		set: func(i int, change func(*serviceapi.StackStepV1)) {
 			m.update(r, func(j *serviceapi.StackJobV1) { change(&j.Parts[n].Steps[i]) })
-		}}, n, p, work, cache)
+		}}
+	if r.Scan {
+		m.mu.Lock()
+		x.scan, x.osv = true, m.osv
+		m.mu.Unlock()
+		x.part = func(change func(*serviceapi.StackPartV1)) {
+			m.update(r, func(j *serviceapi.StackJobV1) { change(&j.Parts[n]) })
+		}
+	}
+	return runSteps(ctx, x, n, p, work, cache)
 }
 
 // steps is what runs one part's steps needs: the sandbox, the profiles and their probe, the container's id, and where
@@ -507,6 +550,10 @@ type steps struct {
 	// registries are the job's private registries (§15.9): their names join the part's egress, Maven's settings carry
 	// them, and their tokens are masked in every output kept.
 	registries []serviceapi.RegistryV1
+	// scan runs a scan's steps with the vulnerability data (osv) bound at /osv, and keeps the part's findings with part.
+	scan bool
+	osv  string
+	part func(change func(*serviceapi.StackPartV1))
 }
 
 // runSteps runs one part's steps in a container of its own and answers the part's failure code or "".
@@ -517,6 +564,12 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 	}
 	spec := profile.Spec()
 	spec.Hosts = registryHosts(x.registries)
+	if x.scan {
+		if x.osv == "" || x.part == nil {
+			return FailSandbox
+		}
+		spec.OSVData = x.osv
+	}
 	session, err := x.sandbox.Open(ctx, x.session, spec, work, cache)
 	if err != nil {
 		return FailSandbox
@@ -536,8 +589,8 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 	env := Env(p, profile, session.Proxy())
 	partCtx, cancel := context.WithTimeout(ctx, time.Duration(profile.TimeoutSeconds)*time.Second)
 	defer cancel()
-	failure, counted := "", -1
-	for i, s := range Steps(p, n) {
+	failure, counted, scanned := "", -1, -1
+	for i, s := range partSteps(p, n, x.scan) {
 		set := func(change func(*serviceapi.StackStepV1)) { x.set(i, change) }
 		switch {
 		case s.Skip != "":
@@ -564,8 +617,14 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 		case err != nil:
 			state, failure = Failed, FailSandbox
 		case code == 0:
+			if s.Name == "scan" {
+				scanned = i
+			}
 		case s.NoTests != 0 && code == s.NoTests:
 			state, note = StepSkipped, "no tests were found"
+		case x.scan && (s.Name == "install" || s.Name == "build"):
+			// A scan goes on without a whole install: lockfiles, the code and what was installed are still read.
+			state, note = Failed, "the scan goes on with what was installed"
 		default:
 			state, failure = Failed, failureOf[s.Name]
 		}
@@ -586,8 +645,20 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 			break
 		}
 	}
-	// The tests' reports are read once the part's container has ended, so nothing can change them while they are read.
+	// The tests' reports and a scan's result are read once the part's container has ended, so nothing can change them
+	// while they are read.
 	end()
+	if scanned >= 0 && failure == "" {
+		result, err := ReadScan(work, n, secrets)
+		if err != nil {
+			failure = FailScan
+			x.set(scanned, func(st *serviceapi.StackStepV1) { st.State, st.Note = Failed, "its result could not be read" })
+		} else {
+			x.part(func(part *serviceapi.StackPartV1) {
+				part.Findings, part.FindingsMore, part.Licences, part.Checks = result.Findings, result.More, result.Licences, result.Checks
+			})
+		}
+	}
 	if counted >= 0 {
 		extra := []string{}
 		if p.Stack == StackPython && realFile(work, ".abcp", filepath.Base(pytestReport(n))) {

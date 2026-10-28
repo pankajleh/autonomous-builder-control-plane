@@ -21,6 +21,9 @@ type StackJobCreateV1 struct {
 	CacheKey  string `json:"cache_key"`
 	// Registries are the project's private registries for this job alone (§15.9); never kept on disk.
 	Registries []RegistryV1 `json:"registries,omitempty"`
+	// Scan makes the job a security scan (Repo C design note SECURITY_AND_COMPLIANCE §11.1): each part is installed (and
+	// built, for Java), then scanned by the image's own scanner; no tests run.
+	Scan bool `json:"scan,omitempty"`
 }
 
 // StackJobV1 is one job. State is QUEUED, RUNNING, PASSED, FAILED, STOPPED or UNKNOWN (running when the controller
@@ -35,6 +38,8 @@ type StackJobV1 struct {
 	EndedAt       string        `json:"ended_at,omitempty"`
 	Parts         []StackPartV1 `json:"parts"`
 	Failure       string        `json:"failure,omitempty"`
+	// Scan says the job is a security scan.
+	Scan bool `json:"scan,omitempty"`
 }
 
 // StackPartV1 is one part of the code: its folder ("" for the top), its stack (python, java, node, or unsupported with
@@ -47,6 +52,31 @@ type StackPartV1 struct {
 	VersionNote string        `json:"version_note,omitempty"`
 	Tool        string        `json:"tool,omitempty"`
 	Steps       []StackStepV1 `json:"steps"`
+	// Findings are a scan's findings for the part, checked and masked; FindingsMore counts those past the limit,
+	// Licences how many installed packages each licence covers, and Checks which of the scan's four checks
+	// (dependencies, secrets, code, licences) were done, failed or skipped. A check has none of them.
+	Findings     []StackFindingV1  `json:"findings,omitempty"`
+	FindingsMore int               `json:"findings_more,omitempty"`
+	Licences     map[string]int    `json:"licences,omitempty"`
+	Checks       map[string]string `json:"checks,omitempty"`
+}
+
+// StackFindingV1 is one finding of a scan: its kind (dependency, secret, code or licence), the tool and its rule, the
+// severity, where it is, and for a dependency the package, its version, the version that fixes it, its licence and the
+// advisories' IDs. A secret's value is never part of it.
+type StackFindingV1 struct {
+	Kind     string   `json:"kind"`
+	Tool     string   `json:"tool"`
+	Rule     string   `json:"rule,omitempty"`
+	Severity string   `json:"severity"`
+	File     string   `json:"file,omitempty"`
+	Line     int      `json:"line,omitempty"`
+	Package  string   `json:"package,omitempty"`
+	Version  string   `json:"version,omitempty"`
+	Fixed    string   `json:"fixed,omitempty"`
+	Licence  string   `json:"licence,omitempty"`
+	IDs      []string `json:"ids,omitempty"`
+	Title    string   `json:"title,omitempty"`
 }
 
 // StackStepV1 is one step (install, build or test): PASSED, FAILED, SKIPPED, STOPPED or NOT_RUN, the command shown,
@@ -84,6 +114,8 @@ var (
 	ErrStackJobConflict     = errors.New("stack job request conflicts")
 	ErrStackJobsBusy        = errors.New("stack jobs busy")
 	ErrStackJobsUnavailable = errors.New("stack jobs unavailable")
+	// ErrStackScansUnavailable: scans need the vulnerability data's folder (--stack-osv-root), which is not set.
+	ErrStackScansUnavailable = errors.New("stack scans unavailable")
 )
 
 // maxStackJobBody leaves room for three private registries with their tokens (§15.9).
@@ -170,6 +202,8 @@ func (s *Server) writeStackJobError(w http.ResponseWriter, id string, err error)
 		s.writeError(w, http.StatusNotFound, ErrorV1{Code: "stack_job_not_found", Message: "stack job not found", RequestID: id})
 	case errors.Is(err, ErrStackJobConflict):
 		s.writeError(w, http.StatusConflict, ErrorV1{Code: "stack_job_conflict", Message: "the request ID names another stack job", RequestID: id})
+	case errors.Is(err, ErrStackScansUnavailable):
+		s.writeError(w, http.StatusServiceUnavailable, ErrorV1{Code: "stack_scans_unavailable", Message: "scans are not configured", RequestID: id})
 	case errors.Is(err, ErrStackJobsBusy):
 		s.writeError(w, http.StatusTooManyRequests, ErrorV1{Code: "stack_jobs_busy", Message: "too many stack jobs are waiting", RequestID: id, Retryable: true})
 	default:
