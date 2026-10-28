@@ -26,7 +26,8 @@ Under a new grant, `change.run`:
 
 A job: `{"id", "kind", "state", "phase", "created_at", "started_at", "ended_at", "before": [parts], "after": [parts],
 "agent": {"summary", "review", "commands", "input_tokens", "output_tokens", "cost_usd", "seconds"}, "result": {"patch_sha256",
-"files": [{"path", "status"}], "insertions", "deletions"}, "reason"}`. Parts are stack jobs' parts. `state` is `QUEUED`,
+"files": [{"path", "status"}], "insertions", "deletions"}, "proof": {"state", "files", "tests", "note"}, "reason"}`; a test
+step may carry `"coverage": {"covered", "total", "tool"}`. Parts are stack jobs' parts. `state` is `QUEUED`,
 `RUNNING` (with `phase` `BASELINE`, `AGENT`, `REVIEW`, `CHECKING`, `RESULT`), `HANDED_BACK`, `NOT_HANDED_BACK`, `FAILED`,
 `STOPPED` or `UNKNOWN`. `reason`:
 
@@ -58,10 +59,23 @@ A job: `{"id", "kind", "state", "phase", "created_at", "started_at", "ended_at",
      200 commands, a fresh container when one could end first) and answers its exit code and its last output, masked;
    - its prompt: the kind's rules, the person's words, the baseline, the limits. A second, shorter session reviews the
      diff against the words and may correct it.
-4. **After:** each part's steps again, recorded in `after`. Handed back only when no worse than before.
-5. **The result:** the changed files copied out as the source was (regular files only, dependency and build folders left
+4. **A fix's tests on the code before it** (Repo C design note `FIX_AND_TEST.md` §3): the change's added or changed test
+   files, by the stack's own conventions (`testFile`: Python's `test_*.py`, `*_test.py`, `conftest.py` and `tests/`;
+   Java's `src/test/`; Node's `*.test.*`, `*.spec.*`, `__tests__/`, `test/`), copied onto the source again in a folder of
+   their own, installed from the cache and tested in a fresh sandbox, as the baseline was. `proof` says `FAILED_BEFORE`,
+   `PASSED_BEFORE`, `NO_TEST` or `NOT_RUN` (with why), with the files and the counts. Shown, never required; the phase
+   stays `CHECKING`, which Repo C reads.
+5. **After:** each part's steps again, recorded in `after`. Handed back only when no worse than before.
+6. **Coverage, for a test job** (`FIX_AND_TEST.md` §4): its baseline and its checks after run the tests with the stack's
+   coverage tool from the image (`/opt/autobuild/coverage`: coverage.py, JaCoCo's agent through `JAVA_TOOL_OPTIONS`, V8's
+   own coverage read by c8) and keep the image report's answer on the test step as `coverage`: the project's lines run,
+   its lines in all, the tool. What a run before left is removed first; the tests' exit code is kept; an image without the
+   tools runs the tests as they are, and a run that left nothing to read has no `coverage`.
+7. **Node's counts** (`FIX_AND_TEST.md` §5): when a Node part writes no JUnit report, its counts come from the summary
+   its runner printed (Jest, Vitest, Node's own, Mocha); none when the output matches none of them, or more than one.
+8. **The result:** the changed files copied out as the source was (regular files only, dependency and build folders left
    out), committed with Git objects only, and diffed against `start`: the patch, its digest and its files.
-6. **Limits:** at most two jobs at once and one per cache key; 90 minutes a job; the folder, the socket and the agent's
+9. **Limits:** at most two jobs at once and one per cache key; 90 minutes a job; the folder, the socket and the agent's
    home deleted when it ends. Caches are the change root's own, apart from stack jobs'.
 
 ## Settings

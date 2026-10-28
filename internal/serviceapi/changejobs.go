@@ -41,7 +41,19 @@ type ChangeJobV1 struct {
 	After         []StackPartV1   `json:"after"`
 	Agent         *ChangeAgentV1  `json:"agent,omitempty"`
 	Result        *ChangeResultV1 `json:"result,omitempty"`
+	Proof         *ChangeProofV1  `json:"proof,omitempty"`
 	Reason        string          `json:"reason,omitempty"`
+}
+
+// ChangeProofV1 is a fix's new tests run on the code as it was before the change (Repo C design note FIX_AND_TEST §3):
+// FAILED_BEFORE (they fail there, so they show what was fixed), PASSED_BEFORE (they pass there too), NO_TEST (the change
+// touched no test file) or NOT_RUN (the project's tests do not run, with why); the test files and the counts on the
+// code before. It is shown, never required.
+type ChangeProofV1 struct {
+	State string        `json:"state"`
+	Files []string      `json:"files"`
+	Tests *StackTestsV1 `json:"tests,omitempty"`
+	Note  string        `json:"note,omitempty"`
 }
 
 // ChangeAgentV1 is what the agent said and used: its summary and its review's, the commands it ran in the sandbox, the

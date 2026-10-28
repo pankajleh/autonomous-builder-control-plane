@@ -565,6 +565,17 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 		return changeEnd{ChangeNotHandedBack, ReasonSecret}
 	}
 
+	// A fix's new tests on the code as it was before the change (FIX_AND_TEST §3): shown, never required. It is a check, so
+	// the phase says so; the product reads no other phase yet.
+	if r.Job.Kind == "fix" {
+		m.update(r, func(j *serviceapi.ChangeJobV1) { j.Phase = PhaseChecking })
+		proof, f := m.prove(ctx, r, parts[agentPart], agentPart, before[agentPart], result, work, filepath.Join(dir, "proof"), cache, registries)
+		if f == FailStopped || ctx.Err() != nil {
+			return stopped(ctx)
+		}
+		m.update(r, func(j *serviceapi.ChangeJobV1) { j.Proof = proof })
+	}
+
 	// The checks after, on the changed files.
 	m.update(r, func(j *serviceapi.ChangeJobV1) { j.Phase, j.After = PhaseChecking, planParts(parts) })
 	if f := m.check(ctx, r, parts, work, cache, "after", registries); f == FailStopped || f == FailSandbox {
@@ -668,6 +679,7 @@ func (m *ChangeManager) check(ctx context.Context, r *changeRecord, parts []Part
 		}
 		n := n
 		f := runSteps(ctx, steps{sandbox: m.sandbox, profiles: m.profiles, probe: m.probe, session: partID(r.Job.ID, n, which), registries: registries,
+			measure: r.Job.Kind == "tests",
 			set: func(i int, change func(*serviceapi.StackStepV1)) {
 				m.update(r, func(j *serviceapi.ChangeJobV1) {
 					if which == "before" {
@@ -685,3 +697,65 @@ func (m *ChangeManager) check(ctx context.Context, r *changeRecord, parts []Part
 }
 
 var _ serviceapi.ChangeJobController = (*ChangeManager)(nil)
+
+// prove runs a fix's added or changed test files on the code as it was before the change (FIX_AND_TEST §3): the job's
+// source again, with only those files from the change, installed from the project's cache and tested in a fresh sandbox
+// as the baseline was. It answers what that showed, and FailStopped when the job was stopped meanwhile.
+func (m *ChangeManager) prove(ctx context.Context, r *changeRecord, p Part, n int, base serviceapi.StackPartV1, result *serviceapi.ChangeResultV1,
+	work, folder, cache string, registries []serviceapi.RegistryV1) (*serviceapi.ChangeProofV1, string) {
+	files, deleted := []string{}, map[string]bool{}
+	for _, f := range result.Files {
+		if testFile(p, f.Path) {
+			files = append(files, f.Path)
+			deleted[f.Path] = f.Status == "deleted"
+		}
+	}
+	if len(files) == 0 {
+		return &serviceapi.ChangeProofV1{State: ProofNoTest, Files: files}, ""
+	}
+	notRun := func(note string) (*serviceapi.ChangeProofV1, string) {
+		return &serviceapi.ChangeProofV1{State: ProofNotRun, Files: files, Note: note}, ""
+	}
+	plan := Steps(p, n)
+	if len(plan) == 0 || plan[len(plan)-1].Name != "test" || plan[len(plan)-1].Skip != "" {
+		return notRun("the project has no tests to run")
+	}
+	if bt, ok := step(base, "test"); !ok || (bt.State != Passed && bt.State != Failed && bt.State != StepSkipped) {
+		return notRun("the tests did not run before the change")
+	}
+	defer os.RemoveAll(folder)
+	if copySource(filepath.Join(m.sources, r.Source), folder) != nil {
+		return notRun("the code before the change could not be read")
+	}
+	for _, f := range files {
+		target := filepath.Join(folder, filepath.FromSlash(f))
+		if deleted[f] {
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return notRun("the code before the change could not be prepared")
+			}
+			continue
+		}
+		names := strings.Split(f, "/")
+		data, readable := readReport(filepath.Join(work, filepath.FromSlash(f)), maxProofFile)
+		dir, err := realDirs(folder, names[:len(names)-1]...)
+		if !realFile(work, names...) || !readable || err != nil || writeReal(dir, names[len(names)-1], data) != nil {
+			return notRun("the code before the change could not be prepared")
+		}
+	}
+	if os.MkdirAll(filepath.Join(folder, ".abcp"), 0o755) != nil {
+		return notRun("the code before the change could not be prepared")
+	}
+	part := serviceapi.StackPartV1{Steps: []serviceapi.StackStepV1{}}
+	for _, s := range plan {
+		part.Steps = append(part.Steps, serviceapi.StackStepV1{Name: s.Name, State: StepWaiting, Command: s.Show})
+	}
+	f := runSteps(ctx, steps{sandbox: m.sandbox, profiles: m.profiles, probe: m.probe, session: partID(r.Job.ID, n, "proof"), registries: registries,
+		set: func(i int, change func(*serviceapi.StackStepV1)) { change(&part.Steps[i]) }}, n, p, folder, cache)
+	if f == FailStopped || ctx.Err() != nil {
+		return nil, FailStopped
+	}
+	pt, _ := step(part, "test")
+	bt, _ := step(base, "test")
+	state, note := proofState(bt, pt)
+	return &serviceapi.ChangeProofV1{State: state, Files: files, Tests: pt.Tests, Note: note}, ""
+}

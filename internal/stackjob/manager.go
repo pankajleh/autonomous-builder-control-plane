@@ -441,7 +441,7 @@ func (m *Manager) runJob(ctx context.Context, r *record, work string) string {
 		for n, p := range parts {
 			part := serviceapi.StackPartV1{Path: p.Dir, Stack: p.Stack, Found: p.Found, Version: p.Version, VersionNote: p.VersionNote, Tool: p.Tool,
 				Steps: []serviceapi.StackStepV1{}}
-			for _, s := range partSteps(p, n, r.Scan) {
+			for _, s := range partSteps(p, n, r.Scan, false) {
 				part.Steps = append(part.Steps, serviceapi.StackStepV1{Name: s.Name, State: StepWaiting, Command: s.Show})
 			}
 			j.Parts = append(j.Parts, part)
@@ -516,11 +516,17 @@ func (p *prober) proved(ctx context.Context, profile ProfileV1) bool {
 var failureOf = map[string]string{"install": FailInstall, "build": FailBuild, "test": FailTests, "scan": FailScan}
 
 // partSteps are a part's steps: a check's, or a scan's.
-func partSteps(p Part, n int, scan bool) []Step {
+func partSteps(p Part, n int, scan, measure bool) []Step {
 	if scan {
 		return ScanSteps(p, n)
 	}
-	return Steps(p, n)
+	s := Steps(p, n)
+	if measure {
+		for i := range s {
+			s[i] = Measured(p, n, s[i])
+		}
+	}
+	return s
 }
 
 func (m *Manager) runPart(ctx context.Context, r *record, n int, p Part, work, cache string, registries []serviceapi.RegistryV1) string {
@@ -554,6 +560,9 @@ type steps struct {
 	scan bool
 	osv  string
 	part func(change func(*serviceapi.StackPartV1))
+	// measure runs the tests with the stack's coverage tool and keeps the project's line coverage on the test step (Repo C
+	// design note FIX_AND_TEST §4), for a change job's tests.
+	measure bool
 }
 
 // runSteps runs one part's steps in a container of its own and answers the part's failure code or "".
@@ -589,8 +598,8 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 	env := Env(p, profile, session.Proxy())
 	partCtx, cancel := context.WithTimeout(ctx, time.Duration(profile.TimeoutSeconds)*time.Second)
 	defer cancel()
-	failure, counted, scanned := "", -1, -1
-	for i, s := range partSteps(p, n, x.scan) {
+	failure, counted, scanned, countedOutput := "", -1, -1, ""
+	for i, s := range partSteps(p, n, x.scan, x.measure) {
 		set := func(change func(*serviceapi.StackStepV1)) { x.set(i, change) }
 		switch {
 		case s.Skip != "":
@@ -629,7 +638,7 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 			state, failure = Failed, failureOf[s.Name]
 		}
 		if s.JUnit && state != Stopped {
-			counted = i
+			counted, countedOutput = i, out.Lines(outputLines)
 		}
 		if failure == "" && folderSize(work, profile.WorkBytes) > profile.WorkBytes {
 			state, failure, note = Failed, FailTooLarge, "the code grew past what a check may write"
@@ -665,9 +674,19 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 		if p.Stack == StackPython && realFile(work, ".abcp", filepath.Base(pytestReport(n))) {
 			extra = append(extra, filepath.Join(work, ".abcp", filepath.Base(pytestReport(n))))
 		}
-		if passed, failed, skipped, ok := Counts(filepath.Join(work, filepath.FromSlash(p.Dir)), extra...); ok {
+		passed, failed, skipped, ok := Counts(filepath.Join(work, filepath.FromSlash(p.Dir)), extra...)
+		if !ok && p.Stack == StackNode {
+			// A Node project seldom writes JUnit; its runner's own summary says the same (FIX_AND_TEST §5).
+			passed, failed, skipped, ok = RunnerCounts(countedOutput)
+		}
+		if ok {
 			tests := &serviceapi.StackTestsV1{Passed: passed, Failed: failed, Skipped: skipped}
 			x.set(counted, func(st *serviceapi.StackStepV1) { st.Tests = tests })
+		}
+		if x.measure {
+			if coverage := ReadCoverage(work, n); coverage != nil {
+				x.set(counted, func(st *serviceapi.StackStepV1) { st.Coverage = coverage })
+			}
 		}
 	}
 	return failure

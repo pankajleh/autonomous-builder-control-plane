@@ -88,23 +88,33 @@ type StackFindingV1 struct {
 }
 
 // StackStepV1 is one step (install, build or test): PASSED, FAILED, SKIPPED, STOPPED or NOT_RUN, the command shown,
-// its time, its exit code, the last lines it printed (masked) and the tests' counts when the tools reported them.
+// its time, its exit code, the last lines it printed (masked), the tests' counts when the tools reported them, and the
+// project's line coverage when a change job measured it.
 type StackStepV1 struct {
-	Name       string        `json:"name"`
-	State      string        `json:"state"`
-	Command    string        `json:"command,omitempty"`
-	Note       string        `json:"note,omitempty"`
-	Seconds    float64       `json:"seconds"`
-	ExitCode   *int          `json:"exit_code,omitempty"`
-	OutputTail string        `json:"output_tail,omitempty"`
-	Tests      *StackTestsV1 `json:"tests,omitempty"`
+	Name       string           `json:"name"`
+	State      string           `json:"state"`
+	Command    string           `json:"command,omitempty"`
+	Note       string           `json:"note,omitempty"`
+	Seconds    float64          `json:"seconds"`
+	ExitCode   *int             `json:"exit_code,omitempty"`
+	OutputTail string           `json:"output_tail,omitempty"`
+	Tests      *StackTestsV1    `json:"tests,omitempty"`
+	Coverage   *StackCoverageV1 `json:"coverage,omitempty"`
 }
 
-// StackTestsV1 counts the tests the tools reported in JUnit form.
+// StackTestsV1 counts the tests the tools reported in JUnit form, or a Node test runner in its own summary.
 type StackTestsV1 struct {
 	Passed  int `json:"passed"`
 	Failed  int `json:"failed"`
 	Skipped int `json:"skipped"`
+}
+
+// StackCoverageV1 is a measured test step's line coverage (Repo C design note FIX_AND_TEST §4): the project's own lines
+// the tests ran, its lines in all, and the tool that measured them with its version.
+type StackCoverageV1 struct {
+	Covered int    `json:"covered"`
+	Total   int    `json:"total"`
+	Tool    string `json:"tool"`
 }
 
 const StackJobSchemaV1 = "StackJobV1"

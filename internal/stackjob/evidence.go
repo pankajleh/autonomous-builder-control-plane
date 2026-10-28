@@ -2,6 +2,7 @@ package stackjob
 
 import (
 	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"io"
 	"io/fs"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
 // tail keeps the last bytes written to it, for a step's output.
@@ -189,4 +192,114 @@ func readReport(path string, left int) ([]byte, bool) {
 		return nil, false
 	}
 	return data, true
+}
+
+// ansiCodes are a terminal's colours, which a runner may print even without a terminal.
+var ansiCodes = regexp.MustCompile("\x1b\\[[0-9;]*[A-Za-z]")
+
+// The summaries four Node test runners print at their end (Repo C design note FIX_AND_TEST §5): Jest's "Tests: 1 failed,
+// 40 passed, 41 total", Vitest's "Tests  1 failed | 40 passed (41)", Node's own "# pass 40" (TAP, as without a terminal)
+// or "ℹ pass 40", and Mocha's "40 passing".
+var (
+	jestSummary   = regexp.MustCompile(`^Tests:\s+((?:\d+ [a-z]+, )*\d+ total)$`)
+	vitestSummary = regexp.MustCompile(`^Tests\s+(\d+ [a-z]+(?: \| \d+ [a-z]+)*) \(\d+\)$`)
+	nodeLine      = regexp.MustCompile(`^(?:#|ℹ) (pass|fail|cancelled|skipped|todo) (\d+)$`)
+	mochaLine     = regexp.MustCompile(`^(\d+) (passing|failing|pending)(?: \(\S+\))?$`)
+	countWord     = regexp.MustCompile(`(\d+) ([a-z]+)`)
+)
+
+// RunnerCounts reads the tests' counts from what a Node test runner printed at its end, for a project that writes no JUnit
+// report. Output that matches none of the four runners, or more than one, gives none: nothing is guessed.
+func RunnerCounts(output string) (passed, failed, skipped int, ok bool) {
+	type counts struct{ passed, failed, skipped int }
+	found := map[string]*counts{}
+	add := func(c *counts, word string, n int) {
+		switch word {
+		case "passed", "pass", "passing":
+			c.passed = n
+		case "failed", "fail", "failing":
+			c.failed = n
+		case "cancelled":
+			c.failed += n
+		case "skipped", "pending", "todo":
+			c.skipped += n
+		}
+	}
+	runner := func(name string, fresh bool) *counts {
+		if fresh || found[name] == nil {
+			found[name] = &counts{}
+		}
+		return found[name]
+	}
+	number := func(s string) (int, bool) {
+		n, err := strconv.Atoi(s)
+		return n, err == nil && n >= 0 && n < 10_000_000
+	}
+	inNode, inMocha := false, false
+	for _, line := range strings.Split(ansiCodes.ReplaceAllString(output, ""), "\n") {
+		line = strings.TrimSpace(line)
+		if m := jestSummary.FindStringSubmatch(line); m != nil {
+			c := runner("jest", true)
+			for _, w := range countWord.FindAllStringSubmatch(m[1], -1) {
+				if n, good := number(w[1]); good {
+					add(c, w[2], n)
+				}
+			}
+			continue
+		}
+		if m := vitestSummary.FindStringSubmatch(line); m != nil {
+			c := runner("vitest", true)
+			for _, w := range countWord.FindAllStringSubmatch(m[1], -1) {
+				if n, good := number(w[1]); good {
+					add(c, w[2], n)
+				}
+			}
+			continue
+		}
+		if m := nodeLine.FindStringSubmatch(line); m != nil {
+			if n, good := number(m[2]); good {
+				// A summary's first line starts it afresh: a second run of the runner is counted, not added to the first.
+				c := runner("node", m[1] == "pass" || !inNode)
+				inNode = true
+				add(c, m[1], n)
+			}
+			continue
+		}
+		if m := mochaLine.FindStringSubmatch(line); m != nil {
+			if n, good := number(m[1]); good {
+				c := runner("mocha", m[2] == "passing" || !inMocha)
+				inMocha = true
+				add(c, m[2], n)
+			}
+			continue
+		}
+	}
+	if len(found) != 1 {
+		return 0, 0, 0, false
+	}
+	for _, c := range found {
+		return c.passed, c.failed, c.skipped, true
+	}
+	return 0, 0, 0, false
+}
+
+// coverageTool is a coverage report's tool and its version, as the images write it: "coverage.py 7.16.2".
+var coverageTool = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9.]{0,30} [0-9][0-9A-Za-z.+-]{0,30}$`)
+
+// ReadCoverage reads what the image's coverage report answered for part n (coverageResult): the project's lines the tests
+// ran, its lines in all and the tool; nil when the run could not be measured.
+func ReadCoverage(work string, n int) *serviceapi.StackCoverageV1 {
+	data, readable := readReport(filepath.Join(work, ".abcp", filepath.Base(coverageResult(n))), 64<<10)
+	if !readable {
+		return nil
+	}
+	var c struct {
+		Tool    string `json:"tool"`
+		Covered int    `json:"covered"`
+		Total   int    `json:"total"`
+	}
+	if json.Unmarshal(data, &c) != nil || c.Total <= 0 || c.Total > 100_000_000 || c.Covered < 0 || c.Covered > c.Total || !coverageTool.MatchString(c.Tool) {
+		return nil
+	}
+	return &serviceapi.StackCoverageV1{Covered: c.Covered, Total: c.Total, Tool: c.Tool}
 }
