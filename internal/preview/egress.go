@@ -72,12 +72,40 @@ func (r AppRelay) Valid() bool {
 // shopifyStore is one DNS label under myshopify.com, as Shopify names stores.
 var shopifyStore = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.myshopify\.com$`)
 
-// egressAllowed reports whether rules allow a tunnel to host:port. The only rule v1 knows is EgressShopifyStores.
+// Package registries a stack job may fetch from (docs/plans/stack-jobs.md; Repo C IMPROVE_EXISTING_PRODUCTS §13.3), each
+// an exact list of names on port 443. Only stack profiles name them; validEgress refuses them on a preview profile.
+const (
+	EgressPyPI         = "pypi"
+	EgressMavenCentral = "maven-central"
+	EgressGradle       = "gradle"
+	EgressNpm          = "npm"
+)
+
+var registryHosts = map[string][]string{
+	EgressPyPI:         {"pypi.org", "files.pythonhosted.org"},
+	EgressMavenCentral: {"repo.maven.apache.org", "repo1.maven.org"},
+	EgressGradle:       {"services.gradle.org", "downloads.gradle.org", "plugins.gradle.org", "plugins-artifacts.gradle.org"},
+	EgressNpm:          {"registry.npmjs.org", "registry.yarnpkg.com", "repo.yarnpkg.com"},
+}
+
+// RegistryRule reports whether rule is one of the package registries' entries.
+func RegistryRule(rule string) bool {
+	_, ok := registryHosts[rule]
+	return ok
+}
+
+// RegistryHosts are the names rule lets through, or none.
+func RegistryHosts(rule string) []string { return slices.Clone(registryHosts[rule]) }
+
+// egressAllowed reports whether rules allow a tunnel to host:port: EgressShopifyStores, and the package registries.
 func egressAllowed(rules []string, host, port string) bool {
 	host = strings.ToLower(host)
 	if _, err := netip.ParseAddr(host); err != nil && port == "443" {
 		for _, rule := range rules {
 			if rule == EgressShopifyStores && shopifyStore.MatchString(host) {
+				return true
+			}
+			if slices.Contains(registryHosts[rule], host) {
 				return true
 			}
 		}

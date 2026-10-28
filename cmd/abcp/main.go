@@ -38,6 +38,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi/platformbridge"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/stackjob"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/timeline"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/workflowauthoritypg"
@@ -803,6 +804,9 @@ func serveCommand(args []string, stderr io.Writer) int {
 	evictionMaxAge := flags.Duration("worktree-eviction-max-age", eviction.DefaultMaxAge, "evict a finished run's worktree this long after it finished (0 disables the rule)")
 	evictionQuota := flags.Int64("worktree-eviction-quota-bytes", eviction.DefaultQuotaBytes, "per-repository retained worktree quota; least recently used evicted first (0 disables the rule)")
 	parallelRuns := flags.Int("parallel-runs", 1, "how many admitted runs of a repository may execute at once (1 to 8)")
+	stackProfilesFile := flags.String("stack-profiles-file", "", "optional protected stack profile file (stack jobs, docs/plans/stack-jobs.md)")
+	stackSourceRoot := flags.String("stack-source-root", "", "folder where Repo C leaves the code a stack job checks")
+	stackRoot := flags.String("stack-root", "", "private folder (mode 0700) for stack jobs: their records, work and dependency caches")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -811,7 +815,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
@@ -1012,6 +1016,21 @@ func serveCommand(args []string, stderr io.Writer) int {
 		go watch.Run(ctx, sources...)
 		appHealth = watch
 	}
+	// Stack jobs (docs/plans/stack-jobs.md) run on the preview runtime's sandbox; without all three settings, or with a
+	// profile file that does not check, the route says they are not configured and the rest of the service runs.
+	var stackJobs serviceapi.StackJobController
+	if *stackProfilesFile != "" || *stackSourceRoot != "" || *stackRoot != "" {
+		profiles, err := stackjob.LoadProfiles(*stackProfilesFile)
+		if err != nil {
+			fmt.Fprintln(stderr, "stack jobs unavailable: their profiles do not check")
+		} else if manager, err := stackjob.New(*stackRoot, *stackSourceRoot, profiles, stackjob.PreviewSandbox{Service: previewService}, time.Now); err != nil {
+			fmt.Fprintln(stderr, "stack jobs unavailable")
+		} else {
+			defer manager.Close()
+			stackJobs = manager
+			fmt.Fprintf(stderr, "abcp stack jobs profiles=%d\n", len(profiles.Profiles))
+		}
+	}
 	// Only a controller with its profiles answers GET /v1/engines; without one the route says it is unsupported.
 	var engines serviceapi.EngineCatalog
 	if admissions != nil {
@@ -1026,7 +1045,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
 		RunAdmission: admissions, DevelopmentRunAdmission: admissions, Engines: engines, AccountLanes: accountLanes, Targets: targets,
-		Deployments: deployments, AppHealth: appHealth,
+		Deployments: deployments, AppHealth: appHealth, StackJobs: stackJobs,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "construct service API")

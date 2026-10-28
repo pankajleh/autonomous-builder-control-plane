@@ -31,6 +31,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
   - account lanes: an administrator's own Codex or Claude account, signed in and out through `/v1/account-lanes` (Codex device sign-in; a Claude setup token kept only here) (#88, live since 2026-10-13 07:02 UTC, recorded in #89);
   - a preview's sample setup token: a preview profile may name `BOOTSTRAP_TOKEN` with a sample value, a hosted one never (#81, live since 2026-10-11 03:30 UTC);
   - a provider replay gap no longer makes a run impossible to preview (#82).
+  - stack jobs: a customer's code installed, built and tested in the preview runtime's sandbox, reaching only its package registries (#155; `docs/plans/stack-jobs.md`; not yet live).
 - The post-EP-006 A/B/C assurance expansion remains discarded and is not part of current runtime authority.
 - Repo C is the product/UX authority. ABCP owns execution admission, the authoritative run lifecycle, projections, evidence and actions, provider coordination after admission, activity normalization and preview runtime.
 - Repo A / Dev-Agent and Ralphex remain execution/provider mechanisms beneath ABCP; Repo C does not call them directly.
