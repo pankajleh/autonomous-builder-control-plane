@@ -185,6 +185,8 @@ type ServerConfig struct {
 	AppHealth AppHealthFeed
 	// StackJobs, when set, answers /v1/stack-jobs (docs/plans/stack-jobs.md) for a service principal granted stack.run.
 	StackJobs StackJobController
+	// ChangeJobs, when set, answers /v1/change-jobs (docs/plans/change-jobs.md) for a service principal granted change.run.
+	ChangeJobs ChangeJobController
 	// RequestLog, when set, gets one line per request with its X-Request-ID (Repo C design note REQUEST_IDS.md).
 	RequestLog io.Writer
 }
@@ -411,9 +413,15 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.repositoryWorktreeRelease(writer, request, principal, requestID)
 	case "/v1/stack-jobs":
 		s.stackJobs(writer, request, principal, requestID)
+	case "/v1/change-jobs":
+		s.changeJobs(writer, request, principal, requestID)
 	default:
 		if strings.HasPrefix(request.URL.Path, "/v1/stack-jobs/") {
 			s.stackJobs(writer, request, principal, requestID)
+			return
+		}
+		if strings.HasPrefix(request.URL.Path, "/v1/change-jobs/") {
+			s.changeJobs(writer, request, principal, requestID)
 			return
 		}
 		if strings.HasPrefix(request.URL.Path, "/v1/hosted/") {

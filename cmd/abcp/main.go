@@ -92,6 +92,17 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		return runCommand(args[1:], stdout, stderr)
 	case "serve":
 		return serveCommand(args[1:], stderr)
+	case "stack-tool":
+		// The change jobs' run tool (docs/plans/change-jobs.md): an MCP server over stdio for the agent.
+		if len(args) != 3 || args[1] != "--socket" || !filepath.IsAbs(args[2]) {
+			fmt.Fprintln(stderr, "usage: abcp stack-tool --socket <path>")
+			return 2
+		}
+		if err := stackjob.ServeStackTool(os.Stdin, stdout, args[2]); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
 	case "context-build":
 		return contextBuildCommand(args[1:], stdout, stderr)
 	case "context-verify":
@@ -807,6 +818,9 @@ func serveCommand(args []string, stderr io.Writer) int {
 	stackProfilesFile := flags.String("stack-profiles-file", "", "optional protected stack profile file (stack jobs, docs/plans/stack-jobs.md)")
 	stackSourceRoot := flags.String("stack-source-root", "", "folder where Repo C leaves the code a stack job checks")
 	stackRoot := flags.String("stack-root", "", "private folder (mode 0700) for stack jobs: their records, work and dependency caches")
+	changeRoot := flags.String("change-root", "", "private folder (mode 0700) for change jobs: their records, patches, work and caches")
+	changeSourceRoot := flags.String("change-source-root", "", "folder where Repo C leaves the code a change job changes")
+	changeEngineFile := flags.String("change-engine-file", "", "protected file naming the change jobs' engine and its lane (docs/plans/change-jobs.md)")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -815,7 +829,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder>] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
@@ -1031,6 +1045,30 @@ func serveCommand(args []string, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "abcp stack jobs profiles=%d\n", len(profiles.Profiles))
 		}
 	}
+	// Change jobs (docs/plans/change-jobs.md) need the stack profiles too; without all their settings, or with one that does
+	// not check, the route says they are not configured and the rest of the service runs.
+	var changeJobs serviceapi.ChangeJobController
+	if *changeRoot != "" || *changeSourceRoot != "" || *changeEngineFile != "" {
+		profiles, profilesErr := stackjob.LoadProfiles(*stackProfilesFile)
+		engine, engineErr := stackjob.LoadEngine(*changeEngineFile)
+		self, selfErr := os.Executable()
+		switch {
+		case profilesErr != nil:
+			fmt.Fprintln(stderr, "change jobs unavailable: the stack profiles do not check")
+		case engineErr != nil:
+			fmt.Fprintln(stderr, "change jobs unavailable: the engine file does not check")
+		case selfErr != nil:
+			fmt.Fprintln(stderr, "change jobs unavailable")
+		default:
+			if manager, err := stackjob.NewChangeManager(*changeRoot, *changeSourceRoot, self, profiles, stackjob.PreviewSandbox{Service: previewService}, engine, time.Now); err != nil {
+				fmt.Fprintln(stderr, "change jobs unavailable")
+			} else {
+				defer manager.Close()
+				changeJobs = manager
+				fmt.Fprintln(stderr, "abcp change jobs ready")
+			}
+		}
+	}
 	// Only a controller with its profiles answers GET /v1/engines; without one the route says it is unsupported.
 	var engines serviceapi.EngineCatalog
 	if admissions != nil {
@@ -1045,7 +1083,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
 		RunAdmission: admissions, DevelopmentRunAdmission: admissions, Engines: engines, AccountLanes: accountLanes, Targets: targets,
-		Deployments: deployments, AppHealth: appHealth, StackJobs: stackJobs,
+		Deployments: deployments, AppHealth: appHealth, StackJobs: stackJobs, ChangeJobs: changeJobs,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "construct service API")

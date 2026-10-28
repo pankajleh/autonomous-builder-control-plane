@@ -103,13 +103,13 @@ type Manager struct {
 	// freeDisk answers the bytes free where jobs work; statfs on the build host.
 	freeDisk func(string) (uint64, bool)
 
+	probe     *prober
 	mu        sync.Mutex
 	records   map[string]*record
 	byRequest map[string]string
 	queue     []string
 	running   string
 	cancel    context.CancelFunc
-	probes    map[string]probe
 	wake      chan struct{}
 	ctx       context.Context
 	stop      context.CancelFunc
@@ -131,7 +131,8 @@ func New(root, sources string, profiles ProfilesV1, sandbox Sandbox, now func() 
 		}
 	}
 	m := &Manager{root: root, sources: sources, profiles: profiles, sandbox: sandbox, now: now, freeDisk: statfsFree,
-		records: map[string]*record{}, byRequest: map[string]string{}, probes: map[string]probe{}, wake: make(chan struct{}, 1)}
+		records: map[string]*record{}, byRequest: map[string]string{}, wake: make(chan struct{}, 1),
+		probe: &prober{root: filepath.Join(root, "probe"), sandbox: sandbox, now: now, probes: map[string]probe{}}}
 	if err := m.load(); err != nil {
 		return nil, err
 	}
@@ -381,7 +382,7 @@ func (m *Manager) run(id string) {
 			}
 		}
 	})
-	m.tidyCaches(r.CacheKey)
+	tidyCaches(filepath.Join(m.root, "caches"), r.CacheKey)
 	m.mu.Lock()
 	m.running, m.cancel = "", nil
 	m.mu.Unlock()
@@ -442,21 +443,31 @@ func (m *Manager) runJob(ctx context.Context, r *record, work string) string {
 	return failure
 }
 
-func (m *Manager) proved(ctx context.Context, profile ProfileV1) bool {
-	m.mu.Lock()
-	p, ok := m.probes[profile.ProfileID]
-	m.mu.Unlock()
-	if ok && (p.ok || m.now().Sub(p.at) < probeRetry) {
-		return p.ok
+// prober proves each stack profile's isolation before it is used, again after probeRetry when it failed.
+type prober struct {
+	root    string
+	sandbox Sandbox
+	now     func() time.Time
+	mu      sync.Mutex
+	probes  map[string]probe
+}
+
+func (p *prober) proved(ctx context.Context, profile ProfileV1) bool {
+	p.mu.Lock()
+	last, ok := p.probes[profile.ProfileID]
+	p.mu.Unlock()
+	if ok && (last.ok || p.now().Sub(last.at) < probeRetry) {
+		return last.ok
 	}
-	dir := filepath.Join(m.root, "probe", profile.ProfileID)
+	dir := filepath.Join(p.root, profile.ProfileID)
 	_ = os.RemoveAll(dir)
+	stamp := p.now().UTC().Format(time.RFC3339Nano)
 	result := os.MkdirAll(filepath.Join(dir, "work"), 0o755) == nil && os.MkdirAll(filepath.Join(dir, "cache"), 0o755) == nil &&
-		m.sandbox.Prove(ctx, partID(profile.ProfileID, 0, "probe "+m.stamp()), profile.Spec(), filepath.Join(dir, "work"), filepath.Join(dir, "cache"))
+		p.sandbox.Prove(ctx, partID(profile.ProfileID, 0, "probe "+stamp), profile.Spec(), filepath.Join(dir, "work"), filepath.Join(dir, "cache"))
 	_ = os.RemoveAll(dir)
-	m.mu.Lock()
-	m.probes[profile.ProfileID] = probe{ok: result, at: m.now()}
-	m.mu.Unlock()
+	p.mu.Lock()
+	p.probes[profile.ProfileID] = probe{ok: result, at: p.now()}
+	p.mu.Unlock()
 	return result
 }
 
@@ -464,11 +475,29 @@ func (m *Manager) proved(ctx context.Context, profile ProfileV1) bool {
 var failureOf = map[string]string{"install": FailInstall, "build": FailBuild, "test": FailTests}
 
 func (m *Manager) runPart(ctx context.Context, r *record, n int, p Part, work, cache string) string {
-	profile, ok := m.profiles.For(p.Stack, p.Version)
-	if !ok || !m.proved(ctx, profile) {
+	return runSteps(ctx, steps{sandbox: m.sandbox, profiles: m.profiles, probe: m.probe, session: partID(r.Job.ID, n, "part"),
+		set: func(i int, change func(*serviceapi.StackStepV1)) {
+			m.update(r, func(j *serviceapi.StackJobV1) { change(&j.Parts[n].Steps[i]) })
+		}}, n, p, work, cache)
+}
+
+// steps is what runs one part's steps needs: the sandbox, the profiles and their probe, the container's id, and where
+// each step's state is kept.
+type steps struct {
+	sandbox  Sandbox
+	profiles ProfilesV1
+	probe    *prober
+	session  string
+	set      func(i int, change func(*serviceapi.StackStepV1))
+}
+
+// runSteps runs one part's steps in a container of its own and answers the part's failure code or "".
+func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) string {
+	profile, ok := x.profiles.For(p.Stack, p.Version)
+	if !ok || !x.probe.proved(ctx, profile) {
 		return FailSandbox
 	}
-	session, err := m.sandbox.Open(ctx, partID(r.Job.ID, n, "part"), profile.Spec(), work, cache)
+	session, err := x.sandbox.Open(ctx, x.session, profile.Spec(), work, cache)
 	if err != nil {
 		return FailSandbox
 	}
@@ -480,25 +509,15 @@ func (m *Manager) runPart(ctx context.Context, r *record, n int, p Part, work, c
 		}
 	}
 	defer end()
-	if p.Stack == StackJava {
-		// Written from the host into a cache a job may have left links in: through real folders only, never a link.
-		m2, err := realDirs(cache, "home", ".m2")
-		if err != nil || writeReal(m2, "settings.xml", []byte(mavenSettings(session.Proxy()))) != nil {
-			return FailSandbox
-		}
-		gradle, err := realDirs(cache, "home", ".gradle")
-		if err != nil || writeReal(gradle, "gradle.properties", []byte(gradleProperties(session.Proxy()))) != nil {
-			return FailSandbox
-		}
+	if javaSettings(p, cache, session.Proxy()) != nil {
+		return FailSandbox
 	}
 	env := Env(p, profile, session.Proxy())
 	partCtx, cancel := context.WithTimeout(ctx, time.Duration(profile.TimeoutSeconds)*time.Second)
 	defer cancel()
 	failure, counted := "", -1
 	for i, s := range Steps(p, n) {
-		set := func(change func(*serviceapi.StackStepV1)) {
-			m.update(r, func(j *serviceapi.StackJobV1) { change(&j.Parts[n].Steps[i]) })
-		}
+		set := func(change func(*serviceapi.StackStepV1)) { x.set(i, change) }
 		switch {
 		case s.Skip != "":
 			set(func(st *serviceapi.StackStepV1) { st.State, st.Note = StepSkipped, s.Skip })
@@ -555,16 +574,35 @@ func (m *Manager) runPart(ctx context.Context, r *record, n int, p Part, work, c
 		}
 		if passed, failed, skipped, ok := Counts(filepath.Join(work, filepath.FromSlash(p.Dir)), extra...); ok {
 			tests := &serviceapi.StackTestsV1{Passed: passed, Failed: failed, Skipped: skipped}
-			m.update(r, func(j *serviceapi.StackJobV1) { j.Parts[n].Steps[counted].Tests = tests })
+			x.set(counted, func(st *serviceapi.StackStepV1) { st.Tests = tests })
 		}
 	}
 	return failure
 }
 
+// javaSettings tells a Java part's Maven and Gradle where the proxy is. Written from the host into a cache a job may have
+// left links in: through real folders only, never a link.
+func javaSettings(p Part, cache string, proxy netip.AddrPort) error {
+	if p.Stack != StackJava {
+		return nil
+	}
+	m2, err := realDirs(cache, "home", ".m2")
+	if err != nil {
+		return err
+	}
+	if err := writeReal(m2, "settings.xml", []byte(mavenSettings(proxy))); err != nil {
+		return err
+	}
+	gradle, err := realDirs(cache, "home", ".gradle")
+	if err != nil {
+		return err
+	}
+	return writeReal(gradle, "gradle.properties", []byte(gradleProperties(proxy)))
+}
+
 // tidyCaches empties a cache past its limit, and removes the least recently used caches while all of them are past
 // theirs, never the one just used.
-func (m *Manager) tidyCaches(current string) {
-	dir := filepath.Join(m.root, "caches")
+func tidyCaches(dir, current string) {
 	if folderSize(filepath.Join(dir, current), cacheBytes) > cacheBytes {
 		_ = os.RemoveAll(filepath.Join(dir, current))
 	}
