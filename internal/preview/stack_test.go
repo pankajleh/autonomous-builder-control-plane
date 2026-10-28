@@ -44,7 +44,7 @@ func TestAStackContainerHasThePreviewWallsAndOnlyItsTwoFolders(t *testing.T) {
 	args := strings.Join(d.stackCreateArgs(id, stackSpec(), "1000:1000", "/srv/stack/work/j", "/srv/stack/caches/k"), " ")
 	for _, want := range []string{"--pull=never", "--network " + d.network(id), "--user 1000:1000", "--cap-drop=ALL", "--security-opt=no-new-privileges",
 		"--read-only", "--cpu-quota=200000", "--memory=4294967296", "--memory-swap=4294967296", "--pids-limit=1024", "--ipc=none", "--log-driver=none",
-		"--tmpfs /tmp:rw,nosuid,nodev,size=268435456,mode=1777", "--mount type=bind,src=/srv/stack/work/j,dst=/work,bind-propagation=rprivate",
+		"--tmpfs /tmp:rw,exec,nosuid,nodev,size=268435456,mode=1777", "--mount type=bind,src=/srv/stack/work/j,dst=/work,bind-propagation=rprivate",
 		"--mount type=bind,src=/srv/stack/caches/k,dst=/cache,bind-propagation=rprivate", "--runtime=runsc", "--label abcp.stack.id=" + id,
 		"--label " + d.label(), "-i PATH=/usr/bin:/bin /bin/sleep 1920"} {
 		if !strings.Contains(args, want) {

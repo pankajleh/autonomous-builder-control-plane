@@ -136,7 +136,8 @@ func (d *dockerRuntime) stackCreateArgs(id string, spec StackSpec, user, work, c
 		"--cpu-period=100000", "--cpu-quota=" + strconv.Itoa(spec.CPUQuota), "--memory=" + strconv.FormatInt(spec.MemoryBytes, 10),
 		"--memory-swap=" + strconv.FormatInt(spec.MemoryBytes, 10), "--pids-limit=" + strconv.Itoa(spec.PidsLimit), "--ulimit=nofile=4096:4096",
 		"--restart=no", "--ipc=none", "--log-driver=none", "--no-healthcheck", "--workdir=/work",
-		"--tmpfs", "/tmp:rw,nosuid,nodev,size=" + strconv.FormatInt(spec.TmpfsBytes, 10) + ",mode=1777",
+		// exec: the code already runs from /work, and native builds run what they compile in /tmp (Docker's default is noexec).
+		"--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=" + strconv.FormatInt(spec.TmpfsBytes, 10) + ",mode=1777",
 		"--mount", "type=bind,src=" + work + ",dst=/work,bind-propagation=rprivate",
 		"--mount", "type=bind,src=" + cache + ",dst=/cache,bind-propagation=rprivate",
 		"--runtime=" + RuntimeGVisor, "--entrypoint=/usr/bin/env", spec.Image,
