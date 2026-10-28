@@ -414,7 +414,11 @@ func (m *Manager) runJob(ctx context.Context, r *record, work string) string {
 		}
 	})
 	cache := filepath.Join(m.root, "caches", r.CacheKey)
-	if os.MkdirAll(filepath.Join(cache, "home"), 0o755) != nil {
+	if os.MkdirAll(cache, 0o755) != nil {
+		return FailSandbox
+	}
+	// The cache is the project's own and a job may leave links in it: its home is made a real folder again first.
+	if _, err := realDirs(cache, "home"); err != nil {
 		return FailSandbox
 	}
 	now := m.now()
@@ -468,19 +472,29 @@ func (m *Manager) runPart(ctx context.Context, r *record, n int, p Part, work, c
 	if err != nil {
 		return FailSandbox
 	}
-	defer session.Close()
+	ended := false
+	end := func() {
+		if !ended {
+			ended = true
+			_ = session.Close()
+		}
+	}
+	defer end()
 	if p.Stack == StackJava {
-		home := filepath.Join(cache, "home")
-		if os.MkdirAll(filepath.Join(home, ".m2"), 0o755) != nil || os.MkdirAll(filepath.Join(home, ".gradle"), 0o755) != nil ||
-			os.WriteFile(filepath.Join(home, ".m2", "settings.xml"), []byte(mavenSettings(session.Proxy())), 0o644) != nil ||
-			os.WriteFile(filepath.Join(home, ".gradle", "gradle.properties"), []byte(gradleProperties(session.Proxy())), 0o644) != nil {
+		// Written from the host into a cache a job may have left links in: through real folders only, never a link.
+		m2, err := realDirs(cache, "home", ".m2")
+		if err != nil || writeReal(m2, "settings.xml", []byte(mavenSettings(session.Proxy()))) != nil {
+			return FailSandbox
+		}
+		gradle, err := realDirs(cache, "home", ".gradle")
+		if err != nil || writeReal(gradle, "gradle.properties", []byte(gradleProperties(session.Proxy()))) != nil {
 			return FailSandbox
 		}
 	}
 	env := Env(p, profile, session.Proxy())
 	partCtx, cancel := context.WithTimeout(ctx, time.Duration(profile.TimeoutSeconds)*time.Second)
 	defer cancel()
-	failure := ""
+	failure, counted := "", -1
 	for i, s := range Steps(p, n) {
 		set := func(change func(*serviceapi.StackStepV1)) {
 			m.update(r, func(j *serviceapi.StackJobV1) { change(&j.Parts[n].Steps[i]) })
@@ -515,28 +529,33 @@ func (m *Manager) runPart(ctx context.Context, r *record, n int, p Part, work, c
 		default:
 			state, failure = Failed, failureOf[s.Name]
 		}
-		var tests *serviceapi.StackTestsV1
 		if s.JUnit && state != Stopped {
-			extra := []string{}
-			if p.Stack == StackPython {
-				extra = append(extra, filepath.Join(work, ".abcp", filepath.Base(pytestReport(n))))
-			}
-			if passed, failed, skipped, ok := Counts(filepath.Join(work, filepath.FromSlash(p.Dir)), extra...); ok {
-				tests = &serviceapi.StackTestsV1{Passed: passed, Failed: failed, Skipped: skipped}
-			}
+			counted = i
 		}
 		if failure == "" && folderSize(work, profile.WorkBytes) > profile.WorkBytes {
 			state, failure, note = Failed, FailTooLarge, "the code grew past what a check may write"
 		}
 		exit := code
 		set(func(st *serviceapi.StackStepV1) {
-			st.State, st.Note, st.Seconds, st.OutputTail, st.Tests = state, note, float64(int(seconds*10))/10, out.Lines(outputLines), tests
+			st.State, st.Note, st.Seconds, st.OutputTail = state, note, float64(int(seconds*10))/10, out.Lines(outputLines)
 			if err == nil {
 				st.ExitCode = &exit
 			}
 		})
 		if failure == FailStopped {
 			break
+		}
+	}
+	// The tests' reports are read once the part's container has ended, so nothing can change them while they are read.
+	end()
+	if counted >= 0 {
+		extra := []string{}
+		if p.Stack == StackPython && realFile(work, ".abcp", filepath.Base(pytestReport(n))) {
+			extra = append(extra, filepath.Join(work, ".abcp", filepath.Base(pytestReport(n))))
+		}
+		if passed, failed, skipped, ok := Counts(filepath.Join(work, filepath.FromSlash(p.Dir)), extra...); ok {
+			tests := &serviceapi.StackTestsV1{Passed: passed, Failed: failed, Skipped: skipped}
+			m.update(r, func(j *serviceapi.StackJobV1) { j.Parts[n].Steps[counted].Tests = tests })
 		}
 	}
 	return failure

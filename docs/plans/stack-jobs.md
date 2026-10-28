@@ -59,7 +59,8 @@ less than 10 GB free).
    `/tmp` a small tmpfs, the image checked by `imageSafe` (its digest among its RepoDigests, its environment from the
    short list). The environment is built from nothing: `PATH`, `HOME=/cache/home`, `CI=1`, the proxy for each tool
    (`HTTPS_PROXY`/`HTTP_PROXY`; `JAVA_TOOL_OPTIONS` with `https.proxyHost`/`https.proxyPort`; Maven's `settings.xml` and
-   Gradle's `gradle.properties` written into the cache's home), and the caches' places (`PIP_CACHE_DIR`,
+   Gradle's `gradle.properties` written into the cache's home through real folders only: the cache is the job's to write,
+   so anything at those names, a link above all, is replaced, never followed), and the caches' places (`PIP_CACHE_DIR`,
    `UV_CACHE_DIR`, `POETRY_CACHE_DIR`, `npm_config_cache`, `GRADLE_USER_HOME`, Maven's local repository).
 5. **The registries, and nothing else**: the group's egress proxy with the profile's rules, new entries beside
    `*.myshopify.com:443`, each an exact list of names on port 443:
@@ -78,7 +79,7 @@ less than 10 GB free).
 
    A step with nothing to do is `SKIPPED`. A failed install or build ends the part. pytest's and unittest's exit code 5,
    no tests found, is `SKIPPED` with that note, not a failure.
-7. **Tests' counts** from JUnit XML the tools wrote under `work` (`target/surefire-reports`, `build/test-results`, the
+7. **Tests' counts**, once the part's container has ended, from JUnit XML the tools wrote under `work` (`target/surefire-reports`, `build/test-results`, the
    pytest report): at most 200 files and 8 MiB read, parsed with limits, or none.
 8. **End**: the evidence is written to `{stack-root}/jobs/{id}/job.json`, the containers and network removed, `work`
    deleted. The job's JSON stays (at most 1,000 kept, oldest removed first).

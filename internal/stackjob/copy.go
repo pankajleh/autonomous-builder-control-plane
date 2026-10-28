@@ -108,3 +108,68 @@ func folderSize(dir string, limit int64) int64 {
 	})
 	return total
 }
+
+// realDirs makes root/rel... real folders, checking each from root down: anything else at a name, a link above all, is
+// removed first, so nothing a job left is followed. root itself is the controller's own.
+func realDirs(root string, rel ...string) (string, error) {
+	path := root
+	for _, part := range rel {
+		path = filepath.Join(path, part)
+		info, err := os.Lstat(path)
+		switch {
+		case err == nil && info.IsDir():
+			continue
+		case err == nil:
+			if os.Remove(path) != nil {
+				return "", errSource
+			}
+		case !os.IsNotExist(err):
+			return "", errSource
+		}
+		if os.Mkdir(path, 0o755) != nil {
+			return "", errSource
+		}
+	}
+	return path, nil
+}
+
+// writeReal writes name in dir (a real folder) afresh: whatever a job left there, a link included, is removed, never
+// followed.
+func writeReal(dir, name string, data []byte) error {
+	path := filepath.Join(dir, name)
+	if info, err := os.Lstat(path); err == nil {
+		if info.IsDir() {
+			err = os.RemoveAll(path)
+		} else {
+			err = os.Remove(path)
+		}
+		if err != nil {
+			return errSource
+		}
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|noFollow, 0o644)
+	if err != nil {
+		return errSource
+	}
+	_, err = f.Write(data)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return errSource
+	}
+	return nil
+}
+
+// realFile reports whether root/rel... is a regular file reached through real folders only.
+func realFile(root string, rel ...string) bool {
+	path := root
+	for i, part := range rel {
+		path = filepath.Join(path, part)
+		info, err := os.Lstat(path)
+		if err != nil || (i < len(rel)-1 && !info.IsDir()) || (i == len(rel)-1 && !info.Mode().IsRegular()) {
+			return false
+		}
+	}
+	return len(rel) > 0
+}

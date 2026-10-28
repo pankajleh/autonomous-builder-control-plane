@@ -372,3 +372,59 @@ func TestProfilesAreCheckedWhenLoaded(t *testing.T) {
 		t.Fatalf("for = %+v", p)
 	}
 }
+
+func TestLinksAJobLeftInItsCacheAreNeverFollowed(t *testing.T) {
+	box := &fakeSandbox{proveOK: true}
+	f := newFixture(t, box)
+	outside := t.TempDir()
+	token := filepath.Join(outside, "token")
+	os.WriteFile(token, []byte("controller secret"), 0o600)
+	os.MkdirAll(filepath.Join(outside, "ssh"), 0o700)
+	home := filepath.Join(f.root, "caches", key, "home")
+	os.MkdirAll(filepath.Join(home, ".gradle"), 0o755)
+	// What a hostile earlier job could leave: .m2 a link to a folder outside, gradle.properties a link to a file outside.
+	os.Symlink(filepath.Join(outside, "ssh"), filepath.Join(home, ".m2"))
+	os.Symlink(token, filepath.Join(home, ".gradle", "gradle.properties"))
+	job := f.wait(t, f.start(t, "req-1", "api", map[string]string{"pom.xml": "<project/>"}).ID)
+	if job.State != Passed {
+		t.Fatalf("job = %+v", job)
+	}
+	if data, _ := os.ReadFile(token); string(data) != "controller secret" {
+		t.Fatalf("the file outside was written: %q", data)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(outside, "ssh")); len(entries) != 0 {
+		t.Fatalf("the folder outside was written: %v", entries)
+	}
+	if info, err := os.Lstat(filepath.Join(home, ".m2")); err != nil || !info.IsDir() {
+		t.Fatal(".m2 is not a real folder again")
+	}
+	if !realFile(home, ".gradle", "gradle.properties") || !realFile(home, ".m2", "settings.xml") {
+		t.Fatal("the proxy files were not written in real folders")
+	}
+	// The whole home a link: made a real folder again before the next job.
+	os.RemoveAll(home)
+	os.Symlink(outside, home)
+	if job := f.wait(t, f.start(t, "req-2", "api", nil).ID); job.State != Passed {
+		t.Fatalf("second job = %+v", job)
+	}
+	if info, err := os.Lstat(home); err != nil || !info.IsDir() {
+		t.Fatal("home is not a real folder again")
+	}
+	if entries, _ := os.ReadDir(outside); len(entries) != 2 {
+		t.Fatalf("outside changed: %v", entries)
+	}
+	// A pytest report reached through a link is not read.
+	box.exec = func(_ context.Context, work, _ string, argv []string, _ io.Writer) (int, error) {
+		if strings.Contains(strings.Join(argv, " "), "pytest") {
+			report := filepath.Join(outside, "pytest-0.xml")
+			os.WriteFile(report, []byte(`<testsuite tests="7"/>`), 0o644)
+			os.RemoveAll(filepath.Join(work, ".abcp"))
+			os.Symlink(outside, filepath.Join(work, ".abcp"))
+		}
+		return 0, nil
+	}
+	py := f.wait(t, f.start(t, "req-3", "lib", map[string]string{"requirements.txt": ""}).ID)
+	if py.State != Passed || py.Parts[0].Steps[2].Tests != nil {
+		t.Fatalf("a linked report was counted: %+v", py.Parts[0].Steps[2])
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // tail keeps the last bytes written to it, for a step's output.
@@ -117,12 +118,8 @@ func Counts(dir string, extra ...string) (passed, failed, skipped int, ok bool) 
 	files = append(files, extra...)
 	read := 0
 	for _, file := range files {
-		info, err := os.Lstat(file)
-		if err != nil || !info.Mode().IsRegular() || info.Size() > maxReportBytes || read+int(info.Size()) > maxReportsBytes {
-			continue
-		}
-		data, err := os.ReadFile(file)
-		if err != nil {
+		data, readable := readReport(file, maxReportsBytes-read)
+		if !readable {
 			continue
 		}
 		read += len(data)
@@ -173,4 +170,23 @@ func suiteCounts(data []byte) (tests, failed, skipped int, ok bool) {
 			depth--
 		}
 	}
+}
+
+// readReport reads one report that is a regular file of at most maxReportBytes, and at most left bytes, opened without
+// following a link or waiting on a pipe.
+func readReport(path string, left int) ([]byte, bool) {
+	f, err := os.OpenFile(path, os.O_RDONLY|noFollow|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxReportBytes || int(info.Size()) > left {
+		return nil, false
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxReportBytes+1))
+	if err != nil || len(data) > maxReportBytes {
+		return nil, false
+	}
+	return data, true
 }
