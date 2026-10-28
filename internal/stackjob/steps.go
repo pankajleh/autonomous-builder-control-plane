@@ -153,7 +153,9 @@ func Env(p Part, profile ProfileV1, proxy netip.AddrPort) []string {
 	case StackJava:
 		gw := proxy.Addr().String()
 		port := proxy.Port()
-		env = append(env, "GRADLE_USER_HOME=/cache/home/.gradle", "JAVA_TOOL_OPTIONS=-Dhttps.proxyHost="+gw+" -Dhttps.proxyPort="+strconv.Itoa(int(port))+
+		// Java takes its home from the user database, not HOME (the runner's user is not in the image's, or is another's
+		// there), so it is named: Maven's local repository and the settings written into the cache are then found.
+		env = append(env, "GRADLE_USER_HOME=/cache/home/.gradle", "JAVA_TOOL_OPTIONS=-Duser.home=/cache/home -Dhttps.proxyHost="+gw+" -Dhttps.proxyPort="+strconv.Itoa(int(port))+
 			" -Dhttp.proxyHost="+gw+" -Dhttp.proxyPort="+strconv.Itoa(int(port)))
 	case StackNode:
 		env = append(env, "npm_config_https_proxy="+px, "npm_config_proxy="+px, "npm_config_update_notifier=false", "YARN_HTTPS_PROXY="+px,

@@ -184,7 +184,7 @@ func TestEnvironmentIsMadeFromNothingButThePathTheProfilesSettingsAndTheProxy(t 
 	profile := ProfileV1{Path: "/opt/java/openjdk/bin:/usr/bin:/bin", Environment: map[string]string{"JAVA_HOME": "/opt/java/openjdk"}}
 	env := strings.Join(Env(Part{Stack: StackJava}, profile, proxy), "\n")
 	for _, want := range []string{"PATH=/opt/java/openjdk/bin:/usr/bin:/bin", "HOME=/cache/home", "CI=1", "HTTPS_PROXY=http://10.213.4.17:3129",
-		"JAVA_HOME=/opt/java/openjdk", "JAVA_TOOL_OPTIONS=-Dhttps.proxyHost=10.213.4.17 -Dhttps.proxyPort=3129 -Dhttp.proxyHost=10.213.4.17 -Dhttp.proxyPort=3129",
+		"JAVA_HOME=/opt/java/openjdk", "JAVA_TOOL_OPTIONS=-Duser.home=/cache/home -Dhttps.proxyHost=10.213.4.17 -Dhttps.proxyPort=3129 -Dhttp.proxyHost=10.213.4.17 -Dhttp.proxyPort=3129",
 		"GRADLE_USER_HOME=/cache/home/.gradle"} {
 		if !strings.Contains(env, want+"\n") && !strings.HasSuffix(env, want) {
 			t.Errorf("java env lacks %q:\n%s", want, env)

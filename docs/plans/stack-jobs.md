@@ -56,9 +56,9 @@ less than 10 GB free).
    --runtime=runsc --network <private> --user <profile user> --cap-drop=ALL --security-opt=no-new-privileges --read-only
    --cpu-quota --memory --memory-swap --pids-limit --ipc=none --log-driver=none`, as this controller's own uid and gid
    (which own the folders; never root), `/work` and `/cache` bound read-write,
-   `/tmp` a small tmpfs, the image checked by `imageSafe` (its digest among its RepoDigests, its environment from the
+   `/tmp` a small tmpfs (with `exec`: the code already runs from `/work`, and native builds run what they compile there), the image checked by `imageSafe` (its digest among its RepoDigests, its environment from the
    short list). The environment is built from nothing: `PATH`, `HOME=/cache/home`, `CI=1`, the proxy for each tool
-   (`HTTPS_PROXY`/`HTTP_PROXY`; `JAVA_TOOL_OPTIONS` with `https.proxyHost`/`https.proxyPort`; Maven's `settings.xml` and
+   (`HTTPS_PROXY`/`HTTP_PROXY`; `JAVA_TOOL_OPTIONS` with `https.proxyHost`/`https.proxyPort` and `user.home=/cache/home`, since Java takes its home from the user database, never from `HOME`, and the runner's uid is not in the image's or is another user's there; Maven's `settings.xml` and
    Gradle's `gradle.properties` written into the cache's home through real folders only: the cache is the job's to write,
    so anything at those names, a link above all, is replaced, never followed), and the caches' places (`PIP_CACHE_DIR`,
    `UV_CACHE_DIR`, `POETRY_CACHE_DIR`, `npm_config_cache`, `GRADLE_USER_HOME`, Maven's local repository).
