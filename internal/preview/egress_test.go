@@ -35,6 +35,34 @@ func TestEgressAllowsOnlyOneShopifyStoreLabelOnPort443(t *testing.T) {
 	}
 }
 
+func TestEgressLetsAStackReachOnlyItsRegistriesOnPort443(t *testing.T) {
+	cases := map[string]map[string]bool{
+		EgressPyPI:         {"pypi.org": true, "files.pythonhosted.org": true, "PyPI.org": true, "test.pypi.org": false, "pypi.org.evil.test": false, "registry.npmjs.org": false},
+		EgressMavenCentral: {"repo.maven.apache.org": true, "repo1.maven.org": true, "maven.apache.org": false, "repo.maven.apache.org.evil.test": false},
+		EgressGradle:       {"services.gradle.org": true, "downloads.gradle.org": true, "plugins.gradle.org": true, "plugins-artifacts.gradle.org": true, "gradle.org": false},
+		EgressNpm:          {"registry.npmjs.org": true, "registry.yarnpkg.com": true, "repo.yarnpkg.com": true, "npmjs.org": false, "registry.npmjs.org.evil.test": false},
+	}
+	for rule, hosts := range cases {
+		if !RegistryRule(rule) || len(RegistryHosts(rule)) == 0 {
+			t.Fatalf("%s is not a registry rule", rule)
+		}
+		for host, want := range hosts {
+			if got := egressAllowed([]string{rule}, host, "443"); got != want {
+				t.Errorf("%s %q: allowed %v, want %v", rule, host, got, want)
+			}
+		}
+		if egressAllowed([]string{rule}, RegistryHosts(rule)[0], "80") || egressAllowed([]string{rule}, "151.101.0.223", "443") {
+			t.Errorf("%s: another port or a numeric address allowed", rule)
+		}
+	}
+	if RegistryRule(EgressShopifyStores) || RegistryRule("github") || egressAllowed([]string{"github"}, "github.com", "443") {
+		t.Fatal("an entry that is no registry was taken for one")
+	}
+	if validEgress(PreviewProfileV1{Egress: []string{EgressPyPI}}) || validEgress(PreviewProfileV1{Hosted: true, Egress: []string{EgressNpm}}) {
+		t.Fatal("a preview profile may not name a registry")
+	}
+}
+
 func TestEgressConnectsOnlyToPublicAddresses(t *testing.T) {
 	for address, want := range map[string]bool{
 		"23.227.38.65": true, "2620:127:f00f::1": true, "8.8.8.8": true, "::ffff:23.227.38.65": true,
