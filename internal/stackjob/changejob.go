@@ -717,7 +717,7 @@ func (m *ChangeManager) prove(ctx context.Context, r *changeRecord, p Part, n in
 		return &serviceapi.ChangeProofV1{State: ProofNotRun, Files: files, Note: note}, ""
 	}
 	plan := Steps(p, n)
-	if t := plan[len(plan)-1]; t.Name != "test" || t.Skip != "" {
+	if len(plan) == 0 || plan[len(plan)-1].Name != "test" || plan[len(plan)-1].Skip != "" {
 		return notRun("the project has no tests to run")
 	}
 	if bt, ok := step(base, "test"); !ok || (bt.State != Passed && bt.State != Failed && bt.State != StepSkipped) {
