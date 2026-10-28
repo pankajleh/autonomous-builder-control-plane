@@ -155,6 +155,9 @@ type egressProxy struct {
 	mu       sync.Mutex
 	conns    map[net.Conn]struct{}
 
+	// hosts are a stack job's own registries' names (§15.9), let through on 443 as the registry rules' names are.
+	hosts []string
+
 	// relay and caller are set by relayTo for a group whose profile names EgressAutobuildRelay.
 	relay  *AppRelay
 	caller string
@@ -283,7 +286,7 @@ func (e *egressProxy) handle(c net.Conn) {
 		return
 	}
 	host, port, err := net.SplitHostPort(request.Host)
-	if err != nil || !egressAllowed(e.rules, host, port) {
+	if err != nil || !egressAllowed(e.rules, host, port) && !(port == "443" && slices.Contains(e.hosts, strings.ToLower(host))) {
 		e.refuse(c, http.StatusForbidden)
 		return
 	}

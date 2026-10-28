@@ -42,6 +42,7 @@ type fakeSandbox struct {
 	proveOK bool
 	proves  int
 	opens   []string
+	specs   []preview.StackSpec
 	calls   []execCall
 	exec    func(ctx context.Context, work, dir string, argv []string, out io.Writer) (int, error)
 }
@@ -58,6 +59,7 @@ func (f *fakeSandbox) Open(_ context.Context, id string, spec preview.StackSpec,
 		return nil, errors.New("bad spec")
 	}
 	f.opens = append(f.opens, spec.Image)
+	f.specs = append(f.specs, spec)
 	return &fakeSession{s: f, work: work}, nil
 }
 func (f *fakeSandbox) Prove(context.Context, string, preview.StackSpec, string, string) bool {

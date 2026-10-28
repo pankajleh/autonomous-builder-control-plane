@@ -92,6 +92,30 @@ profile its `stack`, the `versions` it serves, `image` (`name@sha256:…`), `use
 rules above). With `--stack-source-root` and `--stack-root` they turn stack jobs on; without all three the API answers
 `503`.
 
+## Private registries (F5b)
+
+Repo C design note `IMPROVE_EXISTING_PRODUCTS.md` §15.9. A stack or change job's request may carry `registries`: up to
+three of `{kind, use, scope, url, username, token}`. The kind is `npm`, `maven` or `python`. The use is `all` (it mirrors
+the public registry) or `own` (the company's packages; npm names the scope). The address is `https` on 443, a name and
+never an IP address, a plain path, no user, query or fragment, at most 300 characters. Maven and Python take a user name;
+the token is 8 to 4,096 printable characters with no quotes, `\`, `<`, `>`, `&`, `$` or backquote. A request with any
+other is refused whole. A stack job's request may now be 16 KB and a change job's 40 KB, room for three registries with
+their longest tokens.
+
+- **Kept in memory only:** with the job, never in its record, evidence, answers or logs. `body_digest` covers everything
+  but the tokens. A job that a restart leaves `UNKNOWN` loses them.
+- **Egress:** each registry's name joins that part's own proxy (`StackSpec.Hosts`), on 443 and to public addresses only,
+  as the registry rules' names do.
+- **Settings:** written into the cache's home before the job's parts, through real folders only, and removed when the
+  job ends, again through real folders only, since the job's code may leave links where they were. They are
+  `.npmrc` and `.yarnrc.yml` for npm, `.config/pip/pip.conf` and `.config/uv/uv.toml` for Python, and
+  `.gradle/init.d/abcp-registries.gradle` for Maven. Maven's `settings.xml` carries a server, a mirror of `*` for `all`
+  and an active profile with the repository for `own`; it is written with the proxy before each Java part and removed
+  when the job ends.
+- **Masking:** every kept step output, and every answer the change job's run tool gives the agent, has each token
+  replaced with `[registry token]`: as given, URL-encoded, fully percent-encoded, base64, and in basic authentication's
+  forms. The tokens join the values a change job's leak check looks for (`SECRET_IN_CHANGE`).
+
 ## The probe
 
 Before a profile's first job after start, ABCP runs its image once in the sandbox with the image's `/bin/busybox` (the
@@ -102,6 +126,7 @@ jobs fail `SANDBOX_UNAVAILABLE`.
 ## Tests
 
 Finding the stack, version and tool for each manifest and lockfile; the steps' commands; the egress rules (each name in,
-others and numeric addresses out); the profile checks; the copy refusing links and sizes; the masking; the JUnit counts
+others and numeric addresses out); the profile checks; the copy refusing links and sizes; the masking; the registries' settings, their removal through real folders, their masking and their absence from every
+file ABCP keeps; the JUnit counts
 with hostile XML; the API (grant, replay, refusals, states, stop); the docker arguments, as `docker_test.go` checks the
 previews'. The containers themselves are tried on the build host (F2c), where `runsc` is.

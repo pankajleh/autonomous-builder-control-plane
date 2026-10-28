@@ -198,7 +198,7 @@ func TestEnvironmentIsMadeFromNothingButThePathTheProfilesSettingsAndTheProxy(t 
 		!strings.Contains(py, "POETRY_VIRTUALENVS_IN_PROJECT=true") {
 		t.Fatalf("python env:\n%s", py)
 	}
-	if s := mavenSettings(proxy); !strings.Contains(s, "<host>10.213.4.17</host><port>3129</port>") || !strings.Contains(gradleProperties(proxy), "systemProp.https.proxyPort=3129") {
+	if s := mavenSettings(proxy, nil); !strings.Contains(s, "<host>10.213.4.17</host><port>3129</port>") || !strings.Contains(gradleProperties(proxy), "systemProp.https.proxyPort=3129") {
 		t.Fatalf("java proxy files:\n%s\n%s", s, gradleProperties(proxy))
 	}
 }

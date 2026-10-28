@@ -85,7 +85,7 @@ type egressFixture struct {
 	lookedUp []string
 }
 
-func newEgressFixture(t *testing.T, answers map[string][]string) *egressFixture {
+func newEgressFixture(t *testing.T, answers map[string][]string, hosts ...string) *egressFixture {
 	t.Helper()
 	echo, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -129,6 +129,7 @@ func newEgressFixture(t *testing.T, answers map[string][]string) *egressFixture 
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp4", echo.Addr().String())
 	}
+	f.proxy.hosts = hosts
 	f.proxy.start()
 	t.Cleanup(func() { f.proxy.Close() })
 	return f
@@ -269,5 +270,42 @@ func TestEgressProxyRefusesBeyondItsConcurrentTunnels(t *testing.T) {
 	}
 	if counts := f.proxy.Counts(); counts.Opened != egressMaxConcurrent || counts.Refused != 1 {
 		t.Errorf("counts %+v", counts)
+	}
+}
+
+func TestEgressProxyLetsAJobsOwnRegistriesThroughOn443Only(t *testing.T) {
+	registry := "acme-123456789012.d.codeartifact.ap-south-1.amazonaws.com"
+	f := newEgressFixture(t, map[string][]string{registry: {"52.95.1.10"}, "inside.acme.example": {"10.0.0.9"}}, registry, "inside.acme.example")
+	for target, want := range map[string]string{
+		registry + ":443": "HTTP/1.1 200 Connection Established", strings.ToUpper(registry) + ":443": "HTTP/1.1 200 Connection Established",
+		registry + ":80": "HTTP/1.1 403 Forbidden", "other.d.codeartifact.ap-south-1.amazonaws.com:443": "HTTP/1.1 403 Forbidden",
+		"inside.acme.example:443": "HTTP/1.1 502 Bad Gateway", "52.95.1.10:443": "HTTP/1.1 403 Forbidden",
+	} {
+		if _, status := f.connect(t, connectLine(target)); status != want {
+			t.Errorf("%s: %q, want %q", target, status, want)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.dialed) != 2 || f.dialed[0] != "52.95.1.10:443" || f.dialed[1] != "52.95.1.10:443" {
+		t.Errorf("dialled %v", f.dialed)
+	}
+}
+
+func TestAStackSpecTakesAtMostThreeRegistryNames(t *testing.T) {
+	spec := StackSpec{Image: "ghcr.io/pankajleh/autobuild-stack-node@sha256:" + strings.Repeat("c", 64), CPUQuota: 200000, MemoryBytes: 4 << 30, PidsLimit: 1024,
+		TmpfsBytes: 256 << 20, Lifetime: 30 * time.Minute, Egress: []string{EgressNpm}}
+	for hosts, want := range map[string]bool{
+		"": true, "npm.acme.example": true, "a.example,b.example,c.example": true, "a.example,b.example,c.example,d.example": false,
+		"a.example,a.example": false, "10.0.0.1": false, "Npm.acme.example": false, "localhost": false, "npm.acme.example.": false,
+		"-x.example": false, "a_b.example": false,
+	} {
+		s := spec
+		if hosts != "" {
+			s.Hosts = strings.Split(hosts, ",")
+		}
+		if s.Valid() != want {
+			t.Errorf("%q: %v", hosts, !want)
+		}
 	}
 }

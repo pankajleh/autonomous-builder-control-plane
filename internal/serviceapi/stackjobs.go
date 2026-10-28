@@ -19,6 +19,8 @@ type StackJobCreateV1 struct {
 	RequestID string `json:"request_id"`
 	Source    string `json:"source"`
 	CacheKey  string `json:"cache_key"`
+	// Registries are the project's private registries for this job alone (§15.9); never kept on disk.
+	Registries []RegistryV1 `json:"registries,omitempty"`
 }
 
 // StackJobV1 is one job. State is QUEUED, RUNNING, PASSED, FAILED, STOPPED or UNKNOWN (running when the controller
@@ -84,7 +86,8 @@ var (
 	ErrStackJobsUnavailable = errors.New("stack jobs unavailable")
 )
 
-const maxStackJobBody = 2 << 10
+// maxStackJobBody leaves room for three private registries with their tokens (§15.9).
+const maxStackJobBody = 16 << 10
 
 var (
 	stackJobID      = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -94,7 +97,8 @@ var (
 
 // Valid reports a request of the right shape: a request ID, a folder name and a cache digest.
 func (r StackJobCreateV1) Valid() bool {
-	return stackRequestID.MatchString(r.RequestID) && stackSourceName.MatchString(r.Source) && stackJobID.MatchString(r.CacheKey)
+	return stackRequestID.MatchString(r.RequestID) && stackSourceName.MatchString(r.Source) && stackJobID.MatchString(r.CacheKey) &&
+		validRegistries(r.Registries)
 }
 
 func (s *Server) mayRunStackJobs(principal Principal) bool {

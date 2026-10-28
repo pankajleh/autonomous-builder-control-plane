@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
 // The run tool (docs/plans/change-jobs.md): the agent's only way to run anything. `abcp stack-tool` is an MCP server
@@ -62,6 +64,7 @@ type broker struct {
 	mu      sync.Mutex
 	session Session
 	env     []string
+	secrets []string
 	opened  time.Time
 	opens   int
 	count   int
@@ -69,26 +72,30 @@ type broker struct {
 }
 
 // openBroker listens on the job's socket for the agent's part.
-func (m *ChangeManager) openBroker(ctx context.Context, r *changeRecord, p Part, n int, work, cache string) (*broker, error) {
+func (m *ChangeManager) openBroker(ctx context.Context, r *changeRecord, p Part, n int, work, cache string, registries []serviceapi.RegistryV1) (*broker, error) {
 	profile, ok := m.profiles.For(p.Stack, p.Version)
 	if !ok || !m.probe.proved(ctx, profile) {
 		return nil, errSource
 	}
 	open := func(ctx context.Context, opens int) (Session, []string, error) {
-		session, err := m.sandbox.Open(ctx, partID(r.Job.ID, n, "agent "+strconv.Itoa(opens)), profile.Spec(), work, cache)
+		spec := profile.Spec()
+		spec.Hosts = registryHosts(registries)
+		session, err := m.sandbox.Open(ctx, partID(r.Job.ID, n, "agent "+strconv.Itoa(opens)), spec, work, cache)
 		if err != nil {
 			return nil, nil, err
 		}
-		if javaSettings(p, cache, session.Proxy()) != nil {
+		if javaSettings(p, cache, session.Proxy(), registries) != nil {
 			_ = session.Close()
 			return nil, nil, errSource
 		}
 		return session, Env(p, profile, session.Proxy()), nil
 	}
-	return listenBroker(ctx, m.socket(r.Job.ID), profile.Spec().Lifetime, open)
+	return listenBroker(ctx, m.socket(r.Job.ID), profile.Spec().Lifetime, open, registrySecrets(registries))
 }
 
-func listenBroker(ctx context.Context, socket string, life time.Duration, open func(context.Context, int) (Session, []string, error)) (*broker, error) {
+// listenBroker serves the agent's commands on socket; secrets are the job's registry tokens, masked in every answer so
+// the model never reads one.
+func listenBroker(ctx context.Context, socket string, life time.Duration, open func(context.Context, int) (Session, []string, error), secrets []string) (*broker, error) {
 	_ = os.Remove(socket)
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
@@ -98,7 +105,7 @@ func listenBroker(ctx context.Context, socket string, life time.Duration, open f
 		_ = ln.Close()
 		return nil, errSource
 	}
-	b := &broker{ln: ln, open: open, life: life}
+	b := &broker{ln: ln, open: open, life: life, secrets: secrets}
 	b.ctx, b.cancel = context.WithCancel(ctx)
 	b.wg.Add(1)
 	go b.accept()
@@ -210,7 +217,7 @@ func (b *broker) run(req runRequest) runAnswer {
 	ctx, cancel := context.WithTimeout(b.ctx, limit)
 	defer cancel()
 	code, err := b.session.Exec(ctx, dir, b.env, []string{"/bin/sh", "-c", req.Command}, out)
-	answer := runAnswer{ExitCode: code, Output: out.Lines(commandLines)}
+	answer := runAnswer{ExitCode: code, Output: maskRegistries(out.Lines(commandLines), b.secrets)}
 	switch {
 	case ctx.Err() == context.DeadlineExceeded:
 		answer.ExitCode, answer.TimedOut = -1, true

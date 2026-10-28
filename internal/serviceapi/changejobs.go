@@ -21,6 +21,8 @@ type ChangeJobCreateV1 struct {
 	CacheKey  string `json:"cache_key"`
 	Kind      string `json:"kind"`
 	Words     string `json:"words"`
+	// Registries are the project's private registries for this job alone (§15.9); never kept on disk.
+	Registries []RegistryV1 `json:"registries,omitempty"`
 }
 
 // ChangeJobV1 is one job. State is QUEUED, RUNNING (with its Phase), HANDED_BACK, NOT_HANDED_BACK, FAILED, STOPPED or
@@ -89,7 +91,7 @@ var (
 )
 
 const (
-	maxChangeJobBody = 24 << 10
+	maxChangeJobBody = 40 << 10
 	// MaxChangeWords bounds the person's words, in characters.
 	MaxChangeWords = 4000
 )
@@ -98,7 +100,7 @@ const (
 func (r ChangeJobCreateV1) Valid() bool {
 	return stackRequestID.MatchString(r.RequestID) && stackSourceName.MatchString(r.Source) && stackJobID.MatchString(r.CacheKey) &&
 		(r.Kind == "fix" || r.Kind == "tests") && utf8.ValidString(r.Words) && !strings.ContainsRune(r.Words, 0) &&
-		strings.TrimSpace(r.Words) != "" && utf8.RuneCountInString(r.Words) <= MaxChangeWords
+		strings.TrimSpace(r.Words) != "" && utf8.RuneCountInString(r.Words) <= MaxChangeWords && validRegistries(r.Registries)
 }
 
 func (s *Server) mayRunChangeJobs(principal Principal) bool {
