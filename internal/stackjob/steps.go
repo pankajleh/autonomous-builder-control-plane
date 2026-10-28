@@ -131,6 +131,28 @@ func Steps(p Part, n int) []Step {
 	return nil
 }
 
+// scanTimeout bounds a scan job's scan step (Repo C SECURITY_AND_COMPLIANCE §11.1).
+const scanTimeout = 10 * time.Minute
+
+// ScanSteps are a scan job's steps for a part: its install as a check's; its build for Java only, whose classes
+// SpotBugs reads; no tests; then the image's own scanner, which writes its result to scanReport(n). Fixed text again: the
+// stack and the part's folder are what Detect chose.
+func ScanSteps(p Part, n int) []Step {
+	check := Steps(p, n)
+	if len(check) != 3 {
+		return nil
+	}
+	dir := workDir(p)
+	build := check[1]
+	if p.Stack != StackJava {
+		build = Step{Name: "build", Dir: dir, Skip: "not needed to scan"}
+	}
+	test := Step{Name: "test", Dir: dir, Skip: "a scan runs no tests"}
+	argv := []string{"/opt/autobuild/scan", "--part", dir, "--index", strconv.Itoa(n), "--stack", p.Stack, "--out", scanReport(n)}
+	scan := Step{Name: "scan", Dir: dir, Argv: argv, Show: "the security scan: dependencies, secrets, code and licences", Timeout: scanTimeout}
+	return []Step{check[0], build, test, scan}
+}
+
 // allowedEnvironment are the image settings a stack profile may pass to every step, beside PATH.
 var allowedEnvironment = map[string]bool{"JAVA_HOME": true, "MAVEN_HOME": true, "GRADLE_HOME": true, "LANG": true}
 

@@ -33,6 +33,9 @@ type StackSpec struct {
 	// Hosts are the names of the job's own private registries (Repo C IMPROVE_EXISTING_PRODUCTS §15.9), from its request
 	// and checked there: reached on 443 at public addresses only, as the registry rules' names are.
 	Hosts []string
+	// OSVData is the operator's vulnerability data folder (Repo C SECURITY_AND_COMPLIANCE §11.1), bound read-only at /osv
+	// for a scan job's parts only; "" binds nothing.
+	OSVData string
 }
 
 // Valid reports a spec ABCP may run: a pinned image, bounded limits, and registries only.
@@ -103,7 +106,8 @@ func (s *Service) OpenStack(ctx context.Context, id string, spec StackSpec, work
 func (d *dockerRuntime) openStack(ctx context.Context, id string, spec StackSpec, work, cache string) (_ *StackSession, err error) {
 	user, ok := stackUser()
 	if !sha256Pattern.MatchString(id) || !spec.Valid() || !ok || !stackPath.MatchString(work) || !stackPath.MatchString(cache) ||
-		filepath.Clean(work) != work || filepath.Clean(cache) != cache || strings.Contains(work, "..") || strings.Contains(cache, "..") {
+		filepath.Clean(work) != work || filepath.Clean(cache) != cache || strings.Contains(work, "..") || strings.Contains(cache, "..") ||
+		(spec.OSVData != "" && !stackBindable(spec.OSVData)) {
 		return nil, ErrUnavailable
 	}
 	if !d.runtimeAvailable(ctx, RuntimeGVisor) || !d.stackImageSafe(ctx, spec.Image) {
@@ -147,7 +151,7 @@ func (d *dockerRuntime) openStack(ctx context.Context, id string, spec StackSpec
 // stackCreateArgs is the part's `docker create`. The container only sleeps; each step is a `docker exec` with an
 // environment made from nothing.
 func (d *dockerRuntime) stackCreateArgs(id string, spec StackSpec, user, work, cache string) []string {
-	return []string{"create", "--pull=never", "--name", d.container(id, 0), "--label", d.label(), "--label", "abcp.stack.id=" + id,
+	args := []string{"create", "--pull=never", "--name", d.container(id, 0), "--label", d.label(), "--label", "abcp.stack.id=" + id,
 		"--network", d.network(id), "--user", user, "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
 		"--cpu-period=100000", "--cpu-quota=" + strconv.Itoa(spec.CPUQuota), "--memory=" + strconv.FormatInt(spec.MemoryBytes, 10),
 		"--memory-swap=" + strconv.FormatInt(spec.MemoryBytes, 10), "--pids-limit=" + strconv.Itoa(spec.PidsLimit), "--ulimit=nofile=4096:4096",
@@ -155,9 +159,22 @@ func (d *dockerRuntime) stackCreateArgs(id string, spec StackSpec, user, work, c
 		// exec: the code already runs from /work, and native builds run what they compile in /tmp (Docker's default is noexec).
 		"--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=" + strconv.FormatInt(spec.TmpfsBytes, 10) + ",mode=1777",
 		"--mount", "type=bind,src=" + work + ",dst=/work,bind-propagation=rprivate",
-		"--mount", "type=bind,src=" + cache + ",dst=/cache,bind-propagation=rprivate",
-		"--runtime=" + RuntimeGVisor, "--entrypoint=/usr/bin/env", spec.Image,
-		"-i", "PATH=/usr/bin:/bin", "/bin/sleep", strconv.Itoa(int(spec.Lifetime / time.Second))}
+		"--mount", "type=bind,src=" + cache + ",dst=/cache,bind-propagation=rprivate"}
+	if spec.OSVData != "" {
+		args = append(args, "--mount", "type=bind,src="+spec.OSVData+",dst=/osv,readonly,bind-propagation=rprivate")
+	}
+	return append(args, "--runtime="+RuntimeGVisor, "--entrypoint=/usr/bin/env", spec.Image,
+		"-i", "PATH=/usr/bin:/bin", "/bin/sleep", strconv.Itoa(int(spec.Lifetime/time.Second)))
+}
+
+// stackBindable is a folder a stack container may bind beside /work and /cache: absolute, clean, nothing Docker's mount
+// syntax would read as more, and a real folder, not a link.
+func stackBindable(path string) bool {
+	if !stackPath.MatchString(path) || filepath.Clean(path) != path || strings.Contains(path, "..") {
+		return false
+	}
+	info, err := os.Lstat(path)
+	return err == nil && info.IsDir()
 }
 
 // stackImageSafe checks the image is the pinned one, present locally, declaring no volumes. Its own environment does not

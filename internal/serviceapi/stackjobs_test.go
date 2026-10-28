@@ -140,3 +140,19 @@ func TestAStackJobTakesItsPrivateRegistriesWithTheirLongestTokens(t *testing.T) 
 		t.Fatalf("a refused request reached the backend: %v", backend.calls)
 	}
 }
+
+func TestAStackJobMayBeAScanAndScansNotConfiguredAnswer503(t *testing.T) {
+	s, backend := stackJobServer(t, true)
+	key := strings.Repeat("b", 64)
+	if r := call(s, http.MethodPost, "/v1/stack-jobs", `{"request_id":"req-2","source":"project-1","cache_key":"`+key+`","scan":true}`); r.Code != http.StatusAccepted || !backend.last.Scan {
+		t.Fatalf("scan start = %d %s, scan=%v", r.Code, r.Body.String(), backend.last.Scan)
+	}
+	if r := call(s, http.MethodPost, "/v1/stack-jobs", `{"request_id":"req-3","source":"project-1","cache_key":"`+key+`","scan":"yes"}`); r.Code != http.StatusBadRequest {
+		t.Fatalf("a scan that is not a boolean = %d", r.Code)
+	}
+	backend.err = ErrStackScansUnavailable
+	r := call(s, http.MethodPost, "/v1/stack-jobs", `{"request_id":"req-4","source":"project-1","cache_key":"`+key+`","scan":true}`)
+	if r.Code != http.StatusServiceUnavailable || !strings.Contains(r.Body.String(), `"code":"stack_scans_unavailable"`) {
+		t.Fatalf("scans unavailable = %d %s", r.Code, r.Body.String())
+	}
+}

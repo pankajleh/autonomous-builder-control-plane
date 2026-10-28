@@ -818,6 +818,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	stackProfilesFile := flags.String("stack-profiles-file", "", "optional protected stack profile file (stack jobs, docs/plans/stack-jobs.md)")
 	stackSourceRoot := flags.String("stack-source-root", "", "folder where Repo C leaves the code a stack job checks")
 	stackRoot := flags.String("stack-root", "", "private folder (mode 0700) for stack jobs: their records, work and dependency caches")
+	stackOSVRoot := flags.String("stack-osv-root", "", "folder of OSV's vulnerability data, bound read-only at /osv in scan jobs (docs/plans/stack-jobs.md, Scan jobs); without it scans are refused")
 	changeRoot := flags.String("change-root", "", "private folder (mode 0700) for change jobs: their records, patches, work and caches")
 	changeSourceRoot := flags.String("change-source-root", "", "folder where Repo C leaves the code a change job changes")
 	changeEngineFile := flags.String("change-engine-file", "", "protected file naming the change jobs' engine and its lane (docs/plans/change-jobs.md)")
@@ -829,7 +830,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder>] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder> [--stack-osv-root <folder>]] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
@@ -1043,6 +1044,13 @@ func serveCommand(args []string, stderr io.Writer) int {
 			defer manager.Close()
 			stackJobs = manager
 			fmt.Fprintf(stderr, "abcp stack jobs profiles=%d\n", len(profiles.Profiles))
+			if *stackOSVRoot != "" {
+				if manager.EnableScans(*stackOSVRoot) != nil {
+					fmt.Fprintln(stderr, "stack scans unavailable: the vulnerability data's folder does not check")
+				} else {
+					fmt.Fprintln(stderr, "abcp stack scans ready")
+				}
+			}
 		}
 	}
 	// Change jobs (docs/plans/change-jobs.md) need the stack profiles too; without all their settings, or with one that does
