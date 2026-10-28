@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -411,11 +412,13 @@ func changePrompt(kind, words string, p Part, before serviceapi.StackPartV1) str
 		where = "the folder " + p.Dir
 	}
 	task := "Fix or change the project as the person asks, below. Where the project has tests, add or change a test that fails without " +
-		"your change and passes with it, and run the tests before you finish."
+		"your change and passes with it, and run the tests before you finish. Afterwards your new and changed test files are run on the " +
+		"code as it was before your change, and the person is shown whether they failed there: put the test in the project's usual " +
+		"test files, so it is found."
 	if kind == "tests" {
 		task = "Write tests for the project, as the person asks below: for the part they name, or the parts that need them most. Use the " +
 			"project's own test framework and conventions, change no code other than tests and what tests need to run, and run the " +
-			"tests before you finish: they must pass."
+			"tests before you finish: they must pass. The project's line coverage is measured before and after, and the person is shown both."
 	}
 	return "You are working on a copy of a customer's repository. " + task + "\n\nThe person's words, between the lines:\n-----\n" + words +
 		"\n-----\n\n" + promptRules + "\n\nThe project is " + p.Stack + " " + p.Version + " (" + p.Tool + ") at " + where +
@@ -433,4 +436,75 @@ func reviewPrompt(kind, words string) string {
 		"it, then the files it touches. The person asked, between the lines:\n-----\n" + words + "\n-----\n\n" + promptRules +
 		"\n\nCheck that the change does what was asked, nothing else, and that the tests pass (run them with the run tool). Correct " +
 		"what is wrong with your file tools. Answer with a short review: what you checked and anything you corrected, in at most five lines."
+}
+
+// What a fix's new tests showed on the code before the change (FIX_AND_TEST §3).
+const (
+	ProofFailedBefore, ProofPassedBefore, ProofNoTest, ProofNotRun = "FAILED_BEFORE", "PASSED_BEFORE", "NO_TEST", "NOT_RUN"
+	// maxProofFile bounds one test file copied onto the code before the change; a patch is at most 2 MB in all.
+	maxProofFile = 2 << 20
+)
+
+// nodeTestName is a JavaScript or TypeScript test file's name: x.test.js, x.spec.ts and their kin.
+var nodeTestName = regexp.MustCompile(`\.(?:test|spec)\.[cm]?[jt]sx?$`)
+
+// testFile reports whether rel (the repository's path, as a patch names it) is one of part p's tests by its stack's own
+// conventions: what the change's tests are, run on the code before it.
+func testFile(p Part, rel string) bool {
+	if rel == "" || strings.HasPrefix(rel, "/") || strings.Contains(rel, "\\") {
+		return false
+	}
+	if p.Dir != "" {
+		if !strings.HasPrefix(rel, p.Dir+"/") {
+			return false
+		}
+		rel = strings.TrimPrefix(rel, p.Dir+"/")
+	}
+	names := strings.Split(rel, "/")
+	for _, name := range names {
+		if name == "" || name == "." || name == ".." {
+			return false
+		}
+	}
+	base, dirs := names[len(names)-1], names[:len(names)-1]
+	inDir := func(want ...string) bool {
+		for _, d := range dirs {
+			for _, w := range want {
+				if d == w {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	switch p.Stack {
+	case StackPython:
+		return strings.HasSuffix(base, ".py") && (strings.HasPrefix(base, "test_") || strings.HasSuffix(base, "_test.py") || base == "conftest.py") ||
+			inDir("tests", "test")
+	case StackJava:
+		return strings.HasPrefix(rel, "src/test/") || strings.HasPrefix(rel, "src/integrationTest/") || strings.Contains(rel, "/src/test/")
+	case StackNode:
+		return nodeTestName.MatchString(base) || inDir("__tests__", "tests", "test")
+	}
+	return false
+}
+
+// proofState says what the new tests showed on the code before the change, against the baseline's own test step: they
+// fail there (more failures than the baseline had, or failing where it passed or found no tests), they pass there too,
+// or the run could not tell.
+func proofState(base, before serviceapi.StackStepV1) (string, string) {
+	counted := base.Tests != nil && before.Tests != nil
+	switch {
+	case before.State == Failed && (base.State == Passed || base.State == StepSkipped):
+		return ProofFailedBefore, ""
+	case before.State == Failed && counted && before.Tests.Failed > base.Tests.Failed:
+		return ProofFailedBefore, ""
+	case before.State == Failed:
+		return ProofNotRun, "the project's tests failed before the change too, so the new tests' run could not tell"
+	case before.State == Passed:
+		return ProofPassedBefore, ""
+	case before.State == StepSkipped:
+		return ProofNotRun, "no tests were found on the code before the change"
+	}
+	return ProofNotRun, "the tests could not be run on the code before the change"
 }

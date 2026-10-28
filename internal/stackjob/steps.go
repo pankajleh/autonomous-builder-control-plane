@@ -206,3 +206,59 @@ func gradleProperties(proxy netip.AddrPort) string {
 	return "systemProp.https.proxyHost=" + host + "\nsystemProp.https.proxyPort=" + port +
 		"\nsystemProp.http.proxyHost=" + host + "\nsystemProp.http.proxyPort=" + port + "\norg.gradle.daemon=false\n"
 }
+
+// coverageTools is where a stack image keeps its coverage tools and their report (Repo C design note FIX_AND_TEST §4,
+// tools/stack-images/coverage); an image without it is never measured.
+const coverageTools = "/opt/autobuild/coverage"
+
+// coverageResult is where a measured test step leaves the report's answer for part n, under /work but outside the part.
+func coverageResult(n int) string { return "/work/.abcp/coverage-" + strconv.Itoa(n) + ".json" }
+
+// coverageOmit leaves a Python project's tests and environment out of what coverage.py counts.
+const coverageOmit = "*/.venv/*,*/tests/*,*/test/*,*/test_*.py,*/*_test.py,*/conftest.py"
+
+// jacocoExcludes are the build tools' own classes, which JaCoCo's agent then leaves alone; the report reads only the
+// project's own compiled classes whatever ran.
+const jacocoExcludes = "org.apache.maven.*:org.codehaus.plexus.*:org.eclipse.sisu.*:org.eclipse.aether.*:org.gradle.*:worker.org.gradle.*"
+
+// Measured is test step t run so the project's coverage is measured (FIX_AND_TEST §4): the same tests with the stack's
+// coverage tool around them, then the image's report, whose answer is left at coverageResult(n). What a run before left
+// is removed first, so the checks after a change never read the baseline's. The step's exit code is still the tests' own,
+// and an image without the tools runs the tests as they are. Fixed text again: the paths are ABCP's and the tool's words
+// are Detect's.
+func Measured(p Part, n int, t Step) Step {
+	if t.Skip != "" || t.Name != "test" {
+		return t
+	}
+	id := strconv.Itoa(n)
+	report, result := coverageTools+"/report", coverageResult(n)
+	var data, out, run string
+	switch p.Stack {
+	case StackPython:
+		data, out = "/work/.abcp/coverage-"+id+".data", "/work/.abcp/coverage-"+id+".out.json"
+		cover := "PYTHONPATH=" + coverageTools + "/python .venv/bin/python -m coverage run --data-file=" + data + " --source=. --omit='" + coverageOmit + "' -m"
+		run = `if .venv/bin/python -c "import pytest" 2>/dev/null; then ` + cover + ` pytest -q -p no:cacheprovider --junitxml=` + pytestReport(n) +
+			`; else ` + cover + ` unittest discover; fi`
+		report += " python"
+	case StackJava:
+		data, out = "/work/.abcp/jacoco-"+id+".exec", "/work/.abcp/jacoco-"+id+".xml"
+		run = `JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -javaagent:` + coverageTools + `/jacoco/jacocoagent.jar=destfile=` + data + `,append=true,excludes=` +
+			jacocoExcludes + `" ` + strings.Join(t.Argv, " ")
+		report += " java"
+	case StackNode:
+		data, out = "/work/.abcp/v8-"+id, "/work/.abcp/c8-"+id
+		run = "NODE_V8_COVERAGE=" + data + " " + strings.Join(t.Argv, " ")
+		report += " node"
+	default:
+		return t
+	}
+	plain := strings.Join(t.Argv, " ")
+	if p.Stack == StackPython {
+		plain = t.Argv[2]
+	}
+	script := "rm -rf " + data + " " + out + " " + result + "; if [ -x " + coverageTools + "/report ]; then " + run + "; s=$?; " + report + " " + data + " " +
+		out + " > " + result + " 2>/dev/null; exit $s; fi; " + plain
+	m := t
+	m.Argv = []string{"/bin/sh", "-c", script}
+	return m
+}
