@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
 // Step is one step of a part: install, build or test. A step with Skip set is not run, and says why.
@@ -166,13 +168,15 @@ func Env(p Part, profile ProfileV1, proxy netip.AddrPort) []string {
 }
 
 // mavenSettings and gradleProperties tell Maven's and Gradle's own downloads where the proxy is; written into the
-// cache's home before a Java part's steps.
-func mavenSettings(proxy netip.AddrPort) string {
+// cache's home before a Java part's steps. Maven's also carry the job's own registries (§15.9), and are written again
+// without them when the part ends.
+func mavenSettings(proxy netip.AddrPort, registries []serviceapi.RegistryV1) string {
 	host, port := proxy.Addr().String(), strconv.Itoa(int(proxy.Port()))
-	return `<settings><proxies>` +
+	servers, mirrors, profiles := mavenRegistries(registries)
+	return `<settings>` + servers + mirrors + `<proxies>` +
 		`<proxy><id>abcp-https</id><active>true</active><protocol>https</protocol><host>` + host + `</host><port>` + port + `</port></proxy>` +
 		`<proxy><id>abcp-http</id><active>true</active><protocol>http</protocol><host>` + host + `</host><port>` + port + `</port></proxy>` +
-		`</proxies></settings>` + "\n"
+		`</proxies>` + profiles + `</settings>` + "\n"
 }
 
 func gradleProperties(proxy netip.AddrPort) string {

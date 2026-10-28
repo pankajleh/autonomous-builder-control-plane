@@ -101,6 +101,9 @@ type ChangeManager struct {
 	ctx       context.Context
 	stop      context.CancelFunc
 	wg        sync.WaitGroup
+
+	// registries are each job's private registries (§15.9), kept here only, never in its record.
+	registries map[string][]serviceapi.RegistryV1
 }
 
 // NewChangeManager opens the jobs kept under root, marks any left running UNKNOWN, removes what they left, and starts
@@ -122,7 +125,7 @@ func NewChangeManager(root, sources, tool string, profiles ProfilesV1, sandbox S
 	m := &ChangeManager{root: root, sources: sources, tool: tool, profiles: profiles, sandbox: sandbox, engine: engine, now: now, freeDisk: statfsFree,
 		probe:   &prober{root: filepath.Join(root, "probe"), sandbox: sandbox, now: now, probes: map[string]probe{}},
 		records: map[string]*changeRecord{}, byRequest: map[string]string{}, busy: map[string]bool{}, cancels: map[string]context.CancelFunc{},
-		wake: make(chan struct{}, changeWorkers)}
+		wake: make(chan struct{}, changeWorkers), registries: map[string][]serviceapi.RegistryV1{}}
 	if err := m.load(); err != nil {
 		return nil, err
 	}
@@ -219,7 +222,7 @@ func copyChangeJob(j serviceapi.ChangeJobV1) serviceapi.ChangeJobV1 {
 }
 
 func changeDigest(r serviceapi.ChangeJobCreateV1) string {
-	data, _ := json.Marshal([]string{r.Source, r.CacheKey, r.Kind, r.Words})
+	data, _ := json.Marshal(append([]string{r.Source, r.CacheKey, r.Kind, r.Words}, serviceapi.RegistriesDigestPart(r.Registries)...))
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
@@ -257,6 +260,9 @@ func (m *ChangeManager) StartChangeJob(_ context.Context, req serviceapi.ChangeJ
 	}
 	m.records[r.Job.ID] = r
 	m.byRequest[req.RequestID] = r.Job.ID
+	if len(req.Registries) > 0 {
+		m.registries[r.Job.ID] = append([]serviceapi.RegistryV1(nil), req.Registries...)
+	}
 	m.queue = append(m.queue, r.Job.ID)
 	m.prune()
 	m.nudge()
@@ -410,6 +416,7 @@ func (m *ChangeManager) run(id string) {
 	m.mu.Lock()
 	delete(m.cancels, id)
 	delete(m.busy, r.CacheKey)
+	delete(m.registries, id)
 	m.mu.Unlock()
 }
 
@@ -466,10 +473,18 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 	}
 	now := m.now()
 	_ = os.Chtimes(cache, now, now)
+	m.mu.Lock()
+	registries := m.registries[r.Job.ID]
+	m.mu.Unlock()
+	forget, err := writeRegistrySettings(cache, registries)
+	if err != nil {
+		return changeEnd{ChangeFailed, FailSandbox}
+	}
+	defer forget()
 
 	// The baseline.
 	m.update(r, func(j *serviceapi.ChangeJobV1) { j.Phase, j.Before = PhaseBaseline, planParts(parts) })
-	if f := m.check(ctx, r, parts, work, cache, "before"); f != "" {
+	if f := m.check(ctx, r, parts, work, cache, "before", registries); f != "" {
 		if f == FailStopped || ctx.Err() != nil {
 			return stopped(ctx)
 		}
@@ -482,7 +497,7 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 
 	// The agent, then its review.
 	m.update(r, func(j *serviceapi.ChangeJobV1) { j.Phase, j.Agent = PhaseAgent, &serviceapi.ChangeAgentV1{} })
-	b, err := m.openBroker(ctx, r, parts[agentPart], agentPart, work, cache)
+	b, err := m.openBroker(ctx, r, parts[agentPart], agentPart, work, cache, registries)
 	if err != nil {
 		if ctx.Err() != nil {
 			return stopped(ctx)
@@ -499,7 +514,7 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 	said, err := m.engine.Run(agentCtx, EngineRun{Work: work, Home: home, MCPConfig: mcp, MaxTurns: agentTurns,
 		Prompt: changePrompt(r.Job.Kind, r.Words, parts[agentPart], before[agentPart])})
 	agentCancel()
-	values := m.secretValues()
+	values := append(m.secretValues(), registrySecrets(registries)...)
 	leaked := m.recordAgent(r, said, false, b.commands(), time.Since(started), values)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -552,7 +567,7 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 
 	// The checks after, on the changed files.
 	m.update(r, func(j *serviceapi.ChangeJobV1) { j.Phase, j.After = PhaseChecking, planParts(parts) })
-	if f := m.check(ctx, r, parts, work, cache, "after"); f == FailStopped || f == FailSandbox {
+	if f := m.check(ctx, r, parts, work, cache, "after", registries); f == FailStopped || f == FailSandbox {
 		if f == FailStopped || ctx.Err() != nil {
 			return stopped(ctx)
 		}
@@ -646,13 +661,13 @@ func planParts(parts []Part) []serviceapi.StackPartV1 {
 
 // check runs every supported part's steps into the job's before or after; it answers FailStopped or FailSandbox when the
 // job cannot go on, and "" otherwise, whatever the steps' own results.
-func (m *ChangeManager) check(ctx context.Context, r *changeRecord, parts []Part, work, cache, which string) string {
+func (m *ChangeManager) check(ctx context.Context, r *changeRecord, parts []Part, work, cache, which string, registries []serviceapi.RegistryV1) string {
 	for n, p := range parts {
 		if p.Stack == StackUnsupported {
 			continue
 		}
 		n := n
-		f := runSteps(ctx, steps{sandbox: m.sandbox, profiles: m.profiles, probe: m.probe, session: partID(r.Job.ID, n, which),
+		f := runSteps(ctx, steps{sandbox: m.sandbox, profiles: m.profiles, probe: m.probe, session: partID(r.Job.ID, n, which), registries: registries,
 			set: func(i int, change func(*serviceapi.StackStepV1)) {
 				m.update(r, func(j *serviceapi.ChangeJobV1) {
 					if which == "before" {

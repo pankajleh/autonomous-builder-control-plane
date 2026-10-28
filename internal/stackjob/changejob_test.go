@@ -403,7 +403,7 @@ func TestTheRunToolSpeaksMCPAndOnlyRunsInTheSandbox(t *testing.T) {
 			io.WriteString(out, strings.Repeat(strings.Repeat("\x01", 79)+"\n", 600))
 			return 0, nil
 		}
-		io.WriteString(out, "ran "+dir+" "+argv[2]+"\npassword=hunter2\n")
+		io.WriteString(out, "ran "+dir+" "+argv[2]+"\npassword=hunter2\nfetched with "+npmToken+"\n")
 		if argv[2] == "false" {
 			return 1, nil
 		}
@@ -414,7 +414,7 @@ func TestTheRunToolSpeaksMCPAndOnlyRunsInTheSandbox(t *testing.T) {
 		opens++
 		s, err := box.Open(ctx, "x", testProfiles().Profiles[0].Spec(), base, base)
 		return s, []string{"PATH=/usr/bin"}, err
-	})
+	}, registrySecrets(testRegistries()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +454,8 @@ func TestTheRunToolSpeaksMCPAndOnlyRunsInTheSandbox(t *testing.T) {
 		return r["content"].([]any)[0].(map[string]any)["text"].(string), r["isError"].(bool)
 	}
 	if out, isErr := text(call(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run","arguments":{"command":"npm test","dir":"web"}}}`)); isErr ||
-		!strings.Contains(out, "exit code 0") || !strings.Contains(out, "ran /work/web npm test") || strings.Contains(out, "hunter2") {
+		!strings.Contains(out, "exit code 0") || !strings.Contains(out, "ran /work/web npm test") || strings.Contains(out, "hunter2") ||
+		strings.Contains(out, npmToken) || !strings.Contains(out, RegistryMask) {
 		t.Fatalf("run = %q %v", out, isErr)
 	}
 	if out, isErr := text(call(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run","arguments":{"command":"false"}}}`)); !isErr || !strings.Contains(out, "exit code 1") {

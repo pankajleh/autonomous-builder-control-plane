@@ -30,6 +30,9 @@ type StackSpec struct {
 	TmpfsBytes  int64
 	Lifetime    time.Duration
 	Egress      []string
+	// Hosts are the names of the job's own private registries (Repo C IMPROVE_EXISTING_PRODUCTS §15.9), from its request
+	// and checked there: reached on 443 at public addresses only, as the registry rules' names are.
+	Hosts []string
 }
 
 // Valid reports a spec ABCP may run: a pinned image, bounded limits, and registries only.
@@ -46,8 +49,20 @@ func (s StackSpec) Valid() bool {
 		}
 		seen[rule] = true
 	}
+	if len(s.Hosts) > 3 {
+		return false
+	}
+	for _, host := range s.Hosts {
+		if _, err := netip.ParseAddr(host); err == nil || seen[host] || !stackHost.MatchString(host) {
+			return false
+		}
+		seen[host] = true
+	}
 	return true
 }
+
+// stackHost is a lower-case DNS name with a dot in it.
+var stackHost = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$`)
 
 // StackSession is one part's container, its network and its egress proxy, until Close.
 type StackSession struct {
@@ -118,6 +133,7 @@ func (d *dockerRuntime) openStack(ctx context.Context, id string, spec StackSpec
 		return nil, ErrUnavailable
 	}
 	x.egress = newEgressProxy(listener, spec.Egress)
+	x.egress.hosts = append([]string(nil), spec.Hosts...)
 	x.egress.start()
 	if _, err := d.run(ctx, d.stackCreateArgs(id, spec, user, work, cache)...); err != nil {
 		return nil, ErrUnavailable

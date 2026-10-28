@@ -10,6 +10,7 @@ import (
 
 type testStackJobs struct {
 	calls []string
+	last  StackJobCreateV1
 	err   error
 }
 
@@ -18,6 +19,7 @@ var sampleStackJob = StackJobV1{SchemaVersion: StackJobSchemaV1, ID: strings.Rep
 
 func (t *testStackJobs) StartStackJob(_ context.Context, r StackJobCreateV1) (StackJobV1, error) {
 	t.calls = append(t.calls, "start:"+r.RequestID+":"+r.Source+":"+r.CacheKey[:4])
+	t.last = r
 	return sampleStackJob, t.err
 }
 func (t *testStackJobs) StackJob(_ context.Context, id string) (StackJobV1, error) {
@@ -107,5 +109,34 @@ func TestStackJobsAnswerTheirCodesAndNeedTheirGrant(t *testing.T) {
 	s.reserved.StackJobs = nil
 	if r := call(s, http.MethodGet, "/v1/stack-jobs/"+id, ""); r.Code != http.StatusServiceUnavailable || !strings.Contains(r.Body.String(), "stack_jobs_unavailable") {
 		t.Fatalf("not configured = %d %s", r.Code, r.Body.String())
+	}
+}
+
+func TestAStackJobTakesItsPrivateRegistriesWithTheirLongestTokens(t *testing.T) {
+	s, backend := stackJobServer(t, true)
+	key := strings.Repeat("b", 64)
+	token := strings.Repeat("t", 4096)
+	registry := func(kind, use, extra, url string) string {
+		return `{"kind":"` + kind + `","use":"` + use + `",` + extra + `"url":"` + url + `","token":"` + token + `"}`
+	}
+	registries := `[` + registry("npm", "own", `"scope":"@acme",`, "https://npm.acme.example/npm/acme/") + `,` +
+		registry("maven", "all", `"username":"builder",`, "https://maven.acme.example/repository/maven-public/") + `,` +
+		registry("python", "own", `"username":"aws",`, "https://pypi.acme.example/simple") + `]`
+	body := `{"request_id":"req-r","source":"project-1","cache_key":"` + key + `","registries":` + registries + `}`
+	if r := call(s, http.MethodPost, "/v1/stack-jobs", body); r.Code != http.StatusAccepted || len(backend.last.Registries) != 3 ||
+		backend.last.Registries[1].Username != "builder" || backend.last.Registries[0].Scope != "@acme" || strings.Contains(r.Body.String(), "tttt") {
+		t.Fatalf("start = %d %s, %d registries", r.Code, r.Body.String(), len(backend.last.Registries))
+	}
+	for name, bad := range map[string]string{
+		"http":      `{"request_id":"req-b","source":"project-1","cache_key":"` + key + `","registries":[` + registry("npm", "all", "", "http://npm.acme.example/") + `]}`,
+		"field":     `{"request_id":"req-b","source":"project-1","cache_key":"` + key + `","registries":[{"kind":"npm","use":"all","url":"https://npm.acme.example/","token":"abcdefgh","x":1}]}`,
+		"too large": `{"request_id":"req-b","source":"project-1","cache_key":"` + key + `","registries":` + registries + `,"pad":"` + strings.Repeat("p", 4000) + `"}`,
+	} {
+		if r := call(s, http.MethodPost, "/v1/stack-jobs", bad); r.Code != http.StatusBadRequest {
+			t.Errorf("%s = %d, want 400", name, r.Code)
+		}
+	}
+	if len(backend.calls) != 1 {
+		t.Fatalf("a refused request reached the backend: %v", backend.calls)
 	}
 }

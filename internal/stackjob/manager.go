@@ -114,6 +114,9 @@ type Manager struct {
 	ctx       context.Context
 	stop      context.CancelFunc
 	wg        sync.WaitGroup
+
+	// registries are each job's private registries (§15.9), kept here only, never in its record.
+	registries map[string][]serviceapi.RegistryV1
 }
 
 // New opens the jobs kept under root, marks any left running UNKNOWN, removes what they left, and starts the worker.
@@ -131,7 +134,7 @@ func New(root, sources string, profiles ProfilesV1, sandbox Sandbox, now func() 
 		}
 	}
 	m := &Manager{root: root, sources: sources, profiles: profiles, sandbox: sandbox, now: now, freeDisk: statfsFree,
-		records: map[string]*record{}, byRequest: map[string]string{}, wake: make(chan struct{}, 1),
+		records: map[string]*record{}, byRequest: map[string]string{}, registries: map[string][]serviceapi.RegistryV1{}, wake: make(chan struct{}, 1),
 		probe: &prober{root: filepath.Join(root, "probe"), sandbox: sandbox, now: now, probes: map[string]probe{}}}
 	if err := m.load(); err != nil {
 		return nil, err
@@ -233,7 +236,7 @@ func copyJob(j serviceapi.StackJobV1) serviceapi.StackJobV1 {
 }
 
 func bodyDigest(r serviceapi.StackJobCreateV1) string {
-	data, _ := json.Marshal([]string{r.Source, r.CacheKey})
+	data, _ := json.Marshal(append([]string{r.Source, r.CacheKey}, serviceapi.RegistriesDigestPart(r.Registries)...))
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
@@ -271,6 +274,9 @@ func (m *Manager) StartStackJob(_ context.Context, req serviceapi.StackJobCreate
 	}
 	m.records[r.Job.ID] = r
 	m.byRequest[req.RequestID] = r.Job.ID
+	if len(req.Registries) > 0 {
+		m.registries[r.Job.ID] = append([]serviceapi.RegistryV1(nil), req.Registries...)
+	}
 	m.queue = append(m.queue, r.Job.ID)
 	m.prune()
 	select {
@@ -385,6 +391,7 @@ func (m *Manager) run(id string) {
 	tidyCaches(filepath.Join(m.root, "caches"), r.CacheKey)
 	m.mu.Lock()
 	m.running, m.cancel = "", nil
+	delete(m.registries, id)
 	m.mu.Unlock()
 }
 
@@ -424,13 +431,21 @@ func (m *Manager) runJob(ctx context.Context, r *record, work string) string {
 	}
 	now := m.now()
 	_ = os.Chtimes(cache, now, now)
+	m.mu.Lock()
+	registries := m.registries[r.Job.ID]
+	m.mu.Unlock()
+	forget, err := writeRegistrySettings(cache, registries)
+	if err != nil {
+		return FailSandbox
+	}
+	defer forget()
 	failure, ran := "", false
 	for n, p := range parts {
 		if p.Stack == StackUnsupported {
 			continue
 		}
 		ran = true
-		if f := m.runPart(ctx, r, n, p, work, cache); f != "" && failure == "" {
+		if f := m.runPart(ctx, r, n, p, work, cache, registries); f != "" && failure == "" {
 			failure = f
 		}
 		if failure == FailStopped || failure == FailSandbox {
@@ -474,8 +489,8 @@ func (p *prober) proved(ctx context.Context, profile ProfileV1) bool {
 // failureOf is the job's code for a step that failed.
 var failureOf = map[string]string{"install": FailInstall, "build": FailBuild, "test": FailTests}
 
-func (m *Manager) runPart(ctx context.Context, r *record, n int, p Part, work, cache string) string {
-	return runSteps(ctx, steps{sandbox: m.sandbox, profiles: m.profiles, probe: m.probe, session: partID(r.Job.ID, n, "part"),
+func (m *Manager) runPart(ctx context.Context, r *record, n int, p Part, work, cache string, registries []serviceapi.RegistryV1) string {
+	return runSteps(ctx, steps{sandbox: m.sandbox, profiles: m.profiles, probe: m.probe, session: partID(r.Job.ID, n, "part"), registries: registries,
 		set: func(i int, change func(*serviceapi.StackStepV1)) {
 			m.update(r, func(j *serviceapi.StackJobV1) { change(&j.Parts[n].Steps[i]) })
 		}}, n, p, work, cache)
@@ -489,6 +504,9 @@ type steps struct {
 	probe    *prober
 	session  string
 	set      func(i int, change func(*serviceapi.StackStepV1))
+	// registries are the job's private registries (§15.9): their names join the part's egress, Maven's settings carry
+	// them, and their tokens are masked in every output kept.
+	registries []serviceapi.RegistryV1
 }
 
 // runSteps runs one part's steps in a container of its own and answers the part's failure code or "".
@@ -497,10 +515,13 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 	if !ok || !x.probe.proved(ctx, profile) {
 		return FailSandbox
 	}
-	session, err := x.sandbox.Open(ctx, x.session, profile.Spec(), work, cache)
+	spec := profile.Spec()
+	spec.Hosts = registryHosts(x.registries)
+	session, err := x.sandbox.Open(ctx, x.session, spec, work, cache)
 	if err != nil {
 		return FailSandbox
 	}
+	secrets := registrySecrets(x.registries)
 	ended := false
 	end := func() {
 		if !ended {
@@ -509,7 +530,7 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 		}
 	}
 	defer end()
-	if javaSettings(p, cache, session.Proxy()) != nil {
+	if javaSettings(p, cache, session.Proxy(), x.registries) != nil {
 		return FailSandbox
 	}
 	env := Env(p, profile, session.Proxy())
@@ -556,7 +577,7 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 		}
 		exit := code
 		set(func(st *serviceapi.StackStepV1) {
-			st.State, st.Note, st.Seconds, st.OutputTail = state, note, float64(int(seconds*10))/10, out.Lines(outputLines)
+			st.State, st.Note, st.Seconds, st.OutputTail = state, note, float64(int(seconds*10))/10, maskRegistries(out.Lines(outputLines), secrets)
 			if err == nil {
 				st.ExitCode = &exit
 			}
@@ -582,7 +603,7 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 
 // javaSettings tells a Java part's Maven and Gradle where the proxy is. Written from the host into a cache a job may have
 // left links in: through real folders only, never a link.
-func javaSettings(p Part, cache string, proxy netip.AddrPort) error {
+func javaSettings(p Part, cache string, proxy netip.AddrPort, registries []serviceapi.RegistryV1) error {
 	if p.Stack != StackJava {
 		return nil
 	}
@@ -590,7 +611,7 @@ func javaSettings(p Part, cache string, proxy netip.AddrPort) error {
 	if err != nil {
 		return err
 	}
-	if err := writeReal(m2, "settings.xml", []byte(mavenSettings(proxy))); err != nil {
+	if err := writeReal(m2, "settings.xml", []byte(mavenSettings(proxy, registries))); err != nil {
 		return err
 	}
 	gradle, err := realDirs(cache, "home", ".gradle")
