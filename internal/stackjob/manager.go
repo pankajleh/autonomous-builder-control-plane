@@ -656,6 +656,7 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 		} else {
 			x.part(func(part *serviceapi.StackPartV1) {
 				part.Findings, part.FindingsMore, part.Licences, part.Checks = result.Findings, result.More, result.Licences, result.Checks
+				part.ScanAbout = result.About
 			})
 		}
 	}

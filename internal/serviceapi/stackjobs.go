@@ -59,6 +59,14 @@ type StackPartV1 struct {
 	FindingsMore int               `json:"findings_more,omitempty"`
 	Licences     map[string]int    `json:"licences,omitempty"`
 	Checks       map[string]string `json:"checks,omitempty"`
+	// ScanAbout is what the scan used, for the person's report: each tool's version, and each data source's date.
+	ScanAbout *StackScanAboutV1 `json:"scan_about,omitempty"`
+}
+
+// StackScanAboutV1 is what a scan used: each tool's version, and the date of each source of vulnerability data.
+type StackScanAboutV1 struct {
+	Tools map[string]string `json:"tools,omitempty"`
+	Data  map[string]string `json:"data,omitempty"`
 }
 
 // StackFindingV1 is one finding of a scan: its kind (dependency, secret, code or licence), the tool and its rule, the

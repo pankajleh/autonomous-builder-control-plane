@@ -28,6 +28,8 @@ const (
 	maxLicenceCount = 1_000_000
 	maxFindingLine  = 10_000_000
 	maxMore         = 1_000_000
+	maxAboutTools   = 12
+	maxAboutData    = 6
 )
 
 // scanReport is where part n's scanner writes its result, under /work but outside the part.
@@ -40,6 +42,14 @@ type scanFile struct {
 	More     int               `json:"more"`
 	Licences map[string]int    `json:"licences,omitempty"`
 	Checks   map[string]string `json:"checks,omitempty"`
+	About    *scanAbout        `json:"about,omitempty"`
+}
+
+// scanAbout says what the scan used, for the person's report: each tool's version, and the date of each source of
+// vulnerability data (OSV's ecosystems, as the build host last fetched them).
+type scanAbout struct {
+	Tools map[string]string `json:"tools,omitempty"`
+	Data  map[string]string `json:"data,omitempty"`
 }
 
 type scanFinding struct {
@@ -63,6 +73,7 @@ type ScanResult struct {
 	More     int
 	Licences map[string]int
 	Checks   map[string]string
+	About    *serviceapi.StackScanAboutV1
 }
 
 var (
@@ -73,6 +84,8 @@ var (
 	checkStates   = map[string]bool{"done": true, "failed": true, "skipped": true}
 	findingTool   = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
 	advisoryID    = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,60}$`)
+	toolVersion   = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,40}$`)
+	dataSource    = regexp.MustCompile(`^[A-Za-z0-9._-]{1,40}$`)
 	findingPathOK = regexp.MustCompile(`^[^\x00-\x1f\x7f\\]+$`)
 )
 
@@ -177,5 +190,43 @@ func ReadScan(work string, n int, secrets []string) (ScanResult, error) {
 			result.Checks[check] = state
 		}
 	}
+	if file.About != nil {
+		about, ok := file.About.checked(mask)
+		if !ok {
+			return ScanResult{}, errScan
+		}
+		result.About = about
+	}
 	return result, nil
+}
+
+// checked is what the scan used, every name and version from its pattern and every date printable; nil when it names
+// nothing.
+func (a scanAbout) checked(mask func(string) string) (*serviceapi.StackScanAboutV1, bool) {
+	if len(a.Tools) > maxAboutTools || len(a.Data) > maxAboutData {
+		return nil, false
+	}
+	about := serviceapi.StackScanAboutV1{}
+	for tool, version := range a.Tools {
+		if !findingTool.MatchString(tool) || !toolVersion.MatchString(version) {
+			return nil, false
+		}
+		if about.Tools == nil {
+			about.Tools = map[string]string{}
+		}
+		about.Tools[tool] = version
+	}
+	for source, date := range a.Data {
+		if !dataSource.MatchString(source) || date == "" || !printable(date, 60) {
+			return nil, false
+		}
+		if about.Data == nil {
+			about.Data = map[string]string{}
+		}
+		about.Data[source] = mask(date)
+	}
+	if about.Tools == nil && about.Data == nil {
+		return nil, true
+	}
+	return &about, true
 }
