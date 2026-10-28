@@ -262,3 +262,37 @@ func TestScansAreRefusedWithoutTheirDataAndTheirFolderMustBeReal(t *testing.T) {
 		t.Fatalf("a check without the data = %v", err)
 	}
 }
+
+func TestAScanSaysWhatItUsedForTheReport(t *testing.T) {
+	work := t.TempDir()
+	about := `,"about":{"tools":{"osv-scanner":"2.6.0","betterleaks":"1.9.0","find-sec-bugs":"1.14.0"},"data":{"osv-PyPI":"Wed, 28 Oct 2026 16:48:24 GMT"}}}`
+	writeScan(t, work, 0, strings.TrimSuffix(goodScan, "}")+about)
+	result, err := ReadScan(work, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.About == nil || result.About.Tools["osv-scanner"] != "2.6.0" || result.About.Data["osv-PyPI"] != "Wed, 28 Oct 2026 16:48:24 GMT" {
+		t.Fatalf("about = %+v", result.About)
+	}
+	none := t.TempDir()
+	writeScan(t, none, 0, `{"schema":1,"findings":[],"more":0,"about":{}}`)
+	if r, err := ReadScan(none, 0, nil); err != nil || r.About != nil {
+		t.Fatalf("an empty about = %+v %v", r.About, err)
+	}
+	for name, bad := range map[string]string{
+		"a tool's name":     `{"tools":{"OSV Scanner":"2.6.0"}}`,
+		"a version":         `{"tools":{"osv-scanner":"2.6.0; rm -rf"}}`,
+		"a source's name":   `{"data":{"osv PyPI":"today"}}`,
+		"an empty date":     `{"data":{"osv-PyPI":""}}`,
+		"a control":         `{"data":{"osv-PyPI":"to\u0007day"}}`,
+		"an unknown field":  `{"tools":{},"extra":1}`,
+		"too many tools":    `{"tools":{"a":"1","b":"1","c":"1","d":"1","e":"1","f":"1","g":"1","h":"1","i":"1","j":"1","k":"1","l":"1","m":"1"}}`,
+		"a version as list": `{"tools":{"osv-scanner":["2.6.0"]}}`,
+	} {
+		dir := t.TempDir()
+		writeScan(t, dir, 0, `{"schema":1,"findings":[],"more":0,"about":`+bad+`}`)
+		if _, err := ReadScan(dir, 0, nil); err == nil {
+			t.Fatalf("%s was not refused", name)
+		}
+	}
+}

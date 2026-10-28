@@ -143,7 +143,8 @@ is what it was and a request ID names either a check or a scan, never both. The 
      "fixed": "…", "licence": "…", "ids": ["GHSA-…", "CVE-…"], "title": "…"}],
    "more": 0,
    "licences": {"MIT": 40, "UNKNOWN": 2},
-   "checks": {"dependencies": "done", "secrets": "skipped", "code": "failed", "licences": "done"}}
+   "checks": {"dependencies": "done", "secrets": "skipped", "code": "failed", "licences": "done"},
+   "about": {"tools": {"osv-scanner": "2.6.0"}, "data": {"osv-PyPI": "Wed, 28 Oct 2026 16:48:24 GMT"}}}
   ```
 
   At most 2,000 findings (`more` counts the rest, at most 1,000,000); `rule` at most 120 characters, `file` 300
@@ -152,9 +153,11 @@ is what it was and a request ID names either a check or a scan, never both. The 
   names (at most 100 characters; `UNKNOWN` for packages without one) to how many installed packages each covers, 0 to
   1,000,000; findings of kind `licence` are only the packages to review. `checks` says, for each of the four, `done`,
   `failed` or `skipped` (secrets are looked for in part 0 only). A secret finding has no field for its value. Every text
-  is masked as a step's output is, with the job's registry tokens. A missing file, or one that breaks any of this, fails
+  is masked as a step's output is, with the job's registry tokens. `about` (optional) says what the scan used, for the
+  person's report: at most 12 tools (`[a-z0-9-]{1,40}`) with their versions (`[A-Za-z0-9._+-]{1,40}`), and at most 6
+  sources of vulnerability data (`[A-Za-z0-9._-]{1,40}`) with the date each was fetched (printable, at most 60). A missing file, or one that breaks any of this, fails
   the part `SCAN_FAILED` and keeps nothing of it.
-- **The evidence:** the part's `findings`, `findings_more`, `licences` and `checks` (each left out when empty, so a
+- **The evidence:** the part's `findings`, `findings_more`, `licences`, `checks` and `scan_about` (each left out when empty, so a
   check's parts are unchanged). The file comes from tools run in the customer's own container after their install, so
   it is their data about their code: kept and shown to them, never executed or followed as instructions.
 
