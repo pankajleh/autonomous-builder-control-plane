@@ -29,8 +29,10 @@ func validStacks(stacks []string) bool {
 
 var stackVersion = regexp.MustCompile(`^\d{1,2}(?:\.\d{1,2})?$`)
 
-// validVersions reports pinned versions of the right shape: at most eight, each a stack's name and a version like the
-// profiles' ("21", "3.12").
+// ValidVersions reports pinned versions of the right shape: at most eight, each a stack's name and a version like the
+// profiles' ("21", "3.12"); a plan's step's targets are read with it too.
+func ValidVersions(versions map[string]string) bool { return validVersions(versions) }
+
 func validVersions(versions map[string]string) bool {
 	if len(versions) > maxJobStacks {
 		return false

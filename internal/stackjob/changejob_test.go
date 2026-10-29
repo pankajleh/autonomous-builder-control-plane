@@ -672,8 +672,14 @@ func TestAnAssessmentChecksTheTargetVersionsAndHandsBackAPlanAndNoPatch(t *testi
 func TestAPlanIsReadOnlyInItsShape(t *testing.T) {
 	step := `{"title": "Move to Java 21", "words": "Set the release to 21.", "risk": "medium", "size": "small", "files": ["pom.xml"], "tests": "", "tests_first": true}`
 	ok := `{"summary": "Old.", "paths": [], "steps": [` + step + `]}`
-	if plan, err := parsePlan("  " + ok + "\n"); err != nil || plan.Steps[0].Title != "Move to Java 21" || !plan.Steps[0].TestsFirst {
+	if plan, err := parsePlan("  " + ok + "\n"); err != nil || plan.Steps[0].Title != "Move to Java 21" || !plan.Steps[0].TestsFirst ||
+		plan.Steps[0].Targets == nil || len(plan.Steps[0].Targets) != 0 {
 		t.Fatalf("plan = %+v %v", plan, err)
+	}
+	// A step's targets: the versions it moves the project to.
+	moving := strings.Replace(ok, `"tests_first": true`, `"tests_first": false, "targets": {"java": "21"}`, 1)
+	if plan, err := parsePlan(moving); err != nil || plan.Steps[0].Targets["java"] != "21" {
+		t.Fatalf("targets = %+v %v", plan, err)
 	}
 	if plan, err := parsePlan(`{"summary": "token ghp_` + strings.Repeat("a", 36) + `", "paths": null, "steps": [` + step + `]}`); err != nil ||
 		strings.Contains(plan.Summary, "ghp_") || plan.Paths == nil {
@@ -687,6 +693,8 @@ func TestAPlanIsReadOnlyInItsShape(t *testing.T) {
 		strings.Replace(ok, `"Move to Java 21"`, `"Move\nto"`, 1), strings.Replace(ok, `"summary"`, `"summary": "x", "extra"`, 1),
 		strings.Replace(ok, `"Old."`, `"`+strings.Repeat("a", maxPlanSummary+1)+`"`, 1),
 		`{"summary": "Old.", "paths": [], "steps": [` + strings.TrimSuffix(strings.Repeat(step+",", maxPlanSteps+1), ",") + `]}`,
+		strings.Replace(moving, `"21"`, `"21.0.4"`, 1), strings.Replace(moving, `"java"`, `"Java"`, 1),
+		strings.Replace(moving, `{"java": "21"}`, `["java"]`, 1),
 	}
 	for _, text := range bad {
 		if _, err := parsePlan(text); err == nil {
@@ -748,6 +756,18 @@ func TestAMigrationStepIsMadeAndCheckedOnTheVersionsItMovesTo(t *testing.T) {
 	installs, testCode = true, 1
 	if job := start("step-3"); job.State != ChangeNotHandedBack || job.Reason != ReasonWorse {
 		t.Fatalf("worse = %+v", job)
+	}
+	// A step that moves no version (tests written first) is made and checked on the project's own.
+	testCode = 0
+	runs := len(engine.runs)
+	own, err := f.m.StartChangeJob(context.Background(), serviceapi.ChangeJobCreateV1{RequestID: "step-4", Source: "old", CacheKey: key, Kind: "migrate",
+		Words: "Pin down newer() with tests first."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job := f.wait(t, own.ID); job.State != ChangeHandedBack || job.After[0].Version != "3.12" || job.After[0].VersionNote != "" ||
+		!strings.Contains(engine.runs[runs].Prompt, "python 3.12 (pip) at the top of the repository.") {
+		t.Fatalf("own versions = %+v %s", job, engine.runs[runs].Prompt)
 	}
 }
 

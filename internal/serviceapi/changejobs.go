@@ -69,16 +69,19 @@ type ChangePlanPathV1 struct {
 }
 
 // ChangePlanStepV1 is one step: its title; its words, what to change, fit to start a change job with; its risk and size
-// (low, medium or high; small, medium or large); the files it expects to touch; the tests it relies on; and whether the
-// code needs tests written before it is safe (Repo C design note FIX_AND_TEST).
+// (low, medium or high; small, medium or large); the files it expects to touch; the tests it relies on; whether the
+// code needs tests written before it is safe (Repo C design note FIX_AND_TEST); and its Targets, the versions this step
+// moves the project to, a migration's step's targets when it is made, empty for a step made on the versions in use
+// (tests written first, a library that works on both).
 type ChangePlanStepV1 struct {
-	Title      string   `json:"title"`
-	Words      string   `json:"words"`
-	Risk       string   `json:"risk"`
-	Size       string   `json:"size"`
-	Files      []string `json:"files"`
-	Tests      string   `json:"tests"`
-	TestsFirst bool     `json:"tests_first"`
+	Title      string            `json:"title"`
+	Words      string            `json:"words"`
+	Risk       string            `json:"risk"`
+	Size       string            `json:"size"`
+	Files      []string          `json:"files"`
+	Tests      string            `json:"tests"`
+	TestsFirst bool              `json:"tests_first"`
+	Targets    map[string]string `json:"targets"`
 }
 
 // ChangeProofV1 is a fix's new tests run on the code as it was before the change (Repo C design note FIX_AND_TEST §3):

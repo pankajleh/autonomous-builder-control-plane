@@ -427,9 +427,10 @@ func changePrompt(kind, words string, p Part, before serviceapi.StackPartV1) str
 			"tests before you finish: they must pass. The project's line coverage is measured before and after, and the person is shown both."
 	case "migrate":
 		task = "Make one step of a migration, as the words below describe it: this step and nothing more, in the project's own style. " +
-			"Your commands run on the versions the step moves to, as the project's line below says. The checks before ran on the " +
-			"versions the project uses now; afterwards they run on the new versions, and the change is handed back only when the " +
-			"project installs and builds there and no test that passed before fails. Run the build and the tests before you finish."
+			"Your commands run on the versions the project's line below names: the versions the step moves to, or the versions it " +
+			"uses now when the step moves none. The checks before ran on the versions the project uses now; afterwards they run on " +
+			"the versions in that line, and the change is handed back only when the project installs and builds there and no test " +
+			"that passed before fails. Run the build and the tests before you finish."
 	}
 	return "You are working on a copy of a customer's repository. " + task + "\n\nThe person's words, between the lines:\n-----\n" + words +
 		"\n-----\n\n" + promptRules + "\n\nThe project is " + partLine(p) + ". Before any change, the checks went:\n" + baseline(before) +
