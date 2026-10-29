@@ -79,6 +79,8 @@ const (
 	EgressMavenCentral = "maven-central"
 	EgressGradle       = "gradle"
 	EgressNpm          = "npm"
+	EgressGo           = "go"
+	EgressRubyGems     = "rubygems"
 )
 
 var registryHosts = map[string][]string{
@@ -86,6 +88,8 @@ var registryHosts = map[string][]string{
 	EgressMavenCentral: {"repo.maven.apache.org", "repo1.maven.org"},
 	EgressGradle:       {"services.gradle.org", "downloads.gradle.org", "plugins.gradle.org", "plugins-artifacts.gradle.org"},
 	EgressNpm:          {"registry.npmjs.org", "registry.yarnpkg.com", "repo.yarnpkg.com"},
+	EgressGo:           {"proxy.golang.org", "sum.golang.org"},
+	EgressRubyGems:     {"rubygems.org", "index.rubygems.org"},
 }
 
 // RegistryRule reports whether rule is one of the package registries' entries.

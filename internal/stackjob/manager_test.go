@@ -28,6 +28,8 @@ func testProfiles() ProfilesV1 {
 		profile("python", StackPython, "/usr/local/bin:/usr/bin:/bin", []string{preview.EgressPyPI}, "3.10", "3.11", "3.12", "3.13"),
 		java,
 		profile("node", StackNode, "/usr/local/bin:/usr/bin:/bin", []string{preview.EgressNpm}, "20", "22", "24"),
+		profile("go", StackGo, "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin", []string{preview.EgressGo}, "1.26", "1.27"),
+		profile("ruby", StackRuby, "/usr/local/bin:/usr/bin:/bin", []string{preview.EgressRubyGems}, "3.3", "3.4", "4.0"),
 	}}
 }
 
@@ -241,8 +243,8 @@ func TestJobsWithoutAStackOrASandboxEndWithTheirCodes(t *testing.T) {
 	if job := f.wait(t, f.start(t, "r1", "empty", map[string]string{"README.md": "hi"}).ID); job.State != Failed || job.Failure != FailNoStack {
 		t.Fatalf("no stack = %+v", job)
 	}
-	if job := f.wait(t, f.start(t, "r2", "gosvc", map[string]string{"go.mod": "module x"}).ID); job.Failure != FailUnsupported || job.Parts[0].Found != "go" {
-		t.Fatalf("go = %+v", job)
+	if job := f.wait(t, f.start(t, "r2", "shop", map[string]string{"composer.json": "{}"}).ID); job.Failure != FailUnsupported || job.Parts[0].Found != "php" {
+		t.Fatalf("php = %+v", job)
 	}
 	job := f.wait(t, f.start(t, "r3", "py", map[string]string{"requirements.txt": ""}).ID)
 	if job.Failure != FailSandbox || len(box.opens) != 0 || job.Parts[0].Steps[0].State != StepNotRun {
@@ -348,7 +350,7 @@ func TestProfilesAreCheckedWhenLoaded(t *testing.T) {
 		"no egress":        func(f *ProfilesV1) { f.Profiles[0].Egress = nil },
 		"shopify egress":   func(f *ProfilesV1) { f.Profiles[0].Egress = []string{preview.EgressShopifyStores} },
 		"version twice":    func(f *ProfilesV1) { f.Profiles[2].Versions = []string{"22", "22"} },
-		"unknown stack":    func(f *ProfilesV1) { f.Profiles[0].Stack = "go" },
+		"unknown stack":    func(f *ProfilesV1) { f.Profiles[0].Stack = "php" },
 		"setting":          func(f *ProfilesV1) { f.Profiles[1].Environment = map[string]string{"LD_PRELOAD": "/x.so"} },
 		"timeout":          func(f *ProfilesV1) { f.Profiles[0].TimeoutSeconds = 99999 },
 		"memory":           func(f *ProfilesV1) { f.Profiles[0].MemoryBytes = 1 << 20 },
@@ -363,7 +365,7 @@ func TestProfilesAreCheckedWhenLoaded(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "profiles.json")
 	data, _ := json.Marshal(good)
 	os.WriteFile(path, data, 0o600)
-	if loaded, err := LoadProfiles(path); err != nil || len(loaded.Profiles) != 3 {
+	if loaded, err := LoadProfiles(path); err != nil || len(loaded.Profiles) != 5 {
 		t.Fatalf("load = %v", err)
 	}
 	os.WriteFile(path, []byte(`{"schema_version":1,"profiles":[],"extra":1}`), 0o600)

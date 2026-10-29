@@ -599,6 +599,7 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 	partCtx, cancel := context.WithTimeout(ctx, time.Duration(profile.TimeoutSeconds)*time.Second)
 	defer cancel()
 	failure, counted, scanned, countedOutput := "", -1, -1, ""
+	var countedGo *goTally
 	for i, s := range partSteps(p, n, x.scan, x.measure) {
 		set := func(change func(*serviceapi.StackStepV1)) { x.set(i, change) }
 		switch {
@@ -611,9 +612,15 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 		}
 		set(func(st *serviceapi.StackStepV1) { st.State = Running })
 		out := newTail(outputBytes)
+		var w io.Writer = out
+		var tally *goTally
+		if s.JUnit && p.Stack == StackGo {
+			tally = &goTally{}
+			w = io.MultiWriter(out, tally)
+		}
 		stepCtx, stepCancel := context.WithTimeout(partCtx, s.Timeout)
 		started := time.Now()
-		code, err := session.Exec(stepCtx, s.Dir, env, s.Argv, out)
+		code, err := session.Exec(stepCtx, s.Dir, env, s.Argv, w)
 		timedOut := stepCtx.Err() == context.DeadlineExceeded
 		stepCancel()
 		seconds := time.Since(started).Seconds()
@@ -638,7 +645,7 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 			state, failure = Failed, failureOf[s.Name]
 		}
 		if s.JUnit && state != Stopped {
-			counted, countedOutput = i, out.Lines(outputLines)
+			counted, countedOutput, countedGo = i, out.Lines(outputLines), tally
 		}
 		if failure == "" && folderSize(work, profile.WorkBytes) > profile.WorkBytes {
 			state, failure, note = Failed, FailTooLarge, "the code grew past what a check may write"
@@ -675,9 +682,14 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 			extra = append(extra, filepath.Join(work, ".abcp", filepath.Base(pytestReport(n))))
 		}
 		passed, failed, skipped, ok := Counts(filepath.Join(work, filepath.FromSlash(p.Dir)), extra...)
-		if !ok && p.Stack == StackNode {
-			// A Node project seldom writes JUnit; its runner's own summary says the same (FIX_AND_TEST §5).
+		switch {
+		case ok:
+		case p.Stack == StackNode || p.Stack == StackRuby:
+			// A Node or Ruby project seldom writes JUnit; its runner's own lines say the same (FIX_AND_TEST §5, MORE_STACKS §4).
 			passed, failed, skipped, ok = RunnerCounts(countedOutput)
+		case countedGo != nil:
+			// Nor does a Go project; each test's own line does.
+			passed, failed, skipped, ok = countedGo.Counts()
 		}
 		if ok {
 			tests := &serviceapi.StackTestsV1{Passed: passed, Failed: failed, Skipped: skipped}

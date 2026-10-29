@@ -16,11 +16,13 @@ const (
 	StackPython      = "python"
 	StackJava        = "java"
 	StackNode        = "node"
+	StackGo          = "go"
+	StackRuby        = "ruby"
 	StackUnsupported = "unsupported"
 )
 
 // Defaults are the versions a part runs on when nothing in it says otherwise.
-var defaults = map[string]string{StackPython: "3.12", StackJava: "21", StackNode: "22"}
+var defaults = map[string]string{StackPython: "3.12", StackJava: "21", StackNode: "22", StackGo: "1.27", StackRuby: "3.4"}
 
 // Part is one part of the code: its folder under the job's work ("" for the top), its stack, the version and tool
 // chosen, and what the steps need to know.
@@ -34,6 +36,8 @@ type Part struct {
 	Wrapper      bool
 	Requirements []string
 	Build, Test  bool
+	// Runner is a Ruby part's test runner: "rspec" or "rake" (Repo C MORE_STACKS §4).
+	Runner string
 }
 
 // Available is, for each stack, the versions the stack profiles serve.
@@ -61,16 +65,22 @@ func exists(path string) bool {
 
 // unsupportedMarkers name stacks found but not run yet.
 var unsupportedMarkers = []struct{ file, stack string }{
-	{"go.mod", "go"}, {"composer.json", "php"}, {"Gemfile", "ruby"}, {"Cargo.toml", "rust"},
+	{"composer.json", "php"}, {"Cargo.toml", "rust"},
 }
 
-// stackOf answers the stack of one folder: Java, then Python, then Node, then a stack not run yet, or "".
+// stackOf answers the stack of one folder: Java, then Python, then Ruby and Go, then Node, then a stack not run yet, or
+// "". Ruby and Go come before Node because a Rails project, or a Go service with a front end, has a package.json for it
+// beside its own manifest: the server's stack is the project's (Repo C MORE_STACKS §3).
 func stackOf(dir string) (stack, found string) {
 	switch {
 	case exists(filepath.Join(dir, "pom.xml")) || exists(filepath.Join(dir, "build.gradle")) || exists(filepath.Join(dir, "build.gradle.kts")):
 		return StackJava, ""
 	case exists(filepath.Join(dir, "pyproject.toml")) || exists(filepath.Join(dir, "setup.py")) || len(requirementFiles(dir)) > 0:
 		return StackPython, ""
+	case rubyProject(dir):
+		return StackRuby, ""
+	case exists(filepath.Join(dir, "go.mod")):
+		return StackGo, ""
 	case exists(filepath.Join(dir, "package.json")):
 		return StackNode, ""
 	}
@@ -131,6 +141,10 @@ func part(dir, rel, stack, found string, available Available) Part {
 		java(dir, &p, available)
 	case StackNode:
 		node(dir, &p, available)
+	case StackGo:
+		goPart(dir, &p, available)
+	case StackRuby:
+		rubyPart(dir, &p, available)
 	}
 	return p
 }
@@ -392,4 +406,94 @@ func nodeMajor(v string) string {
 		return ""
 	}
 	return m[1]
+}
+
+// gemLine is a gem a Gemfile asks for.
+var gemLine = regexp.MustCompile(`(?m)^\s*gem\s+["']([A-Za-z0-9._-]{1,100})["']`)
+
+// mobileTools are the gems a mobile app's Gemfile lists for its build tools; a Gemfile of these alone is not a Ruby project.
+var mobileTools = map[string]bool{"fastlane": true, "cocoapods": true, "xcpretty": true, "xcodeproj": true, "danger": true, "slather": true}
+
+// rubyProject reports whether a folder is a Ruby project: a Gemfile asking for at least one gem beyond a mobile app's tools.
+func rubyProject(dir string) bool {
+	gemfile := readSmall(filepath.Join(dir, "Gemfile"))
+	for _, m := range gemLine.FindAllStringSubmatch(gemfile, -1) {
+		if !mobileTools[m[1]] {
+			return true
+		}
+	}
+	return false
+}
+
+// goDirective is go.mod's go line: the oldest Go the module builds with.
+var goDirective = regexp.MustCompile(`(?m)^go\s+(\d+\.\d+)(?:\.\d+)?\s*$`)
+
+func goPart(dir string, p *Part, available Available) {
+	p.Tool, p.Build = "go", true
+	p.Test = hasTestFile(dir, func(name string) bool { return strings.HasSuffix(name, "_test.go") })
+	allowed := func(string) bool { return true }
+	if m := goDirective.FindStringSubmatch(readSmall(filepath.Join(dir, "go.mod"))); m != nil {
+		least := m[1]
+		allowed = func(v string) bool { return compareVersions(v, least) >= 0 }
+	}
+	p.Version, p.VersionNote = choose(StackGo, "", allowed, available)
+}
+
+var (
+	gemfileRuby  = regexp.MustCompile(`(?m)^\s*ruby\s+["'](?:[~>=<\s]*)(\d+\.\d+)`)
+	lockfileRuby = regexp.MustCompile(`(?m)^RUBY VERSION\s*\n\s+ruby\s+(\d+\.\d+)`)
+	lockedRSpec  = regexp.MustCompile(`(?m)^    rspec-core \(`)
+)
+
+func rubyPart(dir string, p *Part, available Available) {
+	p.Tool = "bundler"
+	lock := readSmall(filepath.Join(dir, "Gemfile.lock"))
+	switch {
+	case isDir(filepath.Join(dir, "spec")) && (lockedRSpec.MatchString(lock) || strings.Contains(readSmall(filepath.Join(dir, "Gemfile")), "rspec")):
+		p.Runner = "rspec"
+	case exists(filepath.Join(dir, "Rakefile")) && (isDir(filepath.Join(dir, "test")) || isDir(filepath.Join(dir, "tests"))):
+		p.Runner = "rake"
+	}
+	p.Test = p.Runner != ""
+	asked := majorMinor(strings.TrimPrefix(strings.TrimSpace(firstLine(readSmall(filepath.Join(dir, ".ruby-version")))), "ruby-"))
+	if asked == "" {
+		if m := gemfileRuby.FindStringSubmatch(readSmall(filepath.Join(dir, "Gemfile"))); m != nil {
+			asked = m[1]
+		} else if m := lockfileRuby.FindStringSubmatch(lock); m != nil {
+			asked = m[1]
+		}
+	}
+	p.Version, p.VersionNote = choose(StackRuby, asked, func(string) bool { return true }, available)
+}
+
+func isDir(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.IsDir()
+}
+
+// hasTestFile reports whether a folder holds a test file within four levels, its dependencies and build output left out,
+// looking at most at 5,000 entries.
+func hasTestFile(dir string, test func(string) bool) bool {
+	seen := 0
+	var walk func(string, int) bool
+	walk = func(d string, depth int) bool {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			return false
+		}
+		for _, e := range entries {
+			if seen++; seen > 5000 {
+				return false
+			}
+			if e.Type().IsDir() {
+				if depth < 4 && !strings.HasPrefix(e.Name(), ".") && !skippedFolders[e.Name()] && walk(filepath.Join(d, e.Name()), depth+1) {
+					return true
+				}
+			} else if e.Type().IsRegular() && test(e.Name()) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(dir, 0)
 }

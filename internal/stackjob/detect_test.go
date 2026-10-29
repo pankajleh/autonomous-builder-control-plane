@@ -9,7 +9,8 @@ import (
 	"testing"
 )
 
-var available = Available{StackPython: {"3.10", "3.11", "3.12", "3.13"}, StackJava: {"17", "21"}, StackNode: {"20", "22", "24"}}
+var available = Available{StackPython: {"3.10", "3.11", "3.12", "3.13"}, StackJava: {"17", "21"}, StackNode: {"20", "22", "24"},
+	StackGo: {"1.26", "1.27"}, StackRuby: {"3.3", "3.4", "4.0"}}
 
 func write(t *testing.T, dir string, files map[string]string) {
 	t.Helper()
@@ -108,6 +109,51 @@ func TestNodePartsPickTheirLockfilesToolScriptsAndVersion(t *testing.T) {
 	}
 }
 
+func TestGoAndRubyPartsPickTheirVersionTestsAndRunnerAndComeBeforeNode(t *testing.T) {
+	// Repo C design note MORE_STACKS §3.
+	for _, c := range []struct {
+		files         map[string]string
+		version, note string
+		test          bool
+	}{
+		{map[string]string{"go.mod": "module x\n\ngo 1.22\n", "total_test.go": "package x\n"}, "1.27", "", true},
+		{map[string]string{"go.mod": "module x\n\ngo 1.26.3\n\ntoolchain go1.26.5\n", "internal/sum/sum_test.go": "package sum\n"}, "1.27", "", true},
+		{map[string]string{"go.mod": "module x\n\ngo 1.28\n"}, "1.27", "no version it allows is available, ran on 1.27", false},
+		{map[string]string{"go.mod": "module x\n", "vendor/y/y_test.go": "package y\n", "web/package.json": "{}"}, "1.27", "", false},
+	} {
+		p := detectOne(t, c.files)
+		if p.Stack != StackGo || p.Tool != "go" || !p.Build || p.Version != c.version || p.VersionNote != c.note || p.Test != c.test {
+			t.Errorf("%v: %+v", c.files, p)
+		}
+	}
+	rails := "source \"https://rubygems.org\"\nruby \"~> 3.3.0\"\ngem \"rails\", \"~> 8.0\"\ngroup :test do\n  gem \"rspec-rails\"\nend\n"
+	for _, c := range []struct {
+		files                 map[string]string
+		version, note, runner string
+	}{
+		{map[string]string{"Gemfile": rails, "Gemfile.lock": "GEM\n  specs:\n    rspec-core (3.13.2)\n", "spec/models/basket_spec.rb": "", "package.json": "{}"}, "3.3", "", "rspec"},
+		{map[string]string{"Gemfile": "gem 'rake'\ngem 'minitest'\n", "Rakefile": "", "test/basket_test.rb": "", ".ruby-version": "ruby-3.2.2\n"}, "3.3", "asked for 3.2, ran on 3.3", "rake"},
+		{map[string]string{"Gemfile": "gem 'sinatra'\n", "Gemfile.lock": "RUBY VERSION\n   ruby 4.0.1p0\n"}, "4.0", "", ""},
+		{map[string]string{"Gemfile": "gem 'sinatra'\n", "spec/x_spec.rb": ""}, "3.4", "", ""},
+	} {
+		p := detectOne(t, c.files)
+		if p.Stack != StackRuby || p.Tool != "bundler" || p.Build || p.Version != c.version || p.VersionNote != c.note || p.Runner != c.runner || p.Test != (c.runner != "") {
+			t.Errorf("%v: %+v", c.files, p)
+		}
+	}
+	// A mobile app's Gemfile, its build tools alone, leaves the project to Node; with nothing beside it, to nothing.
+	if p := detectOne(t, map[string]string{"Gemfile": "source 'https://rubygems.org'\ngem 'fastlane'\ngem \"cocoapods\", \"~> 1.15\"\n", "package.json": "{}"}); p.Stack != StackNode {
+		t.Fatalf("mobile app: %+v", p)
+	}
+	if parts := Detect(func() string {
+		d := t.TempDir()
+		write(t, d, map[string]string{"Gemfile": "gem 'fastlane'\n"})
+		return d
+	}(), available); len(parts) != 0 {
+		t.Fatalf("fastlane alone: %+v", parts)
+	}
+}
+
 func TestPartsAreTheTopOrUpToThreeFoldersAndAStackNotRunYetIsNamed(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, map[string]string{"api/pom.xml": "<project/>", "web/package.json": "{}", "docs/readme.md": "", "node_modules/x/package.json": "{}",
@@ -120,8 +166,8 @@ func TestPartsAreTheTopOrUpToThreeFoldersAndAStackNotRunYetIsNamed(t *testing.T)
 	if strings.Join(got, ",") != "api:java,web:node,worker:python" {
 		t.Fatalf("parts = %v", got)
 	}
-	if p := detectOne(t, map[string]string{"go.mod": "module x\n"}); p.Stack != StackUnsupported || p.Found != "go" {
-		t.Fatalf("go: %+v", p)
+	if p := detectOne(t, map[string]string{"composer.json": "{}"}); p.Stack != StackUnsupported || p.Found != "php" {
+		t.Fatalf("php: %+v", p)
 	}
 	if p := detectOne(t, map[string]string{"App.csproj": "<Project/>"}); p.Stack != StackUnsupported || p.Found != "dotnet" {
 		t.Fatalf("dotnet: %+v", p)
@@ -165,6 +211,11 @@ func TestStepsAreFixedCommandsForEachTool(t *testing.T) {
 		{Part{Stack: StackNode, Tool: "pnpm", Build: true, Test: true}, "install: corepack pnpm install --frozen-lockfile @/work | build: corepack pnpm run build @/work | test: corepack pnpm run test @/work"},
 		{Part{Stack: StackNode, Tool: "npm"}, "install: npm ci --no-audit --no-fund @/work | build: skipped | test: skipped"},
 		{Part{Stack: StackNode, Tool: "yarn-berry", Test: true}, "install: corepack yarn install --immutable @/work | build: skipped | test: corepack yarn run test @/work"},
+		{Part{Stack: StackGo, Tool: "go", Build: true, Test: true}, "install: go mod download @/work | build: go build ./... @/work | test: go test -v ./... @/work"},
+		{Part{Stack: StackGo, Tool: "go", Build: true, Dir: "svc"}, "install: go mod download @/work/svc | build: go build ./... @/work/svc | test: skipped"},
+		{Part{Stack: StackRuby, Tool: "bundler", Runner: "rspec", Test: true}, "install: bundle install @/work | build: skipped | test: bundle exec rspec @/work"},
+		{Part{Stack: StackRuby, Tool: "bundler", Runner: "rake", Test: true}, "install: bundle install @/work | build: skipped | test: bundle exec rake test @/work"},
+		{Part{Stack: StackRuby, Tool: "bundler"}, "install: bundle install @/work | build: skipped | test: skipped"},
 	} {
 		if got := shows(c.part); !strings.HasPrefix(got, c.want) {
 			t.Errorf("%+v:\n got  %s\n want %s", c.part, got, c.want)
@@ -174,7 +225,10 @@ func TestStepsAreFixedCommandsForEachTool(t *testing.T) {
 	if !test.JUnit || test.NoTests != 5 || !strings.Contains(test.Argv[2], "--junitxml=/work/.abcp/pytest-1.xml") {
 		t.Fatalf("python test step: %+v", test)
 	}
-	if Steps(Part{Stack: StackUnsupported, Found: "go"}, 0) != nil {
+	if !Steps(Part{Stack: StackGo, Tool: "go", Test: true}, 0)[2].JUnit || !Steps(Part{Stack: StackRuby, Runner: "rspec", Test: true}, 0)[2].JUnit {
+		t.Fatal("a Go or Ruby test step is not counted")
+	}
+	if Steps(Part{Stack: StackUnsupported, Found: "php"}, 0) != nil {
 		t.Fatal("a stack not run yet has steps")
 	}
 }
@@ -197,6 +251,14 @@ func TestEnvironmentIsMadeFromNothingButThePathTheProfilesSettingsAndTheProxy(t 
 	if py := strings.Join(Env(Part{Stack: StackPython}, ProfileV1{Path: "/usr/local/bin:/usr/bin:/bin"}, proxy), "\n"); !strings.Contains(py, "UV_PYTHON_DOWNLOADS=never") ||
 		!strings.Contains(py, "POETRY_VIRTUALENVS_IN_PROJECT=true") {
 		t.Fatalf("python env:\n%s", py)
+	}
+	if g := strings.Join(Env(Part{Stack: StackGo}, ProfileV1{Path: "/usr/local/go/bin:/usr/bin:/bin"}, proxy), "\n"); !strings.Contains(g, "GOPROXY=https://proxy.golang.org\n") ||
+		!strings.Contains(g, "GOTOOLCHAIN=local") || !strings.Contains(g, "GOPATH=/cache/home/go") || !strings.Contains(g, "GOCACHE=/cache/home/.cache/go-build") {
+		t.Fatalf("go env:\n%s", g)
+	}
+	if r := strings.Join(Env(Part{Stack: StackRuby}, ProfileV1{Path: "/usr/local/bin:/usr/bin:/bin"}, proxy), "\n"); !strings.Contains(r, "BUNDLE_PATH=/cache/home/bundle") ||
+		!strings.Contains(r, "BUNDLE_APP_CONFIG=/cache/home/.bundle") || !strings.Contains(r, "GEM_HOME=/cache/home/gems") {
+		t.Fatalf("ruby env:\n%s", r)
 	}
 	if s := mavenSettings(proxy, nil); !strings.Contains(s, "<host>10.213.4.17</host><port>3129</port>") || !strings.Contains(gradleProperties(proxy), "systemProp.https.proxyPort=3129") {
 		t.Fatalf("java proxy files:\n%s\n%s", s, gradleProperties(proxy))

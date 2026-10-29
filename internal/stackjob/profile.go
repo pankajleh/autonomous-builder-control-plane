@@ -34,6 +34,9 @@ type ProfileV1 struct {
 	Egress         []string          `json:"egress"`
 }
 
+// servedStacks are the stacks a profile may serve.
+var servedStacks = map[string]bool{StackPython: true, StackJava: true, StackNode: true, StackGo: true, StackRuby: true}
+
 var (
 	profileID     = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 	versionPat    = regexp.MustCompile(`^\d{1,2}(?:\.\d{1,2})?$`)
@@ -50,7 +53,7 @@ func (p ProfileV1) Spec() preview.StackSpec {
 
 // Validate checks one profile.
 func (p ProfileV1) Validate() error {
-	if !profileID.MatchString(p.ProfileID) || (p.Stack != StackPython && p.Stack != StackJava && p.Stack != StackNode) || len(p.Versions) == 0 ||
+	if !profileID.MatchString(p.ProfileID) || !servedStacks[p.Stack] || len(p.Versions) == 0 ||
 		len(p.Versions) > 8 || !pathPat.MatchString(p.Path) || len(p.Environment) > 8 || p.WorkBytes < 64<<20 || p.WorkBytes > 32<<30 ||
 		p.TimeoutSeconds < 60 || p.TimeoutSeconds > 3600 || !p.Spec().Valid() {
 		return errBadProfile

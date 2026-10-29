@@ -127,6 +127,26 @@ func Steps(p Part, n int) []Step {
 			test.JUnit = true
 		}
 		return []Step{install, build, test}
+	case StackGo:
+		test := Step{Name: "test", Dir: dir, Skip: "the project has no tests"}
+		if p.Test {
+			// Verbose, so the runner's own lines say each test's outcome (RunnerCounts).
+			test = step("test", testTimeout, "go", "test", "-v", "./...")
+			test.JUnit = true
+		}
+		return []Step{step("install", installTimeout, "go", "mod", "download"), step("build", buildTimeout, "go", "build", "./..."), test}
+	case StackRuby:
+		build := Step{Name: "build", Dir: dir, Skip: "a Ruby project has nothing to build"}
+		test := Step{Name: "test", Dir: dir, Skip: "the project has no tests"}
+		switch p.Runner {
+		case "rspec":
+			test = step("test", testTimeout, "bundle", "exec", "rspec")
+			test.JUnit = true
+		case "rake":
+			test = step("test", testTimeout, "bundle", "exec", "rake", "test")
+			test.JUnit = true
+		}
+		return []Step{step("install", installTimeout, "bundle", "install"), build, test}
 	}
 	return nil
 }
@@ -185,6 +205,14 @@ func Env(p Part, profile ProfileV1, proxy netip.AddrPort) []string {
 		env = append(env, "npm_config_https_proxy="+px, "npm_config_proxy="+px, "npm_config_update_notifier=false", "YARN_HTTPS_PROXY="+px,
 			"YARN_HTTP_PROXY="+px, "YARN_ENABLE_TELEMETRY=0", "COREPACK_ENABLE_DOWNLOAD_PROMPT=0", "COREPACK_HOME=/cache/home/.cache/corepack",
 			"NODE_USE_ENV_PROXY=1")
+	case StackGo:
+		// The module proxy alone (no direct fetches from code hosts), the cache's module and build caches, and never another
+		// toolchain downloaded.
+		env = append(env, "GOPATH=/cache/home/go", "GOCACHE=/cache/home/.cache/go-build", "GOPROXY=https://proxy.golang.org", "GOTOOLCHAIN=local",
+			"GOFLAGS=-modcacherw", "GOTELEMETRY=off")
+	case StackRuby:
+		// Bundler installs into the cache, never the project, and its own settings stay there too.
+		env = append(env, "BUNDLE_PATH=/cache/home/bundle", "BUNDLE_APP_CONFIG=/cache/home/.bundle", "GEM_HOME=/cache/home/gems", "BUNDLE_JOBS=4")
 	}
 	return env
 }
@@ -249,6 +277,16 @@ func Measured(p Part, n int, t Step) Step {
 		data, out = "/work/.abcp/v8-"+id, "/work/.abcp/c8-"+id
 		run = "NODE_V8_COVERAGE=" + data + " " + strings.Join(t.Argv, " ")
 		report += " node"
+	case StackGo:
+		// Go measures itself: every package of the module counted, whichever package's tests ran it (Repo C MORE_STACKS §5).
+		data, out = "/work/.abcp/go-cover-"+id+".out", "/work/.abcp/go-cover-"+id+".json"
+		run = "go test -v -coverprofile=" + data + " -coverpkg=./... ./..."
+		report += " go"
+	case StackRuby:
+		// Ruby's own Coverage, started by the image's file in every Ruby process the tests run; each writes into data.
+		data, out = "/work/.abcp/ruby-"+id, "/work/.abcp/ruby-"+id+".json"
+		run = "mkdir -p " + data + " && AUTOBUILD_COVERAGE=" + data + " RUBYOPT=-r" + coverageTools + "/ruby/start.rb " + strings.Join(t.Argv, " ")
+		report += " ruby"
 	default:
 		return t
 	}
