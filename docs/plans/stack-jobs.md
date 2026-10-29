@@ -108,6 +108,11 @@ less than 10 GB free).
    | php | `composer install --no-interaction --no-progress` (Composer's home and cache in the cache) | skipped: nothing to build | `vendor/bin/pest` or `vendor/bin/phpunit`, with `--log-junit` |
    | dotnet | `dotnet restore` (NuGet's packages in the cache) | `dotnet build --no-restore` | `dotnet test --no-build --logger trx`, its logs cleared first |
 
+   Before a .NET part's steps its cache's home gets NuGet's migration marker, `home/.local/share/NuGet/Migrations/1`
+   (where NuGet reads it): NuGet's one-time migrations otherwise take a named mutex, which .NET 8 cannot make in the
+   sandbox (with any IPC mode, as any user), and every restore fails. Written through real folders only, as Maven's
+   settings are.
+
    A step with nothing to do is `SKIPPED`. A failed install or build ends the part. pytest's and unittest's exit code 5,
    no tests found, is `SKIPPED` with that note, not a failure.
 7. **Tests' counts**, once the part's container has ended, from JUnit XML the tools wrote under `work` (`target/surefire-reports`, `build/test-results`, the

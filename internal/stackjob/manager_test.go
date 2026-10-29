@@ -380,6 +380,23 @@ func TestProfilesAreCheckedWhenLoaded(t *testing.T) {
 	}
 }
 
+func TestADotnetPartFindsNuGetsMigrationMarkerInTheCachesHome(t *testing.T) {
+	// NuGet's one-time migrations take a named mutex the sandbox cannot make; the marker skips them.
+	box := &fakeSandbox{proveOK: true}
+	f := newFixture(t, box)
+	outside := t.TempDir()
+	home := filepath.Join(f.root, "caches", key, "home")
+	os.MkdirAll(home, 0o755)
+	os.Symlink(outside, filepath.Join(home, ".local"))
+	f.wait(t, f.start(t, "req-1", "api", map[string]string{"App.csproj": "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>"}).ID)
+	if !realFile(home, ".local", "share", "NuGet", "Migrations", "1") {
+		t.Fatal("no marker in real folders")
+	}
+	if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+		t.Fatalf("the folder outside was written: %v", entries)
+	}
+}
+
 func TestLinksAJobLeftInItsCacheAreNeverFollowed(t *testing.T) {
 	box := &fakeSandbox{proveOK: true}
 	f := newFixture(t, box)

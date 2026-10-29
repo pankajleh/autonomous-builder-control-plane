@@ -84,7 +84,7 @@ func (m *ChangeManager) openBroker(ctx context.Context, r *changeRecord, p Part,
 		if err != nil {
 			return nil, nil, err
 		}
-		if javaSettings(p, cache, session.Proxy(), registries) != nil {
+		if homeSettings(p, cache, session.Proxy(), registries) != nil {
 			_ = session.Close()
 			return nil, nil, errSource
 		}

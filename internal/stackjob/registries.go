@@ -216,7 +216,7 @@ type registryFile struct {
 }
 
 // registryFiles answers the settings files a job's registries need, whatever stack each part is: npm's and Yarn's for
-// npm registries, pip's and uv's for Python ones, Gradle's init script for Maven ones (Maven's settings are javaSettings'
+// npm registries, pip's and uv's for Python ones, Gradle's init script for Maven ones (Maven's settings are homeSettings'
 // own, written with the proxy before each Java part).
 func registryFiles(rs []serviceapi.RegistryV1) []registryFile {
 	files := []registryFile{}
@@ -232,7 +232,7 @@ func registryFiles(rs []serviceapi.RegistryV1) []registryFile {
 	add(gradleInit(rs), "abcp-registries.gradle", ".gradle", "init.d")
 	for _, r := range rs {
 		if r.Kind == "maven" {
-			// Not written here, only removed when the job ends: javaSettings writes it with the registries in it.
+			// Not written here, only removed when the job ends: homeSettings writes it with the registries in it.
 			files = append(files, registryFile{dir: []string{"home", ".m2"}, name: "settings.xml"})
 			break
 		}
