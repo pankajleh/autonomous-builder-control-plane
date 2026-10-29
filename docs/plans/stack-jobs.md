@@ -47,11 +47,12 @@ less than 10 GB free).
    written. The cache is `{stack-root}/caches/{cache_key}` (created at most 2 GB; all caches at most 10 GB, the least
    recently used removed first, never one in use).
 2. **Find the parts and their stacks** from the files at the top of `work`: `pyproject.toml`, `requirements*.txt`,
-   `setup.py` (Python); `pom.xml`, `build.gradle`, `build.gradle.kts` (Java); a `Gemfile` asking for a gem beyond a mobile
-   app's build tools (`fastlane`, `cocoapods` and the like) (Ruby); `go.mod` (Go); `package.json` (Node). With none at the
-   top, each folder one level down that has one is a part, at most three. Several manifests in one folder: Java, then
-   Python, then Ruby, then Go, then Node (a Rails project or a Go service has a `package.json` for its front end beside its
-   own manifest; Repo C `MORE_STACKS.md` §3). A stack no profile serves (its images are not on this host yet) is
+   `setup.py` (Python); `pom.xml`, `build.gradle`, `build.gradle.kts` (Java); `composer.json` (PHP); a `Gemfile` asking for a
+   gem beyond a mobile app's build tools (`fastlane`, `cocoapods` and the like) (Ruby); `go.mod` (Go); a `*.sln`, `*.slnx`,
+   `*.csproj` or `*.fsproj` (.NET); `package.json` (Node). With none at the top, each folder one level down that has one is
+   a part, at most three. Several manifests in one folder: Java, then Python, then PHP, Ruby, Go and .NET, then Node (a
+   Laravel or Rails project, or a Go or .NET service, has a `package.json` for its front end beside its own manifest; Repo C
+   `MORE_STACKS.md` §3). A stack no profile serves (its images are not on this host yet) is
    `unsupported` with what was found, and is not run.
 3. **Pick the version and tool**: Python from `.python-version`, else 3.12 when `requires-python` allows it, else the
    lowest version it allows among 3.10–3.13; tool `uv` with `uv.lock`, `poetry` with `poetry.lock`, else `pip`. Java from `.java-version`,
@@ -61,8 +62,14 @@ less than 10 GB free).
    `yarn`). Go from `go.mod`'s `go` line (the oldest it builds with), else 1.27, among the two releases served; its
    `toolchain` line is never downloaded. Ruby from `.ruby-version`, the `Gemfile`'s `ruby` line or `Gemfile.lock`'s `RUBY
    VERSION`, else 3.4, then 3.3, 3.4 or 4.0; tool Bundler, tests with RSpec when there is a `spec` folder and RSpec is in
-   the lockfile or `Gemfile`, else Rake's `test` task when there is a `Rakefile` and a `test` folder. A version the images
-   lack is the nearest newer one, said in `version_note`.
+   the lockfile or `Gemfile`, else Rake's `test` task when there is a `Rakefile` and a `test` folder. PHP from
+   `composer.json`'s `require.php` (`^8.1`, `>=8.2 <8.4`, `~8.2.0`, `8.3.*`, alternatives with `||`), else 8.4, among 8.2 to
+   8.5; tests with Pest when it is required, else PHPUnit when it is required or there is a `phpunit.xml`. .NET from the
+   newest `TargetFramework` (or `TargetFrameworks`) of the projects within four folders, the SDK that builds it building the
+   older ones too, else 10.0, among 8.0 and 10.0 (9.0 runs on 10.0, rolled forward); tests when a project refers to a test
+   framework (`Microsoft.NET.Test.Sdk`, xUnit, NUnit, MSTest); a folder with more than one solution or project file has its
+   commands name the first solution (or project). A version the images lack is the nearest newer one, said in
+   `version_note`.
 4. **The container**, one per part, from the stack profile for that stack and version: `docker create --pull=never
    --runtime=runsc --network <private> --user <profile user> --cap-drop=ALL --security-opt=no-new-privileges --read-only
    --cpu-quota --memory --memory-swap --pids-limit --ipc=none --log-driver=none`, as this controller's own uid and gid
@@ -80,7 +87,10 @@ less than 10 GB free).
    - `gradle`: `services.gradle.org`, `downloads.gradle.org`, `plugins.gradle.org`, `plugins-artifacts.gradle.org`;
    - `npm`: `registry.npmjs.org`, `registry.yarnpkg.com`, `repo.yarnpkg.com`;
    - `go`: `proxy.golang.org`, `sum.golang.org` (`GOPROXY` is the module proxy alone, `GOTOOLCHAIN=local`);
-   - `rubygems`: `rubygems.org`, `index.rubygems.org`.
+   - `rubygems`: `rubygems.org`, `index.rubygems.org`;
+   - `packagist`: `repo.packagist.org`, `packagist.org`, and `api.github.com` and `codeload.github.com`, where most Composer
+     packages are downloaded from;
+   - `nuget`: `api.nuget.org`, `globalcdn.nuget.org`.
 6. **The steps**, each a `docker exec` with its own time limit inside the job's 30 minutes, its output kept to the last
    200 lines (64 KiB), with anything that looks like a key or token masked:
 
@@ -91,6 +101,8 @@ less than 10 GB free).
    | node | `npm ci` (`npm install` without a lockfile); `corepack pnpm install --frozen-lockfile`; `corepack yarn install --immutable` (Yarn 1: `--frozen-lockfile`) | the tool's `run build` when the script exists | its `run test` when the script exists (not npm's placeholder) |
    | go | `go mod download` | `go build ./...` | `go test -v ./...` when a `_test.go` file is within four levels |
    | ruby | `bundle install` (into the cache: `BUNDLE_PATH=/cache/home/bundle`) | skipped: nothing to build | `bundle exec rspec`, or `bundle exec rake test` |
+   | php | `composer install --no-interaction --no-progress` (Composer's home and cache in the cache) | skipped: nothing to build | `vendor/bin/pest` or `vendor/bin/phpunit`, with `--log-junit` |
+   | dotnet | `dotnet restore` (NuGet's packages in the cache) | `dotnet build --no-restore` | `dotnet test --no-build --logger trx`, its logs cleared first |
 
    A step with nothing to do is `SKIPPED`. A failed install or build ends the part. pytest's and unittest's exit code 5,
    no tests found, is `SKIPPED` with that note, not a failure.
@@ -98,7 +110,8 @@ less than 10 GB free).
    pytest report): at most 200 files and 8 MiB read, parsed with limits, or none. A Node or Ruby part without JUnit takes
    them from its runner's summary in the step's last lines (Jest, Vitest, Node's, Mocha; RSpec, Minitest); a Go part from
    each test's own `--- PASS`, `--- FAIL` or `--- SKIP` line, counted in all the step printed as it printed it (subtests
-   too), not only the lines kept.
+   too), not only the lines kept; a PHP part from PHPUnit's (or Pest's) JUnit report; a .NET part from each test project's
+   TRX log (`Counters`: passed; failed, errors, timeouts and aborted as failed; not run and inconclusive as skipped).
 8. **End**: the evidence is written to `{stack-root}/jobs/{id}/job.json`, the containers and network removed, `work`
    deleted. The job's JSON stays (at most 1,000 kept, oldest removed first).
 
@@ -146,7 +159,7 @@ is what it was and a request ID names either a check or a scan, never both. The 
   a check's or a change job's, and never in the probe.
 - **The steps:** **install** as a check's; **build** only for Java, whose classes SpotBugs reads (the others:
   `SKIPPED`, "not needed to scan"); **test** `SKIPPED` ("a scan runs no tests"); then **scan**: the image's own
-  `/opt/autobuild/scan --part <the part's folder> --index <n> --stack <python|java|node|go|ruby> --out /work/.abcp/scan-<n>.json`,
+  `/opt/autobuild/scan --part <the part's folder> --index <n> --stack <python|java|node|go|ruby|php|dotnet> --out /work/.abcp/scan-<n>.json`,
   within 10 minutes. A failed install or build does not end a scan's part (the step says "the scan goes on with what
   was installed"): lockfiles, the code and what was installed are still read. A scanner that exits non-zero fails the
   part `SCAN_FAILED`; timeouts, the work's size and the sandbox fail it as a check's do.

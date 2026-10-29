@@ -312,6 +312,49 @@ func RunnerCounts(output string) (passed, failed, skipped int, ok bool) {
 	return 0, 0, 0, false
 }
 
+// TRXCounts reads the tests' counts from the TRX logs `dotnet test` wrote into folder (dotnetResults), one a test project,
+// within the reports' limits; none when there is no log to read (Repo C MORE_STACKS §4).
+func TRXCounts(folder string) (passed, failed, skipped int, ok bool) {
+	if info, err := os.Lstat(folder); err != nil || !info.IsDir() {
+		return 0, 0, 0, false
+	}
+	entries, err := os.ReadDir(folder)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	read := 0
+	for i, e := range entries {
+		if i >= maxReports || !e.Type().IsRegular() || !strings.HasSuffix(e.Name(), ".trx") {
+			continue
+		}
+		data, readable := readReport(filepath.Join(folder, e.Name()), maxReportsBytes-read)
+		if !readable {
+			continue
+		}
+		read += len(data)
+		decoder := xml.NewDecoder(bytes.NewReader(data))
+		for {
+			token, err := decoder.Token()
+			if err != nil {
+				break
+			}
+			start, isStart := token.(xml.StartElement)
+			if !isStart || start.Name.Local != "Counters" {
+				continue
+			}
+			a := map[string]int{}
+			for _, attr := range start.Attr {
+				if n, err := strconv.Atoi(attr.Value); err == nil && n >= 0 && n < 10_000_000 {
+					a[attr.Name.Local] = n
+				}
+			}
+			passed, failed, skipped, ok = passed+a["passed"], failed+a["failed"]+a["error"]+a["timeout"]+a["aborted"], skipped+a["notExecuted"]+a["inconclusive"], true
+			break
+		}
+	}
+	return passed, failed, skipped, ok
+}
+
 // goLine is one of Go's verbose lines, one a test (subtests too): --- PASS: TestTotal (0.00s).
 var goLine = regexp.MustCompile(`^--- (PASS|FAIL|SKIP): \S`)
 

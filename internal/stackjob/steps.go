@@ -42,6 +42,20 @@ func workDir(p Part) string {
 // pytestReport is where pytest writes its JUnit report for part n, under /work but outside the part.
 func pytestReport(n int) string { return "/work/.abcp/pytest-" + strconv.Itoa(n) + ".xml" }
 
+// phpunitReport is where PHPUnit or Pest writes its JUnit report for part n (Repo C MORE_STACKS §4).
+func phpunitReport(n int) string { return "/work/.abcp/phpunit-" + strconv.Itoa(n) + ".xml" }
+
+// dotnetResults is the folder `dotnet test` writes part n's TRX logs (and, measured, its coverage) into.
+func dotnetResults(n int) string { return "/work/.abcp/dotnet-" + strconv.Itoa(n) }
+
+// dotnetArgs is the .NET part's solution or project file, when its folder has more than one.
+func dotnetArgs(p Part) []string {
+	if p.Target == "" {
+		return nil
+	}
+	return []string{p.Target}
+}
+
 // Steps are a part's install, build and test, from what Detect found. Every command is fixed text with names Detect
 // chose from a short list; nothing in the customer's code becomes part of a command.
 func Steps(p Part, n int) []Step {
@@ -147,6 +161,27 @@ func Steps(p Part, n int) []Step {
 			test.JUnit = true
 		}
 		return []Step{step("install", installTimeout, "bundle", "install"), build, test}
+	case StackPHP:
+		build := Step{Name: "build", Dir: dir, Skip: "a PHP project has nothing to build"}
+		test := Step{Name: "test", Dir: dir, Skip: "the project has no tests"}
+		if p.Runner == "pest" || p.Runner == "phpunit" {
+			test = step("test", testTimeout, "vendor/bin/"+p.Runner, "--log-junit", phpunitReport(n))
+			test.JUnit = true
+		}
+		return []Step{step("install", installTimeout, "composer", "install", "--no-interaction", "--no-progress"), build, test}
+	case StackDotnet:
+		target := dotnetArgs(p)
+		install := step("install", installTimeout, append([]string{"dotnet", "restore"}, target...)...)
+		build := step("build", buildTimeout, append(append([]string{"dotnet", "build", "--no-restore"}, target...), "-nologo")...)
+		test := Step{Name: "test", Dir: dir, Skip: "the project has no tests"}
+		if p.Test {
+			// The logs of a run before go first: a change job's checks before and after share the folder.
+			results := dotnetResults(n)
+			test = shell("test", testTimeout, strings.Join(append([]string{"dotnet", "test", "--no-build"}, target...), " "),
+				"rm -rf "+results+" && exec dotnet test --no-build "+strings.Join(target, " ")+" --logger trx --results-directory "+results)
+			test.JUnit = true
+		}
+		return []Step{install, build, test}
 	}
 	return nil
 }
@@ -213,6 +248,15 @@ func Env(p Part, profile ProfileV1, proxy netip.AddrPort) []string {
 	case StackRuby:
 		// Bundler installs into the cache, never the project, and its own settings stay there too.
 		env = append(env, "BUNDLE_PATH=/cache/home/bundle", "BUNDLE_APP_CONFIG=/cache/home/.bundle", "GEM_HOME=/cache/home/gems", "BUNDLE_JOBS=4")
+	case StackPHP:
+		// Composer's home and cache are the project's cache.
+		env = append(env, "COMPOSER_HOME=/cache/home/.composer", "COMPOSER_CACHE_DIR=/cache/home/.cache/composer", "COMPOSER_NO_INTERACTION=1")
+	case StackDotnet:
+		// NuGet's packages are the project's cache; nothing is sent to Microsoft; no build server outlives a step; a project
+		// built for an older .NET runs on the image's newer one.
+		env = append(env, "DOTNET_CLI_HOME=/cache/home", "NUGET_PACKAGES=/cache/home/.nuget/packages", "DOTNET_CLI_TELEMETRY_OPTOUT=1",
+			"DOTNET_NOLOGO=1", "DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1", "DOTNET_ROLL_FORWARD=Major", "MSBUILDDISABLENODEREUSE=1",
+			"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1")
 	}
 	return env
 }
@@ -287,11 +331,22 @@ func Measured(p Part, n int, t Step) Step {
 		data, out = "/work/.abcp/ruby-"+id, "/work/.abcp/ruby-"+id+".json"
 		run = "mkdir -p " + data + " && AUTOBUILD_COVERAGE=" + data + " RUBYOPT=-r" + coverageTools + "/ruby/start.rb " + strings.Join(t.Argv, " ")
 		report += " ruby"
+	case StackPHP:
+		// PCOV measures; PHPUnit or Pest writes a Clover file of the project's own code (its <source>).
+		data, out = "/work/.abcp/clover-"+id+".xml", "/work/.abcp/clover-"+id+".json"
+		run = strings.Join(t.Argv, " ") + " --coverage-clover " + data
+		report += " php"
+	case StackDotnet:
+		// coverlet's data collector from the image, loaded without the project referring to it; its files beside the logs.
+		data, out = dotnetResults(n), "/work/.abcp/dotnet-"+id+".json"
+		run = "dotnet test --no-build " + strings.Join(dotnetArgs(p), " ") + " --logger trx --collect 'XPlat Code Coverage' --test-adapter-path " +
+			coverageTools + "/coverlet --results-directory " + data
+		report += " dotnet"
 	default:
 		return t
 	}
 	plain := strings.Join(t.Argv, " ")
-	if p.Stack == StackPython {
+	if p.Stack == StackPython || p.Stack == StackDotnet {
 		plain = t.Argv[2]
 	}
 	script := "rm -rf " + data + " " + out + " " + result + "; if [ -x " + coverageTools + "/report ]; then " + run + "; s=$?; " + report + " " + data + " " +

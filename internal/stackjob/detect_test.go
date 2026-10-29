@@ -11,7 +11,7 @@ import (
 )
 
 var available = Available{StackPython: {"3.10", "3.11", "3.12", "3.13"}, StackJava: {"17", "21"}, StackNode: {"20", "22", "24"},
-	StackGo: {"1.26", "1.27"}, StackRuby: {"3.3", "3.4", "4.0"}}
+	StackGo: {"1.26", "1.27"}, StackRuby: {"3.3", "3.4", "4.0"}, StackPHP: {"8.2", "8.3", "8.4", "8.5"}, StackDotnet: {"8.0", "10.0"}}
 
 func write(t *testing.T, dir string, files map[string]string) {
 	t.Helper()
@@ -155,6 +155,64 @@ func TestGoAndRubyPartsPickTheirVersionTestsAndRunnerAndComeBeforeNode(t *testin
 	}
 }
 
+func TestPHPAndDotnetPartsPickTheirVersionTestsAndTargetAndComeBeforeNode(t *testing.T) {
+	// Repo C MORE_STACKS §3.
+	for _, c := range []struct {
+		files                 map[string]string
+		version, note, runner string
+	}{
+		{map[string]string{"composer.json": `{"require":{"php":"^8.1"},"require-dev":{"phpunit/phpunit":"^11.5"}}`, "package.json": "{}"}, "8.4", "", "phpunit"},
+		{map[string]string{"composer.json": `{"require":{"php":">=8.2 <8.4"},"require-dev":{"pestphp/pest":"^3"}}`}, "8.2", "", "pest"},
+		{map[string]string{"composer.json": `{"require":{"php":"~8.2.0"}}`, "phpunit.xml.dist": "<phpunit/>"}, "8.2", "", "phpunit"},
+		{map[string]string{"composer.json": `{"require":{"php":"^7.4"}}`}, "8.5", "no version it allows is available, ran on 8.5", ""},
+		{map[string]string{"composer.json": `{"require":{"php":"^7.4 || ^8.0"}}`}, "8.4", "", ""},
+		{map[string]string{"composer.json": `{"require":{"php":"8.3.*"}}`}, "8.3", "", ""},
+		{map[string]string{"composer.json": `not json`}, "8.4", "", ""},
+	} {
+		p := detectOne(t, c.files)
+		if p.Stack != StackPHP || p.Tool != "composer" || p.Build || p.Version != c.version || p.VersionNote != c.note || p.Runner != c.runner || p.Test != (c.runner != "") {
+			t.Errorf("%v: %+v", c.files, p)
+		}
+	}
+	test := `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>` +
+		`<ItemGroup><PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" /></ItemGroup></Project>`
+	for _, c := range []struct {
+		files                 map[string]string
+		version, note, target string
+		test                  bool
+	}{
+		{map[string]string{"Shop.sln": "", "src/Shop/Shop.csproj": "<TargetFramework>net8.0</TargetFramework>", "tests/Shop.Tests/Shop.Tests.csproj": test, "web/package.json": "{}"}, "8.0", "", "", true},
+		{map[string]string{"App.csproj": "<TargetFramework>net9.0</TargetFramework>"}, "10.0", "asked for 9.0, ran on 10.0", "", false},
+		{map[string]string{"App.csproj": "<TargetFrameworks>net8.0;net10.0-windows</TargetFrameworks>", "App.Tests.csproj": test}, "10.0", "", "App.Tests.csproj", true},
+		{map[string]string{"A.sln": "", "B.slnx": "", "App.fsproj": "<TargetFramework>net6.0</TargetFramework>"}, "8.0", "asked for 6.0, ran on 8.0", "A.sln", false},
+		{map[string]string{"Legacy.csproj": "<TargetFrameworkVersion>v4.8</TargetFrameworkVersion>"}, "10.0", "", "", false},
+	} {
+		p := detectOne(t, c.files)
+		if p.Stack != StackDotnet || p.Tool != "dotnet" || !p.Build || p.Version != c.version || p.VersionNote != c.note || p.Target != c.target || p.Test != c.test {
+			t.Errorf("%v: %+v", c.files, p)
+		}
+	}
+}
+
+func TestComposerConstraintsAllowTheirMinorVersions(t *testing.T) {
+	for constraint, want := range map[string]string{
+		"": "8.2 8.3 8.4 8.5", "*": "8.2 8.3 8.4 8.5", "^8.1": "8.2 8.3 8.4 8.5", ">=8.3": "8.3 8.4 8.5", ">=8.2 <8.4": "8.2 8.3",
+		">=8.2,<8.4": "8.2 8.3", "~8.3": "8.3 8.4 8.5", "~8.3.1": "8.3", "8.4.*": "8.4", "8.*": "8.2 8.3 8.4 8.5", "8.3": "8.3", "<=8.3": "8.2 8.3",
+		">8.3": "8.4 8.5", "^7.4": "", "^7.4 || ^8.2": "8.2 8.3 8.4 8.5", "^8.2 | ^9.0": "8.2 8.3 8.4 8.5", "dev-main": "8.2 8.3 8.4 8.5",
+	} {
+		allows := composerAllows(constraint)
+		got := []string{}
+		for _, v := range []string{"8.2", "8.3", "8.4", "8.5"} {
+			if allows(v) {
+				got = append(got, v)
+			}
+		}
+		if strings.Join(got, " ") != want {
+			t.Errorf("%q allows %v, want %q", constraint, got, want)
+		}
+	}
+}
+
 func TestPartsAreTheTopOrUpToThreeFoldersAndAStackNotRunYetIsNamed(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, map[string]string{"api/pom.xml": "<project/>", "web/package.json": "{}", "docs/readme.md": "", "node_modules/x/package.json": "{}",
@@ -174,11 +232,8 @@ func TestPartsAreTheTopOrUpToThreeFoldersAndAStackNotRunYetIsNamed(t *testing.T)
 	if parts := Detect(unserved, served); len(parts) != 1 || !reflect.DeepEqual(parts[0], Part{Stack: StackUnsupported, Found: StackGo}) {
 		t.Fatalf("go without a profile: %+v", parts)
 	}
-	if p := detectOne(t, map[string]string{"composer.json": "{}"}); p.Stack != StackUnsupported || p.Found != "php" {
-		t.Fatalf("php: %+v", p)
-	}
-	if p := detectOne(t, map[string]string{"App.csproj": "<Project/>"}); p.Stack != StackUnsupported || p.Found != "dotnet" {
-		t.Fatalf("dotnet: %+v", p)
+	if p := detectOne(t, map[string]string{"Cargo.toml": "[package]\n"}); p.Stack != StackUnsupported || p.Found != "rust" {
+		t.Fatalf("rust: %+v", p)
 	}
 	if parts := Detect(t.TempDir(), available); len(parts) != 0 {
 		t.Fatalf("empty: %+v", parts)
@@ -224,6 +279,11 @@ func TestStepsAreFixedCommandsForEachTool(t *testing.T) {
 		{Part{Stack: StackRuby, Tool: "bundler", Runner: "rspec", Test: true}, "install: bundle install @/work | build: skipped | test: bundle exec rspec @/work"},
 		{Part{Stack: StackRuby, Tool: "bundler", Runner: "rake", Test: true}, "install: bundle install @/work | build: skipped | test: bundle exec rake test @/work"},
 		{Part{Stack: StackRuby, Tool: "bundler"}, "install: bundle install @/work | build: skipped | test: skipped"},
+		{Part{Stack: StackPHP, Tool: "composer", Runner: "phpunit", Test: true}, "install: composer install --no-interaction --no-progress @/work | build: skipped | test: vendor/bin/phpunit --log-junit /work/.abcp/phpunit-0.xml @/work"},
+		{Part{Stack: StackPHP, Tool: "composer", Runner: "pest", Test: true, Dir: "api"}, "install: composer install --no-interaction --no-progress @/work/api | build: skipped | test: vendor/bin/pest --log-junit /work/.abcp/phpunit-0.xml @/work/api"},
+		{Part{Stack: StackPHP, Tool: "composer"}, "install: composer install --no-interaction --no-progress @/work | build: skipped | test: skipped"},
+		{Part{Stack: StackDotnet, Tool: "dotnet", Build: true, Test: true}, "install: dotnet restore @/work | build: dotnet build --no-restore -nologo @/work | test: dotnet test --no-build @/work"},
+		{Part{Stack: StackDotnet, Tool: "dotnet", Build: true, Target: "A.sln"}, "install: dotnet restore A.sln @/work | build: dotnet build --no-restore A.sln -nologo @/work | test: skipped"},
 	} {
 		if got := shows(c.part); !strings.HasPrefix(got, c.want) {
 			t.Errorf("%+v:\n got  %s\n want %s", c.part, got, c.want)
@@ -235,6 +295,10 @@ func TestStepsAreFixedCommandsForEachTool(t *testing.T) {
 	}
 	if !Steps(Part{Stack: StackGo, Tool: "go", Test: true}, 0)[2].JUnit || !Steps(Part{Stack: StackRuby, Runner: "rspec", Test: true}, 0)[2].JUnit {
 		t.Fatal("a Go or Ruby test step is not counted")
+	}
+	if s := Steps(Part{Stack: StackDotnet, Tool: "dotnet", Test: true, Target: "A.sln"}, 2)[2]; !s.JUnit || s.Argv[0] != "/bin/sh" ||
+		s.Argv[2] != "rm -rf /work/.abcp/dotnet-2 && exec dotnet test --no-build A.sln --logger trx --results-directory /work/.abcp/dotnet-2" {
+		t.Fatalf("dotnet test step: %+v", s)
 	}
 	if Steps(Part{Stack: StackUnsupported, Found: "php"}, 0) != nil {
 		t.Fatal("a stack not run yet has steps")
@@ -267,6 +331,14 @@ func TestEnvironmentIsMadeFromNothingButThePathTheProfilesSettingsAndTheProxy(t 
 	if r := strings.Join(Env(Part{Stack: StackRuby}, ProfileV1{Path: "/usr/local/bin:/usr/bin:/bin"}, proxy), "\n"); !strings.Contains(r, "BUNDLE_PATH=/cache/home/bundle") ||
 		!strings.Contains(r, "BUNDLE_APP_CONFIG=/cache/home/.bundle") || !strings.Contains(r, "GEM_HOME=/cache/home/gems") {
 		t.Fatalf("ruby env:\n%s", r)
+	}
+	if php := strings.Join(Env(Part{Stack: StackPHP}, ProfileV1{Path: "/usr/local/bin:/usr/bin:/bin"}, proxy), "\n"); !strings.Contains(php, "COMPOSER_HOME=/cache/home/.composer") ||
+		!strings.Contains(php, "COMPOSER_CACHE_DIR=/cache/home/.cache/composer") {
+		t.Fatalf("php env:\n%s", php)
+	}
+	if dn := strings.Join(Env(Part{Stack: StackDotnet}, ProfileV1{Path: "/usr/bin:/bin"}, proxy), "\n"); !strings.Contains(dn, "NUGET_PACKAGES=/cache/home/.nuget/packages") ||
+		!strings.Contains(dn, "DOTNET_ROLL_FORWARD=Major") || !strings.Contains(dn, "DOTNET_CLI_TELEMETRY_OPTOUT=1") || !strings.Contains(dn, "MSBUILDDISABLENODEREUSE=1") {
+		t.Fatalf("dotnet env:\n%s", dn)
 	}
 	if s := mavenSettings(proxy, nil); !strings.Contains(s, "<host>10.213.4.17</host><port>3129</port>") || !strings.Contains(gradleProperties(proxy), "systemProp.https.proxyPort=3129") {
 		t.Fatalf("java proxy files:\n%s\n%s", s, gradleProperties(proxy))

@@ -35,7 +35,8 @@ type ProfileV1 struct {
 }
 
 // servedStacks are the stacks a profile may serve.
-var servedStacks = map[string]bool{StackPython: true, StackJava: true, StackNode: true, StackGo: true, StackRuby: true}
+var servedStacks = map[string]bool{StackPython: true, StackJava: true, StackNode: true, StackGo: true, StackRuby: true, StackPHP: true,
+	StackDotnet: true}
 
 var (
 	profileID     = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
