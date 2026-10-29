@@ -777,3 +777,80 @@ func TestNoWorseForAMigrationAsksTheNewVersionsToInstallAndBuild(t *testing.T) {
 		t.Fatal("a fix on code that did not install")
 	}
 }
+
+func TestLegacyProfilesServeOnlyAMigrationsChecksBefore(t *testing.T) {
+	// Repo C LEGACY_MIGRATION §5, M4: Java 8 for the checks before, never for a check, a fix or the checks after.
+	profiles := testProfiles()
+	legacy := profiles.Profiles[1]
+	legacy.ProfileID, legacy.Versions, legacy.Legacy = "java-legacy", []string{"8", "11"}, true
+	profiles.Profiles = append(profiles.Profiles, legacy)
+	if err := profiles.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := profiles.Available()[StackJava]; strings.Join(got, ",") != "17,21" {
+		t.Fatalf("available = %v", got)
+	}
+	if got := profiles.WithLegacy()[StackJava]; strings.Join(got, ",") != "17,21,8,11" {
+		t.Fatalf("with legacy = %v", got)
+	}
+	old := map[string]string{"pom.xml": "<project><properties><maven.compiler.source>1.8</maven.compiler.source></properties></project>",
+		"src/main/java/App.java": "class App {}\n"}
+	if parts := Detect(writeTemp(t, old), profiles.Available()); parts[0].Version != "17" || parts[0].VersionNote != "built with Java 17 for Java 8" {
+		t.Fatalf("a check of old code = %+v", parts[0])
+	}
+	box := &fakeSandbox{proveOK: true}
+	engine := &fakeEngine{act: func(run EngineRun, n int) (EngineResult, error) {
+		if strings.Contains(run.Prompt, "Assess") {
+			return EngineResult{Summary: `{"summary": "Java 8.", "paths": [], "steps": [{"title": "Move", "words": "Move to 21.", "risk": "high", "size": "large", "files": [], "tests": "", "tests_first": false}]}`}, nil
+		}
+		if strings.Contains(run.Prompt, "Make one step") {
+			os.WriteFile(filepath.Join(run.Work, "src", "main", "java", "App.java"), []byte("class App { }\n"), 0o644)
+		}
+		return EngineResult{Summary: "done"}, nil
+	}}
+	base, err := os.MkdirTemp("", "cj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	root, sources := filepath.Join(base, "c"), filepath.Join(base, "src")
+	write(t, filepath.Join(sources, "old"), old)
+	m, err := NewChangeManager(root, sources, "/usr/local/bin/abcp", profiles, box, engine, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.freeDisk = func(string) (uint64, bool) { return 100 << 30, true }
+	t.Cleanup(m.Close)
+	f := &changeFixture{m: m, box: box, engine: engine, root: root, sources: sources}
+	run := func(request, kind string) serviceapi.ChangeJobV1 {
+		t.Helper()
+		job, err := m.StartChangeJob(context.Background(), serviceapi.ChangeJobCreateV1{RequestID: request, Source: "old", CacheKey: key, Kind: kind,
+			Words: "Move to Java 21.", Targets: map[string]string{"java": "21"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.wait(t, job.ID)
+	}
+	if job := run("assess-8", "assess"); job.State != ChangeAssessed || job.Before[0].Version != "8" || job.Before[0].VersionNote != "" ||
+		len(job.After) != 1 || job.After[0].Version != "21" {
+		t.Fatalf("assessed = %+v", job)
+	}
+	if job := run("migrate-8", "migrate"); job.Before[0].Version != "8" || len(job.After) != 1 || job.After[0].Version != "21" {
+		t.Fatalf("migrated = %+v", job)
+	}
+	fix, err := m.StartChangeJob(context.Background(), serviceapi.ChangeJobCreateV1{RequestID: "fix-8", Source: "old", CacheKey: key, Kind: "fix", Words: "Fix it."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job := f.wait(t, fix.ID); len(job.Before) != 1 || job.Before[0].Version != "17" {
+		t.Fatalf("a fix of old code = %+v", job.Before)
+	}
+}
+
+// writeTemp writes files into a folder of the test's own.
+func writeTemp(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	write(t, dir, files)
+	return dir
+}

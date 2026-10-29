@@ -87,8 +87,10 @@ its `plan`), `NOT_HANDED_BACK`, `FAILED`, `STOPPED` or `UNKNOWN`. `reason`:
 
 A job of the kind `assess` answers what it would take to move a project to supported versions, and changes nothing:
 
-1. **The baseline**, as a change's, on the versions the project uses now; the agent starts whatever it shows (an old
-   project may not install today, which is what an assessment is for). Test steps carry their coverage, as a test job's.
+1. **The baseline**, as a change's, on the versions the project uses now, out of support ones too where a legacy profile
+   serves them (`stack-jobs.md`, The stack profiles): code that asks for Java 8 is checked on Java 8. The agent starts
+   whatever it shows (an old project may not install today, which is what an assessment is for). Test steps carry their
+   coverage, as a test job's.
 2. **The checks on the targets** (phase `CHECKING`): each part that `targets` moves to a version a profile serves, on a
    fresh copy of the source, so the work folder stays as the baseline left it; recorded in `after`, each part with
    `version_note` "asked to run on 21 instead of 17". Without targets, or with none served, `after` stays empty.
@@ -109,7 +111,8 @@ A job of the kind `assess` answers what it would take to move a project to suppo
 A job of the kind `migrate` makes one step of an assessment's plan, its words the step's, as a change is made, with three
 differences:
 
-- **Versions:** the baseline runs on the project's own versions; the agent's run tool, the review's and the checks after run
+- **Versions:** the baseline runs on the project's own versions, a legacy profile's too, as an assessment's does; the agent's
+  run tool, the review's and the checks after run
   on `targets`, each part pinned as a stack job's `versions` are (with `version_note`); a part whose target no profile
   serves stays on its own version, with a note saying so.
 - **The baseline does not gate:** the agent starts whatever it shows, since old code may not install on its own version.
