@@ -17,14 +17,14 @@ to the job's stack sandbox (`docs/plans/stack-jobs.md`), and nothing from the re
 Under a new grant, `change.run`:
 
 - `POST /v1/change-jobs` with `{"request_id", "source", "cache_key", "kind", "words"}`: `source` a folder directly under
-  `--change-source-root`, as stack jobs name theirs; `cache_key` the project's cache digest; `kind` `fix`, `tests` or
-  `assess` (below);
+  `--change-source-root`, as stack jobs name theirs; `cache_key` the project's cache digest; `kind` `fix`, `tests`,
+  `assess` or `migrate` (below);
   `words` the person's own (at most 4,000 characters, no NUL). `202` with the job, or the same job for the same
   `request_id` and body; `409` for the same `request_id` with another body; `422` when the folder is missing or a link;
   `429` when 10 are waiting; `503` when change jobs are not configured. An optional `"stacks"` names the stacks the job
   may change and check, as a stack job's (`stack-jobs.md`, The API): with none of them in the code, the job ends `FAILED`
   with `UNSUPPORTED_STACK` before any agent or sandbox runs.
-- `"targets"`, for `assess` only: the versions the project would move to, `{"java": "21"}`, shaped as a stack job's pinned
+- `"targets"`, for `assess` and `migrate` only: the versions the project moves to, `{"java": "21"}`, shaped as a stack job's pinned
   `versions` (`stack-jobs.md`, The API); part of the request.
 - `GET /v1/change-jobs/{id}`: the job. `GET /v1/change-jobs/{id}/patch`: the patch once handed back (`text/x-diff`).
   `POST /v1/change-jobs/{id}/stop`.
@@ -103,6 +103,21 @@ A job of the kind `assess` answers what it would take to move a project to suppo
    lines. Every text masked as a step's output is. An answer that is not a plan ends `NOT_HANDED_BACK` with `NO_PLAN`; one
    carrying a secret, `SECRET_IN_CHANGE`. Otherwise the job ends `ASSESSED` with `plan`; the agent's summary is the
    plan's. There is no patch: `GET …/patch` is `404`.
+
+## A migration's steps (Repo C `LEGACY_MIGRATION.md` §5)
+
+A job of the kind `migrate` makes one step of an assessment's plan, its words the step's, as a change is made, with three
+differences:
+
+- **Versions:** the baseline runs on the project's own versions; the agent's run tool, the review's and the checks after run
+  on `targets`, each part pinned as a stack job's `versions` are (with `version_note`); a part whose target no profile
+  serves stays on its own version, with a note saying so.
+- **The baseline does not gate:** the agent starts whatever it shows, since old code may not install on its own version.
+- **No worse** means: every part installs and builds on its new version, whatever the baseline showed; when tests passed
+  or were counted before, no fewer pass and no more fail; when none ran before, they pass. Otherwise `WORSE_AFTER`.
+
+Its prompt says it makes this step and nothing more, on the versions it moves to. No fix's proof; the patch and its rules
+(paths, size, secrets) are a change's.
 
 ## Settings
 

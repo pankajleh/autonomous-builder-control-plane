@@ -335,16 +335,22 @@ func fine(part serviceapi.StackPartV1, name string) bool {
 	return !ok || s.State == Passed || s.State == StepSkipped
 }
 
-// baselineReady reports whether the agent may start: a fix needs the code to install, a test job needs it to build.
+// baselineReady reports whether the agent may start: a fix needs the code to install, a test job needs it to build; a
+// migration's step starts whatever its baseline shows, since old code may not install on its own version today.
 func baselineReady(kind string, part serviceapi.StackPartV1) bool {
-	if kind == "tests" {
+	switch kind {
+	case "tests":
 		return fine(part, "install") && fine(part, "build")
+	case "migrate":
+		return true
 	}
 	return fine(part, "install")
 }
 
 // noWorse reports whether the change left the code no worse than it found it: what installed and built still does, no
-// fewer tests pass and no more fail; and a test job's tests pass and add to those that did.
+// fewer tests pass and no more fail; and a test job's tests pass and add to those that did. A migration's step must
+// install and build on the versions it moves to whatever the baseline showed, and its tests pass there when no test ran
+// before (LEGACY_MIGRATION §5).
 func noWorse(kind string, before, after []serviceapi.StackPartV1, agentPart int) bool {
 	if len(before) != len(after) {
 		return false
@@ -355,9 +361,12 @@ func noWorse(kind string, before, after []serviceapi.StackPartV1, agentPart int)
 		}
 		b, a := before[n], after[n]
 		for _, name := range []string{"install", "build"} {
-			if fine(b, name) && !fine(a, name) {
+			if (fine(b, name) || kind == "migrate") && !fine(a, name) {
 				return false
 			}
+		}
+		if bt, _ := step(b, "test"); kind == "migrate" && bt.Tests == nil && bt.State != Passed && !fine(a, "test") {
+			return false
 		}
 		bt, _ := step(b, "test")
 		at, _ := step(a, "test")
@@ -407,30 +416,34 @@ const promptRules = `Rules:
 
 // changePrompt is the agent's first message.
 func changePrompt(kind, words string, p Part, before serviceapi.StackPartV1) string {
-	where := "the top of the repository"
-	if p.Dir != "" {
-		where = "the folder " + p.Dir
-	}
 	task := "Fix or change the project as the person asks, below. Where the project has tests, add or change a test that fails without " +
 		"your change and passes with it, and run the tests before you finish. Afterwards your new and changed test files are run on the " +
 		"code as it was before your change, and the person is shown whether they failed there: put the test in the project's usual " +
 		"test files, so it is found."
-	if kind == "tests" {
+	switch kind {
+	case "tests":
 		task = "Write tests for the project, as the person asks below: for the part they name, or the parts that need them most. Use the " +
 			"project's own test framework and conventions, change no code other than tests and what tests need to run, and run the " +
 			"tests before you finish: they must pass. The project's line coverage is measured before and after, and the person is shown both."
+	case "migrate":
+		task = "Make one step of a migration, as the words below describe it: this step and nothing more, in the project's own style. " +
+			"Your commands run on the versions the step moves to, as the project's line below says. The checks before ran on the " +
+			"versions the project uses now; afterwards they run on the new versions, and the change is handed back only when the " +
+			"project installs and builds there and no test that passed before fails. Run the build and the tests before you finish."
 	}
 	return "You are working on a copy of a customer's repository. " + task + "\n\nThe person's words, between the lines:\n-----\n" + words +
-		"\n-----\n\n" + promptRules + "\n\nThe project is " + p.Stack + " " + p.Version + " (" + p.Tool + ") at " + where +
-		". Before any change, the checks went:\n" + baseline(before) +
+		"\n-----\n\n" + promptRules + "\n\nThe project is " + partLine(p) + ". Before any change, the checks went:\n" + baseline(before) +
 		"\n\nWhen you are done, answer with a short summary for the pull request: what you changed and why, in at most ten lines."
 }
 
 // reviewPrompt is the review session's message.
 func reviewPrompt(kind, words string) string {
 	what := "fix or change"
-	if kind == "tests" {
+	switch kind {
+	case "tests":
 		what = "tests"
+	case "migrate":
+		what = "a step of a migration"
 	}
 	return "You are reviewing a change (" + what + ") made to a copy of a customer's repository. The change is in .abcp/change.diff; read " +
 		"it, then the files it touches. The person asked, between the lines:\n-----\n" + words + "\n-----\n\n" + promptRules +
