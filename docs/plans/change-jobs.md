@@ -17,12 +17,15 @@ to the job's stack sandbox (`docs/plans/stack-jobs.md`), and nothing from the re
 Under a new grant, `change.run`:
 
 - `POST /v1/change-jobs` with `{"request_id", "source", "cache_key", "kind", "words"}`: `source` a folder directly under
-  `--change-source-root`, as stack jobs name theirs; `cache_key` the project's cache digest; `kind` `fix` or `tests`;
+  `--change-source-root`, as stack jobs name theirs; `cache_key` the project's cache digest; `kind` `fix`, `tests` or
+  `assess` (below);
   `words` the person's own (at most 4,000 characters, no NUL). `202` with the job, or the same job for the same
   `request_id` and body; `409` for the same `request_id` with another body; `422` when the folder is missing or a link;
   `429` when 10 are waiting; `503` when change jobs are not configured. An optional `"stacks"` names the stacks the job
   may change and check, as a stack job's (`stack-jobs.md`, The API): with none of them in the code, the job ends `FAILED`
   with `UNSUPPORTED_STACK` before any agent or sandbox runs.
+- `"targets"`, for `assess` only: the versions the project would move to, `{"java": "21"}`, shaped as a stack job's pinned
+  `versions` (`stack-jobs.md`, The API); part of the request.
 - `GET /v1/change-jobs/{id}`: the job. `GET /v1/change-jobs/{id}/patch`: the patch once handed back (`text/x-diff`).
   `POST /v1/change-jobs/{id}/stop`.
 
@@ -30,10 +33,10 @@ A job: `{"id", "kind", "state", "phase", "created_at", "started_at", "ended_at",
 "agent": {"summary", "review", "commands", "input_tokens", "output_tokens", "cost_usd", "seconds"}, "result": {"patch_sha256",
 "files": [{"path", "status"}], "insertions", "deletions"}, "proof": {"state", "files", "tests", "note"}, "reason"}`; a test
 step may carry `"coverage": {"covered", "total", "tool"}`. Parts are stack jobs' parts. `state` is `QUEUED`,
-`RUNNING` (with `phase` `BASELINE`, `AGENT`, `REVIEW`, `CHECKING`, `RESULT`), `HANDED_BACK`, `NOT_HANDED_BACK`, `FAILED`,
-`STOPPED` or `UNKNOWN`. `reason`:
+`RUNNING` (with `phase` `BASELINE`, `AGENT`, `REVIEW`, `CHECKING`, `RESULT`), `HANDED_BACK`, `ASSESSED` (an assessment, with
+its `plan`), `NOT_HANDED_BACK`, `FAILED`, `STOPPED` or `UNKNOWN`. `reason`:
 
-- not handed back: `SECRET_IN_CHANGE` (the patch or what the agent said carries a private key, a provider's token, or one of the engine's own settings), `BASELINE_FAILED` (a fix needs the code to install, a test job needs it to build), `NO_CHANGE`,
+- not handed back: `NO_PLAN` (an assessment's agent answered no plan of the right shape), `SECRET_IN_CHANGE` (the patch or what the agent said carries a private key, a provider's token, or one of the engine's own settings), `BASELINE_FAILED` (a fix needs the code to install, a test job needs it to build), `NO_CHANGE`,
   `WORSE_AFTER` (it no longer builds, fewer tests pass or more fail, or a test job's tests do not pass), `TOO_LARGE` (over
   200 files or 2 MB), `FORBIDDEN_PATH` (CI settings, workflows, `.claude/` or `.mcp.json`, a submodule, or a file that looks like a secret);
 - failed: `NO_STACK`, `UNSUPPORTED_STACK`, `SOURCE_REFUSED`, `SANDBOX_UNAVAILABLE`, `ENGINE_UNAVAILABLE`, `TIMED_OUT`;
@@ -79,6 +82,27 @@ step may carry `"coverage": {"covered", "total", "tool"}`. Parts are stack jobs'
    out), committed with Git objects only, and diffed against `start`: the patch, its digest and its files.
 9. **Limits:** at most two jobs at once and one per cache key; 90 minutes a job; the folder, the socket and the agent's
    home deleted when it ends. Caches are the change root's own, apart from stack jobs'.
+
+## Assessments (Repo C `LEGACY_MIGRATION.md` §4)
+
+A job of the kind `assess` answers what it would take to move a project to supported versions, and changes nothing:
+
+1. **The baseline**, as a change's, on the versions the project uses now; the agent starts whatever it shows (an old
+   project may not install today, which is what an assessment is for). Test steps carry their coverage, as a test job's.
+2. **The checks on the targets** (phase `CHECKING`): each part that `targets` moves to a version a profile serves, on a
+   fresh copy of the source, so the work folder stays as the baseline left it; recorded in `after`, each part with
+   `version_note` "asked to run on 21 instead of 17". Without targets, or with none served, `after` stays empty.
+3. **The agent** (phase `AGENT`), with the run tool on the project's own versions and its rules: read the code, run what it
+   needs, change no file. Its prompt carries the words, both checks and the plan's shape; its answer is the plan alone, one
+   JSON object (a fenced code block is read too). No review session.
+4. **The plan**, read strictly: `{"summary", "paths": [{"what", "from", "to"}], "steps": [{"title", "words", "risk", "size",
+   "files", "tests", "tests_first"}]}`, no other field and nothing after it; a summary of at most 2,000 characters; at most 8
+   paths; 1 to 20 steps, each titled in at most 200 characters, its words at most 4,000 (so a step can start a change job),
+   `risk` `low`, `medium` or `high`, `size` `small`, `medium` or `large`, at most 50 files as clean paths inside the
+   repository, its tests in at most 1,000 characters; no control characters but line breaks and tabs where text runs over
+   lines. Every text masked as a step's output is. An answer that is not a plan ends `NOT_HANDED_BACK` with `NO_PLAN`; one
+   carrying a secret, `SECRET_IN_CHANGE`. Otherwise the job ends `ASSESSED` with `plan`; the agent's summary is the
+   plan's. There is no patch: `GET …/patch` is `404`.
 
 ## Settings
 

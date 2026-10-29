@@ -48,3 +48,27 @@ func TestPinnedVersionsAreFewAndShapedAndDigestInAnyOrder(t *testing.T) {
 		t.Fatal("versions digest")
 	}
 }
+
+func TestTargetsAreForAnAssessmentAlone(t *testing.T) {
+	job := ChangeJobCreateV1{RequestID: "req-12345678", Source: "src-a", CacheKey: strings.Repeat("d", 64), Kind: "assess", Words: "what would it take"}
+	for _, targets := range []map[string]string{nil, {"java": "21"}, {"python": "3.13", "node": "24"}} {
+		job.Targets = targets
+		if !job.Valid() {
+			t.Errorf("%v refused", targets)
+		}
+	}
+	for _, targets := range []map[string]string{{"java": "latest"}, {"Java": "21"}} {
+		job.Targets = targets
+		if job.Valid() {
+			t.Errorf("%v accepted", targets)
+		}
+	}
+	job.Kind, job.Targets = "fix", map[string]string{"java": "21"}
+	if job.Valid() {
+		t.Fatal("a fix with targets accepted")
+	}
+	job.Kind = "migrate"
+	if job.Targets = nil; job.Valid() {
+		t.Fatal("an unknown kind accepted")
+	}
+}
