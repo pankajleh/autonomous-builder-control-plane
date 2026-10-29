@@ -596,7 +596,7 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 		}
 	}
 	defer end()
-	if javaSettings(p, cache, session.Proxy(), x.registries) != nil {
+	if homeSettings(p, cache, session.Proxy(), x.registries) != nil {
 		return FailSandbox
 	}
 	env := Env(p, profile, session.Proxy())
@@ -714,9 +714,19 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 	return failure
 }
 
-// javaSettings tells a Java part's Maven and Gradle where the proxy is. Written from the host into a cache a job may have
-// left links in: through real folders only, never a link.
-func javaSettings(p Part, cache string, proxy netip.AddrPort, registries []serviceapi.RegistryV1) error {
+// homeSettings writes what a part's tools read from the cache's home before its steps: a Java part's Maven and Gradle
+// settings (where the proxy is); a .NET part's NuGet migration marker (in the home's local data folder, where NuGet reads
+// it), since NuGet's one-time migrations otherwise take a named mutex, which .NET 8 cannot make in the sandbox (with any
+// IPC mode, as any user), and every restore fails. Written from the host into a cache a job may have left links in:
+// through real folders only, never a link.
+func homeSettings(p Part, cache string, proxy netip.AddrPort, registries []serviceapi.RegistryV1) error {
+	if p.Stack == StackDotnet {
+		migrations, err := realDirs(cache, "home", ".local", "share", "NuGet", "Migrations")
+		if err != nil {
+			return err
+		}
+		return writeReal(migrations, "1", nil)
+	}
 	if p.Stack != StackJava {
 		return nil
 	}
