@@ -95,7 +95,7 @@ func TestRelayHostAndCredentialsAreChecked(t *testing.T) {
 // by the matcher insideScript writes from its network's range; a website, a
 // paused app and an app without a credential get none, and nothing listens
 // inside without a relay host. The public blocks drop the server's mark.
-func TestTheInsideListenerPassesOnlyAnAppServersStatusReads(t *testing.T) {
+func TestTheInsideListenerPassesOnlyAnAppServersStatusReadsAndAIAnswers(t *testing.T) {
 	credential := strings.Repeat("c", 43)
 	r := record{Key: "srv-0123456789ab", Sites: []siteRecord{
 		{Name: "cafe", Host: "cafe.example.com", Kind: kindNode, Release: "r1", State: siteLive, Relay: credential},
@@ -112,6 +112,7 @@ func TestTheInsideListenerPassesOnlyAnAppServersStatusReads(t *testing.T) {
 	for _, want := range []string{
 		"\trequest_header -X-Autobuild-Caller\n\trequest_header -X-Autobuild-Relay-Token\n",
 		"\timport inside/cafe.caddy\n\thandle @from_cafe {\n\t\treverse_proxy https://siterelays.deployflix.app {\n",
+		"\thandle @ai_cafe {\n\t\trequest_body {\n\t\t\tmax_size 64KB\n\t\t}\n\t\treverse_proxy https://siterelays.deployflix.app {\n",
 		"\t\t\theader_up X-Autobuild-Site " + credential + "\n\t\t\theader_up X-Autobuild-Host cafe.example.com\n",
 		"\t\t\theader_up X-Autobuild-Caller server\n\t\t\theader_up -Cookie\n\t\t\theader_up -Authorization\n",
 		"\trespond 404\n}\n",
@@ -160,7 +161,8 @@ func TestTheInsideMatchersComeFromEachNetworksRange(t *testing.T) {
 		}
 		return string(b)
 	}
-	if cafe := read("cafe"); cafe != "@from_cafe {\n\tremote_ip 172.21.0.0/16\n\tmethod GET\n\tpath_regexp ^/__autobuild/connect/[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9_-]+$\n}\n" {
+	if cafe := read("cafe"); cafe != "@from_cafe {\n\tremote_ip 172.21.0.0/16\n\tmethod GET\n\tpath_regexp ^/__autobuild/connect/[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9_-]+$\n}\n"+
+		"@ai_cafe {\n\tremote_ip 172.21.0.0/16\n\tmethod POST\n\tpath /__autobuild/ai\n}\n" {
 		t.Fatalf("cafe's matcher:\n%s", cafe)
 	}
 	if plain := read("plain"); !strings.Contains(plain, "\tremote_ip 255.255.255.255/32\n") {

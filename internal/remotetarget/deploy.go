@@ -1016,10 +1016,14 @@ func caddyfileFor(r record, site, host, relayHost string) string {
 		if !ok || paused[name] || !inside[name] {
 			continue
 		}
-		fmt.Fprintf(&servers, "\timport inside/%s.caddy\n\thandle @from_%s {\n\t\treverse_proxy https://%s {\n\t\t\theader_up Host %s\n"+
+		proxy := fmt.Sprintf("\t\treverse_proxy https://%s {\n\t\t\theader_up Host %s\n"+
 			"\t\t\theader_up X-Autobuild-Site %s\n\t\t\theader_up X-Autobuild-Host %s\n\t\t\theader_up X-Autobuild-Client {remote_host}\n"+
-			"\t\t\theader_up X-Autobuild-Caller server\n\t\t\theader_up -Cookie\n\t\t\theader_up -Authorization\n\t\t}\n\t}\n",
-			name, name, relayHost, relayHost, credential, hosts[name])
+			"\t\t\theader_up X-Autobuild-Caller server\n\t\t\theader_up -Cookie\n\t\t\theader_up -Authorization\n\t\t}\n",
+			relayHost, relayHost, credential, hosts[name])
+		// A connection's status read, and an AI answer for the app's own server (Repo C SUPPORT_AGENTS A1), its body bounded
+		// as the gateway bounds a page's.
+		fmt.Fprintf(&servers, "\timport inside/%s.caddy\n\thandle @from_%s {\n%s\t}\n\thandle @ai_%s {\n\t\trequest_body {\n\t\t\tmax_size 64KB\n\t\t}\n%s\t}\n",
+			name, name, proxy, name, proxy)
 	}
 	if servers.Len() > 0 {
 		fmt.Fprintf(&b, "\n# The inside listener (BF-08b2): an app's own server asks Autobuild here, known by its network's range.\nhttp://:%d {\n"+
@@ -1420,18 +1424,20 @@ mkdir -p "$C"
 ` + insideScript + `cat > "$C/Caddyfile.next"
 mv "$C/Caddyfile.next" "$C/Caddyfile"
 `
-	// insideScript writes, for each Node site (@NETS@), the matcher the front
+	// insideScript writes, for each Node site (@NETS@), the matchers the front
 	// door's inside listener knows its app's server by (BF-08b2): its
-	// network's range, and only a connection's status read. A site whose
-	// network is not found gets a range nothing comes from. Both front-door
-	// scripts run it before Caddy reads the Caddyfile that imports these.
+	// network's range, and only a connection's status read or, for the app's
+	// own AI answers (Repo C SUPPORT_AGENTS A1), a post to /__autobuild/ai. A
+	// site whose network is not found gets a range nothing comes from. Both
+	// front-door scripts run it before Caddy reads the Caddyfile that imports
+	// these, so a Caddyfile naming a matcher always finds it.
 	insideScript = `I="$HOME/autobuild/frontdoor/config/inside"
 mkdir -p "$I"
 for n in @NETS@; do
   range=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "autobuild-net-$n" </dev/null 2>/dev/null | tr -s ' ' '\n' |
     grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$' | head -n 1 || true)
   [ -n "$range" ] || range=255.255.255.255/32
-  printf '@from_%s {\n\tremote_ip %s\n\tmethod GET\n\tpath_regexp ^/__autobuild/connect/[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9_-]+$\n}\n' "$n" "$range" > "$I/.$n.caddy.next"
+  printf '@from_%s {\n\tremote_ip %s\n\tmethod GET\n\tpath_regexp ^/__autobuild/connect/[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9_-]+$\n}\n@ai_%s {\n\tremote_ip %s\n\tmethod POST\n\tpath /__autobuild/ai\n}\n' "$n" "$range" "$n" "$range" > "$I/.$n.caddy.next"
   mv "$I/.$n.caddy.next" "$I/$n.caddy"
 done
 `
