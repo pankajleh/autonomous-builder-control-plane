@@ -253,10 +253,12 @@ func Env(p Part, profile ProfileV1, proxy netip.AddrPort) []string {
 		env = append(env, "COMPOSER_HOME=/cache/home/.composer", "COMPOSER_CACHE_DIR=/cache/home/.cache/composer", "COMPOSER_NO_INTERACTION=1")
 	case StackDotnet:
 		// NuGet's packages are the project's cache; nothing is sent to Microsoft; no build server outlives a step; a project
-		// built for an older .NET runs on the image's newer one.
+		// built for an older .NET runs on the image's newer one. .NET keeps a named mutex's files in XDG_RUNTIME_DIR, else
+		// under the user database's home (not HOME), which the read-only root refuses: every named mutex then fails, and
+		// coverlet, which takes one to write its hits, measures nothing.
 		env = append(env, "DOTNET_CLI_HOME=/cache/home", "NUGET_PACKAGES=/cache/home/.nuget/packages", "DOTNET_CLI_TELEMETRY_OPTOUT=1",
 			"DOTNET_NOLOGO=1", "DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1", "DOTNET_ROLL_FORWARD=Major", "MSBUILDDISABLENODEREUSE=1",
-			"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1")
+			"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1", "XDG_RUNTIME_DIR=/tmp")
 	}
 	return env
 }
