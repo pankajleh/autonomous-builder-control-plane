@@ -485,6 +485,10 @@ func testFile(p Part, rel string) bool {
 		return strings.HasPrefix(rel, "src/test/") || strings.HasPrefix(rel, "src/integrationTest/") || strings.Contains(rel, "/src/test/")
 	case StackNode:
 		return nodeTestName.MatchString(base) || inDir("__tests__", "tests", "test")
+	case StackGo:
+		return strings.HasSuffix(base, "_test.go") || inDir("testdata")
+	case StackRuby:
+		return strings.HasSuffix(base, "_spec.rb") || strings.HasSuffix(base, "_test.rb") || inDir("spec", "test")
 	}
 	return false
 }

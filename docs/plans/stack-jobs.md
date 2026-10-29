@@ -43,15 +43,21 @@ less than 10 GB free).
    written. The cache is `{stack-root}/caches/{cache_key}` (created at most 2 GB; all caches at most 10 GB, the least
    recently used removed first, never one in use).
 2. **Find the parts and their stacks** from the files at the top of `work`: `pyproject.toml`, `requirements*.txt`,
-   `setup.py` (Python); `pom.xml`, `build.gradle`, `build.gradle.kts` (Java); `package.json` (Node). With none at the top,
-   each folder one level down that has one is a part, at most three. Several manifests in one folder: Java, then Python,
-   then Node.
+   `setup.py` (Python); `pom.xml`, `build.gradle`, `build.gradle.kts` (Java); a `Gemfile` asking for a gem beyond a mobile
+   app's build tools (`fastlane`, `cocoapods` and the like) (Ruby); `go.mod` (Go); `package.json` (Node). With none at the
+   top, each folder one level down that has one is a part, at most three. Several manifests in one folder: Java, then
+   Python, then Ruby, then Go, then Node (a Rails project or a Go service has a `package.json` for its front end beside its
+   own manifest; Repo C `MORE_STACKS.md` §3).
 3. **Pick the version and tool**: Python from `.python-version`, else 3.12 when `requires-python` allows it, else the
    lowest version it allows among 3.10–3.13; tool `uv` with `uv.lock`, `poetry` with `poetry.lock`, else `pip`. Java from `.java-version`,
    `maven.compiler.release`, `maven.compiler.source`, `java.version`, or Gradle's `languageVersion`, else 21, then 17 or
    21 (the nearest not older); tool Maven or Gradle, the project's wrapper when it has one. Node from `.nvmrc`,
    `.node-version` or `engines.node`'s first major, else 22, then 20, 22 or 24; tool from the lockfile (`npm`, `pnpm`,
-   `yarn`). A version the images lack is the nearest newer one, said in `version_note`.
+   `yarn`). Go from `go.mod`'s `go` line (the oldest it builds with), else 1.27, among the two releases served; its
+   `toolchain` line is never downloaded. Ruby from `.ruby-version`, the `Gemfile`'s `ruby` line or `Gemfile.lock`'s `RUBY
+   VERSION`, else 3.4, then 3.3, 3.4 or 4.0; tool Bundler, tests with RSpec when there is a `spec` folder and RSpec is in
+   the lockfile or `Gemfile`, else Rake's `test` task when there is a `Rakefile` and a `test` folder. A version the images
+   lack is the nearest newer one, said in `version_note`.
 4. **The container**, one per part, from the stack profile for that stack and version: `docker create --pull=never
    --runtime=runsc --network <private> --user <profile user> --cap-drop=ALL --security-opt=no-new-privileges --read-only
    --cpu-quota --memory --memory-swap --pids-limit --ipc=none --log-driver=none`, as this controller's own uid and gid
@@ -67,7 +73,9 @@ less than 10 GB free).
    - `pypi`: `pypi.org`, `files.pythonhosted.org`;
    - `maven-central`: `repo.maven.apache.org`, `repo1.maven.org`;
    - `gradle`: `services.gradle.org`, `downloads.gradle.org`, `plugins.gradle.org`, `plugins-artifacts.gradle.org`;
-   - `npm`: `registry.npmjs.org`, `registry.yarnpkg.com`, `repo.yarnpkg.com`.
+   - `npm`: `registry.npmjs.org`, `registry.yarnpkg.com`, `repo.yarnpkg.com`;
+   - `go`: `proxy.golang.org`, `sum.golang.org` (`GOPROXY` is the module proxy alone, `GOTOOLCHAIN=local`);
+   - `rubygems`: `rubygems.org`, `index.rubygems.org`.
 6. **The steps**, each a `docker exec` with its own time limit inside the job's 30 minutes, its output kept to the last
    200 lines (64 KiB), with anything that looks like a key or token masked:
 
@@ -76,11 +84,16 @@ less than 10 GB free).
    | python | `uv sync --frozen`; `poetry install --no-interaction`; or `python -m venv /work/.venv` then `pip install -r requirements.txt` (or `pip install .`) | `python -m compileall -q .` | `python -m pytest -q --junitxml=…` when pytest is installed in the environment, else `python -m unittest discover` |
    | java | skipped: Maven and Gradle fetch what the code needs while they build | `sh mvnw` or `mvn -B -ntp -DskipTests package`; `sh gradlew` or `gradle --no-daemon assemble` | `… test` |
    | node | `npm ci` (`npm install` without a lockfile); `corepack pnpm install --frozen-lockfile`; `corepack yarn install --immutable` (Yarn 1: `--frozen-lockfile`) | the tool's `run build` when the script exists | its `run test` when the script exists (not npm's placeholder) |
+   | go | `go mod download` | `go build ./...` | `go test -v ./...` when a `_test.go` file is within four levels |
+   | ruby | `bundle install` (into the cache: `BUNDLE_PATH=/cache/home/bundle`) | skipped: nothing to build | `bundle exec rspec`, or `bundle exec rake test` |
 
    A step with nothing to do is `SKIPPED`. A failed install or build ends the part. pytest's and unittest's exit code 5,
    no tests found, is `SKIPPED` with that note, not a failure.
 7. **Tests' counts**, once the part's container has ended, from JUnit XML the tools wrote under `work` (`target/surefire-reports`, `build/test-results`, the
-   pytest report): at most 200 files and 8 MiB read, parsed with limits, or none.
+   pytest report): at most 200 files and 8 MiB read, parsed with limits, or none. A Node or Ruby part without JUnit takes
+   them from its runner's summary in the step's last lines (Jest, Vitest, Node's, Mocha; RSpec, Minitest); a Go part from
+   each test's own `--- PASS`, `--- FAIL` or `--- SKIP` line, counted in all the step printed as it printed it (subtests
+   too), not only the lines kept.
 8. **End**: the evidence is written to `{stack-root}/jobs/{id}/job.json`, the containers and network removed, `work`
    deleted. The job's JSON stays (at most 1,000 kept, oldest removed first).
 
@@ -126,9 +139,9 @@ is what it was and a request ID names either a check or a scan, never both. The 
   build host refreshes. Without it a scan is refused `503 stack_scans_unavailable`; checks are unaffected.
 - **The data:** bound read-only at `/osv` (`--mount type=bind,src=…,dst=/osv,readonly`) in a scan's parts only, never in
   a check's or a change job's, and never in the probe.
-- **The steps:** **install** as a check's; **build** only for Java, whose classes SpotBugs reads (Python and Node:
+- **The steps:** **install** as a check's; **build** only for Java, whose classes SpotBugs reads (the others:
   `SKIPPED`, "not needed to scan"); **test** `SKIPPED` ("a scan runs no tests"); then **scan**: the image's own
-  `/opt/autobuild/scan --part <the part's folder> --index <n> --stack <python|java|node> --out /work/.abcp/scan-<n>.json`,
+  `/opt/autobuild/scan --part <the part's folder> --index <n> --stack <python|java|node|go|ruby> --out /work/.abcp/scan-<n>.json`,
   within 10 minutes. A failed install or build does not end a scan's part (the step says "the scan goes on with what
   was installed"): lockfiles, the code and what was installed are still read. A scanner that exits non-zero fails the
   part `SCAN_FAILED`; timeouts, the work's size and the sandbox fail it as a check's do.

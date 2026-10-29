@@ -205,11 +205,16 @@ var (
 	vitestSummary = regexp.MustCompile(`^Tests\s+(\d+ [a-z]+(?: \| \d+ [a-z]+)*) \(\d+\)$`)
 	nodeLine      = regexp.MustCompile(`^(?:#|ℹ) (pass|fail|cancelled|skipped|todo) (\d+)$`)
 	mochaLine     = regexp.MustCompile(`^(\d+) (passing|failing|pending)(?: \(\S+\))?$`)
-	countWord     = regexp.MustCompile(`(\d+) ([a-z]+)`)
+	// RSpec's summary: 12 examples, 1 failure, 2 pending.
+	rspecSummary = regexp.MustCompile(`^(\d+) examples?, (\d+) failures?(?:, (\d+) pending)?`)
+	// Minitest's summary: 12 runs, 30 assertions, 1 failures, 0 errors, 2 skips.
+	minitestSummary = regexp.MustCompile(`^(\d+) runs, \d+ assertions, (\d+) failures, (\d+) errors, (\d+) skips$`)
+	countWord       = regexp.MustCompile(`(\d+) ([a-z]+)`)
 )
 
-// RunnerCounts reads the tests' counts from what a Node test runner printed at its end, for a project that writes no JUnit
-// report. Output that matches none of the four runners, or more than one, gives none: nothing is guessed.
+// RunnerCounts reads the tests' counts from what a Node or Ruby test runner printed at its end, for a project that writes
+// no JUnit report: Jest, Vitest, node:test, Mocha, RSpec or Minitest. Output that matches none of them, or more than one,
+// gives none: nothing is guessed. Go's counts come from every line of its output instead (goTally).
 func RunnerCounts(output string) (passed, failed, skipped int, ok bool) {
 	type counts struct{ passed, failed, skipped int }
 	found := map[string]*counts{}
@@ -265,6 +270,30 @@ func RunnerCounts(output string) (passed, failed, skipped int, ok bool) {
 			}
 			continue
 		}
+		if m := rspecSummary.FindStringSubmatch(line); m != nil {
+			total, good1 := number(m[1])
+			failures, good2 := number(m[2])
+			pending := 0
+			if m[3] != "" {
+				pending, _ = number(m[3])
+			}
+			if good1 && good2 && failures+pending <= total {
+				c := runner("rspec", true)
+				c.passed, c.failed, c.skipped = total-failures-pending, failures, pending
+			}
+			continue
+		}
+		if m := minitestSummary.FindStringSubmatch(line); m != nil {
+			runs, good1 := number(m[1])
+			failures, good2 := number(m[2])
+			errs, good3 := number(m[3])
+			skips, good4 := number(m[4])
+			if good1 && good2 && good3 && good4 && failures+errs+skips <= runs {
+				c := runner("minitest", true)
+				c.passed, c.failed, c.skipped = runs-failures-errs-skips, failures+errs, skips
+			}
+			continue
+		}
 		if m := mochaLine.FindStringSubmatch(line); m != nil {
 			if n, good := number(m[1]); good {
 				c := runner("mocha", m[2] == "passing" || !inMocha)
@@ -281,6 +310,63 @@ func RunnerCounts(output string) (passed, failed, skipped int, ok bool) {
 		return c.passed, c.failed, c.skipped, true
 	}
 	return 0, 0, 0, false
+}
+
+// goLine is one of Go's verbose lines, one a test (subtests too): --- PASS: TestTotal (0.00s).
+var goLine = regexp.MustCompile(`^--- (PASS|FAIL|SKIP): \S`)
+
+// goTally counts Go's verbose lines as a test step prints them (MORE_STACKS §4): each test has its own line, so a large
+// project's counts are in all of its output, not in the tail a step keeps. A line longer than goLineBytes is not a test's.
+type goTally struct {
+	mu                      sync.Mutex
+	line                    []byte
+	long                    bool
+	passed, failed, skipped int
+}
+
+const goLineBytes = 4 << 10
+
+func (g *goTally) Write(p []byte) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, b := range p {
+		switch {
+		case b == '\n':
+			if !g.long {
+				g.count(string(g.line))
+			}
+			g.line, g.long = g.line[:0], false
+		case len(g.line) >= goLineBytes:
+			g.long = true
+		default:
+			g.line = append(g.line, b)
+		}
+	}
+	return len(p), nil
+}
+
+func (g *goTally) count(line string) {
+	m := goLine.FindStringSubmatch(strings.TrimSpace(ansiCodes.ReplaceAllString(line, "")))
+	switch {
+	case m == nil:
+	case m[1] == "PASS":
+		g.passed++
+	case m[1] == "FAIL":
+		g.failed++
+	default:
+		g.skipped++
+	}
+}
+
+// Counts are the tests counted, with what is left of a last line; none when no test's line was printed.
+func (g *goTally) Counts() (passed, failed, skipped int, ok bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.line) > 0 && !g.long {
+		g.count(string(g.line))
+		g.line = g.line[:0]
+	}
+	return g.passed, g.failed, g.skipped, g.passed+g.failed+g.skipped > 0
 }
 
 // coverageTool is a coverage report's tool and its version, as the images write it: "coverage.py 7.16.2".

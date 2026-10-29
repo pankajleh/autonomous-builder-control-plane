@@ -2,12 +2,14 @@ package stackjob
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/preview"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
@@ -29,11 +31,30 @@ func TestRunnerCountsReadFourNodeRunnersAndNothingElse(t *testing.T) {
 		{"two runners give none", "Tests:       2 passed, 2 total\n# pass 3\n# fail 0\n", 0, 0, 0, false},
 		{"nothing to read", "built in 2s\nall good\n", 0, 0, 0, false},
 		{"a test's own words are not a summary", "    Tests: are fun, 3 total of them\n", 0, 0, 0, false},
+		{"rspec", "..F*.\n\nFinished in 0.4 seconds (files took 1.2 seconds to load)\n12 examples, 1 failure, 2 pending\n", 9, 1, 2, true},
+		{"rspec, all passed", "\x1b[32m3 examples, 0 failures\x1b[0m\n", 3, 0, 0, true},
+		{"minitest", "Finished in 0.01s, 200 runs/s.\n\n12 runs, 30 assertions, 1 failures, 1 errors, 2 skips\n", 8, 2, 2, true},
+		{"minitest that does not add up", "2 runs, 3 assertions, 2 failures, 1 errors, 0 skips\n", 0, 0, 0, false},
+		{"go's lines are not read here", "--- PASS: TestTotal (0.00s)\nok  x 0.1s\n", 0, 0, 0, false},
 	} {
 		passed, failed, skipped, ok := RunnerCounts(c.output)
 		if ok != c.ok || passed != c.passed || failed != c.failed || skipped != c.skip {
 			t.Errorf("%s: %d passed, %d failed, %d skipped, %v", c.name, passed, failed, skipped, ok)
 		}
+	}
+}
+
+func TestGosCountsAreEveryTestsLineInAllItsOutput(t *testing.T) {
+	g := &goTally{}
+	io.WriteString(g, "=== RUN   TestTotal\n--- PASS: TestTotal (0.00s)\n=== RUN   TestSplit\n    --- PASS: TestSplit/even (0.00s)\n    --- FA")
+	io.WriteString(g, "IL: TestSplit/odd (0.01s)\n--- FAIL: TestSplit (0.01s)\n\x1b[33m--- SKIP: TestSlow (0.00s)\x1b[0m\n")
+	io.WriteString(g, "    total_test.go:9: --- PASS: printed by a test, not a test's line\n"+strings.Repeat("x", goLineBytes+10)+"--- PASS: TestLong\n")
+	io.WriteString(g, "FAIL\nFAIL\tx\t0.02s\n--- PASS: TestLast (0.00s)")
+	if p, f, s, ok := g.Counts(); !ok || p != 3 || f != 2 || s != 1 {
+		t.Fatalf("go counts = %d %d %d %v", p, f, s, ok)
+	}
+	if _, _, _, ok := (&goTally{}).Counts(); ok {
+		t.Fatal("counts without a test")
 	}
 }
 
@@ -73,6 +94,10 @@ func TestAMeasuredTestStepWrapsTheTestsAndKeepsTheirExitCode(t *testing.T) {
 		{Part{Stack: StackJava, Tool: "maven"}, []string{`JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -javaagent:/opt/autobuild/coverage/jacoco/jacocoagent.jar=destfile=/work/.abcp/jacoco-0.exec,append=true,excludes=`,
 			`" mvn -B -ntp test;`, "/opt/autobuild/coverage/report java /work/.abcp/jacoco-0.exec /work/.abcp/jacoco-0.xml"}},
 		{Part{Stack: StackNode, Tool: "npm", Test: true}, []string{"NODE_V8_COVERAGE=/work/.abcp/v8-0 npm run test;", "/opt/autobuild/coverage/report node /work/.abcp/v8-0 /work/.abcp/c8-0"}},
+		{Part{Stack: StackGo, Tool: "go", Test: true}, []string{"go test -v -coverprofile=/work/.abcp/go-cover-0.out -coverpkg=./... ./...;",
+			"/opt/autobuild/coverage/report go /work/.abcp/go-cover-0.out /work/.abcp/go-cover-0.json", "fi; go test -v ./..."}},
+		{Part{Stack: StackRuby, Tool: "bundler", Runner: "rspec", Test: true}, []string{"mkdir -p /work/.abcp/ruby-0 && AUTOBUILD_COVERAGE=/work/.abcp/ruby-0 RUBYOPT=-r/opt/autobuild/coverage/ruby/start.rb bundle exec rspec;",
+			"/opt/autobuild/coverage/report ruby /work/.abcp/ruby-0 /work/.abcp/ruby-0.json", "fi; bundle exec rspec"}},
 	} {
 		steps := Steps(c.part, 0)
 		plain := steps[len(steps)-1]
@@ -120,6 +145,14 @@ func TestTestFilesAreKnownByEachStacksConventions(t *testing.T) {
 		{Part{Stack: StackNode}, "src/total.js", false},
 		{Part{Stack: StackNode, Dir: "web"}, "web/test/total.js", true},
 		{Part{Stack: StackNode, Dir: "web"}, "api/test/total.js", false},
+		{Part{Stack: StackGo}, "internal/total/total_test.go", true},
+		{Part{Stack: StackGo}, "internal/total/testdata/case.json", true},
+		{Part{Stack: StackGo}, "internal/total/total.go", false},
+		{Part{Stack: StackRuby}, "spec/models/basket_spec.rb", true},
+		{Part{Stack: StackRuby}, "test/basket_test.rb", true},
+		{Part{Stack: StackRuby}, "spec/fixtures/basket.yml", true},
+		{Part{Stack: StackRuby}, "lib/basket.rb", false},
+		{Part{Stack: StackRuby}, "app/models/latest.rb", false},
 	} {
 		if got := testFile(c.part, c.path); got != c.want {
 			t.Errorf("%s %s = %v", c.part.Stack, c.path, got)
@@ -249,5 +282,45 @@ func TestANodeProjectsCountsComeFromItsRunnersSummary(t *testing.T) {
 	}
 	if tests := job.Parts[0].Steps[2].Tests; tests == nil || *tests != (serviceapi.StackTestsV1{Passed: 3}) || job.Parts[0].Steps[2].Coverage != nil {
 		t.Fatalf("tests = %+v", tests)
+	}
+}
+
+func TestGoAndRubyProjectsCountTheirTests(t *testing.T) {
+	box := &fakeSandbox{proveOK: true}
+	box.exec = func(_ context.Context, _, _ string, argv []string, out io.Writer) (int, error) {
+		switch strings.Join(argv, " ") {
+		case "go test -v ./...":
+			// More tests than the lines a step keeps: each is still counted.
+			for i := 0; i < 300; i++ {
+				fmt.Fprintf(out, "=== RUN   Test%d\n--- PASS: Test%d (0.00s)\n", i, i)
+			}
+			io.WriteString(out, "--- FAIL: TestLast (0.00s)\nFAIL\n")
+			return 1, nil
+		case "bundle exec rspec":
+			io.WriteString(out, "...\n\nFinished in 0.1 seconds\n3 examples, 0 failures\n")
+		}
+		return 0, nil
+	}
+	f := newFixture(t, box)
+	job := f.wait(t, f.start(t, "go-1", "go-1", map[string]string{"go.mod": "module x\n\ngo 1.22\n", "x_test.go": "package x\n"}).ID)
+	if job.State != Failed || job.Failure != FailTests || job.Parts[0].Stack != StackGo || job.Parts[0].Version != "1.27" {
+		t.Fatalf("go job = %+v", job)
+	}
+	if tests := job.Parts[0].Steps[2].Tests; tests == nil || *tests != (serviceapi.StackTestsV1{Passed: 300, Failed: 1}) {
+		t.Fatalf("go tests = %+v", tests)
+	}
+	job = f.wait(t, f.start(t, "rb-1", "rb-1", map[string]string{"Gemfile": "gem 'rspec'\n", "spec/x_spec.rb": ""}).ID)
+	if job.State != Passed || job.Parts[0].Stack != StackRuby || job.Parts[0].Steps[1].State != StepSkipped {
+		t.Fatalf("ruby job = %+v", job)
+	}
+	if tests := job.Parts[0].Steps[2].Tests; tests == nil || *tests != (serviceapi.StackTestsV1{Passed: 3}) {
+		t.Fatalf("ruby tests = %+v", tests)
+	}
+	specs := map[string]bool{}
+	for _, s := range box.specs {
+		specs[strings.Join(s.Egress, ",")] = true
+	}
+	if !specs[preview.EgressGo] || !specs[preview.EgressRubyGems] {
+		t.Fatalf("sandboxes' registries = %v", specs)
 	}
 }
