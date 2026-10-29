@@ -28,14 +28,18 @@ Under a new grant, `stack.run`:
   §10: a stack for administrators first). A part of any other stack is `unsupported`, with its stack as what was found,
   and is not run, as a stack ABCP does not run yet. Without it, every stack the profiles serve. It is part of the
   request: the same `request_id` with other stacks is `409`, in another order the same request.
+- `"versions"`, optional: a stack's version for this job, `{"java": "21"}` (at most eight, each a stack's name and a version
+  like the profiles', `\d{1,2}(\.\d{1,2})?`; Repo C `LEGACY_MIGRATION.md` §1: whether the project builds on the version it
+  would move to). A part of that stack runs on it, with `version_note` "asked to run on 21 instead of 17", when a profile
+  serves it; when none does, on its own version, with a note saying so. Part of the request, as `stacks` is.
 - `GET /v1/stack-jobs/{id}`: the job (below). `POST /v1/stack-jobs/{id}/stop`: stops a queued or running job.
 - One job runs at a time; others wait (`QUEUED`), at most 20 waiting.
 
 A job: `{"id", "state", "created_at", "started_at", "ended_at", "parts": [...], "failure"}`. `state` is `QUEUED`,
 `RUNNING`, `PASSED`, `FAILED`, `STOPPED` or `UNKNOWN` (a job running when the controller stopped). Each part:
 `{"path", "stack", "version", "version_note", "tool", "steps": [{"name", "state", "command", "seconds", "exit_code",
-"output_tail", "tests": {"passed", "failed", "skipped"}}]}`. `stack` is `python`, `java`, `node`, `go`, `ruby` or
-`unsupported` (with what was found, for example `php`, or a stack the request did not name). A step's `state` is `WAITING`, `RUNNING`, `PASSED`, `FAILED`, `SKIPPED` (with a
+"output_tail", "tests": {"passed", "failed", "skipped"}}]}`. `stack` is `python`, `java`, `node`, `go`, `ruby`, `php`, `dotnet` or
+`unsupported` (with what was found, for example `rust`, or a stack the request did not name). A step's `state` is `WAITING`, `RUNNING`, `PASSED`, `FAILED`, `SKIPPED` (with a
 `note`), `STOPPED` or `NOT_RUN`. `failure` is a stable code: `NO_STACK`, `UNSUPPORTED_STACK`, `SOURCE_REFUSED` (the
 copy met a limit), `INSTALL_FAILED`, `BUILD_FAILED`, `TESTS_FAILED`, `TIMED_OUT`, `TOO_LARGE` (the work grew past the
 profile's `work_bytes`), `STOPPED`, `SANDBOX_UNAVAILABLE` (no profile, the probe failed, the container would not start, or

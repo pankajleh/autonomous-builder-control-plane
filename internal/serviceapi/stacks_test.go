@@ -28,3 +28,23 @@ func TestAJobsStacksAreFewNamesEachOnceAndDigestInAnyOrder(t *testing.T) {
 		t.Fatalf("digest parts %v %v", a, b)
 	}
 }
+
+func TestPinnedVersionsAreFewAndShapedAndDigestInAnyOrder(t *testing.T) {
+	job := StackJobCreateV1{RequestID: "req-12345678", Source: "src-a", CacheKey: strings.Repeat("d", 64)}
+	for _, versions := range []map[string]string{nil, {}, {"java": "21"}, {"python": "3.12", "dotnet": "10.0"}} {
+		job.Versions = versions
+		if !job.Valid() {
+			t.Errorf("%v refused", versions)
+		}
+	}
+	for _, versions := range []map[string]string{{"Java": "21"}, {"java": "21.0.1"}, {"java": "latest"}, {"java": ""},
+		{"a": "1", "b": "1", "c": "1", "d": "1", "e": "1", "f": "1", "g": "1", "h": "1", "i": "1"}} {
+		job.Versions = versions
+		if job.Valid() {
+			t.Errorf("%v accepted", versions)
+		}
+	}
+	if VersionsDigestPart(nil) != nil || !slices.Equal(VersionsDigestPart(map[string]string{"node": "22", "java": "21"}), []string{"version:java=21", "version:node=22"}) {
+		t.Fatal("versions digest")
+	}
+}

@@ -437,6 +437,28 @@ func Only(parts []Part, stacks []string) []Part {
 	return out
 }
 
+// Pin runs each part of a pinned stack on the pinned version, when the profiles serve it, with a note saying so; on its
+// own version, with a note saying why, when they do not. A part already on that version, or whose stack is not pinned,
+// stays as it is (Repo C LEGACY_MIGRATION §1).
+func Pin(parts []Part, versions map[string]string, available Available) []Part {
+	if len(versions) == 0 {
+		return parts
+	}
+	out := make([]Part, 0, len(parts))
+	for _, p := range parts {
+		switch v, pinned := versions[p.Stack]; {
+		case !pinned || v == p.Version:
+		case slices.Contains(available[p.Stack], v):
+			p.VersionNote = "asked to run on " + v + " instead of " + p.Version
+			p.Version = v
+		default:
+			p.VersionNote = "asked to run on " + v + ", which is not served; ran on " + p.Version
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 // gemLine is a gem a Gemfile asks for.
 var gemLine = regexp.MustCompile(`(?m)^\s*gem\s+["']([A-Za-z0-9._-]{1,100})["']`)
 
