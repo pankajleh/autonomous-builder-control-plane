@@ -694,3 +694,86 @@ func TestAPlanIsReadOnlyInItsShape(t *testing.T) {
 		}
 	}
 }
+
+func TestAMigrationStepIsMadeAndCheckedOnTheVersionsItMovesTo(t *testing.T) {
+	// Repo C LEGACY_MIGRATION §5.
+	passed, after, testCode := 1, false, 0
+	installs := true
+	box := &fakeSandbox{proveOK: true}
+	steps := passingSteps(&passed, &after, &testCode)
+	box.exec = func(ctx context.Context, work, dir string, argv []string, out io.Writer) (int, error) {
+		if strings.Contains(strings.Join(argv, " "), "pip install") && !after && !installs {
+			return 1, nil
+		}
+		return steps(ctx, work, dir, argv, out)
+	}
+	engine := &fakeEngine{act: func(run EngineRun, n int) (EngineResult, error) {
+		if n%2 == 1 {
+			os.WriteFile(filepath.Join(run.Work, "sample.py"), []byte("def total(xs):\n    return sum(xs or [])\n"), 0o644)
+			return EngineResult{Summary: "Moved total() off the removed form."}, nil
+		}
+		after = true
+		return EngineResult{Summary: "Checked."}, nil
+	}}
+	f := newChangeFixture(t, box, engine)
+	write(t, filepath.Join(f.sources, "old"), pythonProject)
+	start := func(request string) serviceapi.ChangeJobV1 {
+		t.Helper()
+		after = false
+		job, err := f.m.StartChangeJob(context.Background(), serviceapi.ChangeJobCreateV1{RequestID: request, Source: "old", CacheKey: key, Kind: "migrate",
+			Words: "Move the project to Python 3.13.", Targets: map[string]string{"python": "3.13"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.wait(t, job.ID)
+	}
+	job := start("step-1")
+	if job.State != ChangeHandedBack || job.Result == nil || job.Proof != nil || job.Plan != nil {
+		t.Fatalf("job = %+v", job)
+	}
+	if job.Before[0].Version != "3.12" || job.After[0].Version != "3.13" || job.After[0].VersionNote != "asked to run on 3.13 instead of 3.12" {
+		t.Fatalf("versions = %+v %+v", job.Before[0], job.After[0])
+	}
+	if prompt := engine.runs[0].Prompt; !strings.Contains(prompt, "Make one step of a migration") ||
+		!strings.Contains(prompt, "python 3.13 (pip) at the top of the repository, asked to run on 3.13 instead of 3.12") ||
+		!strings.Contains(engine.runs[1].Prompt, "a step of a migration") {
+		t.Fatalf("prompt = %s", prompt)
+	}
+	// Code that does not install on its own version today is still moved, and handed back once it installs on the new one.
+	installs = false
+	if job := start("step-2"); job.State != ChangeHandedBack || job.Before[0].Steps[0].State != Failed {
+		t.Fatalf("not installing before = %+v", job)
+	}
+	// A step whose tests fail on the new version is not handed back.
+	installs, testCode = true, 1
+	if job := start("step-3"); job.State != ChangeNotHandedBack || job.Reason != ReasonWorse {
+		t.Fatalf("worse = %+v", job)
+	}
+}
+
+func TestNoWorseForAMigrationAsksTheNewVersionsToInstallAndBuild(t *testing.T) {
+	part := func(install, build, test string, tests *serviceapi.StackTestsV1) serviceapi.StackPartV1 {
+		return serviceapi.StackPartV1{Stack: StackJava, Steps: []serviceapi.StackStepV1{{Name: "install", State: install}, {Name: "build", State: build},
+			{Name: "test", State: test, Tests: tests}}}
+	}
+	two := &serviceapi.StackTestsV1{Passed: 2}
+	cases := []struct {
+		before, after serviceapi.StackPartV1
+		want          bool
+	}{
+		{part(Failed, StepNotRun, StepNotRun, nil), part(Passed, Passed, Passed, two), true},
+		{part(Failed, StepNotRun, StepNotRun, nil), part(Passed, Failed, StepNotRun, nil), false},
+		{part(Failed, StepNotRun, StepNotRun, nil), part(Passed, Passed, Failed, nil), false},
+		{part(Passed, Passed, Passed, two), part(Passed, Passed, Failed, &serviceapi.StackTestsV1{Passed: 1, Failed: 1}), false},
+		{part(Passed, Passed, Failed, &serviceapi.StackTestsV1{Passed: 1, Failed: 1}), part(Passed, Passed, Failed, &serviceapi.StackTestsV1{Passed: 1, Failed: 1}), true},
+	}
+	for i, c := range cases {
+		if got := noWorse("migrate", []serviceapi.StackPartV1{c.before}, []serviceapi.StackPartV1{c.after}, 0); got != c.want {
+			t.Errorf("case %d = %v", i, got)
+		}
+	}
+	// A fix is held only to what worked before.
+	if !noWorse("fix", []serviceapi.StackPartV1{part(Failed, StepNotRun, StepNotRun, nil)}, []serviceapi.StackPartV1{part(Failed, StepNotRun, StepNotRun, nil)}, 0) {
+		t.Fatal("a fix on code that did not install")
+	}
+}

@@ -501,6 +501,11 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 	if !baselineReady(r.Job.Kind, before[agentPart]) {
 		return changeEnd{ChangeNotHandedBack, ReasonBaseline}
 	}
+	// A migration's step is made and checked after on the versions it moves to (LEGACY_MIGRATION §5); the baseline stays
+	// on the project's own.
+	if r.Job.Kind == "migrate" {
+		parts = Pin(parts, r.Targets, m.profiles.Available())
+	}
 
 	// The agent, then its review.
 	m.update(r, func(j *serviceapi.ChangeJobV1) { j.Phase, j.Agent = PhaseAgent, &serviceapi.ChangeAgentV1{} })

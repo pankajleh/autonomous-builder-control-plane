@@ -13,8 +13,8 @@ import (
 // Repo C in a folder under the change source root, changed by the agent while every command it runs runs in the stack
 // sandbox, and handed back as a patch. ABCP owns the job's lifecycle and evidence; Repo C opens the pull request.
 
-// ChangeJobCreateV1 starts a job. Source and CacheKey are as a stack job's; Kind is fix, tests or assess; Words are the
-// person's own. The same RequestID with the same body replays the same job.
+// ChangeJobCreateV1 starts a job. Source and CacheKey are as a stack job's; Kind is fix, tests, assess or migrate; Words
+// are the person's own, or a migration's step. The same RequestID with the same body replays the same job.
 type ChangeJobCreateV1 struct {
 	RequestID string `json:"request_id"`
 	Source    string `json:"source"`
@@ -25,8 +25,9 @@ type ChangeJobCreateV1 struct {
 	Registries []RegistryV1 `json:"registries,omitempty"`
 	// Stacks, when given, are the stacks the job may change and check, as a stack job's.
 	Stacks []string `json:"stacks,omitempty"`
-	// Targets, for an assessment only, are the versions the project would move to, "java": "21" (Repo C design note
-	// LEGACY_MIGRATION §4): its checks run on them too, as a stack job's pinned versions.
+	// Targets, for an assessment or a migration's step only, are the versions the project moves to, "java": "21" (Repo C
+	// design note LEGACY_MIGRATION §4 and §5): an assessment's checks run on them too, a step's agent and checks after on
+	// them alone, as a stack job's pinned versions.
 	Targets map[string]string `json:"targets,omitempty"`
 }
 
@@ -144,12 +145,12 @@ const (
 )
 
 // Valid reports a request of the right shape: a request ID, a folder name, a cache digest, a kind and the words; targets
-// only for an assessment.
+// only for an assessment or a migration's step.
 func (r ChangeJobCreateV1) Valid() bool {
 	return stackRequestID.MatchString(r.RequestID) && stackSourceName.MatchString(r.Source) && stackJobID.MatchString(r.CacheKey) &&
-		(r.Kind == "fix" || r.Kind == "tests" || r.Kind == "assess") && utf8.ValidString(r.Words) && !strings.ContainsRune(r.Words, 0) &&
+		(r.Kind == "fix" || r.Kind == "tests" || r.Kind == "assess" || r.Kind == "migrate") && utf8.ValidString(r.Words) && !strings.ContainsRune(r.Words, 0) &&
 		strings.TrimSpace(r.Words) != "" && utf8.RuneCountInString(r.Words) <= MaxChangeWords && validRegistries(r.Registries) &&
-		validStacks(r.Stacks) && validVersions(r.Targets) && (r.Kind == "assess" || len(r.Targets) == 0)
+		validStacks(r.Stacks) && validVersions(r.Targets) && (r.Kind == "assess" || r.Kind == "migrate" || len(r.Targets) == 0)
 }
 
 func (s *Server) mayRunChangeJobs(principal Principal) bool {
