@@ -134,6 +134,10 @@ func Detect(work string, available Available) []Part {
 var folderName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 
 func part(dir, rel, stack, found string, available Available) Part {
+	if stack != StackUnsupported && len(available[stack]) == 0 {
+		// A stack no profile serves is found and not run, as one ABCP does not run yet: its images are not on this host.
+		return Part{Dir: rel, Stack: StackUnsupported, Found: stack}
+	}
 	p := Part{Dir: rel, Stack: stack, Found: found}
 	switch stack {
 	case StackPython:

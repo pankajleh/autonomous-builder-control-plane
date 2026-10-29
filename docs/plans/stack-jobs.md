@@ -51,7 +51,8 @@ less than 10 GB free).
    app's build tools (`fastlane`, `cocoapods` and the like) (Ruby); `go.mod` (Go); `package.json` (Node). With none at the
    top, each folder one level down that has one is a part, at most three. Several manifests in one folder: Java, then
    Python, then Ruby, then Go, then Node (a Rails project or a Go service has a `package.json` for its front end beside its
-   own manifest; Repo C `MORE_STACKS.md` §3).
+   own manifest; Repo C `MORE_STACKS.md` §3). A stack no profile serves (its images are not on this host yet) is
+   `unsupported` with what was found, and is not run.
 3. **Pick the version and tool**: Python from `.python-version`, else 3.12 when `requires-python` allows it, else the
    lowest version it allows among 3.10–3.13; tool `uv` with `uv.lock`, `poetry` with `poetry.lock`, else `pip`. Java from `.java-version`,
    `maven.compiler.release`, `maven.compiler.source`, `java.version`, or Gradle's `languageVersion`, else 21, then 17 or

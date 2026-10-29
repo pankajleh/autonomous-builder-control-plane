@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -165,6 +166,13 @@ func TestPartsAreTheTopOrUpToThreeFoldersAndAStackNotRunYetIsNamed(t *testing.T)
 	}
 	if strings.Join(got, ",") != "api:java,web:node,worker:python" {
 		t.Fatalf("parts = %v", got)
+	}
+	// A stack no profile serves yet is found and not run.
+	served := Available{StackPython: {"3.12"}, StackJava: {"21"}, StackNode: {"22"}}
+	unserved := t.TempDir()
+	write(t, unserved, map[string]string{"go.mod": "module x\n", "x_test.go": "package x\n"})
+	if parts := Detect(unserved, served); len(parts) != 1 || !reflect.DeepEqual(parts[0], Part{Stack: StackUnsupported, Found: StackGo}) {
+		t.Fatalf("go without a profile: %+v", parts)
 	}
 	if p := detectOne(t, map[string]string{"composer.json": "{}"}); p.Stack != StackUnsupported || p.Found != "php" {
 		t.Fatalf("php: %+v", p)
