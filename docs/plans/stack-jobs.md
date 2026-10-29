@@ -24,14 +24,18 @@ Under a new grant, `stack.run`:
   `202` with the job, or replays the same job for the same `request_id`. Refused `422 stack_job_not_accepted` when the
   folder is missing, is a link, holds a link out of itself, or is over 300 MB or 20,000 files; `503` when stack jobs are
   not configured.
+- `"stacks"`, optional: the stacks the job may run, at most eight names (`[a-z]{1,16}`) each once (Repo C `MORE_STACKS.md`
+  §10: a stack for administrators first). A part of any other stack is `unsupported`, with its stack as what was found,
+  and is not run, as a stack ABCP does not run yet. Without it, every stack the profiles serve. It is part of the
+  request: the same `request_id` with other stacks is `409`, in another order the same request.
 - `GET /v1/stack-jobs/{id}`: the job (below). `POST /v1/stack-jobs/{id}/stop`: stops a queued or running job.
 - One job runs at a time; others wait (`QUEUED`), at most 20 waiting.
 
 A job: `{"id", "state", "created_at", "started_at", "ended_at", "parts": [...], "failure"}`. `state` is `QUEUED`,
 `RUNNING`, `PASSED`, `FAILED`, `STOPPED` or `UNKNOWN` (a job running when the controller stopped). Each part:
 `{"path", "stack", "version", "version_note", "tool", "steps": [{"name", "state", "command", "seconds", "exit_code",
-"output_tail", "tests": {"passed", "failed", "skipped"}}]}`. `stack` is `python`, `java`, `node` or `unsupported` (with
-what was found, for example `go`). A step's `state` is `WAITING`, `RUNNING`, `PASSED`, `FAILED`, `SKIPPED` (with a
+"output_tail", "tests": {"passed", "failed", "skipped"}}]}`. `stack` is `python`, `java`, `node`, `go`, `ruby` or
+`unsupported` (with what was found, for example `php`, or a stack the request did not name). A step's `state` is `WAITING`, `RUNNING`, `PASSED`, `FAILED`, `SKIPPED` (with a
 `note`), `STOPPED` or `NOT_RUN`. `failure` is a stable code: `NO_STACK`, `UNSUPPORTED_STACK`, `SOURCE_REFUSED` (the
 copy met a limit), `INSTALL_FAILED`, `BUILD_FAILED`, `TESTS_FAILED`, `TIMED_OUT`, `TOO_LARGE` (the work grew past the
 profile's `work_bytes`), `STOPPED`, `SANDBOX_UNAVAILABLE` (no profile, the probe failed, the container would not start, or

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -406,6 +407,23 @@ func nodeMajor(v string) string {
 		return ""
 	}
 	return m[1]
+}
+
+// Only leaves the parts of the stacks a job may run as they are, and makes every other part one found and not run, as a
+// stack ABCP does not run yet (Repo C MORE_STACKS §10: a stack for administrators first). No stacks named, every part
+// stays.
+func Only(parts []Part, stacks []string) []Part {
+	if len(stacks) == 0 {
+		return parts
+	}
+	out := make([]Part, 0, len(parts))
+	for _, p := range parts {
+		if p.Stack != StackUnsupported && !slices.Contains(stacks, p.Stack) {
+			p = Part{Dir: p.Dir, Stack: StackUnsupported, Found: p.Stack}
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // gemLine is a gem a Gemfile asks for.

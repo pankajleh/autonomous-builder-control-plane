@@ -589,3 +589,22 @@ func TestAChangeOrASummaryCarryingASecretIsNotHandedBack(t *testing.T) {
 		t.Fatal("a test password literal counted as a secret")
 	}
 }
+
+func TestAChangeJobChangesOnlyTheStacksItNames(t *testing.T) {
+	box := &fakeSandbox{proveOK: true}
+	engine := &fakeEngine{}
+	f := newChangeFixture(t, box, engine)
+	write(t, filepath.Join(f.sources, "gosvc"), map[string]string{"go.mod": "module x\n\ngo 1.22\n", "total.go": "package x\n"})
+	job, err := f.m.StartChangeJob(context.Background(), serviceapi.ChangeJobCreateV1{RequestID: "gosvc", Source: "gosvc", CacheKey: key, Kind: "fix",
+		Words: "The total is wrong when the list is empty.", Stacks: []string{"python", "java", "node"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job = f.wait(t, job.ID); job.State != ChangeFailed || job.Reason != FailUnsupported || len(engine.runs) != 0 || len(box.opens) != 0 {
+		t.Fatalf("go not named = %+v (%d sessions, %d sandboxes)", job, len(engine.runs), len(box.opens))
+	}
+	if _, err := f.m.StartChangeJob(context.Background(), serviceapi.ChangeJobCreateV1{RequestID: "gosvc", Source: "gosvc", CacheKey: key, Kind: "fix",
+		Words: "The total is wrong when the list is empty."}); err != serviceapi.ErrChangeJobConflict {
+		t.Fatalf("the same request without its stacks = %v", err)
+	}
+}

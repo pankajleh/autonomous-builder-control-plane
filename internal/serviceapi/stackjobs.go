@@ -24,6 +24,10 @@ type StackJobCreateV1 struct {
 	// Scan makes the job a security scan (Repo C design note SECURITY_AND_COMPLIANCE §11.1): each part is installed (and
 	// built, for Java), then scanned by the image's own scanner; no tests run.
 	Scan bool `json:"scan,omitempty"`
+	// Stacks, when given, are the stacks the job may run (Repo C design note MORE_STACKS §10: a stack for administrators
+	// first): a part of any other stack is found and not run, as a stack ABCP does not run yet. Without them, every stack
+	// the profiles serve.
+	Stacks []string `json:"stacks,omitempty"`
 }
 
 // StackJobV1 is one job. State is QUEUED, RUNNING, PASSED, FAILED, STOPPED or UNKNOWN (running when the controller
@@ -148,7 +152,7 @@ var (
 // Valid reports a request of the right shape: a request ID, a folder name and a cache digest.
 func (r StackJobCreateV1) Valid() bool {
 	return stackRequestID.MatchString(r.RequestID) && stackSourceName.MatchString(r.Source) && stackJobID.MatchString(r.CacheKey) &&
-		validRegistries(r.Registries)
+		validRegistries(r.Registries) && validStacks(r.Stacks)
 }
 
 func (s *Server) mayRunStackJobs(principal Principal) bool {

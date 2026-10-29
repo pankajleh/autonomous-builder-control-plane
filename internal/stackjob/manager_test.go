@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -430,5 +431,41 @@ func TestLinksAJobLeftInItsCacheAreNeverFollowed(t *testing.T) {
 	py := f.wait(t, f.start(t, "req-3", "lib", map[string]string{"requirements.txt": ""}).ID)
 	if py.State != Passed || py.Parts[0].Steps[2].Tests != nil {
 		t.Fatalf("a linked report was counted: %+v", py.Parts[0].Steps[2])
+	}
+}
+
+func TestAJobRunsOnlyTheStacksItNames(t *testing.T) {
+	// Repo C MORE_STACKS §10: Go and Ruby for administrators first; anyone else's Go part is found and not run.
+	box := &fakeSandbox{proveOK: true}
+	f := newFixture(t, box)
+	start := func(request string, stacks []string) serviceapi.StackJobV1 {
+		t.Helper()
+		write(t, filepath.Join(f.sources, "svc"), map[string]string{"go.mod": "module x\n\ngo 1.22\n", "web/package.json": "{}"})
+		job, err := f.m.StartStackJob(context.Background(), serviceapi.StackJobCreateV1{RequestID: request, Source: "svc", CacheKey: key, Stacks: stacks})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.wait(t, job.ID)
+	}
+	if job := start("s1", []string{"python", "java", "node"}); job.Failure != FailUnsupported || len(job.Parts) != 1 || job.Parts[0].Stack != StackUnsupported ||
+		job.Parts[0].Found != "go" || len(job.Parts[0].Steps) != 0 {
+		t.Fatalf("go not named = %+v", job)
+	}
+	if job := start("s2", []string{"go", "python", "java", "node"}); job.State != Passed || job.Parts[0].Stack != StackGo || job.Parts[0].Version != "1.27" {
+		t.Fatalf("go named = %+v", job)
+	}
+	if job := start("s3", nil); job.State != Passed || job.Parts[0].Stack != StackGo {
+		t.Fatalf("no stacks named = %+v", job)
+	}
+	// The stacks are part of the request: the same ID with others is another request; in another order, the same one.
+	if _, err := f.m.StartStackJob(context.Background(), serviceapi.StackJobCreateV1{RequestID: "s2", Source: "svc", CacheKey: key, Stacks: []string{"go"}}); err != serviceapi.ErrStackJobConflict {
+		t.Fatalf("other stacks = %v", err)
+	}
+	if _, err := f.m.StartStackJob(context.Background(), serviceapi.StackJobCreateV1{RequestID: "s2", Source: "svc", CacheKey: key, Stacks: []string{"node", "java", "python", "go"}}); err != nil {
+		t.Fatalf("same stacks = %v", err)
+	}
+	if parts := Only([]Part{{Stack: StackRuby, Dir: "api", Version: "3.4", Tool: "bundler"}, {Stack: StackNode, Dir: "web"}, {Stack: StackUnsupported, Found: "php"}}, []string{"node"}); len(parts) != 3 ||
+		!reflect.DeepEqual(parts[0], Part{Dir: "api", Stack: StackUnsupported, Found: StackRuby}) || parts[1].Stack != StackNode || parts[2].Found != "php" {
+		t.Fatalf("only = %+v", parts)
 	}
 }
