@@ -43,6 +43,8 @@ func TestEgressLetsAStackReachOnlyItsRegistriesOnPort443(t *testing.T) {
 		EgressNpm:          {"registry.npmjs.org": true, "registry.yarnpkg.com": true, "repo.yarnpkg.com": true, "npmjs.org": false, "registry.npmjs.org.evil.test": false},
 		EgressGo:           {"proxy.golang.org": true, "sum.golang.org": true, "golang.org": false, "github.com": false, "proxy.golang.org.evil.test": false},
 		EgressRubyGems:     {"rubygems.org": true, "index.rubygems.org": true, "api.rubygems.org": false, "rubygems.org.evil.test": false},
+		EgressPackagist:    {"repo.packagist.org": true, "packagist.org": true, "api.github.com": true, "codeload.github.com": true, "github.com": false, "raw.githubusercontent.com": false},
+		EgressNuGet:        {"api.nuget.org": true, "globalcdn.nuget.org": true, "nuget.org": false, "www.nuget.org": false},
 	}
 	for rule, hosts := range cases {
 		if !RegistryRule(rule) || len(RegistryHosts(rule)) == 0 {

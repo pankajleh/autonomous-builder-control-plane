@@ -98,6 +98,10 @@ func TestAMeasuredTestStepWrapsTheTestsAndKeepsTheirExitCode(t *testing.T) {
 			"/opt/autobuild/coverage/report go /work/.abcp/go-cover-0.out /work/.abcp/go-cover-0.json", "fi; go test -v ./..."}},
 		{Part{Stack: StackRuby, Tool: "bundler", Runner: "rspec", Test: true}, []string{"mkdir -p /work/.abcp/ruby-0 && AUTOBUILD_COVERAGE=/work/.abcp/ruby-0 RUBYOPT=-r/opt/autobuild/coverage/ruby/start.rb bundle exec rspec;",
 			"/opt/autobuild/coverage/report ruby /work/.abcp/ruby-0 /work/.abcp/ruby-0.json", "fi; bundle exec rspec"}},
+		{Part{Stack: StackPHP, Tool: "composer", Runner: "phpunit", Test: true}, []string{"vendor/bin/phpunit --log-junit /work/.abcp/phpunit-0.xml --coverage-clover /work/.abcp/clover-0.xml;",
+			"/opt/autobuild/coverage/report php /work/.abcp/clover-0.xml /work/.abcp/clover-0.json", "fi; vendor/bin/phpunit --log-junit /work/.abcp/phpunit-0.xml"}},
+		{Part{Stack: StackDotnet, Tool: "dotnet", Test: true, Target: "A.sln"}, []string{"dotnet test --no-build A.sln --logger trx --collect 'XPlat Code Coverage' --test-adapter-path /opt/autobuild/coverage/coverlet --results-directory /work/.abcp/dotnet-0;",
+			"/opt/autobuild/coverage/report dotnet /work/.abcp/dotnet-0 /work/.abcp/dotnet-0.json", "fi; rm -rf /work/.abcp/dotnet-0 && exec dotnet test --no-build A.sln --logger trx"}},
 	} {
 		steps := Steps(c.part, 0)
 		plain := steps[len(steps)-1]
@@ -153,6 +157,14 @@ func TestTestFilesAreKnownByEachStacksConventions(t *testing.T) {
 		{Part{Stack: StackRuby}, "spec/fixtures/basket.yml", true},
 		{Part{Stack: StackRuby}, "lib/basket.rb", false},
 		{Part{Stack: StackRuby}, "app/models/latest.rb", false},
+		{Part{Stack: StackPHP}, "tests/Unit/BasketTest.php", true},
+		{Part{Stack: StackPHP}, "src/BasketTest.php", true},
+		{Part{Stack: StackPHP}, "app/Models/Basket.php", false},
+		{Part{Stack: StackDotnet}, "tests/Shop.Tests/BasketTests.cs", true},
+		{Part{Stack: StackDotnet}, "src/Shop.UnitTests/Fixtures/data.json", true},
+		{Part{Stack: StackDotnet}, "src/Shop/BasketTest.fs", true},
+		{Part{Stack: StackDotnet}, "src/Shop/Basket.cs", false},
+		{Part{Stack: StackDotnet}, "src/Contest/Program.cs", false},
 	} {
 		if got := testFile(c.part, c.path); got != c.want {
 			t.Errorf("%s %s = %v", c.part.Stack, c.path, got)
@@ -322,5 +334,54 @@ func TestGoAndRubyProjectsCountTheirTests(t *testing.T) {
 	}
 	if !specs[preview.EgressGo] || !specs[preview.EgressRubyGems] {
 		t.Fatalf("sandboxes' registries = %v", specs)
+	}
+}
+
+func TestDotnetCountsComeFromItsTRXLogs(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, _, ok := TRXCounts(filepath.Join(dir, "none")); ok {
+		t.Fatal("counts without logs")
+	}
+	trx := func(name, counters string) {
+		os.WriteFile(filepath.Join(dir, name), []byte(`<?xml version="1.0" encoding="utf-8"?><TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">`+
+			`<ResultSummary outcome="Failed"><Counters `+counters+` /></ResultSummary></TestRun>`), 0o644)
+	}
+	trx("a.trx", `total="5" executed="4" passed="3" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" notExecuted="1"`)
+	trx("b.trx", `total="2" executed="2" passed="1" failed="0" error="1" notExecuted="0"`)
+	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte(`<Counters passed="99"/>`), 0o644)
+	if p, f, sk, ok := TRXCounts(dir); !ok || p != 4 || f != 2 || sk != 1 {
+		t.Fatalf("trx counts = %d %d %d %v", p, f, sk, ok)
+	}
+}
+
+func TestPHPAndDotnetProjectsCountTheirTests(t *testing.T) {
+	box := &fakeSandbox{proveOK: true}
+	box.exec = func(_ context.Context, work, _ string, argv []string, _ io.Writer) (int, error) {
+		cmd := strings.Join(argv, " ")
+		switch {
+		case strings.HasPrefix(cmd, "vendor/bin/phpunit"):
+			os.WriteFile(filepath.Join(work, ".abcp", "phpunit-0.xml"), []byte(`<testsuites><testsuite name="all" tests="3" failures="1" errors="0" skipped="0">`+
+				`<testsuite name="unit" tests="3" failures="1"/></testsuite></testsuites>`), 0o644)
+			return 1, nil
+		case strings.Contains(cmd, "dotnet test"):
+			os.MkdirAll(filepath.Join(work, ".abcp", "dotnet-0"), 0o755)
+			os.WriteFile(filepath.Join(work, ".abcp", "dotnet-0", "run.trx"), []byte(`<TestRun><ResultSummary><Counters passed="2" failed="0"/></ResultSummary></TestRun>`), 0o644)
+		}
+		return 0, nil
+	}
+	f := newFixture(t, box)
+	job := f.wait(t, f.start(t, "php-1", "php-1", map[string]string{"composer.json": `{"require-dev":{"phpunit/phpunit":"^11"}}`}).ID)
+	if job.State != Failed || job.Failure != FailTests || job.Parts[0].Stack != StackPHP || job.Parts[0].Version != "8.4" {
+		t.Fatalf("php job = %+v", job)
+	}
+	if tests := job.Parts[0].Steps[2].Tests; tests == nil || *tests != (serviceapi.StackTestsV1{Passed: 2, Failed: 1}) {
+		t.Fatalf("php tests = %+v", tests)
+	}
+	job = f.wait(t, f.start(t, "dn-1", "dn-1", map[string]string{"Shop.Tests.csproj": `<TargetFramework>net8.0</TargetFramework><PackageReference Include="xunit" Version="2.9.3" />`}).ID)
+	if job.State != Passed || job.Parts[0].Stack != StackDotnet || job.Parts[0].Version != "8.0" {
+		t.Fatalf("dotnet job = %+v", job)
+	}
+	if tests := job.Parts[0].Steps[2].Tests; tests == nil || *tests != (serviceapi.StackTestsV1{Passed: 2}) {
+		t.Fatalf("dotnet tests = %+v", tests)
 	}
 }

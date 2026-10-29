@@ -19,11 +19,14 @@ const (
 	StackNode        = "node"
 	StackGo          = "go"
 	StackRuby        = "ruby"
+	StackPHP         = "php"
+	StackDotnet      = "dotnet"
 	StackUnsupported = "unsupported"
 )
 
 // Defaults are the versions a part runs on when nothing in it says otherwise.
-var defaults = map[string]string{StackPython: "3.12", StackJava: "21", StackNode: "22", StackGo: "1.27", StackRuby: "3.4"}
+var defaults = map[string]string{StackPython: "3.12", StackJava: "21", StackNode: "22", StackGo: "1.27", StackRuby: "3.4", StackPHP: "8.4",
+	StackDotnet: "10.0"}
 
 // Part is one part of the code: its folder under the job's work ("" for the top), its stack, the version and tool
 // chosen, and what the steps need to know.
@@ -37,8 +40,10 @@ type Part struct {
 	Wrapper      bool
 	Requirements []string
 	Build, Test  bool
-	// Runner is a Ruby part's test runner: "rspec" or "rake" (Repo C MORE_STACKS §4).
+	// Runner is a Ruby part's test runner, "rspec" or "rake", or a PHP part's, "pest" or "phpunit" (Repo C MORE_STACKS §4).
 	Runner string
+	// Target is the solution or project file a .NET part's commands name, when its folder has more than one; "" otherwise.
+	Target string
 }
 
 // Available is, for each stack, the versions the stack profiles serve.
@@ -66,22 +71,26 @@ func exists(path string) bool {
 
 // unsupportedMarkers name stacks found but not run yet.
 var unsupportedMarkers = []struct{ file, stack string }{
-	{"composer.json", "php"}, {"Cargo.toml", "rust"},
+	{"Cargo.toml", "rust"},
 }
 
-// stackOf answers the stack of one folder: Java, then Python, then Ruby and Go, then Node, then a stack not run yet, or
-// "". Ruby and Go come before Node because a Rails project, or a Go service with a front end, has a package.json for it
-// beside its own manifest: the server's stack is the project's (Repo C MORE_STACKS §3).
+// stackOf answers the stack of one folder: Java, then Python, then PHP, Ruby, Go and .NET, then Node, then a stack not run
+// yet, or "". They come before Node because a Laravel or Rails project, or a Go or .NET service with a front end, has a
+// package.json for it beside its own manifest: the server's stack is the project's (Repo C MORE_STACKS §3).
 func stackOf(dir string) (stack, found string) {
 	switch {
 	case exists(filepath.Join(dir, "pom.xml")) || exists(filepath.Join(dir, "build.gradle")) || exists(filepath.Join(dir, "build.gradle.kts")):
 		return StackJava, ""
 	case exists(filepath.Join(dir, "pyproject.toml")) || exists(filepath.Join(dir, "setup.py")) || len(requirementFiles(dir)) > 0:
 		return StackPython, ""
+	case exists(filepath.Join(dir, "composer.json")):
+		return StackPHP, ""
 	case rubyProject(dir):
 		return StackRuby, ""
 	case exists(filepath.Join(dir, "go.mod")):
 		return StackGo, ""
+	case len(dotnetFiles(dir)) > 0:
+		return StackDotnet, ""
 	case exists(filepath.Join(dir, "package.json")):
 		return StackNode, ""
 	}
@@ -89,12 +98,6 @@ func stackOf(dir string) (stack, found string) {
 		if exists(filepath.Join(dir, m.file)) {
 			return StackUnsupported, m.stack
 		}
-	}
-	if matches, _ := filepath.Glob(filepath.Join(dir, "*.csproj")); len(matches) > 0 {
-		return StackUnsupported, "dotnet"
-	}
-	if matches, _ := filepath.Glob(filepath.Join(dir, "*.sln")); len(matches) > 0 {
-		return StackUnsupported, "dotnet"
 	}
 	return "", ""
 }
@@ -150,6 +153,10 @@ func part(dir, rel, stack, found string, available Available) Part {
 		goPart(dir, &p, available)
 	case StackRuby:
 		rubyPart(dir, &p, available)
+	case StackPHP:
+		phpPart(dir, &p, available)
+	case StackDotnet:
+		dotnetPart(dir, &p, available)
 	}
 	return p
 }
@@ -518,4 +525,169 @@ func hasTestFile(dir string, test func(string) bool) bool {
 		return false
 	}
 	return walk(dir, 0)
+}
+
+// composerJSON is what a PHP part's composer.json says of its PHP and its test runners.
+type composerJSON struct {
+	Require    map[string]string `json:"require"`
+	RequireDev map[string]string `json:"require-dev"`
+}
+
+func phpPart(dir string, p *Part, available Available) {
+	p.Tool = "composer"
+	var c composerJSON
+	_ = json.Unmarshal([]byte(readSmall(filepath.Join(dir, "composer.json"))), &c)
+	asks := func(name string) bool { _, a := c.Require[name]; _, b := c.RequireDev[name]; return a || b }
+	switch {
+	case asks("pestphp/pest"):
+		p.Runner = "pest"
+	case asks("phpunit/phpunit") || exists(filepath.Join(dir, "phpunit.xml")) || exists(filepath.Join(dir, "phpunit.xml.dist")):
+		p.Runner = "phpunit"
+	}
+	p.Test = p.Runner != ""
+	p.Version, p.VersionNote = choose(StackPHP, "", composerAllows(c.Require["php"]), available)
+}
+
+// composerAllows reads Composer's constraint on PHP ("^8.1", ">=8.2 <8.5", "~8.2.0", "8.3.*", "^7.4 || ^8.0") well enough to
+// say which minor versions it allows; one it cannot read allows them all.
+func composerAllows(constraint string) func(string) bool {
+	constraint = strings.TrimSpace(constraint)
+	if constraint == "" || constraint == "*" {
+		return func(string) bool { return true }
+	}
+	type bound struct{ low, high string }
+	minor := func(v string) (string, int, int, bool) {
+		parts := strings.Split(strings.TrimSuffix(strings.TrimSuffix(v, ".*"), ".x"), ".")
+		major, err1 := strconv.Atoi(parts[0])
+		m := 0
+		var err2 error
+		if len(parts) > 1 {
+			m, err2 = strconv.Atoi(parts[1])
+		}
+		return strconv.Itoa(major) + "." + strconv.Itoa(m), major, m, err1 == nil && err2 == nil && len(parts) <= 3
+	}
+	alternatives := [][]bound{}
+	for _, alt := range regexp.MustCompile(`\s*\|\|?\s*`).Split(constraint, -1) {
+		bounds := []bound{}
+		for _, clause := range strings.FieldsFunc(alt, func(r rune) bool { return r == ' ' || r == ',' }) {
+			op := strings.TrimRight(clause, "0123456789.*x")
+			v, major, m, good := minor(strings.TrimPrefix(clause, op))
+			if !good {
+				return func(string) bool { return true }
+			}
+			next := strconv.Itoa(major+1) + ".0"
+			switch op {
+			case "^":
+				bounds = append(bounds, bound{v, next})
+			case "~":
+				if strings.Count(strings.TrimPrefix(clause, op), ".") >= 2 {
+					bounds = append(bounds, bound{v, strconv.Itoa(major) + "." + strconv.Itoa(m+1)})
+				} else {
+					bounds = append(bounds, bound{v, next})
+				}
+			case "", "=":
+				// "8.*" is any 8; "8.3", "8.3.1" and "8.3.*" are 8.3.
+				if strings.Count(strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(clause, op), ".*"), ".x"), ".") == 0 {
+					bounds = append(bounds, bound{v, next})
+				} else {
+					bounds = append(bounds, bound{v, strconv.Itoa(major) + "." + strconv.Itoa(m+1)})
+				}
+			case ">=":
+				bounds = append(bounds, bound{v, ""})
+			case ">":
+				bounds = append(bounds, bound{strconv.Itoa(major) + "." + strconv.Itoa(m+1), ""})
+			case "<":
+				bounds = append(bounds, bound{"", v})
+			case "<=":
+				bounds = append(bounds, bound{"", strconv.Itoa(major) + "." + strconv.Itoa(m+1)})
+			default:
+				return func(string) bool { return true }
+			}
+		}
+		alternatives = append(alternatives, bounds)
+	}
+	return func(v string) bool {
+		for _, bounds := range alternatives {
+			all := true
+			for _, b := range bounds {
+				if (b.low != "" && compareVersions(v, b.low) < 0) || (b.high != "" && compareVersions(v, b.high) >= 0) {
+					all = false
+					break
+				}
+			}
+			if all {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// dotnetFiles are a folder's solution and project files, solutions first, in name order.
+func dotnetFiles(dir string) []string {
+	out := []string{}
+	for _, pattern := range []string{"*.sln", "*.slnx", "*.csproj", "*.fsproj"} {
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		sort.Strings(matches)
+		for _, m := range matches {
+			if exists(m) {
+				out = append(out, filepath.Base(m))
+			}
+		}
+	}
+	return out
+}
+
+var (
+	targetFramework = regexp.MustCompile(`<TargetFrameworks?>([^<]{1,200})</TargetFrameworks?>`)
+	frameworkNet    = regexp.MustCompile(`^net(\d{1,2})\.(\d)(?:-[a-z0-9.]+)?$`)
+	testPackage     = regexp.MustCompile(`(?i)Include="(Microsoft\.NET\.Test\.Sdk|xunit|xunit\.v3|NUnit|MSTest\.TestFramework|MSTest)"|<IsTestProject>\s*true`)
+)
+
+// dotnetPart reads the part's projects within four folders: the newest .NET any of them targets is the one asked for,
+// since the SDK that builds it builds the older ones too; tests when a project refers to a test framework.
+func dotnetPart(dir string, p *Part, available Available) {
+	p.Tool, p.Build = "dotnet", true
+	// dotnet finds a folder's one solution or project itself; with more, the solution (or the first project) is named.
+	if files := dotnetFiles(dir); len(files) > 1 {
+		p.Target = files[0]
+	}
+	asked := ""
+	seen := 0
+	var walk func(string, int)
+	walk = func(d string, depth int) {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if seen++; seen > 5000 {
+				return
+			}
+			name := e.Name()
+			switch {
+			case e.Type().IsDir():
+				if depth < 4 && !strings.HasPrefix(name, ".") && !skippedFolders[name] && name != "bin" && name != "obj" {
+					walk(filepath.Join(d, name), depth+1)
+				}
+			case e.Type().IsRegular() && (strings.HasSuffix(name, ".csproj") || strings.HasSuffix(name, ".fsproj")):
+				text := readSmall(filepath.Join(d, name))
+				if testPackage.MatchString(text) {
+					p.Test = true
+				}
+				for _, m := range targetFramework.FindAllStringSubmatch(text, -1) {
+					for _, tfm := range strings.Split(m[1], ";") {
+						if f := frameworkNet.FindStringSubmatch(strings.TrimSpace(tfm)); f != nil {
+							if v := f[1] + "." + f[2]; asked == "" || compareVersions(v, asked) > 0 {
+								asked = v
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	walk(dir, 0)
+	least := asked
+	p.Version, p.VersionNote = choose(StackDotnet, asked, func(v string) bool { return least == "" || compareVersions(v, least) >= 0 }, available)
 }

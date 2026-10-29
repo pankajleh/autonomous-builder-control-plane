@@ -448,6 +448,12 @@ const (
 // nodeTestName is a JavaScript or TypeScript test file's name: x.test.js, x.spec.ts and their kin.
 var nodeTestName = regexp.MustCompile(`\.(?:test|spec)\.[cm]?[jt]sx?$`)
 
+// A .NET test file: BasketTests.cs, BasketTest.fs; or anything in a test project's folder (Shop.Tests/, Shop.UnitTests/).
+var (
+	dotnetTestName   = regexp.MustCompile(`Tests?\.(?:cs|fs)$`)
+	dotnetTestFolder = regexp.MustCompile(`(?:^|/)[A-Za-z0-9_.-]*\.(?:Unit|Integration)?Tests?/`)
+)
+
 // testFile reports whether rel (the repository's path, as a patch names it) is one of part p's tests by its stack's own
 // conventions: what the change's tests are, run on the code before it.
 func testFile(p Part, rel string) bool {
@@ -489,6 +495,10 @@ func testFile(p Part, rel string) bool {
 		return strings.HasSuffix(base, "_test.go") || inDir("testdata")
 	case StackRuby:
 		return strings.HasSuffix(base, "_spec.rb") || strings.HasSuffix(base, "_test.rb") || inDir("spec", "test")
+	case StackPHP:
+		return strings.HasSuffix(base, "Test.php") || inDir("tests", "test")
+	case StackDotnet:
+		return dotnetTestName.MatchString(base) || dotnetTestFolder.MatchString(rel) || inDir("tests", "test")
 	}
 	return false
 }

@@ -81,6 +81,8 @@ const (
 	EgressNpm          = "npm"
 	EgressGo           = "go"
 	EgressRubyGems     = "rubygems"
+	EgressPackagist    = "packagist"
+	EgressNuGet        = "nuget"
 )
 
 var registryHosts = map[string][]string{
@@ -90,6 +92,9 @@ var registryHosts = map[string][]string{
 	EgressNpm:          {"registry.npmjs.org", "registry.yarnpkg.com", "repo.yarnpkg.com"},
 	EgressGo:           {"proxy.golang.org", "sum.golang.org"},
 	EgressRubyGems:     {"rubygems.org", "index.rubygems.org"},
+	// Most Composer packages are downloaded from GitHub's archives, which Packagist names (Repo C MORE_STACKS §7).
+	EgressPackagist: {"repo.packagist.org", "packagist.org", "api.github.com", "codeload.github.com"},
+	EgressNuGet:     {"api.nuget.org", "globalcdn.nuget.org"},
 }
 
 // RegistryRule reports whether rule is one of the package registries' entries.

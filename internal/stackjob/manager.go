@@ -683,6 +683,9 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 		if p.Stack == StackPython && realFile(work, ".abcp", filepath.Base(pytestReport(n))) {
 			extra = append(extra, filepath.Join(work, ".abcp", filepath.Base(pytestReport(n))))
 		}
+		if p.Stack == StackPHP && realFile(work, ".abcp", filepath.Base(phpunitReport(n))) {
+			extra = append(extra, filepath.Join(work, ".abcp", filepath.Base(phpunitReport(n))))
+		}
 		passed, failed, skipped, ok := Counts(filepath.Join(work, filepath.FromSlash(p.Dir)), extra...)
 		switch {
 		case ok:
@@ -692,6 +695,9 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 		case countedGo != nil:
 			// Nor does a Go project; each test's own line does.
 			passed, failed, skipped, ok = countedGo.Counts()
+		case p.Stack == StackDotnet:
+			// .NET's are its TRX logs, outside the part.
+			passed, failed, skipped, ok = TRXCounts(filepath.Join(work, ".abcp", filepath.Base(dotnetResults(n))))
 		}
 		if ok {
 			tests := &serviceapi.StackTestsV1{Passed: passed, Failed: failed, Skipped: skipped}
