@@ -78,6 +78,7 @@ type changeRecord struct {
 	CacheKey   string                 `json:"cache_key"`
 	Words      string                 `json:"words"`
 	Stacks     []string               `json:"stacks,omitempty"`
+	Targets    map[string]string      `json:"targets,omitempty"`
 }
 
 // ChangeManager runs change jobs, at most two at once and one per project.
@@ -224,7 +225,8 @@ func copyChangeJob(j serviceapi.ChangeJobV1) serviceapi.ChangeJobV1 {
 
 func changeDigest(r serviceapi.ChangeJobCreateV1) string {
 	fields := append([]string{r.Source, r.CacheKey, r.Kind, r.Words}, serviceapi.RegistriesDigestPart(r.Registries)...)
-	data, _ := json.Marshal(append(fields, serviceapi.StacksDigestPart(r.Stacks)...))
+	fields = append(fields, serviceapi.StacksDigestPart(r.Stacks)...)
+	data, _ := json.Marshal(append(fields, serviceapi.VersionsDigestPart(r.Targets)...))
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
@@ -254,7 +256,7 @@ func (m *ChangeManager) StartChangeJob(_ context.Context, req serviceapi.ChangeJ
 	if _, err := rand.Read(raw); err != nil {
 		return serviceapi.ChangeJobV1{}, serviceapi.ErrChangeJobsUnavailable
 	}
-	r := &changeRecord{BodyDigest: digest, Source: req.Source, CacheKey: req.CacheKey, Words: req.Words, Stacks: append([]string(nil), req.Stacks...), Job: serviceapi.ChangeJobV1{
+	r := &changeRecord{BodyDigest: digest, Source: req.Source, CacheKey: req.CacheKey, Words: req.Words, Stacks: append([]string(nil), req.Stacks...), Targets: req.Targets, Job: serviceapi.ChangeJobV1{
 		SchemaVersion: serviceapi.ChangeJobSchemaV1, ID: hex.EncodeToString(raw), RequestID: req.RequestID, Kind: req.Kind, State: Queued,
 		CreatedAt: m.stamp(), Before: []serviceapi.StackPartV1{}, After: []serviceapi.StackPartV1{}}}
 	if err := m.save(r); err != nil {
@@ -394,14 +396,14 @@ func (m *ChangeManager) run(id string) {
 	m.mu.Unlock()
 	dir := filepath.Join(m.root, "work", id)
 	end := m.runChange(ctx, r, dir)
-	if ctx.Err() == context.DeadlineExceeded && end.state != ChangeHandedBack && end.state != ChangeNotHandedBack {
+	if ctx.Err() == context.DeadlineExceeded && end.state != ChangeHandedBack && end.state != ChangeNotHandedBack && end.state != ChangeAssessed {
 		end = changeEnd{ChangeFailed, FailTimedOut}
 	}
 	_ = os.RemoveAll(dir)
 	_ = os.Remove(m.socket(id))
 	m.update(r, func(j *serviceapi.ChangeJobV1) {
 		j.State, j.Phase, j.EndedAt = end.state, "", m.stamp()
-		if end.state != ChangeHandedBack {
+		if end.state != ChangeHandedBack && end.state != ChangeAssessed {
 			j.Reason = end.reason
 		}
 		for _, parts := range [][]serviceapi.StackPartV1{j.Before, j.After} {
@@ -493,6 +495,9 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 		return changeEnd{ChangeFailed, FailSandbox}
 	}
 	before := m.snapshot(r).Before
+	if r.Job.Kind == "assess" {
+		return m.assess(ctx, r, dir, work, home, cache, parts, agentPart, before, registries)
+	}
 	if !baselineReady(r.Job.Kind, before[agentPart]) {
 		return changeEnd{ChangeNotHandedBack, ReasonBaseline}
 	}
@@ -681,7 +686,7 @@ func (m *ChangeManager) check(ctx context.Context, r *changeRecord, parts []Part
 		}
 		n := n
 		f := runSteps(ctx, steps{sandbox: m.sandbox, profiles: m.profiles, probe: m.probe, session: partID(r.Job.ID, n, which), registries: registries,
-			measure: r.Job.Kind == "tests",
+			measure: r.Job.Kind == "tests" || r.Job.Kind == "assess",
 			set: func(i int, change func(*serviceapi.StackStepV1)) {
 				m.update(r, func(j *serviceapi.ChangeJobV1) {
 					if which == "before" {

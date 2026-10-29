@@ -13,8 +13,8 @@ import (
 // Repo C in a folder under the change source root, changed by the agent while every command it runs runs in the stack
 // sandbox, and handed back as a patch. ABCP owns the job's lifecycle and evidence; Repo C opens the pull request.
 
-// ChangeJobCreateV1 starts a job. Source and CacheKey are as a stack job's; Kind is fix or tests; Words are the person's
-// own. The same RequestID with the same body replays the same job.
+// ChangeJobCreateV1 starts a job. Source and CacheKey are as a stack job's; Kind is fix, tests or assess; Words are the
+// person's own. The same RequestID with the same body replays the same job.
 type ChangeJobCreateV1 struct {
 	RequestID string `json:"request_id"`
 	Source    string `json:"source"`
@@ -25,10 +25,14 @@ type ChangeJobCreateV1 struct {
 	Registries []RegistryV1 `json:"registries,omitempty"`
 	// Stacks, when given, are the stacks the job may change and check, as a stack job's.
 	Stacks []string `json:"stacks,omitempty"`
+	// Targets, for an assessment only, are the versions the project would move to, "java": "21" (Repo C design note
+	// LEGACY_MIGRATION §4): its checks run on them too, as a stack job's pinned versions.
+	Targets map[string]string `json:"targets,omitempty"`
 }
 
-// ChangeJobV1 is one job. State is QUEUED, RUNNING (with its Phase), HANDED_BACK, NOT_HANDED_BACK, FAILED, STOPPED or
-// UNKNOWN; Reason a stable code once it ended without being handed back. Before and After are the checks' parts.
+// ChangeJobV1 is one job. State is QUEUED, RUNNING (with its Phase), HANDED_BACK, ASSESSED (an assessment with its Plan),
+// NOT_HANDED_BACK, FAILED, STOPPED or UNKNOWN; Reason a stable code once it ended without being handed back. Before and
+// After are the checks' parts: an assessment's After are its parts on their target versions.
 type ChangeJobV1 struct {
 	SchemaVersion string          `json:"schema_version"`
 	ID            string          `json:"id"`
@@ -44,7 +48,36 @@ type ChangeJobV1 struct {
 	Agent         *ChangeAgentV1  `json:"agent,omitempty"`
 	Result        *ChangeResultV1 `json:"result,omitempty"`
 	Proof         *ChangeProofV1  `json:"proof,omitempty"`
+	Plan          *ChangePlanV1   `json:"plan,omitempty"`
 	Reason        string          `json:"reason,omitempty"`
+}
+
+// ChangePlanV1 is an assessment's plan (Repo C design note LEGACY_MIGRATION §4): what is old in the project and what
+// moving it takes, the moves (Paths), and the migration as ordered Steps, each one pull request small enough to review.
+type ChangePlanV1 struct {
+	Summary string             `json:"summary"`
+	Paths   []ChangePlanPathV1 `json:"paths"`
+	Steps   []ChangePlanStepV1 `json:"steps"`
+}
+
+// ChangePlanPathV1 is one move: a runtime, framework or library, from the version in use to the one to move to.
+type ChangePlanPathV1 struct {
+	What string `json:"what"`
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+// ChangePlanStepV1 is one step: its title; its words, what to change, fit to start a change job with; its risk and size
+// (low, medium or high; small, medium or large); the files it expects to touch; the tests it relies on; and whether the
+// code needs tests written before it is safe (Repo C design note FIX_AND_TEST).
+type ChangePlanStepV1 struct {
+	Title      string   `json:"title"`
+	Words      string   `json:"words"`
+	Risk       string   `json:"risk"`
+	Size       string   `json:"size"`
+	Files      []string `json:"files"`
+	Tests      string   `json:"tests"`
+	TestsFirst bool     `json:"tests_first"`
 }
 
 // ChangeProofV1 is a fix's new tests run on the code as it was before the change (Repo C design note FIX_AND_TEST §3):
@@ -110,12 +143,13 @@ const (
 	MaxChangeWords = 4000
 )
 
-// Valid reports a request of the right shape: a request ID, a folder name, a cache digest, a kind and the words.
+// Valid reports a request of the right shape: a request ID, a folder name, a cache digest, a kind and the words; targets
+// only for an assessment.
 func (r ChangeJobCreateV1) Valid() bool {
 	return stackRequestID.MatchString(r.RequestID) && stackSourceName.MatchString(r.Source) && stackJobID.MatchString(r.CacheKey) &&
-		(r.Kind == "fix" || r.Kind == "tests") && utf8.ValidString(r.Words) && !strings.ContainsRune(r.Words, 0) &&
+		(r.Kind == "fix" || r.Kind == "tests" || r.Kind == "assess") && utf8.ValidString(r.Words) && !strings.ContainsRune(r.Words, 0) &&
 		strings.TrimSpace(r.Words) != "" && utf8.RuneCountInString(r.Words) <= MaxChangeWords && validRegistries(r.Registries) &&
-		validStacks(r.Stacks)
+		validStacks(r.Stacks) && validVersions(r.Targets) && (r.Kind == "assess" || len(r.Targets) == 0)
 }
 
 func (s *Server) mayRunChangeJobs(principal Principal) bool {

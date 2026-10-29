@@ -608,3 +608,89 @@ func TestAChangeJobChangesOnlyTheStacksItNames(t *testing.T) {
 		t.Fatalf("the same request without its stacks = %v", err)
 	}
 }
+
+func TestAnAssessmentChecksTheTargetVersionsAndHandsBackAPlanAndNoPatch(t *testing.T) {
+	// Repo C LEGACY_MIGRATION §4.
+	passed, after, testCode := 1, false, 0
+	box := &fakeSandbox{proveOK: true}
+	box.exec = passingSteps(&passed, &after, &testCode)
+	plan := `{"summary": "Python 3.12 is supported; pytest is unpinned.", "paths": [{"what": "Python", "from": "3.12", "to": "3.13"}],
+"steps": [{"title": "Pin pytest", "words": "Pin pytest to a version that supports Python 3.13.", "risk": "low", "size": "small",
+"files": ["requirements.txt"], "tests": "tests/test_one.py", "tests_first": false}]}`
+	answer := "```json\n" + plan + "\n```"
+	var sawWork bool
+	engine := &fakeEngine{act: func(run EngineRun, n int) (EngineResult, error) {
+		// The work folder is as the baseline left it, not as the target's checks would have.
+		_, err := os.Stat(filepath.Join(run.Work, ".venv", "bin", "python"))
+		sawWork = err == nil
+		os.WriteFile(filepath.Join(run.Work, "sample.py"), []byte("changed\n"), 0o644)
+		return EngineResult{Summary: answer, InputTokens: 900, OutputTokens: 300, CostUSD: 0.2}, nil
+	}}
+	f := newChangeFixture(t, box, engine)
+	write(t, filepath.Join(f.sources, "old"), pythonProject)
+	start := func(request string, targets map[string]string) serviceapi.ChangeJobV1 {
+		t.Helper()
+		job, err := f.m.StartChangeJob(context.Background(), serviceapi.ChangeJobCreateV1{RequestID: request, Source: "old", CacheKey: key, Kind: "assess",
+			Words: "What would it take to move to supported versions?", Targets: targets})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.wait(t, job.ID)
+	}
+	job := start("assess-1", map[string]string{"python": "3.13", "java": "21"})
+	if job.State != ChangeAssessed || job.Reason != "" || job.Result != nil || job.Plan == nil || len(engine.runs) != 1 || !sawWork {
+		t.Fatalf("job = %+v (%d sessions)", job, len(engine.runs))
+	}
+	if len(job.Before) != 1 || job.Before[0].Version != "3.12" || len(job.After) != 1 || job.After[0].Version != "3.13" ||
+		job.After[0].VersionNote != "asked to run on 3.13 instead of 3.12" || job.After[0].Steps[2].State != Passed {
+		t.Fatalf("checks = %+v %+v", job.Before, job.After)
+	}
+	if job.Plan.Summary != "Python 3.12 is supported; pytest is unpinned." || len(job.Plan.Steps) != 1 || job.Plan.Steps[0].Files[0] != "requirements.txt" ||
+		job.Agent.Summary != job.Plan.Summary || job.Agent.InputTokens != 900 {
+		t.Fatalf("plan = %+v agent = %+v", job.Plan, job.Agent)
+	}
+	prompt := engine.runs[0].Prompt
+	if !strings.Contains(prompt, "Change no file") || !strings.Contains(prompt, "python 3.13 (pip) at the top of the repository, asked to run on 3.13") ||
+		!strings.Contains(prompt, "What would it take") || !strings.Contains(prompt, `"tests_first"`) {
+		t.Fatalf("prompt = %s", prompt)
+	}
+	if _, err := f.m.ChangeJobPatch(context.Background(), job.ID); !errors.Is(err, serviceapi.ErrChangeJobNotFound) {
+		t.Fatalf("an assessment's patch = %v", err)
+	}
+	// Without targets, no checks after; an answer that is not a plan is not handed back.
+	answer = "I looked at it. It is fine."
+	if job := start("assess-2", nil); job.State != ChangeNotHandedBack || job.Reason != ReasonNoPlan || job.Plan != nil || len(job.After) != 0 ||
+		job.Agent.Summary != answer {
+		t.Fatalf("no plan = %+v", job)
+	}
+	if _, err := f.m.StartChangeJob(context.Background(), serviceapi.ChangeJobCreateV1{RequestID: "assess-1", Source: "old", CacheKey: key, Kind: "assess",
+		Words: "What would it take to move to supported versions?"}); !errors.Is(err, serviceapi.ErrChangeJobConflict) {
+		t.Fatalf("the same request without its targets = %v", err)
+	}
+}
+
+func TestAPlanIsReadOnlyInItsShape(t *testing.T) {
+	step := `{"title": "Move to Java 21", "words": "Set the release to 21.", "risk": "medium", "size": "small", "files": ["pom.xml"], "tests": "", "tests_first": true}`
+	ok := `{"summary": "Old.", "paths": [], "steps": [` + step + `]}`
+	if plan, err := parsePlan("  " + ok + "\n"); err != nil || plan.Steps[0].Title != "Move to Java 21" || !plan.Steps[0].TestsFirst {
+		t.Fatalf("plan = %+v %v", plan, err)
+	}
+	if plan, err := parsePlan(`{"summary": "token ghp_` + strings.Repeat("a", 36) + `", "paths": null, "steps": [` + step + `]}`); err != nil ||
+		strings.Contains(plan.Summary, "ghp_") || plan.Paths == nil {
+		t.Fatalf("masked = %+v %v", plan, err)
+	}
+	bad := []string{
+		"", "Here is the plan: " + ok, ok + " and more", ok + ok, `{"summary": "Old.", "steps": []}`,
+		strings.Replace(ok, `"medium"`, `"huge"`, 1), strings.Replace(ok, `"small"`, `"tiny"`, 1),
+		strings.Replace(ok, `"pom.xml"`, `"../pom.xml"`, 1), strings.Replace(ok, `"pom.xml"`, `"/etc/passwd"`, 1),
+		strings.Replace(ok, `"pom.xml"`, `"a/../b"`, 1), strings.Replace(ok, `"Old."`, `""`, 1),
+		strings.Replace(ok, `"Move to Java 21"`, `"Move\nto"`, 1), strings.Replace(ok, `"summary"`, `"summary": "x", "extra"`, 1),
+		strings.Replace(ok, `"Old."`, `"`+strings.Repeat("a", maxPlanSummary+1)+`"`, 1),
+		`{"summary": "Old.", "paths": [], "steps": [` + strings.TrimSuffix(strings.Repeat(step+",", maxPlanSteps+1), ",") + `]}`,
+	}
+	for _, text := range bad {
+		if _, err := parsePlan(text); err == nil {
+			t.Errorf("accepted %.120q", text)
+		}
+	}
+}
