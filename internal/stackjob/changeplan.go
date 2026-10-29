@@ -149,7 +149,8 @@ func parsePlan(answer string) (*serviceapi.ChangePlanV1, error) {
 	}
 	for _, s := range plan.Steps {
 		if !planText(s.Title, maxPlanTitle, false) || !planText(s.Words, serviceapi.MaxChangeWords, true) || !planRisks[s.Risk] ||
-			!planSizes[s.Size] || len(s.Files) > maxPlanFiles || (s.Tests != "" && !planText(s.Tests, maxPlanTests, true)) {
+			!planSizes[s.Size] || len(s.Files) > maxPlanFiles || (s.Tests != "" && !planText(s.Tests, maxPlanTests, true)) ||
+			!serviceapi.ValidVersions(s.Targets) {
 			return nil, errors.New("not a plan")
 		}
 		for _, f := range s.Files {
@@ -172,6 +173,9 @@ func parsePlan(answer string) (*serviceapi.ChangePlanV1, error) {
 		s.Title, s.Words, s.Tests = Mask(s.Title), Mask(s.Words), Mask(s.Tests)
 		if s.Files == nil {
 			s.Files = []string{}
+		}
+		if s.Targets == nil {
+			s.Targets = map[string]string{}
 		}
 	}
 	return &plan, nil
@@ -224,13 +228,17 @@ func assessPrompt(words string, parts []Part, before []serviceapi.StackPartV1, m
 	b.WriteString(`
 When you are done, answer with the plan alone: one JSON object and nothing else, in exactly this shape:
 {"summary": "…", "paths": [{"what": "Java", "from": "11", "to": "21"}], "steps": [{"title": "…", "words": "…", "risk": "low",
-"size": "small", "files": ["pom.xml"], "tests": "…", "tests_first": false}]}
+"size": "small", "files": ["pom.xml"], "tests": "…", "tests_first": false, "targets": {}}]}
 - summary: what is old in the project and what moving it takes, at most 2,000 characters.
 - paths: each runtime, framework or library to move, from the version in use to the one to move to; at most 8.
 - steps: the migration in order, 1 to 20 steps, each one pull request small enough to review. title: at most 200 characters.
   words: what to change, written for a developer who will make this step alone, at most 4,000 characters. risk: low, medium
   or high. size: small, medium or large. files: the files it expects to touch, as paths from the top of the repository, at
-  most 50. tests: the tests it relies on. tests_first: true when the code needs tests written before this step is safe.`)
+  most 50. tests: the tests it relies on. tests_first: true when the code needs tests written before this step is safe.
+  targets: the versions this step moves the project to, as {"java": "21"}: the step that switches a runtime names it, and
+  the steps after it name it too; {} for a step made and checked on the versions the project uses now (tests written first,
+  a library that works on both). Each step is made from the code with the steps before it merged, and checked on its
+  targets: install, build and the tests that passed before.`)
 	return b.String()
 }
 

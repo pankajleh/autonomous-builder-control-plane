@@ -98,11 +98,13 @@ A job of the kind `assess` answers what it would take to move a project to suppo
    needs, change no file. Its prompt carries the words, both checks and the plan's shape; its answer is the plan alone, one
    JSON object (a fenced code block is read too). No review session.
 4. **The plan**, read strictly: `{"summary", "paths": [{"what", "from", "to"}], "steps": [{"title", "words", "risk", "size",
-   "files", "tests", "tests_first"}]}`, no other field and nothing after it; a summary of at most 2,000 characters; at most 8
+   "files", "tests", "tests_first", "targets"}]}`, no other field and nothing after it; a summary of at most 2,000 characters; at most 8
    paths; 1 to 20 steps, each titled in at most 200 characters, its words at most 4,000 (so a step can start a change job),
    `risk` `low`, `medium` or `high`, `size` `small`, `medium` or `large`, at most 50 files as clean paths inside the
-   repository, its tests in at most 1,000 characters; no control characters but line breaks and tabs where text runs over
-   lines. Every text masked as a step's output is. An answer that is not a plan ends `NOT_HANDED_BACK` with `NO_PLAN`; one
+   repository, its tests in at most 1,000 characters, its `targets` the versions the step moves the project to, as a
+   job's `targets` are (at most 8, `{}` or left out for a step made on the versions in use: tests written first, a library
+   that works on both; the step that switches a runtime and the steps after it name it); no control characters but line
+   breaks and tabs where text runs over lines. Every text masked as a step's output is. An answer that is not a plan ends `NOT_HANDED_BACK` with `NO_PLAN`; one
    carrying a secret, `SECRET_IN_CHANGE`. Otherwise the job ends `ASSESSED` with `plan`; the agent's summary is the
    plan's. There is no patch: `GET …/patch` is `404`.
 
@@ -114,7 +116,9 @@ differences:
 - **Versions:** the baseline runs on the project's own versions, a legacy profile's too, as an assessment's does; the agent's
   run tool, the review's and the checks after run
   on `targets`, each part pinned as a stack job's `versions` are (with `version_note`); a part whose target no profile
-  serves stays on its own version, with a note saying so.
+  serves stays on its own version, with a note saying so. The product sends a step's own `targets` from the plan, so a
+  step with none (tests written first) is made and checked on the versions the project uses now, as served (a version
+  only a legacy profile serves is not: the nearest served one is, as for a fix).
 - **The baseline does not gate:** the agent starts whatever it shows, since old code may not install on its own version.
 - **No worse** means: every part installs and builds on its new version, whatever the baseline showed; when tests passed
   or were counted before, no fewer pass and no more fail; when none ran before, they pass. Otherwise `WORSE_AFTER`.
