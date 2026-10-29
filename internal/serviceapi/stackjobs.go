@@ -28,6 +28,9 @@ type StackJobCreateV1 struct {
 	// first): a part of any other stack is found and not run, as a stack ABCP does not run yet. Without them, every stack
 	// the profiles serve.
 	Stacks []string `json:"stacks,omitempty"`
+	// Versions, when given, pin a stack's version for this job, "java": "21" (Repo C design note LEGACY_MIGRATION §1: whether
+	// the project builds on the version it would move to). A version the profiles do not serve is not used.
+	Versions map[string]string `json:"versions,omitempty"`
 }
 
 // StackJobV1 is one job. State is QUEUED, RUNNING, PASSED, FAILED, STOPPED or UNKNOWN (running when the controller
@@ -152,7 +155,7 @@ var (
 // Valid reports a request of the right shape: a request ID, a folder name and a cache digest.
 func (r StackJobCreateV1) Valid() bool {
 	return stackRequestID.MatchString(r.RequestID) && stackSourceName.MatchString(r.Source) && stackJobID.MatchString(r.CacheKey) &&
-		validRegistries(r.Registries) && validStacks(r.Stacks)
+		validRegistries(r.Registries) && validStacks(r.Stacks) && validVersions(r.Versions)
 }
 
 func (s *Server) mayRunStackJobs(principal Principal) bool {

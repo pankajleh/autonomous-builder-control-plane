@@ -471,3 +471,33 @@ func TestAJobRunsOnlyTheStacksItNames(t *testing.T) {
 		t.Fatalf("only = %+v", parts)
 	}
 }
+
+func TestAJobCanRunAStackOnAPinnedVersion(t *testing.T) {
+	// Repo C LEGACY_MIGRATION §1: whether the project builds on the version it would move to.
+	box := &fakeSandbox{proveOK: true}
+	f := newFixture(t, box)
+	write(t, filepath.Join(f.sources, "api"), map[string]string{"pom.xml": "<project><properties><maven.compiler.release>17</maven.compiler.release></properties></project>"})
+	start := func(request string, versions map[string]string) serviceapi.StackJobV1 {
+		t.Helper()
+		job, err := f.m.StartStackJob(context.Background(), serviceapi.StackJobCreateV1{RequestID: request, Source: "api", CacheKey: key, Versions: versions})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.wait(t, job.ID)
+	}
+	if job := start("v1", nil); job.Parts[0].Version != "17" || job.Parts[0].VersionNote != "" {
+		t.Fatalf("own version = %+v", job.Parts[0])
+	}
+	if job := start("v2", map[string]string{"java": "21"}); job.Parts[0].Version != "21" || job.Parts[0].VersionNote != "asked to run on 21 instead of 17" {
+		t.Fatalf("pinned = %+v", job.Parts[0])
+	}
+	if job := start("v3", map[string]string{"java": "8", "python": "3.12"}); job.Parts[0].Version != "17" || job.Parts[0].VersionNote != "asked to run on 8, which is not served; ran on 17" {
+		t.Fatalf("a version not served = %+v", job.Parts[0])
+	}
+	if job := start("v4", map[string]string{"java": "17"}); job.Parts[0].Version != "17" || job.Parts[0].VersionNote != "" {
+		t.Fatalf("pinned to its own version = %+v", job.Parts[0])
+	}
+	if _, err := f.m.StartStackJob(context.Background(), serviceapi.StackJobCreateV1{RequestID: "v2", Source: "api", CacheKey: key}); err != serviceapi.ErrStackJobConflict {
+		t.Fatalf("the same request without its versions = %v", err)
+	}
+}
