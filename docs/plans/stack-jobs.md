@@ -109,9 +109,10 @@ less than 10 GB free).
    | dotnet | `dotnet restore` (NuGet's packages in the cache) | `dotnet build --no-restore` | `dotnet test --no-build --logger trx`, its logs cleared first |
 
    Before a .NET part's steps its cache's home gets NuGet's migration marker, `home/.local/share/NuGet/Migrations/1`
-   (where NuGet reads it): NuGet's one-time migrations otherwise take a named mutex, which .NET 8 cannot make in the
-   sandbox (with any IPC mode, as any user), and every restore fails. Written through real folders only, as Maven's
-   settings are.
+   (where NuGet reads it): NuGet's one-time migrations otherwise take a named mutex. Written through real folders only, as
+   Maven's settings are. Every .NET step also has `XDG_RUNTIME_DIR=/tmp`: .NET keeps a named mutex's files there, else
+   under the user database's home (not `HOME`), which the read-only root refuses, and then every named mutex fails, among
+   them coverlet's as it writes its hits (0 lines covered on .NET 8).
 
    A step with nothing to do is `SKIPPED`. A failed install or build ends the part. pytest's and unittest's exit code 5,
    no tests found, is `SKIPPED` with that note, not a failure.

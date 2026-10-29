@@ -716,9 +716,9 @@ func runSteps(ctx context.Context, x steps, n int, p Part, work, cache string) s
 
 // homeSettings writes what a part's tools read from the cache's home before its steps: a Java part's Maven and Gradle
 // settings (where the proxy is); a .NET part's NuGet migration marker (in the home's local data folder, where NuGet reads
-// it), since NuGet's one-time migrations otherwise take a named mutex, which .NET 8 cannot make in the sandbox (with any
-// IPC mode, as any user), and every restore fails. Written from the host into a cache a job may have left links in:
-// through real folders only, never a link.
+// it), since NuGet's one-time migrations otherwise take a named mutex, and .NET 8 can make one in the sandbox only with
+// Env's XDG_RUNTIME_DIR. Written from the host into a cache a job may have left links in: through real folders only,
+// never a link.
 func homeSettings(p Part, cache string, proxy netip.AddrPort, registries []serviceapi.RegistryV1) error {
 	if p.Stack == StackDotnet {
 		migrations, err := realDirs(cache, "home", ".local", "share", "NuGet", "Migrations")

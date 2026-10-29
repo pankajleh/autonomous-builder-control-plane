@@ -337,7 +337,8 @@ func TestEnvironmentIsMadeFromNothingButThePathTheProfilesSettingsAndTheProxy(t 
 		t.Fatalf("php env:\n%s", php)
 	}
 	if dn := strings.Join(Env(Part{Stack: StackDotnet}, ProfileV1{Path: "/usr/bin:/bin"}, proxy), "\n"); !strings.Contains(dn, "NUGET_PACKAGES=/cache/home/.nuget/packages") ||
-		!strings.Contains(dn, "DOTNET_ROLL_FORWARD=Major") || !strings.Contains(dn, "DOTNET_CLI_TELEMETRY_OPTOUT=1") || !strings.Contains(dn, "MSBUILDDISABLENODEREUSE=1") {
+		!strings.Contains(dn, "DOTNET_ROLL_FORWARD=Major") || !strings.Contains(dn, "DOTNET_CLI_TELEMETRY_OPTOUT=1") || !strings.Contains(dn, "MSBUILDDISABLENODEREUSE=1") ||
+		!strings.Contains(dn, "XDG_RUNTIME_DIR=/tmp") {
 		t.Fatalf("dotnet env:\n%s", dn)
 	}
 	if s := mavenSettings(proxy, nil); !strings.Contains(s, "<host>10.213.4.17</host><port>3129</port>") || !strings.Contains(gradleProperties(proxy), "systemProp.https.proxyPort=3129") {
