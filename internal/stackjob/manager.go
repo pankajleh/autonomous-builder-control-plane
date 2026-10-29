@@ -90,6 +90,7 @@ type record struct {
 	Source     string                `json:"source"`
 	CacheKey   string                `json:"cache_key"`
 	Scan       bool                  `json:"scan,omitempty"`
+	Stacks     []string              `json:"stacks,omitempty"`
 }
 
 type probe struct {
@@ -259,6 +260,7 @@ func bodyDigest(r serviceapi.StackJobCreateV1) string {
 		// Only a scan says so, so a check's digest, kept with jobs from before scans, is what it was.
 		fields = append(fields, "scan")
 	}
+	fields = append(fields, serviceapi.StacksDigestPart(r.Stacks)...)
 	data, _ := json.Marshal(fields)
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
@@ -292,7 +294,7 @@ func (m *Manager) StartStackJob(_ context.Context, req serviceapi.StackJobCreate
 	if _, err := rand.Read(raw); err != nil {
 		return serviceapi.StackJobV1{}, serviceapi.ErrStackJobsUnavailable
 	}
-	r := &record{BodyDigest: digest, Source: req.Source, CacheKey: req.CacheKey, Scan: req.Scan, Job: serviceapi.StackJobV1{
+	r := &record{BodyDigest: digest, Source: req.Source, CacheKey: req.CacheKey, Scan: req.Scan, Stacks: append([]string(nil), req.Stacks...), Job: serviceapi.StackJobV1{
 		SchemaVersion: serviceapi.StackJobSchemaV1, ID: hex.EncodeToString(raw), RequestID: req.RequestID, State: Queued,
 		CreatedAt: m.stamp(), Parts: []serviceapi.StackPartV1{}, Scan: req.Scan}}
 	if err := m.save(r); err != nil {
@@ -432,7 +434,7 @@ func (m *Manager) runJob(ctx context.Context, r *record, work string) string {
 	if os.Mkdir(filepath.Join(work, ".abcp"), 0o755) != nil {
 		return FailSandbox
 	}
-	parts := Detect(work, m.profiles.Available())
+	parts := Only(Detect(work, m.profiles.Available()), r.Stacks)
 	if len(parts) == 0 {
 		return FailNoStack
 	}

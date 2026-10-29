@@ -20,7 +20,9 @@ Under a new grant, `change.run`:
   `--change-source-root`, as stack jobs name theirs; `cache_key` the project's cache digest; `kind` `fix` or `tests`;
   `words` the person's own (at most 4,000 characters, no NUL). `202` with the job, or the same job for the same
   `request_id` and body; `409` for the same `request_id` with another body; `422` when the folder is missing or a link;
-  `429` when 10 are waiting; `503` when change jobs are not configured.
+  `429` when 10 are waiting; `503` when change jobs are not configured. An optional `"stacks"` names the stacks the job
+  may change and check, as a stack job's (`stack-jobs.md`, The API): with none of them in the code, the job ends `FAILED`
+  with `UNSUPPORTED_STACK` before any agent or sandbox runs.
 - `GET /v1/change-jobs/{id}`: the job. `GET /v1/change-jobs/{id}/patch`: the patch once handed back (`text/x-diff`).
   `POST /v1/change-jobs/{id}/stop`.
 

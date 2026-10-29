@@ -23,6 +23,8 @@ type ChangeJobCreateV1 struct {
 	Words     string `json:"words"`
 	// Registries are the project's private registries for this job alone (§15.9); never kept on disk.
 	Registries []RegistryV1 `json:"registries,omitempty"`
+	// Stacks, when given, are the stacks the job may change and check, as a stack job's.
+	Stacks []string `json:"stacks,omitempty"`
 }
 
 // ChangeJobV1 is one job. State is QUEUED, RUNNING (with its Phase), HANDED_BACK, NOT_HANDED_BACK, FAILED, STOPPED or
@@ -112,7 +114,8 @@ const (
 func (r ChangeJobCreateV1) Valid() bool {
 	return stackRequestID.MatchString(r.RequestID) && stackSourceName.MatchString(r.Source) && stackJobID.MatchString(r.CacheKey) &&
 		(r.Kind == "fix" || r.Kind == "tests") && utf8.ValidString(r.Words) && !strings.ContainsRune(r.Words, 0) &&
-		strings.TrimSpace(r.Words) != "" && utf8.RuneCountInString(r.Words) <= MaxChangeWords && validRegistries(r.Registries)
+		strings.TrimSpace(r.Words) != "" && utf8.RuneCountInString(r.Words) <= MaxChangeWords && validRegistries(r.Registries) &&
+		validStacks(r.Stacks)
 }
 
 func (s *Server) mayRunChangeJobs(principal Principal) bool {

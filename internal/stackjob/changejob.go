@@ -77,6 +77,7 @@ type changeRecord struct {
 	Source     string                 `json:"source"`
 	CacheKey   string                 `json:"cache_key"`
 	Words      string                 `json:"words"`
+	Stacks     []string               `json:"stacks,omitempty"`
 }
 
 // ChangeManager runs change jobs, at most two at once and one per project.
@@ -222,7 +223,8 @@ func copyChangeJob(j serviceapi.ChangeJobV1) serviceapi.ChangeJobV1 {
 }
 
 func changeDigest(r serviceapi.ChangeJobCreateV1) string {
-	data, _ := json.Marshal(append([]string{r.Source, r.CacheKey, r.Kind, r.Words}, serviceapi.RegistriesDigestPart(r.Registries)...))
+	fields := append([]string{r.Source, r.CacheKey, r.Kind, r.Words}, serviceapi.RegistriesDigestPart(r.Registries)...)
+	data, _ := json.Marshal(append(fields, serviceapi.StacksDigestPart(r.Stacks)...))
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
@@ -252,7 +254,7 @@ func (m *ChangeManager) StartChangeJob(_ context.Context, req serviceapi.ChangeJ
 	if _, err := rand.Read(raw); err != nil {
 		return serviceapi.ChangeJobV1{}, serviceapi.ErrChangeJobsUnavailable
 	}
-	r := &changeRecord{BodyDigest: digest, Source: req.Source, CacheKey: req.CacheKey, Words: req.Words, Job: serviceapi.ChangeJobV1{
+	r := &changeRecord{BodyDigest: digest, Source: req.Source, CacheKey: req.CacheKey, Words: req.Words, Stacks: append([]string(nil), req.Stacks...), Job: serviceapi.ChangeJobV1{
 		SchemaVersion: serviceapi.ChangeJobSchemaV1, ID: hex.EncodeToString(raw), RequestID: req.RequestID, Kind: req.Kind, State: Queued,
 		CreatedAt: m.stamp(), Before: []serviceapi.StackPartV1{}, After: []serviceapi.StackPartV1{}}}
 	if err := m.save(r); err != nil {
@@ -450,7 +452,7 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 	if err != nil {
 		return changeEnd{ChangeFailed, FailSandbox}
 	}
-	parts := Detect(work, m.profiles.Available())
+	parts := Only(Detect(work, m.profiles.Available()), r.Stacks)
 	agentPart := -1
 	for n, p := range parts {
 		if p.Stack != StackUnsupported {
