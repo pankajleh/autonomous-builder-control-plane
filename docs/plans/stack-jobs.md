@@ -127,6 +127,11 @@ profile its `stack`, the `versions` it serves, `image` (`name@sha256:…`), `use
 rules above). With `--stack-source-root` and `--stack-root` they turn stack jobs on; without all three the API answers
 `503`.
 
+A profile with `"legacy": true` serves versions out of support (Java 8 and 11, Python 2.7, Node.js 16, PHP 7.4; Repo C
+`LEGACY_MIGRATION.md` §5, M4) for an assessment's and a migration's checks before alone (`change-jobs.md`): a stack job,
+a fix, a test job, a scan, an agent's commands and a migration's checks after never see its versions, so code that asks
+for Java 8 is checked on the newest version it allows, with a note, as before.
+
 ## Private registries (F5b)
 
 Repo C design note `IMPROVE_EXISTING_PRODUCTS.md` §15.9. A stack or change job's request may carry `registries`: up to

@@ -424,6 +424,19 @@ func (m *ChangeManager) run(id string) {
 	m.mu.Unlock()
 }
 
+// sameParts reports whether two findings of a project name the same parts in the same order, whatever their versions.
+func sameParts(a, b []Part) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for n := range a {
+		if a[n].Dir != b[n].Dir || a[n].Stack != b[n].Stack {
+			return false
+		}
+	}
+	return true
+}
+
 // socket is the job's broker socket: 96 bits of the job's id, short since a Unix socket's path is bounded.
 func (m *ChangeManager) socket(id string) string { return filepath.Join(m.root, "s", id[:24]+".sock") }
 
@@ -486,9 +499,16 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 	}
 	defer forget()
 
-	// The baseline.
-	m.update(r, func(j *serviceapi.ChangeJobV1) { j.Phase, j.Before = PhaseBaseline, planParts(parts) })
-	if f := m.check(ctx, r, parts, work, cache, "before", registries); f != "" {
+	// The baseline: an assessment's or a migration's on the project's own versions, out of support ones too where a legacy
+	// profile serves them (LEGACY_MIGRATION §5, M4); the same parts, found again with them.
+	baseline := parts
+	if r.Job.Kind == "assess" || r.Job.Kind == "migrate" {
+		if legacy := Only(Detect(work, m.profiles.WithLegacy()), r.Stacks); sameParts(legacy, parts) {
+			baseline = legacy
+		}
+	}
+	m.update(r, func(j *serviceapi.ChangeJobV1) { j.Phase, j.Before = PhaseBaseline, planParts(baseline) })
+	if f := m.check(ctx, r, baseline, work, cache, "before", registries); f != "" {
 		if f == FailStopped || ctx.Err() != nil {
 			return stopped(ctx)
 		}
@@ -496,7 +516,7 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 	}
 	before := m.snapshot(r).Before
 	if r.Job.Kind == "assess" {
-		return m.assess(ctx, r, dir, work, home, cache, parts, agentPart, before, registries)
+		return m.assess(ctx, r, dir, work, home, cache, parts, baseline, agentPart, before, registries)
 	}
 	if !baselineReady(r.Job.Kind, before[agentPart]) {
 		return changeEnd{ChangeNotHandedBack, ReasonBaseline}

@@ -43,7 +43,8 @@ var (
 	planSizes = map[string]bool{"small": true, "medium": true, "large": true}
 )
 
-// movedParts answers the parts the targets move to another version, as pinned: the parts an assessment checks again.
+// movedParts answers the parts the targets move to a version other than the baseline's, as pinned: the parts an
+// assessment checks again.
 func movedParts(pinned, parts []Part) []Part {
 	out := []Part{}
 	for n, p := range pinned {
@@ -56,9 +57,9 @@ func movedParts(pinned, parts []Part) []Part {
 
 // assess runs an assessment once its baseline ran: the checks on the target versions, on a copy of the source of their
 // own so the agent finds the work folder as the baseline left it; then the agent, whose answer is the plan.
-func (m *ChangeManager) assess(ctx context.Context, r *changeRecord, dir, work, home, cache string, parts []Part, agentPart int,
+func (m *ChangeManager) assess(ctx context.Context, r *changeRecord, dir, work, home, cache string, parts, baseline []Part, agentPart int,
 	before []serviceapi.StackPartV1, registries []serviceapi.RegistryV1) changeEnd {
-	moved := movedParts(Pin(parts, r.Targets, m.profiles.Available()), parts)
+	moved := movedParts(Pin(parts, r.Targets, m.profiles.Available()), baseline)
 	if len(moved) > 0 {
 		folder := filepath.Join(dir, "target")
 		if copySource(filepath.Join(m.sources, r.Source), folder) != nil || os.Mkdir(filepath.Join(folder, ".abcp"), 0o755) != nil {
@@ -92,7 +93,7 @@ func (m *ChangeManager) assess(ctx context.Context, r *changeRecord, dir, work, 
 	started := time.Now()
 	agentCtx, agentCancel := context.WithTimeout(ctx, agentTime)
 	said, err := m.engine.Run(agentCtx, EngineRun{Work: work, Home: home, MCPConfig: mcp, MaxTurns: agentTurns,
-		Prompt: assessPrompt(r.Words, parts, before, moved, after)})
+		Prompt: assessPrompt(r.Words, baseline, before, moved, after)})
 	agentCancel()
 	values := append(m.secretValues(), registrySecrets(registries)...)
 	leaked := leaks([]byte(said.Summary), values)

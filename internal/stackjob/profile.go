@@ -17,7 +17,9 @@ type ProfilesV1 struct {
 }
 
 // ProfileV1 is one image and what it serves: a stack's versions, its PATH and few settings, its limits and its
-// registries. Each stack and version is served by one profile.
+// registries. Each stack and version is served by one profile. A legacy profile serves versions out of support, for a
+// migration's checks before alone (Repo C LEGACY_MIGRATION §5, M4): never for a stack job, a fix, tests, a scan, an
+// agent's commands or a migration's checks after.
 type ProfileV1 struct {
 	ProfileID      string            `json:"profile_id"`
 	Stack          string            `json:"stack"`
@@ -32,6 +34,7 @@ type ProfileV1 struct {
 	WorkBytes      int64             `json:"work_bytes"`
 	TimeoutSeconds int               `json:"timeout_seconds"`
 	Egress         []string          `json:"egress"`
+	Legacy         bool              `json:"legacy,omitempty"`
 }
 
 // servedStacks are the stacks a profile may serve.
@@ -111,8 +114,19 @@ func (f ProfilesV1) Validate() error {
 	return nil
 }
 
-// Available is each stack's versions.
+// Available is each stack's versions, legacy ones left out.
 func (f ProfilesV1) Available() Available {
+	out := Available{}
+	for _, p := range f.Profiles {
+		if !p.Legacy {
+			out[p.Stack] = append(out[p.Stack], p.Versions...)
+		}
+	}
+	return out
+}
+
+// WithLegacy is each stack's versions, legacy ones too: what an assessment's or a migration's checks before may run on.
+func (f ProfilesV1) WithLegacy() Available {
 	out := Available{}
 	for _, p := range f.Profiles {
 		out[p.Stack] = append(out[p.Stack], p.Versions...)
