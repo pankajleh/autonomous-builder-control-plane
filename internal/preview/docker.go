@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,8 +26,10 @@ import (
 
 type dockerCommand func(context.Context, ...string) (string, error)
 type presentation struct {
-	server                *http.Server
-	transport             *http.Transport
+	server    *http.Server
+	transport *http.Transport
+	// slow carries an app's own AI conversation requests (aiConversationPath), dialling through transport.
+	slow                  *http.Transport
 	url, endpoint, handle string
 	appCookies            bool
 	appAuthorization      bool
@@ -41,6 +44,24 @@ type presentation struct {
 	// are nil for every other group.
 	stopOutput context.CancelFunc
 	outputDone chan struct{}
+}
+
+// An app's own AI conversation waits for its model (Repo C's APP_AI.md, and its gateway's slowRequest): a POST to
+// /api/ai/(public/)conversations, a conversation's messages or its hand-over may answer later than a page's 5 s, so its
+// answer is awaited for aiResponseWait, under the presentation server's 30 s write deadline. Every other request keeps
+// 5 s. On 2026-10-30 a support app's answer after 5.6 s reached its visitor as this proxy's 503.
+var aiConversationPath = regexp.MustCompile(`^/api/ai/(?:public/)?conversations(?:/[0-9]{1,12}/(?:messages|handover))?$`)
+
+const aiResponseWait = 29 * time.Second
+
+// presentedTransport sends an app's AI conversation requests by slow and every other request by page.
+type presentedTransport struct{ page, slow http.RoundTripper }
+
+func (t presentedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodPost && aiConversationPath.MatchString(r.URL.Path) {
+		return t.slow.RoundTrip(r)
+	}
+	return t.page.RoundTrip(r)
 }
 
 // Preview networks live only in previewSubnets. The host's own rule (the owner's abcp-preview-isolation unit, board #93,
@@ -594,9 +615,12 @@ func (g *presentation) present() error {
 	g.transport = &http.Transport{Proxy: nil, DisableKeepAlives: true, MaxConnsPerHost: 8, ResponseHeaderTimeout: 5 * time.Second, DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 		return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "tcp4", g.endpoint)
 	}}
+	g.slow = &http.Transport{Proxy: nil, DisableKeepAlives: true, MaxConnsPerHost: 8, ResponseHeaderTimeout: aiResponseWait, DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+		return g.transport.DialContext(ctx, network, address)
+	}}
 	target := &url.URL{Scheme: "http", Host: g.endpoint}
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = g.transport
+	proxy.Transport = presentedTransport{page: g.transport, slow: g.slow}
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, "preview unavailable", http.StatusServiceUnavailable)
 	}
@@ -822,6 +846,9 @@ func (d *dockerRuntime) Stop(ctx context.Context, id string) error {
 		g.closed.Store(true)
 		_ = g.server.Close()
 		g.transport.CloseIdleConnections()
+		if g.slow != nil {
+			g.slow.CloseIdleConnections()
+		}
 		if g.egress != nil {
 			_ = g.egress.Close()
 		}

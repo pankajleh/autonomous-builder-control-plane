@@ -164,6 +164,49 @@ func TestDockerRejectsImageSecretsAndAnonymousVolumes(t *testing.T) {
 		})
 	}
 }
+
+// An app's own AI conversation waits for its model: a POST to its conversation routes is answered after a page's 5 s,
+// while a GET of the same path, another POST and a page still get the presentation's 503 at 5 s.
+func TestControllerProxyWaitsLongerOnlyForAnAppsAIConversation(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(6 * time.Second)
+		w.Write([]byte("answer"))
+	}))
+	t.Cleanup(target.Close)
+	parsed, _ := url.Parse(target.URL)
+	g := &presentation{endpoint: parsed.Host}
+	if err := g.present(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { g.server.Close() })
+	for _, c := range []struct {
+		method, path string
+		want         int
+	}{
+		{http.MethodPost, "/api/ai/public/conversations", 200},
+		{http.MethodPost, "/api/ai/conversations/12/messages", 200},
+		{http.MethodPost, "/api/ai/public/conversations/7/handover", 200},
+		{http.MethodGet, "/api/ai/public/conversations", 503},
+		{http.MethodPost, "/api/ai/public/conversations/7/other", 503},
+		{http.MethodPost, "/api/orders", 503},
+		{http.MethodGet, "/", 503},
+	} {
+		t.Run(c.method+c.path, func(t *testing.T) {
+			t.Parallel()
+			req, _ := http.NewRequest(c.method, g.url+c.path, strings.NewReader("{}"))
+			begun := time.Now()
+			response, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(response.Body)
+			response.Body.Close()
+			if response.StatusCode != c.want || c.want == 200 && string(body) != "answer" {
+				t.Fatal("unexpected answer", response.StatusCode, string(body), time.Since(begun))
+			}
+		})
+	}
+}
 func TestControllerProxyBindsLoopbackAndOnlyDialsPresentedService(t *testing.T) {
 	var mu sync.Mutex
 	var receivedHost, auth, cookie, path string
