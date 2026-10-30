@@ -204,6 +204,39 @@ func TestTheProxyRefusesWhatIsNotARelayRequest(t *testing.T) {
 	}
 }
 
+func TestTheProxyPassesThePassageSearchsWordsAndNoOtherQuery(t *testing.T) {
+	f := newRelayFixture(t, []string{EgressAutobuildRelay}, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"passages":[]}`)
+	})
+	status, _ := f.ask(t, "GET /__autobuild/sources/search?q=Can+I+build+an+app+without+code%3F HTTP/1.1\r\nHost: 10.213.0.1:3129\r\n\r\n")
+	if status != "200 OK" {
+		t.Fatal(status)
+	}
+	for raw, want := range map[string]string{
+		"GET /__autobuild/sources?q=x HTTP/1.1\r\nHost: x\r\n\r\n":                                        "404 Not Found",
+		"GET /__autobuild/sources/search?q=x&q=y HTTP/1.1\r\nHost: x\r\n\r\n":                             "404 Not Found",
+		"GET /__autobuild/sources/search?q=x&visitor=y HTTP/1.1\r\nHost: x\r\n\r\n":                       "404 Not Found",
+		"GET /__autobuild/sources/search?q=%20 HTTP/1.1\r\nHost: x\r\n\r\n":                               "404 Not Found",
+		"GET /__autobuild/sources/search?q=%zz HTTP/1.1\r\nHost: x\r\n\r\n":                               "404 Not Found",
+		"GET /__autobuild/sources/search?q=" + strings.Repeat("w", 1001) + " HTTP/1.1\r\nHost: x\r\n\r\n": "404 Not Found",
+		"POST /__autobuild/sources/search?q=x HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n":           "404 Not Found",
+	} {
+		if status, _ := f.ask(t, raw); status != want {
+			t.Errorf("%q: %s, want %s", strings.SplitN(raw, "\r\n", 2)[0][:min(80, len(strings.SplitN(raw, "\r\n", 2)[0]))], status, want)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.seen) != 1 {
+		t.Fatalf("%d requests reached the relay", len(f.seen))
+	}
+	if r := f.seen[0]; r.URL.Path != "/__autobuild/sources/search" || r.URL.RawQuery != "q=Can+I+build+an+app+without+code%3F" ||
+		r.URL.Query().Get("q") != "Can I build an app without code?" {
+		t.Fatalf("relay saw %s", r.URL)
+	}
+}
+
 func TestWithoutTheRuleTheProxyRelaysNothing(t *testing.T) {
 	f := newRelayFixture(t, []string{EgressShopifyStores}, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	if status, _ := f.ask(t, "GET /__autobuild/ai HTTP/1.1\r\nHost: x\r\n\r\n"); status != "405 Method Not Allowed" {

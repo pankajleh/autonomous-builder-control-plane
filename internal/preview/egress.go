@@ -46,6 +46,34 @@ const (
 // relayPath is a path the relay passes on: under /__autobuild/, plain characters only.
 var relayPath = regexp.MustCompile(`^/__autobuild/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+){0,7}$`)
 
+// relaySearchPath is the one relay path that takes a query: an app's server searching the passages Autobuild read for it
+// (Repo C design note SUPPORT_AGENTS §12, A2b), as GET ?q=<words>. Its words go on alone, re-encoded, and no longer than
+// relayQueryLimit; every other path still takes none.
+const (
+	relaySearchPath  = "/__autobuild/sources/search"
+	relayQueryLimit  = 2 << 10
+	relaySearchWords = 1000
+)
+
+// relayQuery is the query forward passes on for request ("" for none), and whether request's query may go on at all.
+func relayQuery(request *http.Request) (string, bool) {
+	if request.URL.RawQuery == "" {
+		return "", true
+	}
+	if request.Method != http.MethodGet || request.URL.Path != relaySearchPath || len(request.URL.RawQuery) > relayQueryLimit {
+		return "", false
+	}
+	values, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil || len(values) != 1 || len(values["q"]) != 1 {
+		return "", false
+	}
+	words := values.Get("q")
+	if strings.TrimSpace(words) == "" || len(words) > relaySearchWords {
+		return "", false
+	}
+	return url.Values{"q": {words}}.Encode(), true
+}
+
 // relayToken is the token the app relay knows ABCP by.
 var relayToken = regexp.MustCompile(`^[A-Za-z0-9_-]{32,128}$`)
 
@@ -344,13 +372,14 @@ func (e *egressProxy) handle(c net.Conn) {
 }
 
 // forward passes one plain request for a path under /__autobuild/ to the app relay and writes its answer back. Only the
-// method, the path, the body and its content type go on; the relay token and the caller are the proxy's own.
+// method, the path, the passage search's words (relayQuery), the body and its content type go on; the relay token and
+// the caller are the proxy's own.
 func (e *egressProxy) forward(c net.Conn, reader *bufio.Reader, request *http.Request) {
 	switch {
 	case request.Method != http.MethodGet && request.Method != http.MethodPost:
 		e.refuse(c, http.StatusMethodNotAllowed)
 		return
-	case request.URL.IsAbs() || request.URL.RawQuery != "" || request.URL.Fragment != "" || !relayPath.MatchString(request.URL.Path):
+	case request.URL.IsAbs() || request.URL.Fragment != "" || !relayPath.MatchString(request.URL.Path):
 		e.refuse(c, http.StatusNotFound)
 		return
 	case len(request.TransferEncoding) > 0 || request.Method == http.MethodPost && request.ContentLength < 0:
@@ -358,6 +387,11 @@ func (e *egressProxy) forward(c net.Conn, reader *bufio.Reader, request *http.Re
 		return
 	case request.ContentLength > relayBodyLimit:
 		e.refuse(c, http.StatusRequestEntityTooLarge)
+		return
+	}
+	query, queryAllowed := relayQuery(request)
+	if !queryAllowed {
+		e.refuse(c, http.StatusNotFound)
 		return
 	}
 	c.SetDeadline(time.Now().Add(relayTimeout + 5*time.Second))
@@ -376,7 +410,11 @@ func (e *egressProxy) forward(c net.Conn, reader *bufio.Reader, request *http.Re
 	}
 	ctx, cancel := context.WithTimeout(e.ctx, relayTimeout)
 	defer cancel()
-	out, err := http.NewRequestWithContext(ctx, request.Method, e.relay.URL+request.URL.Path, bytes.NewReader(body))
+	target := e.relay.URL + request.URL.Path
+	if query != "" {
+		target += "?" + query
+	}
+	out, err := http.NewRequestWithContext(ctx, request.Method, target, bytes.NewReader(body))
 	if err != nil {
 		e.refuse(c, http.StatusBadRequest)
 		return
