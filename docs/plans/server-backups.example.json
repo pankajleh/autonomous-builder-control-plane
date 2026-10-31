@@ -1,0 +1,32 @@
+{
+  "areas": {
+    "AU": {"bucket": "autobuild-bf14-backups-au-123456789012", "region": "ap-southeast-2", "prefix": "hosted/servers/"},
+    "BR": {"bucket": "autobuild-bf14-backups-br-123456789012", "region": "sa-east-1", "prefix": "hosted/servers/"},
+    "CA": {"bucket": "autobuild-bf14-backups-ca-123456789012", "region": "ca-central-1", "prefix": "hosted/servers/"},
+    "EEA": {"bucket": "autobuild-bf14-backups-eea-123456789012", "region": "eu-central-1", "prefix": "hosted/servers/"},
+    "IN": {"bucket": "autobuild-bf14-backups-123456789012", "region": "ap-south-1", "prefix": "hosted/servers/"},
+    "JP": {"bucket": "autobuild-bf14-backups-jp-123456789012", "region": "ap-northeast-1", "prefix": "hosted/servers/"},
+    "KR": {"bucket": "autobuild-bf14-backups-kr-123456789012", "region": "ap-northeast-2", "prefix": "hosted/servers/"},
+    "SG": {"bucket": "autobuild-bf14-backups-sg-123456789012", "region": "ap-southeast-1", "prefix": "hosted/servers/"},
+    "UK": {"bucket": "autobuild-bf14-backups-uk-123456789012", "region": "eu-west-2", "prefix": "hosted/servers/"},
+    "US": {"bucket": "autobuild-bf14-backups-us-123456789012", "region": "us-east-1", "prefix": "hosted/servers/"}
+  },
+  "regions": {
+    "aws": {
+      "us-east-1": "US", "us-east-2": "US", "us-west-1": "US", "us-west-2": "US", "ca-central-1": "CA", "ca-west-1": "CA",
+      "mx-central-1": "MX", "sa-east-1": "BR", "eu-west-2": "UK", "eu-central-1": "EEA", "eu-west-1": "EEA", "eu-west-3": "EEA",
+      "eu-north-1": "EEA", "eu-south-1": "EEA", "eu-south-2": "EEA", "eu-central-2": "CH", "ap-south-1": "IN", "ap-south-2": "IN",
+      "ap-southeast-1": "SG", "ap-southeast-2": "AU", "ap-northeast-1": "JP", "ap-northeast-3": "JP", "ap-northeast-2": "KR", "ap-east-1": "HK",
+      "ap-east-2": "TW", "ap-southeast-3": "ID", "ap-southeast-4": "AU", "ap-southeast-5": "MY", "ap-southeast-6": "NZ", "ap-southeast-7": "TH",
+      "me-central-1": "AE", "me-south-1": "BH", "il-central-1": "IL", "af-south-1": "ZA"
+    },
+    "digitalocean": {
+      "nyc3": "US", "sfo3": "US", "atl1": "US", "ric1": "US", "tor1": "CA", "lon1": "UK",
+      "fra1": "EEA", "ams3": "EEA", "blr1": "IN", "sgp1": "SG", "syd1": "AU"
+    },
+    "hostinger": {
+      "mum2": "IN"
+    }
+  },
+  "unplaced": "IN"
+}

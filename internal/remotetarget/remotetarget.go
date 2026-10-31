@@ -106,6 +106,9 @@ type record struct {
 	Drift *serviceapi.DriftV1 `json:"drift,omitempty"`
 	// Each backup is also copied off the target, through a one-object upload address (offsite.go, BF-14.4d d1).
 	BackupsOffServer bool `json:"backups_off_server,omitempty"`
+	// Where a bought server is, which picks its legal area's bucket (areas.go, R2); empty for one bought before R2.
+	Provider string `json:"provider,omitempty"`
+	Region   string `json:"region,omitempty"`
 }
 
 // Manager keeps the targets in one private folder.
@@ -129,11 +132,14 @@ type Manager struct {
 
 	// Backups copied off the server (offsite.go): the instance metadata address and, for tests, an S3 address in
 	// place of the bucket's own.
-	metadataURL string
-	s3Endpoint  string
+	metadataURL    string
+	s3Endpoint     string
+	bucketEndpoint func(bucket, region string) string
 	// uploadsFile is the hosted backups' settings (bucket and key), whose key signs the upload addresses of the targets
 	// whose backups are copied off them; empty, none is copied.
 	uploadsFile string
+	// areasFile is the server backups' settings (areas.go): each legal area's bucket and each region's legal area.
+	areasFile string
 
 	// relayHost is where sites' front-door blocks send Autobuild's paths
 	// (BF-08a); empty, they send nothing on.
@@ -265,6 +271,9 @@ func (m *Manager) CreateTarget(ctx context.Context, key string, create serviceap
 	if !validAddress(address) || port < 1 || port > 65535 || !userPattern.MatchString(user) || user == "root" {
 		return serviceapi.TargetV1{}, serviceapi.ErrTargetInvalid
 	}
+	if err := m.checkBoughtArea(create); err != nil {
+		return serviceapi.TargetV1{}, err
+	}
 	if _, err := m.addresses(ctx, address); err != nil {
 		return serviceapi.TargetV1{}, err
 	}
@@ -299,6 +308,7 @@ func (m *Manager) CreateTarget(ctx context.Context, key string, create serviceap
 		SchemaVersion: recordSchema, Key: key, Address: address, Port: port, User: user,
 		PublicKey: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPublic))) + " " + comment,
 		State:     stateNew, CreatedAt: m.now().UTC().Format(time.RFC3339), BackupsOffServer: create.BackupsOffServer,
+		Provider: create.Provider, Region: create.Region,
 	}
 	if err := writePrivate(filepath.Join(m.dir, key+".key"), pem.EncodeToMemory(block)); err != nil {
 		return serviceapi.TargetV1{}, serviceapi.ErrTargetUnavailable
@@ -622,6 +632,7 @@ func (r record) view() serviceapi.TargetV1 {
 	return serviceapi.TargetV1{
 		Key: r.Key, Address: r.Address, Port: r.Port, User: r.User, PublicKey: r.PublicKey, State: r.State,
 		HostKeyFingerprint: r.Fingerprint, CreatedAt: r.CreatedAt, Preflight: r.Preflight, BackupsOffServer: r.BackupsOffServer,
+		Provider: r.Provider, Region: r.Region,
 	}
 }
 

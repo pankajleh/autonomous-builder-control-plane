@@ -305,10 +305,9 @@ func (m *Manager) backUp(ctx context.Context, session remote, key, site, reason,
 	if wp {
 		detail += fmt.Sprintf("; uploads %d bytes", uploads)
 	}
-	if t, ok := m.offsiteFor(key); ok {
-		detail += "; " + m.copyBackups(key, site, id, func(backup string) string { return m.copyOffsite(ctx, session, key, site, backup, t) })
-	} else if u, ok := m.uploadsFor(key); ok {
-		detail += "; " + m.copyBackups(key, site, id, func(backup string) string { return m.copyUploaded(ctx, session, key, site, backup, u) })
+	// A bought server's copies go to its legal area's bucket alone; host 1's by its role (areas.go, offsite.go).
+	if copy := m.copier(ctx, session, key, site); copy != nil {
+		detail += "; " + m.copyBackups(key, site, id, copy)
 	}
 	return id, detail, nil
 }

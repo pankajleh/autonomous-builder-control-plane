@@ -49,6 +49,10 @@ to `s3://<bucket>/hosted/servers/<target>/<site>/<backup>.dump`:
 
 The settings file is read afresh at each backup and used only while it is private (mode 0600) and valid.
 
+**Since R2** (`server-backups-areas.md`), a bought server names its provider and region when it is created, and its
+copies go only to the bucket of that region's legal area (`--server-backups-file`); India's is the hosted backups'
+bucket and `hosted/servers/`, as above. A server whose area has no bucket is refused (`backups_area_unready`).
+
 ## Also
 
 `MaxTargets` goes from 20 to 200: with BF-14 offered to everyone, each person may add two servers of their own while
