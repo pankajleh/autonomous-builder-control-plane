@@ -13,7 +13,16 @@ import (
 type testAccountLanes struct {
 	signIns  []string
 	signOuts []string
+	asks     []string
+	asked    []AccountLaneAskV1
+	answer   AccountLaneAnswerV1
 	err      error
+}
+
+func (t *testAccountLanes) Ask(_ context.Context, lane string, ask AccountLaneAskV1) (AccountLaneAnswerV1, error) {
+	t.asks = append(t.asks, lane)
+	t.asked = append(t.asked, ask)
+	return t.answer, t.err
 }
 
 func (t *testAccountLanes) AccountLanes(context.Context) (AccountLanesV1, error) {

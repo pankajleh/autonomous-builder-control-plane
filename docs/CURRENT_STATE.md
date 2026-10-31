@@ -29,6 +29,7 @@ Operational role: current checkpoint and authority projection for Repo B / ABCP.
   - the engines read by Repo C: `GET /v1/engines` answers each profile's executor, models, reasoning, lane and whether its credentials are in place, never a value (#84, live since 2026-10-12 19:59 UTC, recorded in #85);
   - model and reasoning per build: a request may pick the task's model and level from its profile's `executor_choices`, pinned in the run's manifest; `/v1/engines` gives the choices (#86, live since 2026-10-12 20:47 UTC, recorded in #87);
   - account lanes: an administrator's own Codex or Claude account, signed in and out through `/v1/account-lanes` (Codex device sign-in; a Claude setup token kept only here) (#88, live since 2026-10-13 07:02 UTC, recorded in #89);
+  - a signed-in Claude account lane answers one question for an administrator's own app in Try it, through `POST /v1/account-lanes/{lane}/ask` (`claude -p` once, every tool off, an empty folder, only the lane's settings; one at a time per lane) (#177; `docs/plans/account-lane-ask.md`; not yet live);
   - a preview's sample setup token: a preview profile may name `BOOTSTRAP_TOKEN` with a sample value, a hosted one never (#81, live since 2026-10-11 03:30 UTC);
   - a provider replay gap no longer makes a run impossible to preview (#82).
   - stack jobs: a customer's code installed, built and tested in the preview runtime's sandbox, reaching only its package registries (#155; `docs/plans/stack-jobs.md`; not yet live).

@@ -805,6 +805,8 @@ func serveCommand(args []string, stderr io.Writer) int {
 	previewProfileFile := flags.String("preview-profile-file", "", "optional protected preview profile file")
 	admissionProfileFile := flags.String("admission-profile-file", "", "optional protected run admission profile file")
 	accountLanesFile := flags.String("account-lanes-file", "", "optional protected account lanes file (administrators' own Codex and Claude accounts)")
+	accountLaneAskModel := flags.String("account-lane-ask-model", accountlane.DefaultAskModel, "model a signed-in Claude account lane answers an administrator's own app with (docs/plans/account-lane-ask.md)")
+	accountLaneAskTimeout := flags.Duration("account-lane-ask-timeout", accountlane.DefaultAskTimeout, "time one question to an account lane may take, its wait for the lane included (at most 1m)")
 	targetsDir := flags.String("targets-dir", "", "optional private folder (mode 0700) for remote targets: their SSH keys and preflights")
 	siteRelayHost := flags.String("site-relay-host", "", "optional host that remote sites with a relay credential send Autobuild's paths (/__autobuild/*) to (BF-08a)")
 	appRelayURL := flags.String("app-relay-url", "", "optional loopback http origin of the app relay (the preview gateway) that previews' apps ask Autobuild through (BF-08b)")
@@ -830,7 +832,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file>] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder> [--stack-osv-root <folder>]] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file> [--account-lane-ask-model <model>] [--account-lane-ask-timeout <duration>]] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder> [--stack-osv-root <folder>]] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
@@ -978,7 +980,8 @@ func serveCommand(args []string, stderr io.Writer) int {
 	if *evictionInterval > 0 {
 		go sweeper.Run(ctx, *evictionInterval)
 	}
-	// Account lanes (docs/plans/account-lanes.md): without the file the routes say they are unsupported.
+	// Account lanes (docs/plans/account-lanes.md): without the file the routes say they are unsupported. A signed-in Claude
+	// lane answers an administrator's own app one question at a time (docs/plans/account-lane-ask.md).
 	var accountLanes serviceapi.AccountLaneController
 	if *accountLanesFile != "" {
 		file, err := accountlane.ReadFile(*accountLanesFile)
@@ -986,7 +989,8 @@ func serveCommand(args []string, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "load account lanes configuration:", err)
 			return 1
 		}
-		manager, err := accountlane.New(file, accountlane.CodexDeviceLogin, time.Now)
+		manager, err := accountlane.New(file, accountlane.CodexDeviceLogin, time.Now,
+			accountlane.WithAsk(accountlane.AskConfig{Model: *accountLaneAskModel, Timeout: *accountLaneAskTimeout}))
 		if err != nil {
 			fmt.Fprintln(stderr, "load account lanes configuration:", err)
 			return 1

@@ -53,6 +53,8 @@ type AccountLaneController interface {
 	AccountLanes(context.Context) (AccountLanesV1, error)
 	SignIn(context.Context, string, AccountLaneSignInV1) (AccountLaneV1, error)
 	SignOut(context.Context, string) (AccountLaneV1, error)
+	// Ask asks a signed-in Claude lane one question (docs/plans/account-lane-ask.md).
+	Ask(context.Context, string, AccountLaneAskV1) (AccountLaneAnswerV1, error)
 }
 
 var (
@@ -74,7 +76,7 @@ func (s *Server) mayControlAccounts(principal Principal) bool {
 	return principal.PrincipalType == PrincipalService && s.authority.Match(principal, "accounts.control") == nil
 }
 
-// /v1/account-lanes, /v1/account-lanes/{lane} and /v1/account-lanes/{lane}/sign-in
+// /v1/account-lanes, /v1/account-lanes/{lane}, /v1/account-lanes/{lane}/sign-in and /v1/account-lanes/{lane}/ask
 func (s *Server) accountLanes(w http.ResponseWriter, r *http.Request, principal Principal, id string) {
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid account lane request", RequestID: id})
@@ -104,6 +106,13 @@ func (s *Server) accountLanes(w http.ResponseWriter, r *http.Request, principal 
 			return
 		}
 		s.writeJSON(w, http.StatusOK, lanes)
+	case strings.HasSuffix(rest, "/ask") && strings.Count(rest, "/") == 2 && r.Method == http.MethodPost:
+		lane := strings.TrimSuffix(strings.TrimPrefix(rest, "/"), "/ask")
+		if !accountLaneNamePattern.MatchString(lane) {
+			s.writeAccountLaneError(w, id, ErrAccountLaneAskInvalid)
+			return
+		}
+		s.accountLaneAsk(w, r, lane, id)
 	case strings.HasSuffix(rest, "/sign-in") && r.Method == http.MethodPost:
 		lane := strings.TrimSuffix(strings.TrimPrefix(rest, "/"), "/sign-in")
 		if !accountLaneNamePattern.MatchString(lane) {
@@ -147,6 +156,17 @@ func (s *Server) writeAccountLaneError(w http.ResponseWriter, id string, err err
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid account lane request", RequestID: id})
 	case errors.Is(err, ErrAccountLaneSignedIn):
 		s.writeError(w, http.StatusConflict, ErrorV1{Code: "account_lane_signed_in", Message: "account lane is already signed in", RequestID: id})
+	case errors.Is(err, ErrAccountLaneAskInvalid):
+		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "account_lane_ask_invalid", Message: "invalid account lane question", RequestID: id})
+	case errors.Is(err, ErrAccountLaneAskUnsupported):
+		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "account_lane_ask_unsupported", Message: "this account lane does not answer questions", RequestID: id})
+	case errors.Is(err, ErrAccountLaneSignedOut):
+		s.writeError(w, http.StatusConflict, ErrorV1{Code: "account_lane_signed_out", Message: "account lane is signed out", RequestID: id})
+	case errors.Is(err, ErrAccountLaneBusy):
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusTooManyRequests, ErrorV1{Code: "account_lane_busy", Message: "account lane is answering another question", RequestID: id, Retryable: true})
+	case errors.Is(err, ErrAccountLaneTimeout):
+		s.writeError(w, http.StatusGatewayTimeout, ErrorV1{Code: "account_lane_timeout", Message: "account lane did not answer in time", RequestID: id, Retryable: true})
 	default:
 		s.writeError(w, http.StatusServiceUnavailable, ErrorV1{Code: "account_lane_unavailable", Message: "account lane is unavailable", RequestID: id, Retryable: true})
 	}
