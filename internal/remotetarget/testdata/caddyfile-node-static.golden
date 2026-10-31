@@ -1,0 +1,637 @@
+=== relays on
+# Written by ABCP (BF-14.2a, BF-14.2b, BF-14.2c). A static site serves the release its link points to; a Node app is its container.
+
+cafe.example.com {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	handle /__autobuild/* {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ccccccccccccccccccccccccccccccccccccccccccc
+			header_up X-Autobuild-Host {host}
+			header_up X-Autobuild-Client {remote_host}
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle {
+		reverse_proxy autobuild-app-cafe:8080 {
+			header_up Origin ^https:// http://
+		}
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+crm.example.com {
+	reverse_proxy autobuild-app-crm:8080 {
+		header_up Origin ^https:// http://
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+menu.deployflix.app {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	handle /__autobuild/* {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ddddddddddddddddddddddddddddddddddddddddddd
+			header_up X-Autobuild-Host {host}
+			header_up X-Autobuild-Client {remote_host}
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle {
+		root * /srv/sites/menu
+		file_server
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+paused.deployflix.app {
+	respond "This app is paused." 503
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+shop.example.com {
+	root * /srv/sites/shop
+	file_server
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+tasks.example.com {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	handle /__autobuild/* {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ttttttttttttttttttttttttttttttttttttttttttt
+			header_up X-Autobuild-Host {host}
+			header_up X-Autobuild-Client {remote_host}
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle {
+		reverse_proxy autobuild-app-tasks:8080 {
+			header_up Origin ^https:// http://
+		}
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+# The inside listener (BF-08b2): an app's own server asks Autobuild here, known by its network's range.
+http://:8089 {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	request_header -X-Autobuild-Relay-Token
+	import inside/cafe.caddy
+	handle @from_cafe {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ccccccccccccccccccccccccccccccccccccccccccc
+			header_up X-Autobuild-Host cafe.example.com
+			header_up X-Autobuild-Client {remote_host}
+			header_up X-Autobuild-Caller server
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle @ai_cafe {
+		request_body {
+			max_size 64KB
+		}
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ccccccccccccccccccccccccccccccccccccccccccc
+			header_up X-Autobuild-Host cafe.example.com
+			header_up X-Autobuild-Client {remote_host}
+			header_up X-Autobuild-Caller server
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	import inside/tasks.caddy
+	handle @from_tasks {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ttttttttttttttttttttttttttttttttttttttttttt
+			header_up X-Autobuild-Host tasks.example.com
+			header_up X-Autobuild-Client {remote_host}
+			header_up X-Autobuild-Caller server
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle @ai_tasks {
+		request_body {
+			max_size 64KB
+		}
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ttttttttttttttttttttttttttttttttttttttttttt
+			header_up X-Autobuild-Host tasks.example.com
+			header_up X-Autobuild-Client {remote_host}
+			header_up X-Autobuild-Caller server
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	respond 404
+}
+=== relays off
+# Written by ABCP (BF-14.2a, BF-14.2b, BF-14.2c). A static site serves the release its link points to; a Node app is its container.
+
+cafe.example.com {
+	reverse_proxy autobuild-app-cafe:8080 {
+		header_up Origin ^https:// http://
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+crm.example.com {
+	reverse_proxy autobuild-app-crm:8080 {
+		header_up Origin ^https:// http://
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+menu.deployflix.app {
+	root * /srv/sites/menu
+	file_server
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+paused.deployflix.app {
+	respond "This app is paused." 503
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+shop.example.com {
+	root * /srv/sites/shop
+	file_server
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+tasks.example.com {
+	reverse_proxy autobuild-app-tasks:8080 {
+		header_up Origin ^https:// http://
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+=== a new static site
+# Written by ABCP (BF-14.2a, BF-14.2b, BF-14.2c). A static site serves the release its link points to; a Node app is its container.
+
+blog.example.com {
+	root * /srv/sites/blog
+	file_server
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+cafe.example.com {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	handle /__autobuild/* {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ccccccccccccccccccccccccccccccccccccccccccc
+			header_up X-Autobuild-Host {host}
+			header_up X-Autobuild-Client {remote_host}
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle {
+		reverse_proxy autobuild-app-cafe:8080 {
+			header_up Origin ^https:// http://
+		}
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+crm.example.com {
+	reverse_proxy autobuild-app-crm:8080 {
+		header_up Origin ^https:// http://
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+menu.deployflix.app {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	handle /__autobuild/* {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ddddddddddddddddddddddddddddddddddddddddddd
+			header_up X-Autobuild-Host {host}
+			header_up X-Autobuild-Client {remote_host}
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle {
+		root * /srv/sites/menu
+		file_server
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+paused.deployflix.app {
+	respond "This app is paused." 503
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+shop.example.com {
+	root * /srv/sites/shop
+	file_server
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+tasks.example.com {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	handle /__autobuild/* {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ttttttttttttttttttttttttttttttttttttttttttt
+			header_up X-Autobuild-Host {host}
+			header_up X-Autobuild-Client {remote_host}
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle {
+		reverse_proxy autobuild-app-tasks:8080 {
+			header_up Origin ^https:// http://
+		}
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+# The inside listener (BF-08b2): an app's own server asks Autobuild here, known by its network's range.
+http://:8089 {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	request_header -X-Autobuild-Relay-Token
+	import inside/cafe.caddy
+	handle @from_cafe {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ccccccccccccccccccccccccccccccccccccccccccc
+			header_up X-Autobuild-Host cafe.example.com
+			header_up X-Autobuild-Client {remote_host}
+			header_up X-Autobuild-Caller server
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle @ai_cafe {
+		request_body {
+			max_size 64KB
+		}
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ccccccccccccccccccccccccccccccccccccccccccc
+			header_up X-Autobuild-Host cafe.example.com
+			header_up X-Autobuild-Client {remote_host}
+			header_up X-Autobuild-Caller server
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	import inside/tasks.caddy
+	handle @from_tasks {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ttttttttttttttttttttttttttttttttttttttttttt
+			header_up X-Autobuild-Host tasks.example.com
+			header_up X-Autobuild-Client {remote_host}
+			header_up X-Autobuild-Caller server
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle @ai_tasks {
+		request_body {
+			max_size 64KB
+		}
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ttttttttttttttttttttttttttttttttttttttttttt
+			header_up X-Autobuild-Host tasks.example.com
+			header_up X-Autobuild-Client {remote_host}
+			header_up X-Autobuild-Caller server
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	respond 404
+}
+=== a site taken off
+# Written by ABCP (BF-14.2a, BF-14.2b, BF-14.2c). A static site serves the release its link points to; a Node app is its container.
+
+crm.example.com {
+	reverse_proxy autobuild-app-crm:8080 {
+		header_up Origin ^https:// http://
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+menu.deployflix.app {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	handle /__autobuild/* {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ddddddddddddddddddddddddddddddddddddddddddd
+			header_up X-Autobuild-Host {host}
+			header_up X-Autobuild-Client {remote_host}
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle {
+		root * /srv/sites/menu
+		file_server
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+paused.deployflix.app {
+	respond "This app is paused." 503
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+shop.example.com {
+	root * /srv/sites/shop
+	file_server
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+tasks.example.com {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	handle /__autobuild/* {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ttttttttttttttttttttttttttttttttttttttttttt
+			header_up X-Autobuild-Host {host}
+			header_up X-Autobuild-Client {remote_host}
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle {
+		reverse_proxy autobuild-app-tasks:8080 {
+			header_up Origin ^https:// http://
+		}
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+# The inside listener (BF-08b2): an app's own server asks Autobuild here, known by its network's range.
+http://:8089 {
+	request_header -X-Autobuild-Site
+	request_header -X-Autobuild-Host
+	request_header -X-Autobuild-Client
+	request_header -X-Autobuild-Caller
+	request_header -X-Autobuild-Relay-Token
+	import inside/tasks.caddy
+	handle @from_tasks {
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ttttttttttttttttttttttttttttttttttttttttttt
+			header_up X-Autobuild-Host tasks.example.com
+			header_up X-Autobuild-Client {remote_host}
+			header_up X-Autobuild-Caller server
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	handle @ai_tasks {
+		request_body {
+			max_size 64KB
+		}
+		reverse_proxy https://siterelays.deployflix.app {
+			header_up Host siterelays.deployflix.app
+			header_up X-Autobuild-Site ttttttttttttttttttttttttttttttttttttttttttt
+			header_up X-Autobuild-Host tasks.example.com
+			header_up X-Autobuild-Client {remote_host}
+			header_up X-Autobuild-Caller server
+			header_up -Cookie
+			header_up -Authorization
+		}
+	}
+	respond 404
+}
+=== a node app's host changed
+# Written by ABCP (BF-14.2a, BF-14.2b, BF-14.2c). A static site serves the release its link points to; a Node app is its container.
+
+cafe.example.com {
+	reverse_proxy autobuild-app-cafe:8080 {
+		header_up Origin ^https:// http://
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+www.crm.example.com {
+	reverse_proxy autobuild-app-crm:8080 {
+		header_up Origin ^https:// http://
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+menu.deployflix.app {
+	root * /srv/sites/menu
+	file_server
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+paused.deployflix.app {
+	respond "This app is paused." 503
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+shop.example.com {
+	root * /srv/sites/shop
+	file_server
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
+
+tasks.example.com {
+	reverse_proxy autobuild-app-tasks:8080 {
+		header_up Origin ^https:// http://
+	}
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}
