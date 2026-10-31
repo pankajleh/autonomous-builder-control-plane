@@ -53,8 +53,15 @@ func (m *Manager) setupToken(key, site string) (string, error) {
 
 // startApp starts a site's app with its database and its setup token, and,
 // while relays are on, the address of the front door's inside listener
-// (BF-08b2), where its own server asks Autobuild.
+// (BF-08b2), where its own server asks Autobuild. A WordPress website starts
+// with its address and its administrator's instead (wpsites.go).
 func (m *Manager) startApp(ctx context.Context, session remote, key, site, sandbox string) (string, error) {
+	m.mu.Lock()
+	r, err := m.read(key)
+	m.mu.Unlock()
+	if err == nil && wpData(r, site) {
+		return m.startWebsite(ctx, session, key, site, sandbox)
+	}
 	token, err := m.setupToken(key, site)
 	if err != nil {
 		return "", errStep("no setup token could be kept")

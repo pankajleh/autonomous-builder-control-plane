@@ -44,6 +44,8 @@ const (
 const (
 	kindStatic = "static"
 	kindNode   = "node"
+	// kindWP is a WordPress website (wpsites.go).
+	kindWP = "wp"
 
 	sandboxGVisor   = "gvisor"
 	sandboxStandard = "standard"
@@ -67,8 +69,9 @@ var (
 	databasePattern  = regexp.MustCompile(`^app_[a-z0-9_]{1,40}$`)
 )
 
-// databaseRecord is a Node app's database on its target. It is kept after the
-// app is removed, with its backups, until it is removed in its own right.
+// databaseRecord is a Node app's database on its target, or a WordPress
+// website's (its name says which). It is kept after the app is removed, with
+// its backups, until it is removed in its own right.
 type databaseRecord struct {
 	Site      string         `json:"site"`
 	Name      string         `json:"name"`
@@ -77,6 +80,9 @@ type databaseRecord struct {
 	// SetupToken is the app's setup token (BF-14.2c, setup.go), kept with its
 	// data and gone with it.
 	SetupToken string `json:"setup_token,omitempty"`
+	// AdminEmail is a WordPress website's administrator's address
+	// (wpsites.go): the site's data was made with it, so it is kept with it.
+	AdminEmail string `json:"admin_email,omitempty"`
 }
 
 // backupRecord is a backup as ABCP keeps it: what it shows, and each table's
@@ -113,12 +119,35 @@ func countTotals(counts map[string]int64) (int, int64) { return pgcount.Totals(c
 // underscores.
 func databaseName(site string) string { return "app_" + strings.ReplaceAll(site, "-", "_") }
 
-// siteKind is "node" or "static" (a site kept before BF-14.2b has none).
+// siteKind is "node", "wp" or "static" (a site kept before BF-14.2b has none).
 func siteKind(s siteRecord) string {
-	if s.Kind == kindNode {
-		return kindNode
+	if s.Kind == kindNode || s.Kind == kindWP {
+		return s.Kind
 	}
 	return kindStatic
+}
+
+// appKind is true for a site that runs in a container of its own with data of
+// its own: a Node app or a WordPress website.
+func appKind(kind string) bool { return kind == kindNode || kind == kindWP }
+
+// dataName is a site's database and login as its kind names it: app_<site>
+// for a Node app, wp_<site> for a WordPress website.
+func dataName(kind, site string) string {
+	if kind == kindWP {
+		return wpDatabaseName(site)
+	}
+	return databaseName(site)
+}
+
+// wpData is true when a site's data is a WordPress website's: its database
+// record says so by its name, or, before it has one, its site does.
+func wpData(r record, site string) bool {
+	if d, ok := findDatabase(r, site); ok {
+		return wpDatabasePattern.MatchString(d.Name)
+	}
+	s, ok := findSite(r, site)
+	return ok && siteKind(s) == kindWP
 }
 
 // sandbox is gVisor when the target's last check found it, else the standard
@@ -182,9 +211,12 @@ func setDatabase(r *record, d databaseRecord) {
 	r.Databases = append(r.Databases, d)
 }
 
-// nodeNetworks are the sites whose networks the front door joins: every Node
-// app it serves.
-func (m *Manager) nodeNetworks(key string) string {
+// nodeNetworks are the Node apps whose networks the front door joins, and
+// whose servers its inside listener knows by their network's range.
+func (m *Manager) nodeNetworks(key string) string { return m.appNetworks(key, kindNode) }
+
+// appNetworks are the sites of one kind the target serves, by name.
+func (m *Manager) appNetworks(key, kind string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, err := m.read(key)
@@ -193,11 +225,19 @@ func (m *Manager) nodeNetworks(key string) string {
 	}
 	var names []string
 	for _, s := range r.Sites {
-		if siteKind(s) == kindNode && served(s) && siteNamePattern.MatchString(s.Name) {
+		if siteKind(s) == kind && served(s) && siteNamePattern.MatchString(s.Name) {
 			names = append(names, s.Name)
 		}
 	}
 	return strings.Join(names, " ")
+}
+
+// withNetworks fills a front-door script with the sites whose networks the
+// front door joins: the Node apps (@NETS@), whose servers ask the inside
+// listener for status reads and AI answers, and the WordPress websites
+// (@WPNETS@), whose sites hand it their contact messages.
+func (m *Manager) withNetworks(script, key string) string {
+	return fill(script, "NETS", m.nodeNetworks(key), "WPNETS", m.appNetworks(key, kindWP))
 }
 
 func newBackupID(now time.Time) string {
@@ -208,19 +248,33 @@ func newBackupID(now time.Time) string {
 
 // backUp dumps a Node app's database on its target, with each table's rows
 // counted in the dump's own snapshot, records the backup and prunes the ones
-// no longer kept, never the one named keep (a restore's). It answers the new
-// backup's id and the step's detail.
+// no longer kept, never the one named keep (a restore's). A WordPress
+// website's backup is its database's dump and its uploads (wpsites.go). It
+// answers the new backup's id and the step's detail.
 func (m *Manager) backUp(ctx context.Context, session remote, key, site, reason, release, keep string) (string, string, error) {
-	db := databaseName(site)
-	if !siteNamePattern.MatchString(site) || !databasePattern.MatchString(db) {
+	m.mu.Lock()
+	r, err := m.read(key)
+	m.mu.Unlock()
+	wp := err == nil && wpData(r, site)
+	db, script := databaseName(site), backupScript
+	if wp {
+		db, script = wpDatabaseName(site), wpBackupScript
+	}
+	if !siteNamePattern.MatchString(site) || !(databasePattern.MatchString(db) || wpDatabasePattern.MatchString(db)) {
 		return "", "", errStep("failed")
 	}
 	id := newBackupID(m.now())
-	out, err := run(ctx, session, fill(backupScript, "N", site, "DB", db, "ID", id), nil)
+	out, err := run(ctx, session, fill(script, "N", site, "DB", db, "ID", id), nil)
 	if err != nil {
 		return "", "", err
 	}
-	size, counts, err := parseBackup(out)
+	var size, uploads int64
+	var counts map[string]int64
+	if wp {
+		size, uploads, counts, err = parseWPBackup(out)
+	} else {
+		size, counts, err = parseBackup(out)
+	}
 	if err != nil {
 		_, _ = run(ctx, session, fill(removeBackupsScript, "N", site, "LIST", id), nil)
 		return "", "", err
@@ -228,6 +282,9 @@ func (m *Manager) backUp(ctx context.Context, session remote, key, site, reason,
 	tables, rows := countTotals(counts)
 	backup := backupRecord{BackupV1: serviceapi.BackupV1{BackupID: id, Reason: reason, TakenAt: m.stamp(), Bytes: size, Release: release,
 		Tables: &tables, Rows: &rows}, Counts: counts}
+	if wp {
+		backup.UploadsBytes = &uploads
+	}
 	m.mu.Lock()
 	var drop []string
 	if r, err := m.read(key); err == nil {
@@ -245,6 +302,9 @@ func (m *Manager) backUp(ctx context.Context, session remote, key, site, reason,
 		_, _ = run(ctx, session, fill(removeBackupsScript, "N", site, "LIST", strings.Join(drop, " ")), nil)
 	}
 	detail := fmt.Sprintf("%d bytes, %d tables, %d rows", size, tables, rows)
+	if wp {
+		detail += fmt.Sprintf("; uploads %d bytes", uploads)
+	}
 	if t, ok := m.offsiteFor(key); ok {
 		detail += "; " + m.copyBackups(key, site, id, func(backup string) string { return m.copyOffsite(ctx, session, key, site, backup, t) })
 	} else if u, ok := m.uploadsFor(key); ok {
@@ -505,9 +565,11 @@ mv "$B/.@ID@.part" "$B/@ID@.dump"
 wc -c < "$B/@ID@.dump"
 printf '%s\n' "$counts"
 `
+	// removeBackupsScript removes backups' files: a WordPress website's
+	// uploads beside its dump too.
 	removeBackupsScript = `set -eu
 cd "$HOME/autobuild/backups/@N@"
-for b in @LIST@; do rm -f "./$b.dump"; done
+for b in @LIST@; do rm -f "./$b.dump" "./$b.uploads.tar"; done
 `
 	// startAppScript reads the app's setup token on its input, so no command
 	// line and no script holds it, and keeps it beside database.env. An app on

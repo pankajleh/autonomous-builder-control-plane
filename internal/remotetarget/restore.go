@@ -46,11 +46,11 @@ func restoreSteps() []string {
 	return []string{"back_up", "restore_copy", "stop_app", "switch_database", "start_app", "wait_health", "check", "clean_up"}
 }
 
-// createRestorePlan says what restoring one of a Node app's backups would do.
-// Nothing on the target changes.
+// createRestorePlan says what restoring one of a Node app's backups, or a
+// WordPress website's, would do. Nothing on the target changes.
 func (m *Manager) createRestorePlan(key string, create serviceapi.PlanCreateV1) (serviceapi.PlanV1, error) {
 	want := *create.Restore
-	if create.Release != "" || create.Site != (serviceapi.PlanSiteV1{}) || !siteNamePattern.MatchString(want.Site) || !backupIDPattern.MatchString(want.Backup) {
+	if create.Release != "" || create.Site != (serviceapi.PlanSiteV1{}) || create.AdminEmail != "" || !siteNamePattern.MatchString(want.Site) || !backupIDPattern.MatchString(want.Backup) {
 		return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
 	}
 	m.mu.Lock()
@@ -64,7 +64,7 @@ func (m *Manager) createRestorePlan(key string, create serviceapi.PlanCreateV1) 
 	}
 	site, ok := findSite(r, want.Site)
 	d, kept := findDatabase(r, want.Site)
-	if !ok || !kept || siteKind(site) != kindNode || !served(site) {
+	if !ok || !kept || !appKind(siteKind(site)) || !served(site) || d.Name != dataName(siteKind(site), site.Name) {
 		return serviceapi.PlanV1{}, serviceapi.ErrSiteUnknown
 	}
 	if site.State == siteStopped {
@@ -92,6 +92,10 @@ func (m *Manager) createRestorePlan(key string, create serviceapi.PlanCreateV1) 
 		Images: []string{NodeRuntimeImage, NodePostgresImage}, Database: d.Name, Sandbox: box, Backup: &shown,
 		CreatedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(planLifetime).Format(time.RFC3339),
 	}
+	if siteKind(site) == kindWP {
+		// A WordPress website's uploads go back with its database.
+		plan.Steps, plan.Images = wpRestoreSteps(), []string{WordPressServerImage, WordPressMariaDBImage}
+	}
 	plan.Hash = planHash(plan)
 	if err := m.writeJSON(filepath.Join(m.dir, "plans"), plan.PlanID, planRecord{SchemaVersion: planSchema, Plan: plan}); err != nil {
 		return serviceapi.PlanV1{}, err
@@ -105,7 +109,7 @@ func (m *Manager) createRestorePlan(key string, create serviceapi.PlanCreateV1) 
 func restoreStale(r record, plan serviceapi.PlanV1) bool {
 	site, ok := findSite(r, plan.Site.Name)
 	d, kept := findDatabase(r, plan.Site.Name)
-	if !ok || !kept || siteKind(site) != kindNode || !served(site) || site.State == siteStopped || site.Release != plan.Release.Digest || plan.Backup == nil {
+	if !ok || !kept || !appKind(siteKind(site)) || !served(site) || site.State == siteStopped || site.Release != plan.Release.Digest || plan.Backup == nil {
 		return true
 	}
 	_, ok = findBackup(d, plan.Backup.BackupID)
@@ -167,31 +171,42 @@ func (m *Manager) runCheckBackup(ctx context.Context, rec *operationRecord, r re
 		return "the backup is no longer kept"
 	}
 	if err := m.step(rec, "check_restore", func() (string, error) {
-		return m.restoreCopy(ctx, session, r.Key, site, b, "check_"+databaseName(site), false)
+		return m.restoreCopy(ctx, session, r.Key, site, b, "check_", false)
 	}); err != nil {
 		return stepDetail(err)
 	}
 	return ""
 }
 
-// restoreCopy restores a backup into copy, as the app's login, and compares
-// every table's rows with what the database held when the backup was taken;
-// it records the check on the backup. The copy is dropped unless keep, and
-// always when the rows differ.
-func (m *Manager) restoreCopy(ctx context.Context, session remote, key, site string, b backupRecord, copy string, keep bool) (string, error) {
-	db := databaseName(site)
-	if !databasePattern.MatchString(db) || !backupIDPattern.MatchString(b.BackupID) || b.Tables == nil {
+// restoreCopy restores a backup into a copy of the app's database named with
+// prefix (check_ or restore_), as the app's login, and compares every table's
+// rows with what the database held when the backup was taken; it records the
+// check on the backup. The copy is dropped unless keep, and always when the
+// rows differ. A WordPress website's copy is restored into the shared MariaDB,
+// where no login reaches it, once its uploads' tar is found readable.
+func (m *Manager) restoreCopy(ctx context.Context, session remote, key, site string, b backupRecord, prefix string, keep bool) (string, error) {
+	m.mu.Lock()
+	r, err := m.read(key)
+	m.mu.Unlock()
+	wp := err == nil && wpData(r, site)
+	db, script, drop := databaseName(site), restoreCopyScript, dropDatabaseScript
+	if wp {
+		db, script, drop = wpDatabaseName(site), wpRestoreCopyScript, wpDropCopyScript
+	}
+	copy := prefix + db
+	if !(databasePattern.MatchString(db) || wpDatabasePattern.MatchString(db)) || (prefix != "check_" && prefix != "restore_") ||
+		!backupIDPattern.MatchString(b.BackupID) || b.Tables == nil {
 		return "", errStep("the backup's rows were not counted")
 	}
 	mode := "drop"
 	if keep {
 		mode = "keep"
 	}
-	out, err := run(ctx, session, fill(restoreCopyScript, "N", site, "DB", db, "ID", b.BackupID, "COPY", copy, "KEEP", mode), nil)
+	out, err := run(ctx, session, fill(script, "N", site, "DB", db, "ID", b.BackupID, "COPY", copy, "KEEP", mode), nil)
 	if err != nil {
 		m.recordBackupCheck(key, site, b.BackupID, false, stepDetail(err))
 		if keep {
-			_, _ = run(ctx, session, fill(dropDatabaseScript, "COPY", copy), nil)
+			_, _ = run(ctx, session, fill(drop, "COPY", copy), nil)
 		}
 		return "", err
 	}
@@ -199,7 +214,7 @@ func (m *Manager) restoreCopy(ctx context.Context, session remote, key, site str
 	if err != nil {
 		m.recordBackupCheck(key, site, b.BackupID, false, stepDetail(err))
 		if keep {
-			_, _ = run(ctx, session, fill(dropDatabaseScript, "COPY", copy), nil)
+			_, _ = run(ctx, session, fill(drop, "COPY", copy), nil)
 		}
 		return "", err
 	}
@@ -207,7 +222,7 @@ func (m *Manager) restoreCopy(ctx context.Context, session remote, key, site str
 	m.recordBackupCheck(key, site, b.BackupID, ok, detail)
 	if !ok {
 		if keep {
-			_, _ = run(ctx, session, fill(dropDatabaseScript, "COPY", copy), nil)
+			_, _ = run(ctx, session, fill(drop, "COPY", copy), nil)
 		}
 		return "", errStep(detail)
 	}
@@ -285,6 +300,9 @@ func (m *Manager) runRestore(ctx context.Context, rec *operationRecord, r record
 		m.markFirstPending(rec, "failed", "the backup is no longer kept")
 		return "the backup is no longer kept"
 	}
+	if wpData(r, site) {
+		return m.runRestoreWebsite(ctx, rec, r, session, b)
+	}
 	db := databaseName(site)
 	start := func() (string, error) { return m.startApp(ctx, session, r.Key, site, rec.Sandbox) }
 	for _, s := range rec.Operation.Steps {
@@ -296,7 +314,7 @@ func (m *Manager) runRestore(ctx context.Context, rec *operationRecord, r record
 				return detail, err
 			})
 		case "restore_copy":
-			err = m.step(rec, s.Name, func() (string, error) { return m.restoreCopy(ctx, session, r.Key, site, b, "restore_"+db, true) })
+			err = m.step(rec, s.Name, func() (string, error) { return m.restoreCopy(ctx, session, r.Key, site, b, "restore_", true) })
 		case "stop_app":
 			err = m.step(rec, s.Name, func() (string, error) { return run(ctx, session, fill(stopAppOnlyScript, "N", site), nil) })
 		case "switch_database":
@@ -366,7 +384,8 @@ func nextNightly(now time.Time) time.Time {
 	return at
 }
 
-// Nightly backs up and checks every Node app each confirmed target serves,
+// Nightly backs up and checks every Node app and WordPress website each
+// confirmed target serves,
 // every night at 02:30 India time, until ctx ends. A target busy then is
 // tried once more 15 minutes later.
 func (m *Manager) Nightly(ctx context.Context) {
@@ -434,7 +453,7 @@ func (m *Manager) startNightly(key, night string) (operationRecord, string) {
 	for _, s := range r.Sites {
 		anyServed = anyServed || served(s)
 		// A stopped app's data cannot change, so it is not backed up again.
-		if _, kept := findDatabase(r, s.Name); kept && siteKind(s) == kindNode && served(s) && s.State != siteStopped {
+		if _, kept := findDatabase(r, s.Name); kept && appKind(siteKind(s)) && served(s) && s.State != siteStopped {
 			steps = append(steps, serviceapi.OperationStepV1{Name: "back_up", Site: s.Name, State: "pending"},
 				serviceapi.OperationStepV1{Name: "check_restore", Site: s.Name, State: "pending"})
 		}
@@ -501,7 +520,7 @@ func (m *Manager) runNightly(ctx context.Context, rec *operationRecord, r record
 			continue
 		}
 		if err := m.siteStep(rec, "check_restore", site, func() (string, error) {
-			return m.restoreCopy(ctx, session, r.Key, site, b, "check_"+databaseName(site), false)
+			return m.restoreCopy(ctx, session, r.Key, site, b, "check_", false)
 		}); err != nil {
 			note(site, err)
 		}

@@ -23,7 +23,8 @@ import (
 // names a bucket for a target, each backup taken there is also copied to s3://<bucket>/<target>/<site>/<backup>.dump
 // by the server itself, with its own short-lived credentials from the instance role it was given (EC2's metadata,
 // IMDSv2): no key is kept on the server or in ABCP. A copy that fails leaves the backup on the server and says why;
-// the next backup of the same app tries the ones not yet copied again.
+// the next backup of the same app tries the ones not yet copied again. A WordPress website's backup is two files, its
+// dump and its uploads (<backup>.uploads.tar beside <backup>.dump), and is copied when both are.
 
 // offsiteTarget is where one target's backups are copied.
 type offsiteTarget struct {
@@ -85,6 +86,18 @@ func (m *Manager) copyBackups(key, site, id string, copy func(backup string) str
 	return said
 }
 
+// backupFiles are a backup's files on the server: its dump, and a WordPress website's uploads beside it.
+func (m *Manager) backupFiles(key, site, id string) []string {
+	m.mu.Lock()
+	r, err := m.read(key)
+	m.mu.Unlock()
+	files := []string{id + ".dump"}
+	if err == nil && wpData(r, site) {
+		files = append(files, id+".uploads.tar")
+	}
+	return files
+}
+
 // copyOffsite copies one backup and records the outcome on it.
 func (m *Manager) copyOffsite(ctx context.Context, session remote, key, site, id string, t offsiteTarget) string {
 	if !keyPattern.MatchString(key) || !siteNamePattern.MatchString(site) || !backupIDPattern.MatchString(id) {
@@ -94,14 +107,23 @@ func (m *Manager) copyOffsite(ctx context.Context, session remote, key, site, id
 	if s3 == "" {
 		s3 = "https://" + t.Bucket + ".s3." + t.Region + ".amazonaws.com"
 	}
-	object := key + "/" + site + "/" + id + ".dump"
-	out, err := run(ctx, session, fill(offsiteScript, "N", site, "ID", id, "BUCKET", t.Bucket, "REGION", t.Region, "KEY", object,
-		"IMDS", m.metadataURL, "S3", s3), nil)
-	copied := serviceapi.BackupOffsiteV1{At: m.stamp(), OK: err == nil, Detail: "s3://" + t.Bucket + "/" + object}
-	if err != nil {
-		copied.Detail = stepDetail(err)
-	} else if !strings.HasPrefix(lastLine(out), "copied ") {
-		copied.OK, copied.Detail = false, "the copy said nothing"
+	copied := serviceapi.BackupOffsiteV1{At: m.stamp(), OK: true}
+	var addresses []string
+	for _, file := range m.backupFiles(key, site, id) {
+		object := key + "/" + site + "/" + file
+		out, err := run(ctx, session, fill(offsiteScript, "N", site, "FILE", file, "BUCKET", t.Bucket, "REGION", t.Region, "KEY", object,
+			"IMDS", m.metadataURL, "S3", s3), nil)
+		if err != nil {
+			copied.OK, copied.Detail = false, stepDetail(err)
+			break
+		} else if !strings.HasPrefix(lastLine(out), "copied ") {
+			copied.OK, copied.Detail = false, "the copy said nothing"
+			break
+		}
+		addresses = append(addresses, "s3://"+t.Bucket+"/"+object)
+	}
+	if copied.OK {
+		copied.Detail = strings.Join(addresses, ", ")
 	}
 	return m.noteOffsite(key, site, id, copied)
 }
@@ -132,7 +154,7 @@ func (m *Manager) noteOffsite(key, site, id string, copied serviceapi.BackupOffs
 // S3 PUT of one backup (Signature Version 4, the dump's SHA-256 as its payload hash) and reads the object back to
 // compare its size. It prints no credential; a failure names the step and S3's error code only.
 const offsiteScript = `set -eu
-f="$HOME/autobuild/backups/@N@/@ID@.dump"
+f="$HOME/autobuild/backups/@N@/@FILE@"
 if [ ! -s "$f" ]; then echo "the backup is no longer on the server" >&2; exit 4; fi
 if ! command -v python3 >/dev/null 2>&1; then echo "the server has no python3 to copy with" >&2; exit 4; fi
 AB_FILE="$f" AB_BUCKET='@BUCKET@' AB_REGION='@REGION@' AB_KEY='@KEY@' AB_IMDS='@IMDS@' AB_S3='@S3@' python3 - <<'PY'
@@ -224,7 +246,7 @@ const (
 var (
 	uploadKeyID  = regexp.MustCompile(`^(AKIA|ASIA)[A-Z0-9]{16}$`)
 	uploadSecret = regexp.MustCompile(`^[A-Za-z0-9/+=]{40}$`)
-	uploadURL    = regexp.MustCompile(`^https?://[A-Za-z0-9.:-]+/hosted/servers/[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9-]+\.dump\?[A-Za-z0-9%&=._-]+$`)
+	uploadURL    = regexp.MustCompile(`^https?://[A-Za-z0-9.:-]+/hosted/servers/[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9-]+\.(dump|uploads\.tar)\?[A-Za-z0-9%&=._-]+$`)
 )
 
 // SetUploadsFile names the hosted backups' private settings file (mode 0600), whose key signs the upload addresses of the
@@ -271,27 +293,33 @@ func (m *Manager) copyUploaded(ctx context.Context, session remote, key, site, i
 	if endpoint == "" {
 		endpoint = "https://" + s.Bucket + ".s3." + s.Region + ".amazonaws.com"
 	}
-	object := "hosted/servers/" + key + "/" + site + "/" + id + ".dump"
-	copied := serviceapi.BackupOffsiteV1{At: m.stamp(), Detail: "s3://" + s.Bucket + "/" + object}
-	address := presignPut(endpoint, object, s, m.now(), uploadExpiry)
-	if !uploadURL.MatchString(address) {
-		copied.Detail = "the upload address could not be made"
-		return m.noteOffsite(key, site, id, copied)
-	}
-	out, err := run(ctx, session, fill(uploadScript, "N", site, "ID", id, "URL", address), nil)
-	size, said := strings.CutPrefix(lastLine(out), "uploaded ")
-	switch {
-	case err != nil:
-		copied.Detail = stepDetail(err)
-	case !said || size == "":
-		copied.Detail = "the copy said nothing"
-	default:
-		if status, length := headObject(ctx, endpoint, object, s, m.now()); status != http.StatusOK || length != size {
-			copied.Detail = fmt.Sprintf("the copy could not be read back (%d)", status)
-		} else {
-			copied.OK = true
+	copied := serviceapi.BackupOffsiteV1{At: m.stamp()}
+	var addresses []string
+	for _, file := range m.backupFiles(key, site, id) {
+		object := "hosted/servers/" + key + "/" + site + "/" + file
+		address := presignPut(endpoint, object, s, m.now(), uploadExpiry)
+		if !uploadURL.MatchString(address) {
+			copied.Detail = "the upload address could not be made"
+			return m.noteOffsite(key, site, id, copied)
 		}
+		out, err := run(ctx, session, fill(uploadScript, "N", site, "FILE", file, "URL", address), nil)
+		size, said := strings.CutPrefix(lastLine(out), "uploaded ")
+		switch {
+		case err != nil:
+			copied.Detail = stepDetail(err)
+		case !said || size == "":
+			copied.Detail = "the copy said nothing"
+		default:
+			if status, length := headObject(ctx, endpoint, object, s, m.now()); status != http.StatusOK || length != size {
+				copied.Detail = fmt.Sprintf("the copy could not be read back (%d)", status)
+			}
+		}
+		if copied.Detail != "" {
+			return m.noteOffsite(key, site, id, copied)
+		}
+		addresses = append(addresses, "s3://"+s.Bucket+"/"+object)
 	}
+	copied.OK, copied.Detail = true, strings.Join(addresses, ", ")
 	return m.noteOffsite(key, site, id, copied)
 }
 
@@ -359,7 +387,7 @@ func signature(s uploadSettings, amz, scope, canonical string) string {
 // uploadScript runs on the server: it puts one backup at its upload address and says its size. The address is the only
 // thing it is given; it prints no address, and a failure names S3's status and error code only.
 const uploadScript = `set -eu
-f="$HOME/autobuild/backups/@N@/@ID@.dump"
+f="$HOME/autobuild/backups/@N@/@FILE@"
 if [ ! -s "$f" ]; then echo "the backup is no longer on the server" >&2; exit 4; fi
 if ! command -v python3 >/dev/null 2>&1; then echo "the server has no python3 to copy with" >&2; exit 4; fi
 AB_FILE="$f" AB_URL='@URL@' python3 - <<'PY'

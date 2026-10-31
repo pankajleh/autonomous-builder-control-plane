@@ -68,10 +68,10 @@ func (m *Manager) runRelay(ctx context.Context, rec *operationRecord, r record, 
 		work func() (string, error)
 	}{
 		{"write_site", func() (string, error) {
-			return run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, "", "")))
+			return run(ctx, session, m.withNetworks(writeSiteScript, r.Key), strings.NewReader(m.caddyfile(r.Key, "", "")))
 		}},
 		{"reload_frontdoor", func() (string, error) {
-			return run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
+			return run(ctx, session, m.withNetworks(frontDoorScript, r.Key), nil)
 		}},
 	}
 	for _, s := range steps {

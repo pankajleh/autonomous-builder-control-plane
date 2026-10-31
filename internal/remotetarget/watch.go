@@ -46,7 +46,7 @@ func (m *Manager) HealthObservations(ctx context.Context) ([]appwatch.Observatio
 				out = append(out, appwatch.Observation{App: app, State: appwatch.Busy})
 			default:
 				path := "/"
-				if s.Kind == kindNode {
+				if appKind(s.Kind) {
 					path = "/health"
 				}
 				looks = append(looks, look{app: app, address: r.Address, host: s.Host, path: path})

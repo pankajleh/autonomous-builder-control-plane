@@ -20,8 +20,8 @@ import (
 )
 
 // A release is one app version's files as a tar, named by the tar's SHA-256
-// (Repo C design note BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md §11, BF-14.2a, and
-// kind node from BF-14.2b). It
+// (Repo C design note BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md §11, BF-14.2a, kind
+// node from BF-14.2b, and kind wp from Repo C WORDPRESS_WEBSITES.md §13). It
 // carries autobuild-release.json, the manifest, which names every other file
 // with its SHA-256 and size. ABCP keeps it under <dir>/releases and never
 // changes it; what reaches a server is checked against the manifest there.
@@ -56,6 +56,8 @@ type manifest struct {
 	Version       string         `json:"version"`
 	Kind          string         `json:"kind"`
 	Files         []manifestFile `json:"files"`
+	// self is the manifest's own file: its name, SHA-256 and size.
+	self manifestFile
 }
 
 // releaseRecord is a kept release, in <dir>/releases/<digest>.json beside its tar.
@@ -63,6 +65,10 @@ type releaseRecord struct {
 	SchemaVersion int                  `json:"schema_version"`
 	Release       serviceapi.ReleaseV1 `json:"release"`
 	Files         []manifestFile       `json:"files"`
+	// Manifest is a WordPress website's autobuild-release.json, which its
+	// release folder keeps (the site marks its pages with its version) and the
+	// server checks as it checks the other files.
+	Manifest *manifestFile `json:"manifest,omitempty"`
 }
 
 func (m *Manager) releaseDir() string { return filepath.Join(m.dir, "releases") }
@@ -143,6 +149,10 @@ func (m *Manager) PutRelease(_ context.Context, digest string, body io.Reader) (
 		SchemaVersion: serviceapi.ReleaseSchemaV1, Digest: digest, App: man.App, Version: man.Version, Kind: man.Kind,
 		Files: len(man.Files), Bytes: total, ReceivedAt: m.now().UTC().Format("2006-01-02T15:04:05Z"),
 	}}
+	if man.Kind == kindWP {
+		self := man.self
+		rec.Manifest = &self
+	}
 	if err := os.Rename(name, filepath.Join(m.releaseDir(), digest+".tar")); err != nil {
 		return serviceapi.ReleaseV1{}, false, serviceapi.ErrTargetUnavailable
 	}
@@ -245,9 +255,12 @@ func readReleaseTar(r io.Reader) (manifest, error) {
 	}
 	var man manifest
 	if strictjson.Decode(manifestData, &man) != nil || man.SchemaVersion != manifestSchema || !appPattern.MatchString(man.App) ||
-		!versionPattern.MatchString(man.Version) || (man.Kind != kindStatic && man.Kind != kindNode) || len(man.Files) != len(seen) || len(man.Files) == 0 {
+		!versionPattern.MatchString(man.Version) || (man.Kind != kindStatic && man.Kind != kindNode && man.Kind != kindWP) ||
+		len(man.Files) != len(seen) || len(man.Files) == 0 {
 		return manifest{}, invalid
 	}
+	sum := sha256.Sum256(manifestData)
+	man.self = manifestFile{Path: manifestName, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(manifestData))}
 	if !sort.SliceIsSorted(man.Files, func(i, j int) bool { return man.Files[i].Path < man.Files[j].Path }) {
 		return manifest{}, invalid
 	}
@@ -258,8 +271,9 @@ func readReleaseTar(r io.Reader) (manifest, error) {
 		}
 		index = index || f.Path == "index.html"
 	}
-	// A static site opens from index.html; a Node app follows Node format 1.
-	if (man.Kind == kindStatic && !index) || (man.Kind == kindNode && !validNodeFiles(man.Files)) {
+	// A static site opens from index.html; a Node app follows Node format 1;
+	// a WordPress website follows Repo C's WordPress website format.
+	if (man.Kind == kindStatic && !index) || (man.Kind == kindNode && !validNodeFiles(man.Files)) || (man.Kind == kindWP && !validWPFiles(man.Files)) {
 		return manifest{}, invalid
 	}
 	return man, nil

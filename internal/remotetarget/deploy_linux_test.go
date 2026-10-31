@@ -91,6 +91,13 @@ func newLocalRemote(t *testing.T) *localRemote {
 	// was there when it started; $HOME/restore.loses-rows makes a restore
 	// lose every row. An app container's state for inspect is in
 	// $S/c-<name>.state when a test sets one, and its output in $S/c-<name>.log.
+	// The shared MariaDB keeps its databases as the Postgres's are kept, its
+	// logins' passwords in $S/role-<login>; a WordPress website's volume is the
+	// folder $S/wpvol-<volume>, whose uploads the kit's files program tars and
+	// puts back for real; a website's start on a database with no WordPress
+	// installs it, with the administrator's password on its volume, and keeps
+	// the env files it was given in $S/c-<name>.env. $HOME/reset.fails makes a
+	// reset link not sent.
 	fake := `#!/bin/sh
 echo "$@" >> "$HOME/docker.log"
 S="$HOME/.docker"
@@ -114,11 +121,35 @@ case "$1" in
     esac ;;
   logs) n=$(last "$@"); [ -f "$S/c-$n" ] || { echo "Error response from daemon: No such container: $n" >&2; exit 1; }; cat "$S/c-$n.log" 2>/dev/null || true ;;
   run)
+    case "$*" in
+      *"--entrypoint /usr/local/bin/files"*)
+        v=$(echo "$*" | sed -n 's/.*type=volume,src=\([a-z0-9-]*\),dst=\/data.*/\1/p'); d="$S/wpvol-$v"
+        touch "$S/vol-$v"; mkdir -p "$d/uploads"
+        case "$(last "$@")" in
+          backup) tar -C "$d" -cf - uploads ;;
+          restore)
+            rm -rf "$d/.in"; mkdir "$d/.in"
+            if ! tar -C "$d/.in" -xf - 2>/dev/null || [ ! -d "$d/.in/uploads" ]; then
+              rm -rf "$d/.in"; echo "files: the tar could not be read, or holds no uploads/; nothing was changed" >&2; exit 65
+            fi
+            rm -rf "$d/uploads"; mv "$d/.in/uploads" "$d/uploads"; rm -rf "$d/.in"; echo restored ;;
+        esac
+        exit 0 ;;
+    esac
     n=""; net=""; prev=""
     for a; do [ "$prev" = "--name" ] && n=$a; [ "$prev" = "--network" ] && net=$a; prev=$a; done
     touch "$S/c-$n"; mkdir -p "$S/nets/$n"
     if [ -n "$net" ]; then touch "$S/nets/$n/$net"; fi
-    case "$n" in autobuild-app-*) if [ -f "$HOME/app.fails-once" ]; then touch "$S/c-$n.unhealthy"; rm -f "$HOME/app.fails-once"; fi ;; esac ;;
+    case "$n" in autobuild-app-*) if [ -f "$HOME/app.fails-once" ]; then touch "$S/c-$n.unhealthy"; rm -f "$HOME/app.fails-once"; fi ;; esac
+    case "$*" in *"--entrypoint /usr/local/bin/autobuild-wp-server"*)
+      for f in $(echo "$*" | sed -n 's/.*--env-file \([^ ]*\) --env-file \([^ ]*\) .*/\1 \2/p'); do cat "$f"; done > "$S/c-$n.env"
+      d="$S/wpvol-autobuild-wp-${n#autobuild-app-}"; db=$(sed -n 's/^DB_NAME=//p' "$S/c-$n.env")
+      mkdir -p "$d/uploads" "$d/autobuild"
+      if [ -f "$S/db-$db" ] && [ ! -s "$S/db-$db" ]; then
+        echo '{"wp_options":135,"wp_posts":12,"wp_users":1}' > "$S/db-$db"
+        echo "$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')" > "$d/autobuild/admin-password"
+      fi ;;
+    esac ;;
   rm) n=$(last "$@"); rm -rf "$S/c-$n" "$S/c-$n.unhealthy" "$S/c-$n.exited" "$S/c-$n.down" "$S/nets/$n" ;;
   kill) n=$(last "$@"); [ -f "$S/c-$n" ] || exit 1; if [ ! -f "$HOME/app.restarts" ]; then touch "$S/c-$n.down"; fi ;;
   start) n=$(last "$@"); [ -f "$S/c-$n" ] || exit 1; rm -f "$S/c-$n.down" ;;
@@ -144,7 +175,37 @@ case "$1" in
         echo '{"public.people":2}' > "$S/db-$db"; exit 0 ;;
     esac
     case "$*" in
-      *pg_isready*) exit 0 ;;
+      *pg_isready*|*mariadb-admin*) exit 0 ;;
+      *"autobuild-mariadb create-site "*)
+        d=$(last "$@"); IFS= read -r pw; echo "$pw" >> "$S/mariadb.stdin"; printf '%s' "$pw" > "$S/role-$d"
+        [ -f "$S/db-$d" ] || touch "$S/db-$d"; echo made ;;
+      *"autobuild-mariadb dump "*) d=$(last "$@"); [ -f "$S/db-$d" ] || exit 1; printf 'MARIADB fake dump of %s\n' "$d"; rows "$d" ;;
+      *"autobuild-mariadb restore "*)
+        d=$(last "$@"); tail -n +2 > "$S/db-$d"
+        if [ -f "$HOME/restore.loses-rows" ]; then echo '{"wp_posts":0}' > "$S/db-$d"; fi; echo restored ;;
+      *"autobuild-mariadb counts "*) d=$(last "$@"); [ -f "$S/db-$d" ] || exit 1; rows "$d" ;;
+      *"mariadb --no-defaults"*)
+        sql=$(cat); echo "$sql" >> "$S/mariadb.sql"
+        schemas=$(echo "$sql" | sed -n "s/.*table_schema = '\([a-z0-9_]*\)'.*/\1/p")
+        into=$(echo "$schemas" | sed -n 1p); from=$(echo "$schemas" | sed -n 2p)
+        aside=$(echo "$sql" | sed -n 's/^CREATE DATABASE \([a-z0-9_]*\) .*/\1/p')
+        echo "$sql" | while IFS= read -r line; do
+          case "$line" in
+            "SHOW DATABASES;") for f in "$S"/db-*; do [ -e "$f" ] && echo "${f##*/db-}"; done ;;
+            "DROP DATABASE "*) rm -f "$S/db-$(echo "$line" | sed -n 's/^DROP DATABASE \(IF EXISTS \)\{0,1\}\([a-z0-9_]*\);$/\2/p')" ;;
+            "CREATE DATABASE "*) touch "$S/db-$(echo "$line" | sed -n 's/^CREATE DATABASE \([a-z0-9_]*\) .*/\1/p')" ;;
+            "DROP USER "*) rm -f "$S/role-$(echo "$line" | sed -n "s/^DROP USER IF EXISTS '\([a-z0-9_]*\)'.*/\1/p")" ;;
+            "PREPARE swap FROM @swap;")
+              if [ ! -s "$S/db-$from" ]; then echo "ERROR 1064 (42000) at line 11: near 'NULL' at line 1" >&2; exit 1; fi
+              mv "$S/db-$into" "$S/db-$aside"; mv "$S/db-$from" "$S/db-$into"; : > "$S/db-$from" ;;
+          esac
+        done || exit 1 ;;
+      *"admin-password take"*)
+        f="$S/wpvol-autobuild-wp-${n#autobuild-app-}/autobuild/admin-password"
+        mv "$f" "$f.taking" 2>/dev/null || exit 0; cat "$f.taking"; rm -f "$f.taking" ;;
+      *"reset-link "*)
+        last "$@" >> "$S/reset.log"
+        if [ -f "$HOME/reset.fails" ]; then echo "not sent: the relay did not answer" >&2; exit 1; fi; echo sent ;;
       *"-h 127.0.0.1"*)
         u=$(echo "$*" | sed -n 's/.* -U \([a-z0-9_]*\) .*/\1/p'); d=$(echo "$*" | sed -n 's/.* -d \([a-z0-9_]*\) .*/\1/p')
         IFS= read -r pw
@@ -226,7 +287,7 @@ case "$1" in
       inspect) if [ -f "$S/vol-$3" ]; then exit 0; else exit 1; fi ;;
       create) touch "$S/vol-$(last "$@")" ;;
       ls) for f in "$S"/vol-*; do [ -e "$f" ] && echo "volume ${f##*/vol-}"; done ;;
-      rm) rm -f "$S/vol-$(last "$@")" ;;
+      rm) rm -rf "$S/vol-$(last "$@")" "$S/wpvol-$(last "$@")" ;;
     esac ;;
   image)
     case "$2" in
@@ -295,7 +356,7 @@ func (l *localRemote) serve(host, path string) (string, error) {
 	for i, line := range lines {
 		if line == host+" {" && i+1 < len(lines) {
 			if app, ok := strings.CutPrefix(strings.TrimSpace(lines[i+1]), "reverse_proxy autobuild-app-"); ok {
-				app = strings.TrimSuffix(app, ":8080 {")
+				app = strings.TrimSuffix(strings.TrimSuffix(app, " {"), ":8080")
 				state := filepath.Join(l.home, ".docker")
 				_, running := os.Stat(filepath.Join(state, "c-autobuild-app-"+app))
 				_, unhealthy := os.Stat(filepath.Join(state, "c-autobuild-app-"+app+".unhealthy"))

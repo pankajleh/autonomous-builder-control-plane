@@ -149,7 +149,7 @@ func TestTheInsideMatchersComeFromEachNetworksRange(t *testing.T) {
 	if err := os.WriteFile(bin+"/docker", []byte(fake), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("/bin/sh", "-c", "set -eu\n"+fill(insideScript, "NETS", "cafe plain"))
+	cmd := exec.Command("/bin/sh", "-c", "set -eu\n"+fill(insideScript, "NETS", "cafe plain", "WPNETS", ""))
 	cmd.Env = []string{"HOME=" + home, "PATH=" + bin + ":/usr/bin:/bin"}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
