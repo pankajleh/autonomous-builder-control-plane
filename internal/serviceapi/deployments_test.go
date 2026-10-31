@@ -3,6 +3,7 @@ package serviceapi
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,8 @@ type testDeployments struct {
 	zipErr error
 	// adminEmail is the last plan's administrator's address.
 	adminEmail string
+	// pages are the last page files a site was given.
+	pages []PageFileV1
 }
 
 var sampleOperation = OperationV1{SchemaVersion: OperationSchemaV1, OperationID: "op-0123456789abcdef", Target: "srv-0123456789ab", Kind: "apply",
@@ -174,6 +177,14 @@ func (d *testDeployments) SiteAdminPassword(_ context.Context, target, site stri
 func (d *testDeployments) SiteResetLink(_ context.Context, target, site string) (SiteResetLinkV1, error) {
 	d.calls = append(d.calls, "reset-link:"+target+":"+site)
 	return SiteResetLinkV1{SchemaVersion: SiteResetLinkSchemaV1, Target: target, Site: site, Email: "owner@example.com", Sent: true}, d.err
+}
+
+func (d *testDeployments) SetSitePages(_ context.Context, target, site string, r SitePagesRequestV1) (OperationV1, error) {
+	d.calls = append(d.calls, fmt.Sprintf("pages:%s:%s:%s:%d", target, site, r.RequestID, len(r.Files)))
+	d.pages = r.Files
+	op := sampleOperation
+	op.Kind, op.PlanID, op.Steps = "pages", "", []OperationStepV1{{Name: "check_app", State: "pending"}}
+	return op, d.err
 }
 
 func deploymentServer(t *testing.T, grant bool) (*Server, *testDeployments) {
@@ -630,3 +641,81 @@ func TestAWordPressWebsitesPasswordIsTakenWithAPostAndNeverCachedOrLogged(t *tes
 		t.Fatalf("plan = %d %s (%q)", r.Code, r.Body.String(), backend.adminEmail)
 	}
 }
+
+// pageFile is one page file as Repo C sends it.
+func pageFile(name, content string) PageFileV1 {
+	return PageFileV1{Name: name, ContentBase64: base64.StdEncoding.EncodeToString([]byte(content))}
+}
+
+// SP1b (Repo C STANDARD_PAGES.md §14): a WordPress website's page files are a POST of their own, larger than any other
+// target request within their own bound, checked before the backend sees them, and answered as an operation.
+func TestASitesPageFilesArePostedWithinTheirBoundAndAnswerAnOperation(t *testing.T) {
+	s, backend := deploymentServer(t, true)
+	path := "/v1/targets/srv-0123456789ab/sites/blog/pages"
+	post := func(files []PageFileV1, request string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(SitePagesRequestV1{RequestID: request, Files: files})
+		return call(s, http.MethodPost, path, string(body))
+	}
+	// The largest set: 4 files of 256 KiB, 1 MiB in all, well past the 1 MiB of an ordinary body once in base64.
+	big := `{"x":"` + strings.Repeat("a", MaxPageFileBytes-8) + `"}`
+	var largest []PageFileV1
+	for _, name := range []string{"a.json", "b.json", "c.json", "d.json"} {
+		largest = append(largest, pageFile(name, big))
+	}
+	if r := post(largest, "req-pages-0001"); r.Code != http.StatusAccepted || !strings.Contains(r.Body.String(), `"kind":"pages"`) || len(backend.pages) != 4 {
+		t.Fatalf("pages = %d %s", r.Code, r.Body.String())
+	}
+	if got, _ := DecodePageFiles(backend.pages); string(got[3].Content) != big {
+		t.Fatal("the files reach the backend as given")
+	}
+	backend.calls = nil
+	for name, body := range map[string]string{
+		"no files":       `{"request_id":"req-pages-0002","files":[]}`,
+		"unknown field":  `{"request_id":"req-pages-0002","files":[],"site":"x"}`,
+		"a bad name":     `{"request_id":"req-pages-0002","files":[` + mustJSON(pageFile("../terms.json", "{}")) + `]}`,
+		"not an object":  `{"request_id":"req-pages-0002","files":[` + mustJSON(pageFile("terms.json", "[1]")) + `]}`,
+		"out of order":   `{"request_id":"req-pages-0002","files":[` + mustJSON(pageFile("terms.json", "{}")) + `,` + mustJSON(pageFile("about.json", "{}")) + `]}`,
+		"past its bound": `{"request_id":"req-pages-0002","files":[` + mustJSON(pageFile("terms.json", "{}")) + `]` + strings.Repeat(" ", MaxPageFilesRequestBytes) + `}`,
+	} {
+		r := call(s, http.MethodPost, path, body)
+		// Past its bound the body is refused as too large before it is read.
+		want := http.StatusBadRequest
+		if name == "past its bound" {
+			want = http.StatusRequestEntityTooLarge
+		}
+		if r.Code != want || !strings.Contains(r.Body.String(), `"code":"invalid_request"`) {
+			t.Errorf("%s = %d %s", name, r.Code, r.Body.String())
+		}
+	}
+	for _, c := range []struct{ method, path string }{
+		{http.MethodGet, path}, {http.MethodPut, path}, {http.MethodPost, "/v1/targets/srv-0123456789ab/sites/Blog/pages"},
+		{http.MethodPost, path + "/x"},
+	} {
+		if r := call(s, c.method, c.path, `{"request_id":"req-pages-0003","files":[`+mustJSON(pageFile("terms.json", "{}"))+`]}`); r.Code != http.StatusBadRequest {
+			t.Errorf("%s %s = %d", c.method, c.path, r.Code)
+		}
+	}
+	if len(backend.calls) != 0 {
+		t.Fatalf("calls = %v", backend.calls)
+	}
+	for err, want := range map[error]struct {
+		status int
+		code   string
+	}{
+		ErrSiteStopped:   {http.StatusConflict, "site_stopped"},
+		ErrSiteUnknown:   {http.StatusNotFound, "site_unknown"},
+		ErrTargetBusy:    {http.StatusConflict, "target_busy"},
+		ErrTargetInvalid: {http.StatusBadRequest, "invalid_request"},
+	} {
+		backend.err = err
+		if r := post([]PageFileV1{pageFile("terms.json", "{}")}, "req-pages-0004"); r.Code != want.status || !strings.Contains(r.Body.String(), `"code":"`+want.code+`"`) {
+			t.Errorf("%v = %d %s", err, r.Code, r.Body.String())
+		}
+	}
+	denied, deniedBackend := deploymentServer(t, false)
+	if r := call(denied, http.MethodPost, path, `{"request_id":"req-pages-0005","files":[`+mustJSON(pageFile("terms.json", "{}"))+`]}`); r.Code != http.StatusForbidden || len(deniedBackend.calls) != 0 {
+		t.Fatal("pages without targets.control", r.Code, deniedBackend.calls)
+	}
+}
+
+func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }

@@ -39,9 +39,11 @@ const (
 )
 
 var (
-	ErrPreviewUnavailable              = errors.New("preview NOT_AVAILABLE")
-	ErrPreviewIneligible               = errors.New("preview checkpoint ineligible")
-	ErrPreviewProfile                  = errors.New("preview profile unavailable")
+	ErrPreviewUnavailable = errors.New("preview NOT_AVAILABLE")
+	ErrPreviewIneligible  = errors.New("preview checkpoint ineligible")
+	ErrPreviewProfile     = errors.New("preview profile unavailable")
+	// ErrPreviewPagesRefused is a create carrying page files for a profile without a pages service.
+	ErrPreviewPagesRefused             = errors.New("preview profile takes no page files")
 	ErrActivityUnavailable             = errors.New("activity extension unavailable")
 	ErrUnsupportedCapability           = errors.New("unsupported capability")
 	ErrDependencyNotFound              = errors.New("dependency resource not found")
@@ -387,6 +389,10 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	if isAccountLaneAsk(request) {
 		// A question to an account lane may carry three pictures: the relay's megabyte and 16 KB more.
 		limit = MaxAccountLaneAskBytes
+	}
+	if isPageFilesUpload(request) {
+		// A preview's create and a site's pages may carry an app's page files (pagefiles.go).
+		limit = MaxPageFilesRequestBytes
 	}
 	if request.ContentLength > limit {
 		s.writeError(writer, http.StatusRequestEntityTooLarge, ErrorV1{Code: "invalid_request", Message: "request body exceeds limit", RequestID: requestID})
@@ -950,6 +956,8 @@ func (s *Server) writeDependencyError(writer http.ResponseWriter, requestID stri
 		status, apiError.Code, apiError.Message = http.StatusConflict, "run_not_finished", "run is not finished"
 	case errors.Is(err, ErrPreviewProfile):
 		status, apiError.Code, apiError.Message = http.StatusNotFound, "unknown_preview_profile", "preview profile is not available"
+	case errors.Is(err, ErrPreviewPagesRefused):
+		status, apiError.Code, apiError.Message = http.StatusBadRequest, "invalid_request", "preview profile takes no page files"
 	case errors.Is(err, ErrActivityUnavailable):
 		status, apiError.Code, apiError.Message, apiError.Retryable = http.StatusServiceUnavailable, "activity_unavailable", "activity extension is unavailable", true
 	case errors.Is(err, ErrAuthorityDenied):
@@ -1254,15 +1262,20 @@ func (s *Server) runPreviews(w http.ResponseWriter, r *http.Request, principal P
 		s.writeDependencyError(w, id, ErrAuthorityDenied)
 		return
 	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, 8193))
-	if err != nil || len(data) == 0 || len(data) > 8192 {
+	// A command is at most 8192 bytes; only a create carrying page files may be longer, within their own bound.
+	limit := 8192
+	if len(tail) == 0 {
+		limit = MaxPageFilesRequestBytes
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, int64(limit)+1))
+	if err != nil || len(data) == 0 || len(data) > limit {
 		bad()
 		return
 	}
 	var result PreviewV1
 	if len(tail) == 0 {
 		var command PreviewRequestV1
-		if decodeStrictJSON(data, &command) != nil || ValidatePreviewRequestV1(command, run) != nil {
+		if decodeStrictJSON(data, &command) != nil || ValidatePreviewRequestV1(command, run) != nil || (len(command.Pages) == 0 && len(data) > 8192) {
 			bad()
 			return
 		}

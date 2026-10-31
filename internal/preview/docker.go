@@ -35,6 +35,8 @@ type presentation struct {
 	appAuthorization      bool
 	// volume is the hosted data volume mounted at /data in the data service, or "" for a preview.
 	volume string
+	// pages is the folder of page files mounted read-only at /pages in the profile's pages service, or "" for none.
+	pages string
 	// gateway is the host's own address on the group's network, which no service may reach (see previewSubnets).
 	gateway netip.Addr
 	// egress is the group's filtering proxy on the gateway, for a profile with Egress (egress.go), or nil.
@@ -218,9 +220,25 @@ func sourceMount(p PreviewProfileV1, path string) string {
 	return "type=bind,src=" + path + ",dst=/source,readonly,bind-recursive=readonly,bind-propagation=rprivate"
 }
 
+// pagesMount is the read-only bind of a preview's page files at /pages (Repo C design note STANDARD_PAGES §14), with
+// the same options as the source's (sourceMount): recursively read-only with rprivate propagation under Docker's
+// default runtime, and the plain read-only bind under gVisor, which refuses recursive read-only binds. The folder is
+// one this controller wrote, with nothing mounted inside it.
+func pagesMount(p PreviewProfileV1, path string) string {
+	if p.Runtime == RuntimeGVisor {
+		return "type=bind,src=" + path + ",dst=" + PagesPath + ",readonly,bind-propagation=rprivate"
+	}
+	return "type=bind,src=" + path + ",dst=" + PagesPath + ",readonly,bind-recursive=readonly,bind-propagation=rprivate"
+}
+
 // createArgs is one service's `docker create`. hosts are "name:ip" entries for the services started before it, given
 // only under gVisor (see startOrder).
 func (d *dockerRuntime) createArgs(id, path string, p PreviewProfileV1, s ServiceProfileV1, i int, volume string, hosts ...string) []string {
+	return d.createArgsWith(id, path, p, s, i, volume, "", hosts...)
+}
+
+// createArgsWith is createArgs with the folder of the preview's page files, mounted in the pages service, or "".
+func (d *dockerRuntime) createArgsWith(id, path string, p PreviewProfileV1, s ServiceProfileV1, i int, volume, pages string, hosts ...string) []string {
 	args := []string{"create", "--pull=never", "--name", d.container(id, i), "--label", d.label(), "--label", "abcp.preview.id=" + id, "--network", d.network(id), "--network-alias", s.Name, "--user", s.User, "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", "--cpu-period=100000", "--cpu-quota=" + strconv.Itoa(p.CPUQuota), "--memory=" + strconv.FormatInt(p.MemoryBytes, 10), "--memory-swap=" + strconv.FormatInt(p.MemoryBytes, 10), "--pids-limit=" + strconv.Itoa(p.PidsLimit), "--ulimit=nofile=1024:1024", "--restart=no", "--ipc=none", "--log-driver=none", "--no-healthcheck", "--workdir=/scratch", "--tmpfs", "/scratch:" + scratchOptions(p, s), "--entrypoint=/usr/bin/env"}
 	if p.Runtime != "" {
 		args = append(args, "--runtime="+p.Runtime)
@@ -233,6 +251,9 @@ func (d *dockerRuntime) createArgs(id, path string, p PreviewProfileV1, s Servic
 	}
 	if s.DataVolume {
 		args = append(args, "--mount", "type=volume,src="+volume+",dst="+DataPath)
+	}
+	if s.MountPages && pages != "" {
+		args = append(args, "--mount", pagesMount(p, pages))
 	}
 	args = append(args, s.Image)
 	args = append(args, cleanEnv(s)...)
@@ -328,6 +349,12 @@ func (d *dockerRuntime) networkGateway(ctx context.Context, id string) (netip.Ad
 // endpoint refuses host network, bridge attachment, published ports and any
 // second network. Only the configured presented service IP/port is returned.
 func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfileV1, s ServiceProfileV1, i int, volume string) (string, error) {
+	return d.endpointWith(ctx, id, p, s, i, volume, "")
+}
+
+// endpointWith is endpoint for a group whose pages service mounts the page files in pages ("" for none): exactly that
+// read-only bind at /pages in exactly that service, and no /pages anywhere else.
+func (d *dockerRuntime) endpointWith(ctx context.Context, id string, p PreviewProfileV1, s ServiceProfileV1, i int, volume, pages string) (string, error) {
 	raw, err := d.run(ctx, "inspect", d.container(id, i))
 	if err != nil {
 		return "", ErrUnavailable
@@ -374,7 +401,8 @@ func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfil
 			return "", ErrUnavailable
 		}
 	}
-	sourceFound, volumeFound := false, false
+	sourceFound, volumeFound, pagesFound := false, false, false
+	wantPages := s.MountPages && pages != ""
 	for _, m := range v.Mounts {
 		if m.Type == "tmpfs" && m.Destination == "/scratch" {
 			continue
@@ -384,12 +412,17 @@ func (d *dockerRuntime) endpoint(ctx context.Context, id string, p PreviewProfil
 			volumeFound = true
 			continue
 		}
+		// The page files this preview was created with, read-only at /pages, in the pages service alone (STANDARD_PAGES §14).
+		if m.Type == "bind" && m.Destination == PagesPath && !m.RW && wantPages && m.Source == pages && pages == filepath.Join(d.root, "pages", id) && !pagesFound {
+			pagesFound = true
+			continue
+		}
 		if m.Type != "bind" || m.Destination != "/source" || m.RW || !s.MountSource || m.Source != filepath.Join(d.root, "sources", id) || sourceFound {
 			return "", ErrUnavailable
 		}
 		sourceFound = true
 	}
-	if s.MountSource != sourceFound || s.DataVolume != volumeFound {
+	if s.MountSource != sourceFound || s.DataVolume != volumeFound || wantPages != pagesFound {
 		return "", ErrUnavailable
 	}
 	network, ok := v.NetworkSettings.Networks[d.network(id)]
@@ -463,8 +496,12 @@ func (d *dockerRuntime) runtimeAvailable(ctx context.Context, name string) bool 
 }
 
 // caller is who the group's app relay says is asking (BF-08b): "preview <id>" or "hosted <hosting key>".
-func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume, settings, setup, caller string, output HostedOutput) (_ *presentation, err error) {
+func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p PreviewProfileV1, probe bool, volume, settings, setup, caller string, output HostedOutput, pages string) (_ *presentation, err error) {
 	if !sha256Pattern.MatchString(id) || p.Validate() != nil || (p.dataService() >= 0) != (volume != "") {
+		return nil, ErrUnavailable
+	}
+	// Page files are the preview's own folder, for a profile with a pages service; a hosted start never has any.
+	if pages != "" && (p.pagesService() < 0 || p.Hosted || pages != filepath.Join(d.root, "pages", id) || strings.ContainsAny(pages, ",\x00\r\n")) {
 		return nil, ErrUnavailable
 	}
 	// A hosted start of a profile that takes settings names their file; a probe and every other start name none.
@@ -501,7 +538,7 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 			return nil, err
 		}
 	}
-	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, appAuthorization: p.AppAuthorization, volume: volume, gateway: gateway}
+	g := &presentation{handle: jsonDigest([]string{d.namespace, id, "route"}), appCookies: p.AppCookies, appAuthorization: p.AppAuthorization, volume: volume, pages: pages, gateway: gateway}
 	// Until the group is handed back, a failed start must end its attached server here, as its proxy below.
 	defer func() {
 		if err != nil {
@@ -538,7 +575,7 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 	hosts := []string{}
 	for _, i := range startOrder(p) {
 		s := p.Services[i]
-		if _, err := d.run(ctx, d.createArgs(id, path, p, s, i, volume, hosts...)...); err != nil {
+		if _, err := d.run(ctx, d.createArgsWith(id, path, p, s, i, volume, pages, hosts...)...); err != nil {
 			return nil, err
 		}
 		name := d.container(id, i)
@@ -576,7 +613,7 @@ func (d *dockerRuntime) startGroup(ctx context.Context, id, path string, p Previ
 		} else if _, err := d.run(ctx, args...); err != nil {
 			return nil, err
 		}
-		endpoint, err := d.endpoint(ctx, id, p, s, i, volume)
+		endpoint, err := d.endpointWith(ctx, id, p, s, i, volume, pages)
 		if err != nil {
 			return nil, err
 		}
@@ -682,7 +719,27 @@ func (d *dockerRuntime) Start(ctx context.Context, id, path string, p PreviewPro
 	if p.Hosted {
 		return "", ErrUnavailable
 	}
-	return d.start(ctx, id, path, p, "", "", "", "preview "+id, nil)
+	return d.start(ctx, id, path, p, "", "", "", "preview "+id, nil, "")
+}
+
+// StartPages starts a preview with its page files, the folder pages (<root>/pages/<id>), read-only at /pages in the
+// profile's pages service (Repo C design note STANDARD_PAGES §14), and with its app's kept data as StartKept does when
+// keyDigest names it ("" for a profile that keeps none).
+func (d *dockerRuntime) StartPages(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest, pages string) (string, error) {
+	if p.Hosted || p.pagesService() < 0 || pages == "" || p.KeepData != (keyDigest != "") {
+		return "", ErrUnavailable
+	}
+	volume := ""
+	if keyDigest != "" {
+		if p.dataService() < 0 || !sha256Pattern.MatchString(keyDigest) {
+			return "", ErrUnavailable
+		}
+		volume = d.keptVolume(keyDigest)
+		if used, err := d.volumeInUse(ctx, volume); err != nil || used {
+			return "", ErrUnavailable
+		}
+	}
+	return d.start(ctx, id, path, p, volume, "", "", "preview "+id, nil, pages)
 }
 
 // StartKept starts a kept-data preview with its app's volume. It refuses while any container still uses that volume,
@@ -695,7 +752,7 @@ func (d *dockerRuntime) StartKept(ctx context.Context, id, path string, p Previe
 	if used, err := d.volumeInUse(ctx, volume); err != nil || used {
 		return "", ErrUnavailable
 	}
-	return d.start(ctx, id, path, p, volume, "", "", "preview "+id, nil)
+	return d.start(ctx, id, path, p, volume, "", "", "preview "+id, nil, "")
 }
 
 // RemoveKept removes an app's kept data volume, refused while a container still uses it. A volume never made is fine.
@@ -747,7 +804,7 @@ func (d *dockerRuntime) StartHosted(ctx context.Context, id, path string, p Prev
 	if p.dataService() >= 0 {
 		volume = d.volume(keyDigest)
 	}
-	return d.start(ctx, id, path, p, volume, settings, setup, "hosted "+key, output)
+	return d.start(ctx, id, path, p, volume, settings, setup, "hosted "+key, output, "")
 }
 
 // validSettingsFile accepts an absolute, clean path to a regular file only its owner can read or write.
@@ -758,14 +815,14 @@ func validSettingsFile(path string) bool {
 	info, err := os.Lstat(path)
 	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0077 == 0
 }
-func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume, settings, setup, caller string, output HostedOutput) (string, error) {
+func (d *dockerRuntime) start(ctx context.Context, id, path string, p PreviewProfileV1, volume, settings, setup, caller string, output HostedOutput, pages string) (string, error) {
 	if !sha256Pattern.MatchString(id) || path != filepath.Join(d.root, "sources", id) || strings.ContainsAny(path, ",\x00\r\n") {
 		return "", ErrUnavailable
 	}
 	if !d.Available(p) {
 		return "", ErrUnavailable
 	}
-	g, err := d.startGroup(ctx, id, path, p, false, volume, settings, setup, caller, output)
+	g, err := d.startGroup(ctx, id, path, p, false, volume, settings, setup, caller, output, pages)
 	if err != nil {
 		_ = d.Stop(context.Background(), id)
 		return "", err
@@ -812,7 +869,7 @@ func (d *dockerRuntime) Healthy(ctx context.Context, id string, p PreviewProfile
 		return unsafe()
 	}
 	for i, s := range p.Services {
-		endpoint, err := d.endpoint(ctx, id, p, s, i, g.volume)
+		endpoint, err := d.endpointWith(ctx, id, p, s, i, g.volume, g.pages)
 		if err != nil || s.Presented && endpoint != g.endpoint {
 			return unsafe()
 		}
@@ -930,6 +987,10 @@ func (d *dockerRuntime) Reconcile(ctx context.Context) error {
 const probeSourceName = ".abcp-preview-source-probe"
 const probeSourceContents = "governed preview source probe"
 
+// The probe's page file, mounted as a preview's page files are, which the pages service's user must read.
+const probePagesName = "abcp-preview-pages-probe.json"
+const probePagesContents = `{"probe":"governed preview pages probe"}`
+
 // prove is intentionally conservative: a local pinned image must also contain
 // the fixed offline probe tools. Missing tools, unusable container IPs, egress,
 // or an unreachable explicit loopback listener all leave capability false.
@@ -941,6 +1002,9 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 	checkout := Checkout{Root: filepath.Join(d.root, "sources")}
 	path := filepath.Join(checkout.Root, id)
 	sourceCreated := false
+	// A profile with a pages service mounts a probe page file there, as a preview created with page files does.
+	pageFiles := PageFiles{Root: filepath.Join(d.root, "pages")}
+	pages, pagesCreated := "", false
 	// A hosted profile's probe mounts a throwaway data volume of its own, removed afterwards.
 	volume := ""
 	if p.dataService() >= 0 {
@@ -950,6 +1014,9 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 		err := d.Stop(context.Background(), id)
 		if err == nil && sourceCreated {
 			err = checkout.Remove(id)
+		}
+		if err == nil && pagesCreated {
+			err = pageFiles.Remove(id)
 		}
 		if err == nil && volume != "" {
 			err = d.removeVolume(context.Background(), volume)
@@ -982,7 +1049,22 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 			break
 		}
 	}
-	g, err := d.startGroup(ctx, id, path, p, true, volume, "", "", "preview "+id, nil)
+	if p.pagesService() >= 0 {
+		root, err := privateDirectory(pageFiles.Root, true)
+		if err != nil {
+			return false
+		}
+		root.Close()
+		pages = filepath.Join(pageFiles.Root, id)
+		if os.Mkdir(pages, 0700) != nil {
+			return false
+		}
+		pagesCreated = true
+		if os.WriteFile(filepath.Join(pages, probePagesName), []byte(probePagesContents), 0600) != nil || readableSource(pages) != nil {
+			return false
+		}
+	}
+	g, err := d.startGroup(ctx, id, path, p, true, volume, "", "", "preview "+id, nil, pages)
 	if err != nil {
 		return false
 	}
@@ -1017,6 +1099,13 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 			// real bind mount exposes readable bytes to that user before approval.
 			data, err := d.run(ctx, append(args, "cat", "/source/"+probeSourceName)...)
 			if err != nil || data != probeSourceContents {
+				return false
+			}
+		}
+		if s.MountPages {
+			// The same for the page files, at /pages, through the pages service's own user.
+			data, err := d.run(ctx, append(args, "cat", PagesPath+"/"+probePagesName)...)
+			if err != nil || data != probePagesContents {
 				return false
 			}
 		}
@@ -1175,7 +1264,7 @@ func (d *dockerRuntime) dataExec(ctx context.Context, id string, p PreviewProfil
 	if g == nil || g.volume == "" || !d.internalNetwork(ctx, id) {
 		return nil, ErrUnavailable
 	}
-	if _, err := d.endpoint(ctx, id, p, p.Services[i], i, g.volume); err != nil {
+	if _, err := d.endpointWith(ctx, id, p, p.Services[i], i, g.volume, g.pages); err != nil {
 		return nil, ErrUnavailable
 	}
 	args := []string{"exec"}

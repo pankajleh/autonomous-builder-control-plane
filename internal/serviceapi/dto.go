@@ -406,6 +406,9 @@ type PreviewRequestV1 struct {
 	CheckpointActivityID string           `json:"checkpoint_activity_id"`
 	ProfileID            string           `json:"profile_id"`
 	DelegatedActor       DelegatedActorV1 `json:"delegated_actor"`
+	// Pages are the app's page files (pagefiles.go), read-only at /pages in the profile's pages service from this
+	// preview's start; only a profile with one takes them. Omitted when none, so a create without them keeps its digest.
+	Pages []PageFileV1 `json:"pages,omitempty"`
 }
 type PreviewStopRequestV1 struct {
 	SchemaVersion     int              `json:"schema_version"`
@@ -435,6 +438,8 @@ type PreviewV1 struct {
 	EvidenceID             string `json:"evidence_id"`
 	RequestID              string `json:"request_id"`
 	RequestDigest          string `json:"request_digest"`
+	// PagesDigest names the page files the preview was created with (PageFilesDigest); omitted when none.
+	PagesDigest string `json:"pages_digest,omitempty"`
 	// RouteHandle is opaque, server-only and usable only while READY. It is
 	// neither a public URL nor a browser access grant.
 	RouteHandle string `json:"route_handle,omitempty"`
@@ -490,6 +495,9 @@ func ValidatePreviewRequestV1(c PreviewRequestV1, run string) error {
 	if c.SchemaVersion != 1 || ValidatePrincipalID(c.RequestID) != nil || runtimecatalog.ValidateIdentifier(run) != nil || c.ExpectedRunID != run || !isLowerSHA256(c.CheckpointActivityID) || ValidatePrincipalID(c.ProfileID) != nil || !validPreviewActor(c.DelegatedActor) {
 		return errors.New("invalid preview command")
 	}
+	if _, err := DecodePageFiles(c.Pages); err != nil {
+		return errors.New("invalid preview command")
+	}
 	return nil
 }
 func ValidatePreviewStopRequestV1(c PreviewStopRequestV1, run, preview string) error {
@@ -500,7 +508,7 @@ func ValidatePreviewStopRequestV1(c PreviewStopRequestV1, run, preview string) e
 }
 
 func ValidatePreviewV1(v PreviewV1) error {
-	if v.SchemaVersion != "PreviewV1" || !isLowerSHA256(v.PreviewID) || v.Revision == 0 || runtimecatalog.ValidateIdentifier(v.RunID) != nil || ValidatePrincipalID(v.ProductAuthorizationID) != nil || ValidatePrincipalID(v.ProductTaskID) != nil || ValidatePrincipalID(v.ProductVersionID) != nil || !isLowerSHA256(v.CheckpointActivityID) || !isLowerGitObjectID(v.SourceSHA) || ValidatePrincipalID(v.ProfileID) != nil || !isLowerSHA256(v.ProfileDigest) || !isLowerSHA256(v.ValidationID) || !isLowerSHA256(v.EvidenceID) || ValidatePrincipalID(v.RequestID) != nil || !isLowerSHA256(v.RequestDigest) {
+	if v.SchemaVersion != "PreviewV1" || !isLowerSHA256(v.PreviewID) || v.Revision == 0 || runtimecatalog.ValidateIdentifier(v.RunID) != nil || ValidatePrincipalID(v.ProductAuthorizationID) != nil || ValidatePrincipalID(v.ProductTaskID) != nil || ValidatePrincipalID(v.ProductVersionID) != nil || !isLowerSHA256(v.CheckpointActivityID) || !isLowerGitObjectID(v.SourceSHA) || ValidatePrincipalID(v.ProfileID) != nil || !isLowerSHA256(v.ProfileDigest) || !isLowerSHA256(v.ValidationID) || !isLowerSHA256(v.EvidenceID) || ValidatePrincipalID(v.RequestID) != nil || !isLowerSHA256(v.RequestDigest) || (v.PagesDigest != "" && !isLowerSHA256(v.PagesDigest)) {
 		return errors.New("invalid preview identity")
 	}
 	created, e1 := time.Parse(time.RFC3339Nano, v.CreatedAt)

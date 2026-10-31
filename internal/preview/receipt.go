@@ -28,6 +28,10 @@ type commandBinding struct {
 	RequestID       string
 	DelegatedActor  serviceapi.DelegatedActorV1
 	BodyDigest      string
+	// PagesDigest names the page files a create carried (serviceapi.PageFilesDigest). BodyDigest is then the command's
+	// without them, so a receipt binds the files without keeping them. Omitted when none, so receipts without page
+	// files keep their digests.
+	PagesDigest string `json:",omitempty"`
 }
 
 func receiptIdentity(p ownerIdentity, id string) string {
@@ -38,16 +42,18 @@ func receiptIdentity(p ownerIdentity, id string) string {
 	}{"preview-command-v2", p, id})
 }
 
-func createReceipt(p serviceapi.Principal, authorityDigest, run string, c serviceapi.PreviewRequestV1) receipt {
-	return bindReceipt(commandBinding{owner(p), authorityDigest, "create", run, "", c.RequestID, c.DelegatedActor, jsonDigest(c)})
+// createReceipt binds a create; pagesDigest names its page files ("" for none).
+func createReceipt(p serviceapi.Principal, authorityDigest, run string, c serviceapi.PreviewRequestV1, pagesDigest string) receipt {
+	c.Pages = nil
+	return bindReceipt(commandBinding{owner(p), authorityDigest, "create", run, "", c.RequestID, c.DelegatedActor, jsonDigest(c), pagesDigest})
 }
 
 func stopReceipt(p serviceapi.Principal, authorityDigest, run, id string, c serviceapi.PreviewStopRequestV1) receipt {
-	return bindReceipt(commandBinding{owner(p), authorityDigest, "stop", run, id, c.RequestID, c.DelegatedActor, jsonDigest(c)})
+	return bindReceipt(commandBinding{owner(p), authorityDigest, "stop", run, id, c.RequestID, c.DelegatedActor, jsonDigest(c), ""})
 }
 
 func forgetReceipt(p serviceapi.Principal, authorityDigest, run, id string, c serviceapi.PreviewStopRequestV1) receipt {
-	return bindReceipt(commandBinding{owner(p), authorityDigest, "forget-data", run, id, c.RequestID, c.DelegatedActor, jsonDigest(c)})
+	return bindReceipt(commandBinding{owner(p), authorityDigest, "forget-data", run, id, c.RequestID, c.DelegatedActor, jsonDigest(c), ""})
 }
 
 func bindReceipt(b commandBinding) receipt {
@@ -63,9 +69,10 @@ func (r receipt) valid(v serviceapi.PreviewV1, o ownerIdentity, creating bool) b
 	if creating {
 		c := serviceapi.PreviewRequestV1{SchemaVersion: 1, RequestID: b.RequestID, ExpectedRunID: b.RunID, CheckpointActivityID: v.CheckpointActivityID, ProfileID: v.ProfileID, DelegatedActor: b.DelegatedActor}
 		return b.Operation == "create" && b.PreviewID == "" && serviceapi.ValidatePreviewRequestV1(c, b.RunID) == nil &&
-			b.BodyDigest == jsonDigest(c) && v.RequestID == b.RequestID && v.RequestDigest == r.Digest && v.PreviewID == jsonDigest([]string{r.Key, r.Digest})
+			b.BodyDigest == jsonDigest(c) && b.PagesDigest == v.PagesDigest && (b.PagesDigest == "" || sha256Pattern.MatchString(b.PagesDigest)) &&
+			v.RequestID == b.RequestID && v.RequestDigest == r.Digest && v.PreviewID == jsonDigest([]string{r.Key, r.Digest})
 	}
 	c := serviceapi.PreviewStopRequestV1{SchemaVersion: 1, RequestID: b.RequestID, ExpectedRunID: b.RunID, ExpectedPreviewID: b.PreviewID, DelegatedActor: b.DelegatedActor}
-	return (b.Operation == "stop" || b.Operation == "forget-data") && b.PreviewID == v.PreviewID && terminal(v.Status) &&
+	return (b.Operation == "stop" || b.Operation == "forget-data") && b.PreviewID == v.PreviewID && terminal(v.Status) && b.PagesDigest == "" &&
 		serviceapi.ValidatePreviewStopRequestV1(c, b.RunID, b.PreviewID) == nil && b.BodyDigest == jsonDigest(c)
 }

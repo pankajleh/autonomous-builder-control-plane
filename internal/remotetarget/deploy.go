@@ -133,6 +133,9 @@ type operationRecord struct {
 	// AdminEmail is a WordPress website's administrator's address, which its
 	// data keeps from the step that makes its database (wpsites.go).
 	AdminEmail string `json:"admin_email,omitempty"`
+	// PagesDigest names the page files a pages operation puts on its site
+	// (pages.go), which a repeated request must carry again.
+	PagesDigest string `json:"pages_digest,omitempty"`
 }
 
 // remote runs scripts on a target.
@@ -514,6 +517,8 @@ func (m *Manager) run(rec operationRecord) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		delete(m.busy, key)
+		// A pages operation's files go with it, however it ended (pages.go).
+		delete(m.pageFiles, op.OperationID)
 		op.EndedAt = m.stamp()
 		if failed == "" {
 			op.State = opSucceeded
@@ -590,6 +595,8 @@ func (m *Manager) run(rec operationRecord) {
 		failed = m.runIsolation(ctx, &rec, r, session)
 	case "relay":
 		failed = m.runRelay(ctx, &rec, r, session)
+	case "pages":
+		failed = m.runPages(ctx, &rec, r, session)
 	default:
 		failed = m.runApply(ctx, &rec, r, session)
 	}

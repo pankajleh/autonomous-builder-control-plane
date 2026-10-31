@@ -136,6 +136,23 @@ sign-in cookies stay its own. Even then, a cookie whose name starts with `__Host
 or `__Host-unlock` (the preview gateway's own) never passes in either direction. The
 field is omitted when false, so profiles without it keep their digests.
 
+A preview profile may name one service with `"mount_pages": true` (never a hosted
+profile): a WordPress website's own server, which puts its app's standard pages on
+after its import (Repo C design note `STANDARD_PAGES.md` §14; `docs/plans/standard-pages.md`).
+A create for such a profile may carry the app's page files (below); the controller
+writes them to the preview's own folder, `<service-root>/previews/pages/<preview>/`
+(the folder 0755 and its files 0644 under a private 0700 parent, as the source's),
+and mounts it at `/pages` in that service alone with the source's options:
+`readonly,bind-recursive=readonly,bind-propagation=rprivate`, or
+`readonly,bind-propagation=rprivate` under gVisor. Inspection accepts exactly that
+read-only bind, in exactly that service, for a preview started with page files, and
+refuses a `/pages` mount anywhere else. The startup probe of such a profile mounts a
+probe page file there and reads it through the service's own user before the profile
+is approved. The folder goes with the source once the containers are gone, and a
+restart removes what an earlier controller left. A preview created without page
+files mounts nothing at `/pages`. The field is omitted when false, so other profiles
+keep their digests.
+
 Missing profile configuration or an unsupported host/profile leaves
 `preview_runtime=false` at `GET /v1/extensions/pdlc-experience`. At least one
 profile must pass the full isolation, blocked-egress, mount and loopback-access
@@ -187,7 +204,18 @@ Create: `POST /v1/runs/{runId}/previews`
 ```
 
 Use the actual registered run ID and a clean checkpoint activity ID from its
-activity API. Product authorization/task/version identities come from the
+activity API.
+
+A create may also carry `"pages"`: an app's page files, each
+`{"name": "privacy-policy.json", "content_base64": "..."}`, for a profile with a
+pages service only (otherwise 400 `invalid_request`). They are opaque named files:
+names match `^[a-z][a-z0-9-]{0,59}\.json$` and come in strictly increasing order,
+each is the canonical standard base64 of a UTF-8 JSON object of at most 256 KiB,
+at most 20 files and 1 MiB in all. Such a create may be up to 1,463,640 bytes
+(`serviceapi.MaxPageFilesRequestBytes`); without pages it keeps 8192. The receipt
+binds the files by `pages_digest` (the SHA-256 of one `<name> <sha256 of its bytes>`
+line per file, in name order), which the preview answers; the journal never keeps
+the files, and a create without them keeps its digest. Product authorization/task/version identities come from the
 controller-created admission capsule, not the caller.
 
 List: `GET /v1/runs/{runId}/previews` returns `PreviewListV1` with `run_id` and a

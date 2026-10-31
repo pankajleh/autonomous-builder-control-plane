@@ -1284,6 +1284,8 @@ type testPreviewController struct {
 	calls             int
 	forgot            int
 	err               error
+	// created is the last create's command, as the controller got it.
+	created PreviewRequestV1
 }
 
 func grantPreviewControl(s *Server) {
@@ -1297,8 +1299,9 @@ func (p *testPreviewController) ResolvePreviewRoute(_ context.Context, principal
 	p.routeRun, p.routeID = run, id
 	return p.route, p.err
 }
-func (p *testPreviewController) CreatePreview(_ context.Context, principal Principal, authorityDigest, _ string, _ PreviewRequestV1) (PreviewV1, error) {
+func (p *testPreviewController) CreatePreview(_ context.Context, principal Principal, authorityDigest, _ string, c PreviewRequestV1) (PreviewV1, error) {
 	p.calls++
+	p.created = c
 	p.principal = principal
 	p.authorityDigest = authorityDigest
 	return p.result, p.err

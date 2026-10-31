@@ -44,7 +44,7 @@ func routeService(t *testing.T) (*Service, *routeRuntime, serviceapi.PreviewV1, 
 	s, _ := serviceAt(t, filepath.Join(t.TempDir(), "previews"), &rt.memoryRuntime, func() time.Time { return now })
 	s.runtime = rt
 	p, c := testProfile(), createCommand("route-create")
-	r := createReceipt(principal(), testAuthorityDigest, "run-1", c)
+	r := createReceipt(principal(), testAuthorityDigest, "run-1", c, "")
 	v := serviceapi.PreviewV1{
 		SchemaVersion: "PreviewV1", PreviewID: jsonDigest([]string{r.Key, r.Digest}), Revision: 1, RunID: "run-1",
 		CheckpointActivityID: c.CheckpointActivityID, SourceSHA: strings.Repeat("c", 40), ProductAuthorizationID: "auth-1", ProductTaskID: "task-1", ProductVersionID: "version-1",
