@@ -13,6 +13,9 @@
 //
 // No credential leaves ABCP: answers carry only the state, when it was signed
 // in, and a pending device sign-in's link and code.
+//
+// A signed-in Claude lane also answers one question at a time for an
+// administrator's own app (ask.go; Repo C AI_IN_EVERY_APP §10, AE3).
 package accountlane
 
 import (
@@ -82,12 +85,18 @@ type Manager struct {
 	pending map[string]*DeviceLogin
 	ctx     context.Context
 	cancel  context.CancelFunc
+
+	ask AskConfig
+	// asking holds one slot per lane: the question it is answering.
+	asking map[string]chan struct{}
 }
 
 // New checks every lane and answers the manager. A lane whose file or home is
 // not the operator's private one, or whose file gives anything but its home
-// (and, for Claude, its token), is refused.
-func New(file FileV1, start StartDeviceLogin, clock func() time.Time) (*Manager, error) {
+// (and, for Claude, its token), is refused. Without WithAsk, a question is
+// asked of `claude` on the PATH, with DefaultAskModel, DefaultAskTimeout and
+// DefaultAskBusyWait.
+func New(file FileV1, start StartDeviceLogin, clock func() time.Time, options ...Option) (*Manager, error) {
 	if file.SchemaVersion != 1 || len(file.Lanes) == 0 || len(file.Lanes) > MaxLanes {
 		return nil, errors.New("invalid account lanes file")
 	}
@@ -113,8 +122,18 @@ func New(file FileV1, start StartDeviceLogin, clock func() time.Time) (*Manager,
 			return nil, err
 		}
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Manager{lanes: append([]LaneV1(nil), file.Lanes...), start: start, clock: clock, pending: map[string]*DeviceLogin{}, ctx: ctx, cancel: cancel}, nil
+	m := &Manager{lanes: append([]LaneV1(nil), file.Lanes...), start: start, clock: clock, pending: map[string]*DeviceLogin{},
+		ask: AskConfig{Model: DefaultAskModel, Timeout: DefaultAskTimeout, BusyWait: DefaultAskBusyWait}, asking: map[string]chan struct{}{}}
+	for _, lane := range file.Lanes {
+		m.asking[lane.Lane] = make(chan struct{}, 1)
+	}
+	for _, option := range options {
+		if err := option(m); err != nil {
+			return nil, err
+		}
+	}
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	return m, nil
 }
 
 // Close stops every pending device sign-in.

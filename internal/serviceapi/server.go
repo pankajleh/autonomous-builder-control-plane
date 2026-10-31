@@ -384,6 +384,10 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 	}
+	if isAccountLaneAsk(request) {
+		// A question to an account lane may carry three pictures: the relay's megabyte and 16 KB more.
+		limit = MaxAccountLaneAskBytes
+	}
 	if request.ContentLength > limit {
 		s.writeError(writer, http.StatusRequestEntityTooLarge, ErrorV1{Code: "invalid_request", Message: "request body exceeds limit", RequestID: requestID})
 		return
