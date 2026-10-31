@@ -138,6 +138,10 @@ type Manager struct {
 	// relayHost is where sites' front-door blocks send Autobuild's paths
 	// (BF-08a); empty, they send nothing on.
 	relayHost string
+
+	// pageFiles are the page files of each pages operation not yet run
+	// (pages.go), by operation id: held in memory alone, never recorded.
+	pageFiles map[string][]serviceapi.PageFile
 }
 
 // New keeps targets in dir, a folder open to the controller's user alone.

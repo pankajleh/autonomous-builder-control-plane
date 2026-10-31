@@ -97,7 +97,10 @@ func newLocalRemote(t *testing.T) *localRemote {
 	// puts back for real; a website's start on a database with no WordPress
 	// installs it, with the administrator's password on its volume, and keeps
 	// the env files it was given in $S/c-<name>.env. $HOME/reset.fails makes a
-	// reset link not sent.
+	// reset link not sent. A website's kit is 1.2.0, or what $S/c-<name>.kit
+	// says; its container's /scratch/autobuild-pages is $S/pages-<name>; its
+	// page set keeps each page as $S/page-<name>-<slug>, which $S/page-<slug>.edited
+	// makes kept and $S/page-<slug>.refused refused, as the kit does.
 	fake := `#!/bin/sh
 echo "$@" >> "$HOME/docker.log"
 S="$HOME/.docker"
@@ -175,6 +178,21 @@ case "$1" in
         echo '{"public.people":2}' > "$S/db-$db"; exit 0 ;;
     esac
     case "$*" in
+      *"plugin get autobuild-site --field=version"*) if [ -f "$S/c-$n.kit" ]; then cat "$S/c-$n.kit"; else echo 1.2.0; fi ;;
+      "/bin/busybox rm -rf /scratch/autobuild-pages") rm -rf "$S/pages-$n" ;;
+      "/bin/busybox mkdir -m 700 /scratch/autobuild-pages") mkdir -m 700 "$S/pages-$n" ;;
+      "/bin/busybox tee /scratch/autobuild-pages/"*) f=$(last "$@"); [ -d "$S/pages-$n" ] || exit 1; cat > "$S/pages-$n/${f##*/}" ;;
+      *"autobuild-site page set "*)
+        slug=""; file=""; prev=""; for a; do [ "$prev" = set ] && slug=$a; [ "$prev" = "$slug" ] && [ -n "$slug" ] && [ -z "$file" ] && [ "$a" != "$slug" ] && file=$a; prev=$a; done
+        src="$S/pages-$n/${file##*/}"
+        [ -f "$src" ] || { echo "Error: $file cannot be read" >&2; exit 1; }
+        if [ -f "$S/page-$slug.refused" ]; then printf 'Error: The page was not set:\nthe content holds a block or markup a standard page never has\n' >&2; exit 1; fi
+        if [ -f "$S/page-$slug.edited" ]; then printf '{"slug":"%s","page":"kept","why":"edited in WordPress since it was last imported or set","footer":"none"}\n' "$slug"; exit 0; fi
+        kept="$S/page-$n-$slug"; page=created; footer=added
+        if [ -f "$kept" ]; then footer=there; if cmp -s "$kept" "$src"; then page=unchanged; else page=updated; fi; fi
+        cp "$src" "$kept"
+        echo "Warning: a line WP-CLI may print first" >&2
+        printf '{"slug":"%s","page":"%s","why":"","footer":"%s"}\n' "$slug" "$page" "$footer" ;;
       *pg_isready*|*mariadb-admin*) exit 0 ;;
       *"autobuild-mariadb create-site "*)
         d=$(last "$@"); IFS= read -r pw; echo "$pw" >> "$S/mariadb.stdin"; printf '%s' "$pw" > "$S/role-$d"

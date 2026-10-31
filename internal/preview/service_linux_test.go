@@ -60,6 +60,8 @@ type memoryRuntime struct {
 	keptOverlap              bool
 	// keptVolumes is each kept-data key whose volume exists, by its first 24 hex characters, as Docker names it.
 	keptVolumes map[string]bool
+	// pagesSeen is each start with page files (pages_linux_test.go).
+	pagesSeen []pagesStart
 }
 
 func (r *memoryRuntime) Available(PreviewProfileV1) bool {

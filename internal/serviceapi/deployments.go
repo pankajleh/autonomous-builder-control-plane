@@ -173,10 +173,11 @@ type OperationStepV1 struct {
 // OperationV1 is a change ABCP carries out on a target. Kind is "apply",
 // "remove", "backup", "restore", "check_backup", "nightly" (every Node app on
 // the target, with no site of its own), "stop", "start", "remove_data",
-// "clean" or "drift" (the last two with no site), or "isolation" (P1b: Site
-// and another app kept apart). State is "queued", "running",
-// "succeeded", "failed" or "unknown" (interrupted: unknown until reconciled,
-// never safe to repeat blindly).
+// "clean" or "drift" (the last two with no site), "isolation" (P1b: Site
+// and another app kept apart) or "pages" (a WordPress website's page files
+// put on, Repo C design note STANDARD_PAGES.md §14). State is "queued",
+// "running", "succeeded", "failed" or "unknown" (interrupted: unknown until
+// reconciled, never safe to repeat blindly).
 type OperationV1 struct {
 	SchemaVersion string            `json:"schema_version"`
 	OperationID   string            `json:"operation_id"`
@@ -189,6 +190,34 @@ type OperationV1 struct {
 	Steps         []OperationStepV1 `json:"steps"`
 	StartedAt     string            `json:"started_at"`
 	EndedAt       string            `json:"ended_at,omitempty"`
+	// Pages is what each page file came to on the site, once a pages
+	// operation's set_pages step ran; omitted for every other operation.
+	Pages []SitePageV1 `json:"pages,omitempty"`
+}
+
+// SitePagesRequestV1 puts an app's page files on its WordPress website on a
+// target (Repo C design note STANDARD_PAGES.md §14): a backup first, as before
+// an update, then each file into the site's container and the kit's
+// `wp autobuild-site page set <name less .json> <file> --format=json` there.
+// RequestID makes a repeated request answer the same operation; the same
+// RequestID with other files is refused.
+type SitePagesRequestV1 struct {
+	RequestID string       `json:"request_id"`
+	Files     []PageFileV1 `json:"files"`
+}
+
+// SitePageV1 is what one page file came to on a WordPress website. Outcome is
+// what the kit's command answered, "created", "updated", "unchanged" or "kept"
+// (left as the site has it, Why saying why, as the kit words it), or
+// "refused" when the command did not set it (Detail is its last line of
+// error). Footer is the footer link's: "none", "there", "added" or "full";
+// empty when refused. One file kept or refused never fails the operation.
+type SitePageV1 struct {
+	File    string `json:"file"`
+	Outcome string `json:"outcome"`
+	Why     string `json:"why,omitempty"`
+	Footer  string `json:"footer,omitempty"`
+	Detail  string `json:"detail,omitempty"`
 }
 
 // SiteCheckV1 is the last check that a site answers with its release.
@@ -531,6 +560,9 @@ type DeploymentController interface {
 	// password-reset email (Repo C WORDPRESS_WEBSITES.md §13.3).
 	SiteAdminPassword(ctx context.Context, target, site string) (SiteAdminPasswordV1, error)
 	SiteResetLink(ctx context.Context, target, site string) (SiteResetLinkV1, error)
+	// SetSitePages puts page files on a WordPress website as an operation,
+	// after a backup (Repo C STANDARD_PAGES.md §14).
+	SetSitePages(ctx context.Context, target, site string, request SitePagesRequestV1) (OperationV1, error)
 }
 
 var (
@@ -615,7 +647,7 @@ func (s *Server) releases(w http.ResponseWriter, r *http.Request, principal Prin
 
 // /v1/targets/{key}/plans, /apply, /operations/{id}, /sites, /sites/{name}/remove, /sites/{name}/backups,
 // /sites/{name}/backups/{backup} (its file), /sites/{name}/backups/{backup}/spreadsheets, /sites/{name}/backups/{backup}/check, /sites/{name}/errors, /sites/{name}/stop and /start,
-// /sites/{name}/admin-password, /sites/{name}/reset-link, /databases, /databases/{name}/remove, /clean, /drift and /isolation
+// /sites/{name}/admin-password, /sites/{name}/reset-link, /sites/{name}/pages, /databases, /databases/{name}/remove, /clean, /drift and /isolation
 func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id string, parts []string, body func(any) bool) {
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid deployment request", RequestID: id})
@@ -786,6 +818,20 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 			return
 		}
 		s.writeJSON(w, http.StatusOK, sent)
+	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "pages" && r.Method == http.MethodPost:
+		// Page files have a bound of their own (pagefiles.go).
+		var request SitePagesRequestV1
+		data, err := io.ReadAll(io.LimitReader(r.Body, MaxPageFilesRequestBytes+1))
+		if err != nil || len(data) == 0 || len(data) > MaxPageFilesRequestBytes || decodeStrictJSON(data, &request) != nil || len(request.Files) == 0 {
+			bad()
+			return
+		}
+		if _, err := DecodePageFiles(request.Files); err != nil {
+			bad()
+			return
+		}
+		op, err := s.reserved.Deployments.SetSitePages(r.Context(), key, parts[2], request)
+		operation(op, err, http.StatusAccepted)
 	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "relay" && r.Method == http.MethodPut:
 		var relay SiteRelayV1
 		if !body(&relay) {

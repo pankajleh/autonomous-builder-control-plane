@@ -108,6 +108,24 @@ type ServiceProfileV1 struct {
 	// Settings names the values a hosted start must carry for this service (hosted profiles only, at most one
 	// service), each one of hostedSettings. Omitted when unset.
 	Settings []string `json:"settings,omitempty"`
+	// MountPages mounts the page files a preview was created with read-only at /pages in this service (Repo C design
+	// note STANDARD_PAGES §14: a WordPress website's standard pages, which its runtime puts on after its import). At
+	// most one service of a preview profile, never a hosted one. A preview created without page files mounts nothing
+	// there. Omitted when false, so other profiles keep their digests.
+	MountPages bool `json:"mount_pages,omitempty"`
+}
+
+// PagesPath is where a preview's page files are mounted.
+const PagesPath = "/pages"
+
+// pagesService returns the index of the service that takes page files, or -1.
+func (p PreviewProfileV1) pagesService() int {
+	for i, s := range p.Services {
+		if s.MountPages {
+			return i
+		}
+	}
+	return -1
 }
 
 // settingsService returns the index of the service that takes settings, or -1.
@@ -283,6 +301,15 @@ func (p PreviewProfileV1) Validate() error {
 		}
 	}
 	if takers > 1 {
+		return ErrUnavailable
+	}
+	pages := 0
+	for _, s := range p.Services {
+		if s.MountPages {
+			pages++
+		}
+	}
+	if pages > 1 || pages == 1 && p.Hosted {
 		return ErrUnavailable
 	}
 	return nil

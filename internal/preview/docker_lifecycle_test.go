@@ -157,6 +157,19 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 		}
 		v["HostConfig"].(map[string]any)["Runtime"] = runtime
 		v["HostConfig"].(map[string]any)["ExtraHosts"] = hosts
+		// A page files bind (STANDARD_PAGES §14) is reported as Docker reports a read-only bind.
+		for j, arg := range created {
+			if arg == "--mount" && j+1 < len(created) && strings.Contains(created[j+1], ",dst="+PagesPath+",") {
+				source := strings.TrimPrefix(strings.Split(created[j+1], ",")[1], "src=")
+				mounts, _ := v["Mounts"].([]any)
+				if typed, ok := v["Mounts"].([]map[string]any); ok {
+					for _, m := range typed {
+						mounts = append(mounts, m)
+					}
+				}
+				v["Mounts"] = append(mounts, map[string]any{"Type": "bind", "Destination": PagesPath, "Source": source, "RW": false})
+			}
+		}
 		return encoded([]any{v})
 	case "ps":
 		ids := []string{}
@@ -179,6 +192,21 @@ func (f *dockerFixture) run(ctx context.Context, args ...string) (string, error)
 				return "", ErrUnavailable
 			}
 			file := filepath.Join(path, probeSourceName)
+			info, err := os.Stat(file)
+			if err != nil || info.Mode().Perm()&0004 == 0 {
+				return "", ErrUnavailable
+			}
+			data, err := os.ReadFile(file)
+			return string(data), err
+		}
+		if strings.Contains(joined, "cat "+PagesPath+"/"+probePagesName) {
+			// The probe's page file, read through the bind as the service's user: readable for others, as for the source.
+			path := filepath.Join(f.d.root, "pages", f.id)
+			dir, err := os.Stat(path)
+			if err != nil || dir.Mode().Perm()&0005 != 0005 {
+				return "", ErrUnavailable
+			}
+			file := filepath.Join(path, probePagesName)
 			info, err := os.Stat(file)
 			if err != nil || info.Mode().Perm()&0004 == 0 {
 				return "", ErrUnavailable

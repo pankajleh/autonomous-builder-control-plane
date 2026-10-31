@@ -22,6 +22,12 @@ type Runtime interface {
 	Reconcile(context.Context) error
 }
 
+// pagesRuntime starts a preview with its page files read-only at /pages in its profile's pages service (Repo C design
+// note STANDARD_PAGES §14), and with its app's kept data when keyDigest names it ("" for a profile that keeps none).
+type pagesRuntime interface {
+	StartPages(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest, pages string) (string, error)
+}
+
 // keptRuntime starts a preview with its app's kept data and forgets that data (Repo C design note TRY_IT_KEEPS_DATA).
 type keptRuntime interface {
 	StartKept(ctx context.Context, id, path string, p PreviewProfileV1, keyDigest string) (string, error)
@@ -39,11 +45,13 @@ const KeptDataIdle = 90 * 24 * time.Hour
 func keptKey(task string) string { return jsonDigest([]string{"try-it-data", task}) }
 
 type Service struct {
-	mu                  sync.Mutex
-	store               *store
-	profiles            map[string]PreviewProfileV1
-	resolver            SourceResolver
-	checkout            Materializer
+	mu       sync.Mutex
+	store    *store
+	profiles map[string]PreviewProfileV1
+	resolver SourceResolver
+	checkout Materializer
+	// pageFiles keeps each preview's page files, beside the sources.
+	pageFiles           PageFiles
 	runtime             Runtime
 	ctx                 context.Context
 	cancel              context.CancelFunc
@@ -95,7 +103,7 @@ func newService(parent context.Context, root string, profiles map[string]Preview
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
-	s := &Service{store: store, profiles: profiles, resolver: resolver, checkout: checkout, runtime: runtime, ctx: ctx, cancel: cancel, workers: map[string]context.CancelFunc{}, keptLocks: map[string]*sync.Mutex{}, now: now}
+	s := &Service{store: store, profiles: profiles, resolver: resolver, checkout: checkout, pageFiles: PageFiles{Root: filepath.Join(root, "pages")}, runtime: runtime, ctx: ctx, cancel: cancel, workers: map[string]context.CancelFunc{}, keptLocks: map[string]*sync.Mutex{}, now: now}
 	// Restart never resumes candidate execution. Reconcile all objects carrying
 	// this private root's namespace, including objects created before a crash.
 	cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -103,7 +111,7 @@ func newService(parent context.Context, root string, profiles map[string]Preview
 	cleanCancel()
 	if runtimeErr != nil {
 		s.unavailable = true
-	} else if checkout.Reconcile() != nil {
+	} else if checkout.Reconcile() != nil || s.pageFiles.Reconcile() != nil {
 		s.unavailable = true
 	}
 	if store.load() != nil {
@@ -173,7 +181,12 @@ func (s *Service) CreatePreview(ctx context.Context, p serviceapi.Principal, aut
 	if serviceapi.ValidatePreviewRequestV1(c, run) != nil || !owner(p).valid() || !sha256Pattern.MatchString(authorityDigest) {
 		return empty, serviceapi.ErrPreviewIneligible
 	}
-	receipt := createReceipt(p, authorityDigest, run, c)
+	pages, err := serviceapi.DecodePageFiles(c.Pages)
+	if err != nil {
+		return empty, serviceapi.ErrPreviewIneligible
+	}
+	pagesDigest := serviceapi.PageFilesDigest(pages)
+	receipt := createReceipt(p, authorityDigest, run, c, pagesDigest)
 	key, d := receipt.Key, receipt.Digest
 	s.mu.Lock()
 	if s.closed || s.store.broken {
@@ -188,6 +201,11 @@ func (s *Service) CreatePreview(ctx context.Context, p serviceapi.Principal, aut
 	if !ok || profile.Hosted {
 		s.mu.Unlock()
 		return empty, serviceapi.ErrPreviewProfile
+	}
+	// Only a profile with a pages service takes page files (a WordPress website's, STANDARD_PAGES §14).
+	if len(pages) > 0 && profile.pagesService() < 0 {
+		s.mu.Unlock()
+		return empty, serviceapi.ErrPreviewPagesRefused
 	}
 	if s.unavailable || s.ctx.Err() != nil || !s.runtime.Available(profile) {
 		s.mu.Unlock()
@@ -212,7 +230,7 @@ func (s *Service) CreatePreview(ctx context.Context, p serviceapi.Principal, aut
 	}
 	now := s.now().UTC()
 	id := jsonDigest([]string{key, d})
-	v := serviceapi.PreviewV1{SchemaVersion: "PreviewV1", PreviewID: id, Revision: s.store.revisions[run] + 1, RunID: run, CheckpointActivityID: c.CheckpointActivityID, SourceSHA: source.SHA, ProductAuthorizationID: source.ProductAuthorizationID, ProductTaskID: source.ProductTaskID, ProductVersionID: source.ProductVersionID, ProfileID: c.ProfileID, ProfileDigest: profile.Digest(), Status: "REQUESTED", Health: "UNKNOWN", CreatedAt: stamp(now), ExpiresAt: stamp(now.Add(time.Duration(profile.TTLSeconds) * time.Second)), ValidationID: source.ValidationID, EvidenceID: jsonDigest([]string{id, "REQUESTED"}), RequestID: c.RequestID, RequestDigest: d}
+	v := serviceapi.PreviewV1{SchemaVersion: "PreviewV1", PreviewID: id, Revision: s.store.revisions[run] + 1, RunID: run, CheckpointActivityID: c.CheckpointActivityID, SourceSHA: source.SHA, ProductAuthorizationID: source.ProductAuthorizationID, ProductTaskID: source.ProductTaskID, ProductVersionID: source.ProductVersionID, ProfileID: c.ProfileID, ProfileDigest: profile.Digest(), Status: "REQUESTED", Health: "UNKNOWN", CreatedAt: stamp(now), ExpiresAt: stamp(now.Add(time.Duration(profile.TTLSeconds) * time.Second)), ValidationID: source.ValidationID, EvidenceID: jsonDigest([]string{id, "REQUESTED"}), RequestID: c.RequestID, RequestDigest: d, PagesDigest: pagesDigest}
 	receipt.Result = v
 	if err = s.store.append(v, &receipt); err != nil {
 		return empty, serviceapi.ErrPreviewUnavailable
@@ -220,7 +238,7 @@ func (s *Service) CreatePreview(ctx context.Context, p serviceapi.Principal, aut
 	workerCtx, cancel := context.WithDeadline(s.ctx, parseTime(v.ExpiresAt))
 	s.workers[id] = cancel
 	s.wg.Add(1)
-	go s.work(workerCtx, id, source, profile)
+	go s.work(workerCtx, id, source, profile, pages)
 	return v, nil
 }
 func stamp(t time.Time) string     { return t.UTC().Format(time.RFC3339Nano) }
@@ -256,7 +274,9 @@ func (s *Service) transition(id, status, health, route string) bool {
 	}
 	return !terminal(v.Status)
 }
-func (s *Service) work(ctx context.Context, id string, source Source, p PreviewProfileV1) {
+
+// work starts a preview and watches it; pages are the page files it was created with, mounted at /pages from its start.
+func (s *Service) work(ctx context.Context, id string, source Source, p PreviewProfileV1, pages []serviceapi.PageFile) {
 	defer s.wg.Done()
 	defer func() {
 		cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -264,6 +284,10 @@ func (s *Service) work(ctx context.Context, id string, source Source, p PreviewP
 		cancel()
 		if err == nil {
 			err = s.checkout.Remove(id)
+		}
+		// Page files go once the containers mounting them are gone, as the source does.
+		if err == nil {
+			err = s.pageFiles.Remove(id)
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -300,7 +324,19 @@ func (s *Service) work(ctx context.Context, id string, source Source, p PreviewP
 		fail()
 		return
 	}
+	pagesPath := ""
+	if len(pages) > 0 {
+		if pagesPath, err = s.pageFiles.Write(id, pages); err != nil {
+			fail()
+			return
+		}
+	}
 	if ctx.Err() != nil || !s.transition(id, "STARTING", "UNKNOWN", "") {
+		fail()
+		return
+	}
+	paged, pagesOK := s.runtime.(pagesRuntime)
+	if pagesPath != "" && !pagesOK {
 		fail()
 		return
 	}
@@ -319,8 +355,14 @@ func (s *Service) work(ctx context.Context, id string, source Source, p PreviewP
 			fail()
 			return
 		}
-		route, err = kept.StartKept(ctx, id, path, p, keptKey(source.ProductTaskID))
+		if pagesPath != "" {
+			route, err = paged.StartPages(ctx, id, path, p, keptKey(source.ProductTaskID), pagesPath)
+		} else {
+			route, err = kept.StartKept(ctx, id, path, p, keptKey(source.ProductTaskID))
+		}
 		lock.Unlock()
+	} else if pagesPath != "" {
+		route, err = paged.StartPages(ctx, id, path, p, "", pagesPath)
 	} else {
 		route, err = s.runtime.Start(ctx, id, path, p)
 	}
