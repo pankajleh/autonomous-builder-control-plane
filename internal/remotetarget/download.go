@@ -1,6 +1,7 @@
 package remotetarget
 
 import (
+	"archive/tar"
 	"context"
 	"errors"
 	"io"
@@ -18,7 +19,8 @@ import (
 // BF10_GOING_BACK_SAFELY.md §9). The size kept for it is checked on the server
 // first; then the file is read as it comes, never held whole or parsed.
 // Closing it ends the read and the session. It runs beside operations, since
-// it changes nothing.
+// it changes nothing. A WordPress website's backup is two files, read as one
+// tar (openWebsiteBackup).
 func (m *Manager) OpenBackup(ctx context.Context, key, site, backup string) (io.ReadCloser, int64, error) {
 	if !siteNamePattern.MatchString(site) || !backupIDPattern.MatchString(backup) {
 		return nil, 0, serviceapi.ErrBackupUnknown
@@ -26,6 +28,9 @@ func (m *Manager) OpenBackup(ctx context.Context, key, site, backup string) (io.
 	r, b, err := m.listedBackup(key, site, backup)
 	if err != nil {
 		return nil, 0, err
+	}
+	if wpData(r, site) {
+		return m.openWebsiteBackup(ctx, r, site, b)
 	}
 	size := b.Bytes
 	session, outcome := m.open(ctx, r)
@@ -69,6 +74,10 @@ func (m *Manager) OpenSpreadsheets(ctx context.Context, key, site, backup string
 	if err != nil {
 		return nil, err
 	}
+	if wpData(r, site) {
+		// A WordPress website's dump is MariaDB's SQL, which pgcsv does not read.
+		return nil, serviceapi.ErrTargetInvalid
+	}
 	taken, err := time.Parse(time.RFC3339, b.TakenAt)
 	if err != nil {
 		return nil, serviceapi.ErrBackupUnknown
@@ -109,6 +118,76 @@ func (m *Manager) OpenSpreadsheets(ctx context.Context, key, site, backup string
 		<-done
 		_ = session.Close()
 	}}, nil
+}
+
+// The files in a WordPress website's backup as it is downloaded.
+const (
+	websiteDumpName    = "database.sql"
+	websiteUploadsName = "uploads.tar"
+)
+
+// websiteBackupSize is the size of a WordPress website's backup as one tar:
+// a ustar header and the file in whole blocks for each of the two files, and
+// the two empty blocks that end it.
+func websiteBackupSize(dump, uploads int64) int64 {
+	blocks := func(n int64) int64 { return 512 + (n+511)/512*512 }
+	return blocks(dump) + blocks(uploads) + 1024
+}
+
+// openWebsiteBackup opens one listed backup of a WordPress website (Repo C
+// design note WORDPRESS_WEBSITES.md §13.1, "Download gives both"): one tar of
+// its database's dump (database.sql) and its uploads' tar (uploads.tar), each
+// as it is on the server. Both sizes kept for it are checked on the server
+// first, so the tar's size is known before it is read; then each file is read
+// as it comes into the tar, never held whole or parsed. A file that is not
+// the size kept for it ends the read in an error.
+func (m *Manager) openWebsiteBackup(ctx context.Context, r record, site string, b backupRecord) (io.ReadCloser, int64, error) {
+	taken, err := time.Parse(time.RFC3339, b.TakenAt)
+	if err != nil || b.UploadsBytes == nil || *b.UploadsBytes <= 0 {
+		return nil, 0, serviceapi.ErrBackupUnknown
+	}
+	dump, uploads := b.Bytes, *b.UploadsBytes
+	session, outcome := m.open(ctx, r)
+	if session == nil {
+		return nil, 0, errStep(outcome)
+	}
+	out, err := run(ctx, session, fill(websiteBackupSizesScript, "N", site, "ID", b.BackupID), nil)
+	if err != nil {
+		_ = session.Close()
+		return nil, 0, err
+	}
+	if strings.Join(strings.Fields(out), " ") != strconv.FormatInt(dump, 10)+" "+strconv.FormatInt(uploads, 10) {
+		_ = session.Close()
+		return nil, 0, serviceapi.ErrBackupUnknown
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tw := tar.NewWriter(pw)
+		write := func(name, file string, size int64) error {
+			if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: size, Typeflag: tar.TypeReg, ModTime: taken,
+				Format: tar.FormatUSTAR}); err != nil {
+				return err
+			}
+			return session.Stream(streamCtx, fill(backupFileReadScript, "N", site, "FILE", file), tw)
+		}
+		err := write(websiteDumpName, b.BackupID+".dump", dump)
+		if err == nil {
+			err = write(websiteUploadsName, b.BackupID+".uploads.tar", uploads)
+		}
+		if err == nil {
+			err = tw.Close()
+		}
+		_ = pw.CloseWithError(err)
+	}()
+	return &backupReader{PipeReader: pr, end: func() {
+		cancel()
+		_ = pr.Close()
+		<-done
+		_ = session.Close()
+	}}, websiteBackupSize(dump, uploads), nil
 }
 
 // listedBackup is the target and a backup it lists, with the size kept for it.
@@ -154,6 +233,16 @@ if [ -f "$f" ]; then wc -c < "$f"; else echo missing; fi
 	// backupReadScript writes a backup's file to its output as it is.
 	backupReadScript = `set -eu
 exec cat "$HOME/autobuild/backups/@N@/@ID@.dump"
+`
+	// websiteBackupSizesScript prints a WordPress website's backup's two
+	// sizes on the server, or missing for each that is not there.
+	websiteBackupSizesScript = `set -eu
+B="$HOME/autobuild/backups/@N@"
+for f in "$B/@ID@.dump" "$B/@ID@.uploads.tar"; do if [ -f "$f" ]; then wc -c < "$f"; else echo missing; fi; done
+`
+	// backupFileReadScript writes one of a backup's files to its output as it is.
+	backupFileReadScript = `set -eu
+exec cat "$HOME/autobuild/backups/@N@/@FILE@"
 `
 	// backupDataScript writes a backup's data as text, with the database container's own pg_restore and no database.
 	backupDataScript = `set -eu

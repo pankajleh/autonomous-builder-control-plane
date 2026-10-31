@@ -26,9 +26,12 @@ import (
 // Node app and checks the backup (BF-14.2b-1, second part). A Node app can be
 // stopped and started, an app's data removed once its site is off, a target
 // cleaned up once nothing is left, and a target checked against ABCP's record
-// (BF-14.5a).
+// (BF-14.5a). A WordPress website (kind wp, Repo C design note
+// WORDPRESS_WEBSITES.md §13, W5b) goes on a target as a Node app does, with
+// the shared MariaDB in place of the Postgres and its uploads backed up beside
+// its database; its administrator's password is read from it once.
 
-// ReleaseV1 describes a release ABCP keeps.
+// ReleaseV1 describes a release ABCP keeps. Kind is "static", "node" or "wp".
 type ReleaseV1 struct {
 	SchemaVersion string `json:"schema_version"`
 	Digest        string `json:"digest"`
@@ -66,6 +69,12 @@ type PlanCreateV1 struct {
 	// and it was taken while that same release ran; today's data is backed up
 	// first. Not with a conversion.
 	StartFrom string `json:"start_from,omitempty"`
+	// AdminEmail is the owner's sign-in address, required for a WordPress
+	// website's release and refused for any other (Repo C design note
+	// WORDPRESS_WEBSITES.md §13.3): the site's first start makes its
+	// administrator with it as the user name and email. A site keeps the
+	// address its data was made with.
+	AdminEmail string `json:"admin_email,omitempty"`
 }
 
 // MaxConversionBytes bounds a plan's conversion.
@@ -110,19 +119,25 @@ type PlanV1 struct {
 	// with stop_app, back_up, convert before switch_site. A Node app updated
 	// onto a backup: the same with stop_app, back_up, restore_data before
 	// switch_site, and clean_up after check. A restore: back_up, restore_copy,
-	// stop_app, switch_database, start_app, wait_health, check, clean_up.
+	// stop_app, switch_database, start_app, wait_health, check, clean_up. A
+	// WordPress website's steps are a Node app's; its restore puts its uploads
+	// back too, with restore_files after switch_database.
 	Steps []string `json:"steps"`
 	// Conversion is the SQL a plan runs on the app's data before the release
 	// starts, when it has one.
 	Conversion *PlanConversionV1 `json:"conversion,omitempty"`
 	// StartFrom is the backup the release starts on, when it starts on one.
 	StartFrom *BackupV1 `json:"start_from,omitempty"`
-	// Images are what a Node app runs, by digest; Database is its database and
-	// login, made on the server the first time; Sandbox is "gvisor" or
-	// "standard". All three are empty for a static site.
+	// Images are what a Node app or a WordPress website runs, by digest;
+	// Database is its database and login, made on the server the first time
+	// (app_<site>, or wp_<site> for a WordPress website); Sandbox is "gvisor"
+	// or "standard". All three are empty for a static site.
 	Images   []string `json:"images,omitempty"`
 	Database string   `json:"database,omitempty"`
 	Sandbox  string   `json:"sandbox,omitempty"`
+	// AdminEmail is a WordPress website's administrator's address: the one
+	// asked for, or the one the site's kept data was made with.
+	AdminEmail string `json:"admin_email,omitempty"`
 	// Backup is the backup a restore plan puts back; Release is then the
 	// release the app keeps running.
 	Backup    *BackupV1 `json:"backup,omitempty"`
@@ -184,12 +199,13 @@ type SiteCheckV1 struct {
 }
 
 // SiteV1 is a site ABCP put on a target. State is "deploying", "live",
-// "failed", "removing", "stopped" (a Node app paused, BF-14.5a) or "unknown".
+// "failed", "removing", "stopped" (a Node app or a WordPress website paused,
+// BF-14.5a) or "unknown".
 type SiteV1 struct {
 	Name string `json:"name"`
 	Host string `json:"host"`
-	// Kind is "node" for a Node app and empty for a static site; a Node app
-	// also names its database and sandbox.
+	// Kind is "node" for a Node app, "wp" for a WordPress website and empty for
+	// a static site; an app also names its database and sandbox.
 	Kind      string       `json:"kind,omitempty"`
 	Database  string       `json:"database,omitempty"`
 	Sandbox   string       `json:"sandbox,omitempty"`
@@ -207,14 +223,18 @@ type SitesV1 struct {
 	Sites         []SiteV1 `json:"sites"`
 }
 
-// BackupV1 is one backup of a Node app's database, kept on its server.
-// Reason is "before_update", "before_restore", "nightly" or "manual".
+// BackupV1 is one backup of a Node app's database, kept on its server, or of
+// a WordPress website's database and uploads. Reason is "before_update",
+// "before_restore", "nightly" or "manual".
 type BackupV1 struct {
 	BackupID string `json:"backup_id"`
 	Reason   string `json:"reason"`
 	TakenAt  string `json:"taken_at"`
-	Bytes    int64  `json:"bytes"`
-	Release  string `json:"release,omitempty"`
+	// Bytes is the database's dump; UploadsBytes is a WordPress website's
+	// uploads (its media library) as a tar, kept beside it.
+	Bytes        int64  `json:"bytes"`
+	UploadsBytes *int64 `json:"uploads_bytes,omitempty"`
+	Release      string `json:"release,omitempty"`
 	// Tables and Rows are what the database held when the backup was taken,
 	// counted in the same snapshot as the dump.
 	Tables *int   `json:"tables,omitempty"`
@@ -410,6 +430,40 @@ type SiteSetupV1 struct {
 	Token         string `json:"token"`
 }
 
+// SiteAdminPasswordV1 is a WordPress website's administrator, with the
+// password its first start made, read from the site once (Repo C design note
+// WORDPRESS_WEBSITES.md §13.3): the site deletes it as it is read, and ABCP
+// neither logs nor keeps it. Taken is true, and Password empty, once it was
+// read before. User is the administrator's user name (the owner's address, or
+// admin when the address is longer than WordPress's 60 characters); WordPress
+// signs in by Email either way, at https://<Host>/wp-admin/.
+type SiteAdminPasswordV1 struct {
+	SchemaVersion string `json:"schema_version"`
+	Target        string `json:"target"`
+	Site          string `json:"site"`
+	Host          string `json:"host"`
+	User          string `json:"user"`
+	Email         string `json:"email"`
+	Password      string `json:"password,omitempty"`
+	Taken         bool   `json:"taken"`
+}
+
+// SiteResetLinkV1 says a WordPress website sent its administrator
+// WordPress's own password-reset email, the way the site sends its mail (the
+// server's relay); the link is never read by ABCP.
+type SiteResetLinkV1 struct {
+	SchemaVersion string `json:"schema_version"`
+	Target        string `json:"target"`
+	Site          string `json:"site"`
+	Email         string `json:"email"`
+	Sent          bool   `json:"sent"`
+}
+
+const (
+	SiteAdminPasswordSchemaV1 = "SiteAdminPasswordV1"
+	SiteResetLinkSchemaV1     = "SiteResetLinkV1"
+)
+
 const (
 	SiteSetupSchemaV1  = "SiteSetupV1"
 	NameSchemaV1       = "NameV1"
@@ -472,6 +526,11 @@ type DeploymentController interface {
 	// front door as an operation, so the site's block sends Autobuild's paths
 	// on to the relay (BF-08a).
 	SetSiteRelay(ctx context.Context, target, site string, relay SiteRelayV1) (OperationV1, error)
+	// SiteAdminPassword reads a WordPress website's administrator's password
+	// from the site once; SiteResetLink has the site send its administrator a
+	// password-reset email (Repo C WORDPRESS_WEBSITES.md §13.3).
+	SiteAdminPassword(ctx context.Context, target, site string) (SiteAdminPasswordV1, error)
+	SiteResetLink(ctx context.Context, target, site string) (SiteResetLinkV1, error)
 }
 
 var (
@@ -488,6 +547,7 @@ var (
 	ErrDataInUse        = errors.New("data in use")
 	ErrTargetInUse      = errors.New("target in use")
 	ErrSetupPending     = errors.New("setup pending")
+	ErrNotSent          = errors.New("not sent")
 )
 
 var (
@@ -555,7 +615,7 @@ func (s *Server) releases(w http.ResponseWriter, r *http.Request, principal Prin
 
 // /v1/targets/{key}/plans, /apply, /operations/{id}, /sites, /sites/{name}/remove, /sites/{name}/backups,
 // /sites/{name}/backups/{backup} (its file), /sites/{name}/backups/{backup}/spreadsheets, /sites/{name}/backups/{backup}/check, /sites/{name}/errors, /sites/{name}/stop and /start,
-// /databases, /databases/{name}/remove, /clean, /drift and /isolation
+// /sites/{name}/admin-password, /sites/{name}/reset-link, /databases, /databases/{name}/remove, /clean, /drift and /isolation
 func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id string, parts []string, body func(any) bool) {
 	bad := func() {
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid deployment request", RequestID: id})
@@ -701,6 +761,31 @@ func (s *Server) targetDeployments(w http.ResponseWriter, r *http.Request, id st
 			return
 		}
 		s.writeJSON(w, http.StatusOK, setup)
+	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "admin-password" && r.Method == http.MethodPost:
+		// A POST: taking the password deletes it on the site. The answer is
+		// never cached, logged or kept.
+		if !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		password, err := s.reserved.Deployments.SiteAdminPassword(r.Context(), key, parts[2])
+		if err != nil {
+			s.writeDeploymentError(w, id, err)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		s.writeJSON(w, http.StatusOK, password)
+	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "reset-link" && r.Method == http.MethodPost:
+		if !requestBodyEmpty(r) {
+			bad()
+			return
+		}
+		sent, err := s.reserved.Deployments.SiteResetLink(r.Context(), key, parts[2])
+		if err != nil {
+			s.writeDeploymentError(w, id, err)
+			return
+		}
+		s.writeJSON(w, http.StatusOK, sent)
 	case len(parts) == 4 && parts[1] == "sites" && siteNamePattern.MatchString(parts[2]) && parts[3] == "relay" && r.Method == http.MethodPut:
 		var relay SiteRelayV1
 		if !body(&relay) {
@@ -863,6 +948,8 @@ func (s *Server) writeDeploymentError(w http.ResponseWriter, id string, err erro
 		s.writeError(w, http.StatusConflict, ErrorV1{Code: "target_in_use", Message: "sites or app data are still on this target", RequestID: id})
 	case errors.Is(err, ErrBackupUnknown):
 		s.writeError(w, http.StatusNotFound, ErrorV1{Code: "backup_unknown", Message: "backup is not kept or cannot be restored", RequestID: id})
+	case errors.Is(err, ErrNotSent):
+		s.writeError(w, http.StatusBadGateway, ErrorV1{Code: "not_sent", Message: "the site could not send the email", RequestID: id, Retryable: true})
 	case errors.Is(err, ErrSetupPending):
 		s.writeError(w, http.StatusConflict, ErrorV1{Code: "setup_pending", Message: "the app has no setup token yet: start it again", RequestID: id})
 	case errors.Is(err, ErrOperationUnknown):

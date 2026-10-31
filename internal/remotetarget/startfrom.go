@@ -67,7 +67,7 @@ func (m *Manager) restoreData(ctx context.Context, session remote, key, site, id
 	if !ok {
 		return "", errStep("the backup is no longer kept")
 	}
-	restored, err := m.restoreCopy(ctx, session, key, site, b, "restore_"+db, true)
+	restored, err := m.restoreCopy(ctx, session, key, site, b, "restore_", true)
 	if err != nil {
 		return "", err
 	}

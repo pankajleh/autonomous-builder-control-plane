@@ -23,6 +23,8 @@ type testDeployments struct {
 	// zip is a backup's spreadsheets as made; zipErr ends them after it.
 	zip    string
 	zipErr error
+	// adminEmail is the last plan's administrator's address.
+	adminEmail string
 }
 
 var sampleOperation = OperationV1{SchemaVersion: OperationSchemaV1, OperationID: "op-0123456789abcdef", Target: "srv-0123456789ab", Kind: "apply",
@@ -40,7 +42,7 @@ func (d *testDeployments) Release(_ context.Context, digest string) (ReleaseV1, 
 	return ReleaseV1{SchemaVersion: ReleaseSchemaV1, Digest: digest}, d.err
 }
 func (d *testDeployments) CreatePlan(_ context.Context, target string, c PlanCreateV1) (PlanV1, error) {
-	d.conversion, d.startFrom = len(c.Conversion), c.StartFrom
+	d.conversion, d.startFrom, d.adminEmail = len(c.Conversion), c.StartFrom, c.AdminEmail
 	if c.Restore != nil {
 		d.calls = append(d.calls, "restore:"+target+":"+c.Restore.Site+":"+c.Restore.Backup)
 	} else {
@@ -161,6 +163,17 @@ func (d *testDeployments) SiteSetup(_ context.Context, target, site string) (Sit
 func (d *testDeployments) SetSiteRelay(_ context.Context, target, site string, relay SiteRelayV1) (OperationV1, error) {
 	d.calls = append(d.calls, "relay:"+target+":"+site+":"+fmt.Sprint(len(relay.Credential)))
 	return sampleOperation, d.err
+}
+
+func (d *testDeployments) SiteAdminPassword(_ context.Context, target, site string) (SiteAdminPasswordV1, error) {
+	d.calls = append(d.calls, "admin-password:"+target+":"+site)
+	return SiteAdminPasswordV1{SchemaVersion: SiteAdminPasswordSchemaV1, Target: target, Site: site, Host: "blog.example.com", User: "owner@example.com",
+		Email: "owner@example.com", Password: strings.Repeat("ab", 24)}, d.err
+}
+
+func (d *testDeployments) SiteResetLink(_ context.Context, target, site string) (SiteResetLinkV1, error) {
+	d.calls = append(d.calls, "reset-link:"+target+":"+site)
+	return SiteResetLinkV1{SchemaVersion: SiteResetLinkSchemaV1, Target: target, Site: site, Email: "owner@example.com", Sent: true}, d.err
 }
 
 func deploymentServer(t *testing.T, grant bool) (*Server, *testDeployments) {
@@ -458,6 +471,7 @@ func TestDeploymentsNeedTheGrantAndMapErrorsToStableCodes(t *testing.T) {
 		ErrDataInUse:         {http.StatusConflict, "data_in_use"},
 		ErrTargetInUse:       {http.StatusConflict, "target_in_use"},
 		ErrSetupPending:      {http.StatusConflict, "setup_pending"},
+		ErrNotSent:           {http.StatusBadGateway, "not_sent"},
 	} {
 		backend.err = err
 		r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/apply", `{"plan_id":"pln-0123456789abcdef","plan_hash":"`+strings.Repeat("a", 64)+`","request_id":"req-12345678"}`)
@@ -546,5 +560,73 @@ func TestASiteBackupsSpreadsheetsAreAnsweredAsTheyAreMade(t *testing.T) {
 		if body, err := io.ReadAll(response.Body); err == nil {
 			t.Fatalf("a zip that failed part way was answered whole: %d %q", response.StatusCode, body)
 		}
+	}
+}
+
+// W5b (Repo C WORDPRESS_WEBSITES.md §13.3): a WordPress website's
+// administrator's password is taken with a POST, since taking it deletes it on
+// the site, and answered never to be cached or logged; a GET, a body or a
+// malformed path is refused before anything is asked. A reset link is a POST
+// too, and a plan carries the administrator's address to the backend.
+func TestAWordPressWebsitesPasswordIsTakenWithAPostAndNeverCachedOrLogged(t *testing.T) {
+	s, backend := deploymentServer(t, true)
+	var log bytes.Buffer
+	s.reserved.RequestLog = &log
+	r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/sites/blog/admin-password", "")
+	if r.Code != http.StatusOK || r.Header().Get("Cache-Control") != "no-store" ||
+		!strings.Contains(r.Body.String(), `"schema_version":"SiteAdminPasswordV1"`) || !strings.Contains(r.Body.String(), `"password":"`+strings.Repeat("ab", 24)+`"`) ||
+		!strings.Contains(r.Body.String(), `"user":"owner@example.com"`) || !strings.Contains(r.Body.String(), `"taken":false`) {
+		t.Fatalf("admin password = %d %v %s", r.Code, r.Header(), r.Body.String())
+	}
+	if strings.Contains(log.String(), strings.Repeat("ab", 24)) || !strings.Contains(log.String(), "admin-password") {
+		t.Fatalf("the request log = %s", log.String())
+	}
+	r = call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/sites/blog/reset-link", "")
+	if r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"sent":true`) || !strings.Contains(r.Body.String(), `"email":"owner@example.com"`) {
+		t.Fatalf("reset link = %d %s", r.Code, r.Body.String())
+	}
+	if strings.Join(backend.calls, ",") != "admin-password:srv-0123456789ab:blog,reset-link:srv-0123456789ab:blog" {
+		t.Fatalf("calls = %v", backend.calls)
+	}
+	backend.calls = nil
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/blog/admin-password", ""},
+		{http.MethodPut, "/v1/targets/srv-0123456789ab/sites/blog/admin-password", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/blog/admin-password", "{}"},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/Blog/admin-password", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/blog/admin-password/x", ""},
+		{http.MethodGet, "/v1/targets/srv-0123456789ab/sites/blog/reset-link", ""},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/blog/reset-link", `{"email":"x@example.com"}`},
+		{http.MethodPost, "/v1/targets/srv-0123456789ab/sites/bl..og/reset-link", ""},
+	} {
+		if r := call(s, c.method, c.path, c.body); r.Code != http.StatusBadRequest || !strings.Contains(r.Body.String(), `"code":"invalid_request"`) {
+			t.Errorf("%s %s %q = %d %s", c.method, c.path, c.body, r.Code, r.Body.String())
+		}
+	}
+	if len(backend.calls) != 0 {
+		t.Fatalf("calls = %v", backend.calls)
+	}
+	for err, want := range map[error]struct {
+		status int
+		code   string
+	}{
+		ErrSiteStopped:   {http.StatusConflict, "site_stopped"},
+		ErrSiteUnknown:   {http.StatusNotFound, "site_unknown"},
+		ErrTargetInvalid: {http.StatusBadRequest, "invalid_request"},
+		ErrNotSent:       {http.StatusBadGateway, "not_sent"},
+	} {
+		backend.err = err
+		for _, path := range []string{"admin-password", "reset-link"} {
+			r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/sites/blog/"+path, "")
+			if r.Code != want.status || !strings.Contains(r.Body.String(), `"code":"`+want.code+`"`) || strings.Contains(r.Body.String(), strings.Repeat("ab", 24)) {
+				t.Errorf("%s %v = %d %s", path, err, r.Code, r.Body.String())
+			}
+		}
+	}
+	backend.err = nil
+	digest := strings.Repeat("ab", 32)
+	if r := call(s, http.MethodPost, "/v1/targets/srv-0123456789ab/plans", `{"release":"`+digest+`","site":{"name":"blog","host":"blog.example.com"},"admin_email":"owner@example.com"}`); r.Code != http.StatusCreated ||
+		backend.adminEmail != "owner@example.com" {
+		t.Fatalf("plan = %d %s (%q)", r.Code, r.Body.String(), backend.adminEmail)
 	}
 }

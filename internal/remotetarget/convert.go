@@ -79,7 +79,7 @@ func (m *Manager) unConvert(ctx context.Context, rec *operationRecord, key strin
 	if !ok {
 		return "the data could not be put back: its backup is not kept"
 	}
-	if _, err := m.restoreCopy(ctx, session, key, site, b, "restore_"+db, true); err != nil {
+	if _, err := m.restoreCopy(ctx, session, key, site, b, "restore_", true); err != nil {
 		return "the data could not be put back: " + stepDetail(err)
 	}
 	if _, err := run(ctx, session, fill(switchDatabaseScript, "DB", db), nil); err != nil {

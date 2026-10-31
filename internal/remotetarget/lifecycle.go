@@ -14,7 +14,8 @@ import (
 )
 
 // Lifecycle on a target (Repo C design note BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md
-// §11, BF-14.5a): a Node app stopped and started without losing anything, an
+// §11, BF-14.5a): a Node app or a WordPress website stopped and started
+// without losing anything, an
 // app's data removed once its site is off, a target cleaned up once nothing is
 // left (each removal confirmed by repeating its name), and a read-only check
 // of the target against ABCP's record. The check repairs nothing but one
@@ -30,7 +31,10 @@ const (
 
 var (
 	objectPattern = regexp.MustCompile(`^autobuild-[a-z0-9-]{1,60}$`)
-	copyPattern   = regexp.MustCompile(`^(check|restore|previous)_app_[a-z0-9_]{1,40}$`)
+	copyPattern   = regexp.MustCompile(`^(check|restore|previous)_(app|wp)_[a-z0-9_]{1,40}$`)
+	// wpNamePattern is a WordPress website's database or a copy of it: the
+	// shared MariaDB's, not the Postgres's.
+	wpNamePattern = regexp.MustCompile(`^((check|restore|previous)_)?wp_[a-z0-9_]{1,40}$`)
 )
 
 // startLifecycle records an operation on a target's site and marks the target
@@ -109,7 +113,7 @@ func (m *Manager) startStop(key, site string, request serviceapi.OperationReques
 		return deref(existing), err
 	}
 	s, ok := findSite(r, site)
-	if !ok || siteKind(s) != kindNode || !served(s) {
+	if !ok || !appKind(siteKind(s)) || !served(s) {
 		return serviceapi.OperationV1{}, serviceapi.ErrSiteUnknown
 	}
 	steps, state := []string{"stop_app", "write_site", "reload_frontdoor"}, siteStopped
@@ -144,10 +148,10 @@ func (m *Manager) runStop(ctx context.Context, rec *operationRecord, r record, s
 	}{
 		{"stop_app", func() (string, error) { return run(ctx, session, fill(stopAppOnlyScript, "N", site), nil) }},
 		{"write_site", func() (string, error) {
-			return run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
+			return run(ctx, session, m.withNetworks(writeSiteScript, r.Key), strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
 		}},
 		{"reload_frontdoor", func() (string, error) {
-			return run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
+			return run(ctx, session, m.withNetworks(frontDoorScript, r.Key), nil)
 		}},
 	}
 	for _, s := range steps {
@@ -171,12 +175,16 @@ func (m *Manager) runStart(ctx context.Context, rec *operationRecord, r record, 
 			}
 		}
 		m.mu.Unlock()
-		if _, err := run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, site, rec.Host))); err != nil {
+		if _, err := run(ctx, session, m.withNetworks(writeSiteScript, r.Key), strings.NewReader(m.caddyfile(r.Key, site, rec.Host))); err != nil {
 			return "the app is stopped again"
 		}
-		_, _ = run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
+		_, _ = run(ctx, session, m.withNetworks(frontDoorScript, r.Key), nil)
 		rec.Paused = true
 		return "the app is stopped again"
+	}
+	kind := kindNode
+	if wpData(r, site) {
+		kind = kindWP
 	}
 	steps := []struct {
 		name string
@@ -184,20 +192,20 @@ func (m *Manager) runStart(ctx context.Context, rec *operationRecord, r record, 
 	}{
 		{"start_app", func() (string, error) { return m.startApp(ctx, session, r.Key, site, rec.Sandbox) }},
 		{"wait_health", func() (string, error) {
-			out, err := run(ctx, session, fill(waitHealthScript, "N", site, "WAIT", fmt.Sprint(m.healthWait)), nil)
+			out, err := run(ctx, session, fill(waitHealthScript, "N", site, "WAIT", m.waitFor(kind)), nil)
 			if err != nil {
 				return "", errStep(stepDetail(err) + "; " + pauseAgain())
 			}
 			return out, nil
 		}},
 		{"write_site", func() (string, error) {
-			return run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
+			return run(ctx, session, m.withNetworks(writeSiteScript, r.Key), strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
 		}},
 		{"reload_frontdoor", func() (string, error) {
-			return run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
+			return run(ctx, session, m.withNetworks(frontDoorScript, r.Key), nil)
 		}},
 		{"check", func() (string, error) {
-			return m.checkSite(ctx, r, rec.Host, releaseRecord{Release: serviceapi.ReleaseV1{Kind: kindNode}})
+			return m.checkSite(ctx, r, rec.Host, releaseRecord{Release: serviceapi.ReleaseV1{Kind: kind}})
 		}},
 	}
 	for _, s := range steps {
@@ -227,7 +235,7 @@ func (m *Manager) Databases(_ context.Context, key string) (serviceapi.Databases
 
 // RemoveData removes an app's database, its login, database.env and its
 // backups for good, once its site is off the target and Confirm repeats the
-// database's name.
+// database's name; a WordPress website's volume, its uploads, goes too.
 func (m *Manager) RemoveData(_ context.Context, key, site string, request serviceapi.ConfirmedRequestV1) (serviceapi.OperationV1, error) {
 	if !siteNamePattern.MatchString(site) || !requestIDPattern.MatchString(request.RequestID) {
 		return serviceapi.OperationV1{}, serviceapi.ErrTargetInvalid
@@ -242,13 +250,18 @@ func (m *Manager) RemoveData(_ context.Context, key, site string, request servic
 	if !ok {
 		return serviceapi.OperationV1{}, serviceapi.ErrSiteUnknown
 	}
-	if request.Confirm != d.Name || !databasePattern.MatchString(d.Name) {
+	wp := wpDatabasePattern.MatchString(d.Name) && d.Name == wpDatabaseName(site)
+	if request.Confirm != d.Name || !(databasePattern.MatchString(d.Name) || wp) {
 		return serviceapi.OperationV1{}, serviceapi.ErrTargetInvalid
 	}
 	if _, on := findSite(r, site); on {
 		return serviceapi.OperationV1{}, serviceapi.ErrDataInUse
 	}
-	rec, err := m.startLifecycle(&r, "remove_data", site, request.RequestID, []string{"start_database", "drop_database", "remove_backups"}, "")
+	steps := []string{"start_database", "drop_database", "remove_backups"}
+	if wp {
+		steps = []string{"start_database", "drop_database", "remove_volume", "remove_backups"}
+	}
+	rec, err := m.startLifecycle(&r, "remove_data", site, request.RequestID, steps, "")
 	if err != nil {
 		return serviceapi.OperationV1{}, err
 	}
@@ -259,16 +272,22 @@ func (m *Manager) RemoveData(_ context.Context, key, site string, request servic
 func (m *Manager) runRemoveData(ctx context.Context, rec *operationRecord, r record, session remote) string {
 	site := rec.Operation.Site
 	db := databaseName(site)
-	steps := []struct {
-		name string
-		work func() (string, error)
-	}{
-		{"start_database", func() (string, error) { return run(ctx, session, startDatabaseScript, nil) }},
-		{"drop_database", func() (string, error) { return run(ctx, session, fill(dropDataScript, "N", site, "DB", db), nil) }},
-		{"remove_backups", func() (string, error) { return run(ctx, session, fill(removeSiteBackupsScript, "N", site), nil) }},
+	start, drop := startDatabaseScript, dropDataScript
+	if wpData(r, site) {
+		db, start, drop = wpDatabaseName(site), m.withNetworks(wpStartDatabaseScript, r.Key), wpDropDataScript
 	}
-	for _, s := range steps {
-		if err := m.step(rec, s.name, s.work); err != nil {
+	steps := map[string]func() (string, error){
+		"start_database": func() (string, error) { return run(ctx, session, start, nil) },
+		"drop_database":  func() (string, error) { return run(ctx, session, fill(drop, "N", site, "DB", db), nil) },
+		"remove_volume":  func() (string, error) { return run(ctx, session, fill(wpRemoveVolumeScript, "N", site), nil) },
+		"remove_backups": func() (string, error) { return run(ctx, session, fill(removeSiteBackupsScript, "N", site), nil) },
+	}
+	for _, s := range rec.Operation.Steps {
+		work, ok := steps[s.Name]
+		if !ok {
+			continue
+		}
+		if err := m.step(rec, s.Name, work); err != nil {
 			return stepDetail(err)
 		}
 	}
@@ -289,8 +308,8 @@ func (m *Manager) runRemoveData(ctx context.Context, rec *operationRecord, r rec
 
 // CleanTarget removes everything ABCP put on a target once no site and no
 // app's data is left and Confirm repeats the target's key: the front door,
-// the shared Postgres and its volume, the networks, the pinned images and
-// ~/autobuild. Nothing else on the target is touched.
+// the shared Postgres and MariaDB and their volumes, the networks, the pinned
+// images and ~/autobuild. Nothing else on the target is touched.
 func (m *Manager) CleanTarget(_ context.Context, key string, request serviceapi.ConfirmedRequestV1) (serviceapi.OperationV1, error) {
 	if !requestIDPattern.MatchString(request.RequestID) {
 		return serviceapi.OperationV1{}, serviceapi.ErrTargetInvalid
@@ -419,6 +438,7 @@ type serverState struct {
 	backups    map[string]map[string]bool // site: backup ids
 	databases  map[string]bool
 	postgres   bool
+	mariadb    bool
 	caddyfile  string
 }
 
@@ -443,10 +463,12 @@ func parseServer(out string) serverState {
 				s.backups[f[1]] = map[string]bool{}
 			}
 			s.backups[f[1]][f[2]] = true
-		case len(f) == 2 && f[0] == "database" && (databasePattern.MatchString(f[1]) || copyPattern.MatchString(f[1])):
+		case len(f) == 2 && f[0] == "database" && (databasePattern.MatchString(f[1]) || wpDatabasePattern.MatchString(f[1]) || copyPattern.MatchString(f[1])):
 			s.databases[f[1]] = true
 		case len(f) == 1 && f[0] == "postgres":
 			s.postgres = true
+		case len(f) == 1 && f[0] == "mariadb":
+			s.mariadb = true
 		case len(f) == 2 && f[0] == "caddyfile" && digestPattern.MatchString(f[1]):
 			s.caddyfile = f[1]
 		case len(f) == 1 && f[0] == "done":
@@ -473,14 +495,14 @@ func (m *Manager) compare(r *record, seen serverState) serviceapi.DriftV1 {
 	}
 	// Reconcile first: a site an interrupted operation left unknown takes the
 	// release its link points at when ABCP keeps that release and, for a Node
-	// app, its container runs.
+	// app or a WordPress website, its container runs.
 	for _, s := range r.Sites {
 		if s.State != siteUnknown {
 			continue
 		}
 		digest, ok := strings.CutPrefix(seen.links[s.Name], "../releases/")
 		running := seen.containers["autobuild-app-"+s.Name]
-		if ok && digestPattern.MatchString(digest) && kept[digest] && seen.releases[digest] && (siteKind(s) != kindNode || running) {
+		if ok && digestPattern.MatchString(digest) && kept[digest] && seen.releases[digest] && (!appKind(siteKind(s)) || running) {
 			s.Release, s.State, s.UpdatedAt = digest, siteLive, m.stamp()
 			m.setSite(r, s)
 			report.Reconciled = append(report.Reconciled, s.Name)
@@ -490,15 +512,29 @@ func (m *Manager) compare(r *record, seen serverState) serviceapi.DriftV1 {
 	}
 	expected := map[string]bool{} // containers that should run
 	nets, vols := map[string]bool{}, map[string]bool{}
-	postgres := len(r.Databases) > 0
+	postgres, mariadb := false, false
+	for _, d := range r.Databases {
+		if wpDatabasePattern.MatchString(d.Name) {
+			// A WordPress website's volume, its uploads, is kept with its data.
+			mariadb = true
+			vols["autobuild-wp-"+d.Site] = true
+		} else {
+			postgres = true
+		}
+	}
 	anyServed := false
 	for _, s := range r.Sites {
 		if !served(s) {
 			continue
 		}
 		anyServed = true
-		if siteKind(s) == kindNode {
-			postgres = true
+		if appKind(siteKind(s)) {
+			if siteKind(s) == kindWP {
+				mariadb = true
+				vols["autobuild-wp-"+s.Name] = true
+			} else {
+				postgres = true
+			}
 			nets["autobuild-net-"+s.Name] = true
 			if s.State != siteStopped {
 				expected["autobuild-app-"+s.Name] = true
@@ -523,6 +559,11 @@ func (m *Manager) compare(r *record, seen serverState) serviceapi.DriftV1 {
 		nets["autobuild-db"] = true
 		vols["autobuild-pgdata"] = true
 	}
+	if mariadb {
+		expected["autobuild-mariadb"] = true
+		nets["autobuild-db"] = true
+		vols["autobuild-mariadb-data"] = true
+	}
 	names := func(set map[string]bool) []string {
 		out := make([]string, 0, len(set))
 		for n := range set {
@@ -532,7 +573,7 @@ func (m *Manager) compare(r *record, seen serverState) serviceapi.DriftV1 {
 		return out
 	}
 	siteOf := func(name string) string {
-		for _, prefix := range []string{"autobuild-app-", "autobuild-net-"} {
+		for _, prefix := range []string{"autobuild-app-", "autobuild-net-", "autobuild-wp-"} {
 			if s, ok := strings.CutPrefix(name, prefix); ok {
 				return s
 			}
@@ -565,12 +606,12 @@ func (m *Manager) compare(r *record, seen serverState) serviceapi.DriftV1 {
 	}
 	for _, v := range names(vols) {
 		if !seen.volumes[v] {
-			add("volume_missing", "", v)
+			add("volume_missing", siteOf(v), v)
 		}
 	}
 	for _, v := range names(seen.volumes) {
 		if !vols[v] {
-			add("volume_unknown", "", v)
+			add("volume_unknown", siteOf(v), v)
 		}
 	}
 	for _, site := range sortedKeys(seen.links) {
@@ -588,21 +629,27 @@ func (m *Manager) compare(r *record, seen serverState) serviceapi.DriftV1 {
 			add("release_unknown", "", d[:12])
 		}
 	}
-	if seen.postgres {
-		recorded := map[string]bool{}
-		for _, d := range r.Databases {
-			recorded[d.Name] = true
-			if !seen.databases[d.Name] {
-				add("database_missing", d.Site, d.Name)
-			}
+	// Each database server's databases are compared when it was read: the
+	// Postgres's app_ ones, the MariaDB's wp_ ones.
+	listed := func(name string) bool {
+		if wpNamePattern.MatchString(name) {
+			return seen.mariadb
 		}
-		for _, d := range names(seen.databases) {
-			switch {
-			case copyPattern.MatchString(d):
-				add("copy_left", "", d)
-			case !recorded[d]:
-				add("database_unknown", "", d)
-			}
+		return seen.postgres
+	}
+	recorded := map[string]bool{}
+	for _, d := range r.Databases {
+		recorded[d.Name] = true
+		if listed(d.Name) && !seen.databases[d.Name] {
+			add("database_missing", d.Site, d.Name)
+		}
+	}
+	for _, d := range names(seen.databases) {
+		switch {
+		case copyPattern.MatchString(d):
+			add("copy_left", "", d)
+		case !recorded[d]:
+			add("database_unknown", "", d)
 		}
 	}
 	for _, d := range r.Databases {
@@ -666,11 +713,18 @@ if [ -d "$B/@N@" ]; then n=$(find "$B/@N@" -maxdepth 1 -name '*.dump' | wc -l); 
 	stopDatabaseScript = `set -eu
 ` + dockerHost + `
 docker rm -f autobuild-postgres >/dev/null 2>&1 || true
+docker rm -f autobuild-mariadb >/dev/null 2>&1 || true
 echo stopped
 `
+	// removeVolumeScript removes the shared databases' volumes: the Postgres's
+	// and the MariaDB's.
 	removeVolumeScript = `set -eu
 ` + dockerHost + `
-if docker volume inspect autobuild-pgdata >/dev/null 2>&1; then docker volume rm autobuild-pgdata >/dev/null; echo removed; else echo "not there"; fi
+said="not there"
+for v in autobuild-pgdata autobuild-mariadb-data; do
+  if docker volume inspect "$v" >/dev/null 2>&1; then docker volume rm "$v" >/dev/null; said=removed; fi
+done
+echo "$said"
 `
 	removeNetworksScript = `set -eu
 ` + dockerHost + `
@@ -683,7 +737,7 @@ echo "$n removed"
 `
 	removeImagesScript = `set -eu
 ` + dockerHost + `
-for image in ` + FrontDoorImage + ` ` + NodeRuntimeImage + ` ` + NodePostgresImage + `; do
+for image in ` + FrontDoorImage + ` ` + NodeRuntimeImage + ` ` + NodePostgresImage + ` ` + WordPressServerImage + ` ` + WordPressMariaDBImage + `; do
   docker image rm "$image" >/dev/null 2>&1 || true
 done
 echo removed
@@ -706,6 +760,10 @@ if [ -d "$A/backups" ]; then for f in "$A/backups"/*/*.dump; do if [ -f "$f" ]; 
 if [ "$(docker inspect -f '{{.State.Running}}' autobuild-postgres 2>/dev/null || true)" = "true" ]; then
   echo postgres
   docker exec autobuild-postgres ` + psql + ` -qAtX -c "SELECT datname FROM pg_database WHERE datname ~ '^(check_|restore_|previous_)?app_'" | sed 's/^/database /'
+fi
+if [ "$(docker inspect -f '{{.State.Running}}' autobuild-mariadb 2>/dev/null || true)" = "true" ]; then
+  echo mariadb
+  printf 'SHOW DATABASES;\n' | ` + mariadbAdmin + ` --skip-column-names | grep -E '^((check|restore|previous)_)?wp_[a-z0-9_]+$' | sed 's/^/database /'
 fi
 if [ -f "$A/frontdoor/config/Caddyfile" ]; then echo "caddyfile $(sha256sum < "$A/frontdoor/config/Caddyfile" | cut -d' ' -f1)"; fi
 echo done

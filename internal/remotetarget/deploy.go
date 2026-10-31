@@ -130,6 +130,9 @@ type operationRecord struct {
 	// checked against, and whether the site is crashed and started again.
 	Other string `json:"other,omitempty"`
 	Crash bool   `json:"crash,omitempty"`
+	// AdminEmail is a WordPress website's administrator's address, which its
+	// data keeps from the step that makes its database (wpsites.go).
+	AdminEmail string `json:"admin_email,omitempty"`
 }
 
 // remote runs scripts on a target.
@@ -195,6 +198,26 @@ func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.Pl
 	if r.State != stateConfirmed {
 		return serviceapi.PlanV1{}, serviceapi.ErrTargetNotReady
 	}
+	kind := release.Release.Kind
+	adminEmail := ""
+	if kind == kindWP {
+		// A WordPress website's administrator is the owner's address; a site
+		// keeps the one its data was made with, whose administrator it is.
+		email, ok := checkAdminEmail(create.AdminEmail)
+		if !ok {
+			return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
+		}
+		adminEmail = email
+		if d, kept := findDatabase(r, name); kept && adminEmailPattern.MatchString(d.AdminEmail) {
+			adminEmail = d.AdminEmail
+		}
+	} else if create.AdminEmail != "" {
+		return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
+	}
+	if d, kept := findDatabase(r, name); kept && appKind(kind) && d.Name != dataName(kind, name) {
+		// The data kept under this name is another kind's: it is removed first.
+		return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
+	}
 	replaces := ""
 	running := false
 	for _, s := range r.Sites {
@@ -202,8 +225,8 @@ func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.Pl
 			return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
 		}
 		if s.Name == name {
-			// A site keeps its kind: a static site becomes a Node app, or back,
-			// only by removing it first.
+			// A site keeps its kind: a static site becomes a Node app or a
+			// WordPress website, or back, only by removing it first.
 			if s.Release != "" && siteKind(s) != release.Release.Kind {
 				return serviceapi.PlanV1{}, serviceapi.ErrTargetInvalid
 			}
@@ -227,7 +250,8 @@ func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.Pl
 	if replaces == release.Release.Digest {
 		replaces = ""
 	}
-	if release.Release.Kind == kindNode {
+	if appKind(kind) {
+		// A WordPress website's steps are a Node app's (wpsites.go).
 		steps = nodeSteps(steps[0], frontdoor, replaces != "")
 	} else {
 		steps = append(steps, "switch_site", "write_site", frontdoor, "check")
@@ -271,8 +295,12 @@ func (m *Manager) CreatePlan(_ context.Context, key string, create serviceapi.Pl
 		Site: serviceapi.PlanSiteV1{Name: name, Host: host}, Replaces: replaces, Steps: steps,
 		CreatedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(planLifetime).Format(time.RFC3339),
 	}
-	if release.Release.Kind == kindNode {
+	switch kind {
+	case kindNode:
 		plan.Images, plan.Database, plan.Sandbox = []string{NodeRuntimeImage, NodePostgresImage}, databaseName(name), sandbox(r)
+	case kindWP:
+		plan.Images, plan.Database, plan.Sandbox = []string{WordPressServerImage, WordPressMariaDBImage}, wpDatabaseName(name), sandbox(r)
+		plan.AdminEmail = adminEmail
 	}
 	if create.Conversion != "" {
 		plan.Conversion = &serviceapi.PlanConversionV1{Digest: conversionDigest(create.Conversion), Bytes: len(create.Conversion)}
@@ -362,7 +390,7 @@ func (m *Manager) Apply(_ context.Context, key string, apply serviceapi.ApplyV1)
 		op.Steps = append(op.Steps, serviceapi.OperationStepV1{Name: step, State: "pending"})
 	}
 	rec := operationRecord{SchemaVersion: operationSchema, Operation: op, Host: plan.Site.Host, Release: plan.Release.Digest,
-		Replaces: plan.Replaces, Sandbox: plan.Sandbox, Backup: backup, Conversion: conversion, StartFrom: startFrom}
+		Replaces: plan.Replaces, Sandbox: plan.Sandbox, Backup: backup, Conversion: conversion, StartFrom: startFrom, AdminEmail: plan.AdminEmail}
 	if err := m.writeJSON(filepath.Join(m.dir, "operations"), op.OperationID, rec); err != nil {
 		return serviceapi.OperationV1{}, err
 	}
@@ -373,8 +401,8 @@ func (m *Manager) Apply(_ context.Context, key string, apply serviceapi.ApplyV1)
 	// The site keeps the release it serves until its link is switched.
 	site, _ := findSite(r, plan.Site.Name)
 	site.Name, site.Host, site.State, site.UpdatedAt, site.Operation = plan.Site.Name, plan.Site.Host, siteDeploying, m.stamp(), op.OperationID
-	if plan.Release.Kind == kindNode {
-		site.Kind, site.Database, site.Sandbox = kindNode, plan.Database, plan.Sandbox
+	if appKind(plan.Release.Kind) {
+		site.Kind, site.Database, site.Sandbox = plan.Release.Kind, plan.Database, plan.Sandbox
 	}
 	m.setSite(&r, site)
 	if err := m.write(r); err != nil {
@@ -420,8 +448,8 @@ func (m *Manager) RemoveSite(_ context.Context, key, name string, remove service
 		Steps: []serviceapi.OperationStepV1{{Name: "unlink_site", State: "pending"}, {Name: "write_site", State: "pending"},
 			{Name: "reload_frontdoor", State: "pending"}, {Name: "remove_files", State: "pending"}},
 	}
-	if siteKind(site) == kindNode {
-		// A Node app stops first; its database and backups are kept.
+	if appKind(siteKind(site)) {
+		// An app stops first; its database and backups are kept.
 		op.Steps = append([]serviceapi.OperationStepV1{{Name: "stop_app", State: "pending"}}, op.Steps...)
 	}
 	rec := operationRecord{SchemaVersion: operationSchema, Operation: op, Host: site.Host, Release: site.Release}
@@ -612,6 +640,7 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 		return "release_missing"
 	}
 	site := op.Site
+	wp := release.Release.Kind == kindWP
 	// converting or starting on a backup (startfrom.go), the app is stopped
 	// before its data changes.
 	starting := rec.StartFrom != ""
@@ -700,27 +729,49 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 			}
 		case "write_site":
 			err = m.step(rec, s.Name, func() (string, error) {
-				return run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
+				return run(ctx, session, m.withNetworks(writeSiteScript, r.Key), strings.NewReader(m.caddyfile(r.Key, site, rec.Host)))
 			})
 		case "start_frontdoor", "reload_frontdoor":
 			err = m.step(rec, s.Name, func() (string, error) {
-				return run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
+				return run(ctx, session, m.withNetworks(frontDoorScript, r.Key), nil)
 			})
 		case "check":
 			err = m.step(rec, s.Name, func() (string, error) { return m.checkSite(ctx, r, rec.Host, release) })
 		case "get_images":
-			err = m.step(rec, s.Name, func() (string, error) { return run(ctx, session, getImagesScript, nil) })
-		case "start_database":
-			err = m.step(rec, s.Name, func() (string, error) { return run(ctx, session, startDatabaseScript, nil) })
-		case "make_database":
 			err = m.step(rec, s.Name, func() (string, error) {
+				if wp {
+					return run(ctx, session, wpGetImagesScript, nil)
+				}
+				return run(ctx, session, getImagesScript, nil)
+			})
+		case "start_database":
+			err = m.step(rec, s.Name, func() (string, error) {
+				if wp {
+					return run(ctx, session, m.withNetworks(wpStartDatabaseScript, r.Key), nil)
+				}
+				return run(ctx, session, startDatabaseScript, nil)
+			})
+		case "make_database":
+			kind := release.Release.Kind
+			err = m.step(rec, s.Name, func() (string, error) {
+				if wp {
+					return run(ctx, session, fill(wpMakeDatabaseScript, "N", site, "DB", wpDatabaseName(site)), nil)
+				}
 				return run(ctx, session, fill(makeDatabaseScript, "N", site, "DB", databaseName(site)), nil)
 			})
 			if err == nil {
 				m.mu.Lock()
 				if cur, readErr := m.read(r.Key); readErr == nil {
-					if _, ok := findDatabase(cur, site); !ok {
-						setDatabase(&cur, databaseRecord{Site: site, Name: databaseName(site), CreatedAt: m.stamp()})
+					d, ok := findDatabase(cur, site)
+					if !ok {
+						d = databaseRecord{Site: site, Name: dataName(kind, site), CreatedAt: m.stamp()}
+					}
+					// A WordPress website's data keeps the administrator it is made with.
+					if wp && d.AdminEmail == "" {
+						d.AdminEmail = rec.AdminEmail
+					}
+					if !ok || wp {
+						setDatabase(&cur, d)
 						_ = m.write(cur)
 					}
 				}
@@ -748,7 +799,7 @@ func (m *Manager) runApply(ctx context.Context, rec *operationRecord, r record, 
 			})
 		case "wait_health":
 			err = m.step(rec, s.Name, func() (string, error) {
-				out, err := run(ctx, session, fill(waitHealthScript, "N", site, "WAIT", fmt.Sprint(m.healthWait)), nil)
+				out, err := run(ctx, session, fill(waitHealthScript, "N", site, "WAIT", m.waitFor(release.Release.Kind)), nil)
 				if err != nil && converting {
 					return "", undo(err)
 				}
@@ -772,16 +823,21 @@ func (m *Manager) runRemove(ctx context.Context, rec *operationRecord, r record,
 		name string
 		work func() (string, error)
 	}{
-		{"stop_app", func() (string, error) { return run(ctx, session, fill(stopAppScript, "N", site), nil) }},
+		{"stop_app", func() (string, error) {
+			if wpData(r, site) {
+				return run(ctx, session, fill(wpStopAppScript, "N", site), nil)
+			}
+			return run(ctx, session, fill(stopAppScript, "N", site), nil)
+		}},
 		{"unlink_site", func() (string, error) { return run(ctx, session, fill(unlinkScript, "N", site), nil) }},
 		{"write_site", func() (string, error) {
-			return run(ctx, session, fill(writeSiteScript, "NETS", m.nodeNetworks(r.Key)), strings.NewReader(m.caddyfile(r.Key, site, "")))
+			return run(ctx, session, m.withNetworks(writeSiteScript, r.Key), strings.NewReader(m.caddyfile(r.Key, site, "")))
 		}},
 		{"reload_frontdoor", func() (string, error) {
 			if m.liveSitesExcept(r.Key, site) == 0 {
 				return run(ctx, session, stopFrontDoorScript, nil)
 			}
-			return run(ctx, session, fill(frontDoorScript, "NETS", m.nodeNetworks(r.Key)), nil)
+			return run(ctx, session, m.withNetworks(frontDoorScript, r.Key), nil)
 		}},
 		{"remove_files", func() (string, error) { return m.pruneReleases(ctx, session, r.Key, site), nil }},
 	}
@@ -816,11 +872,17 @@ func (m *Manager) sendRelease(ctx context.Context, session remote, release relea
 		return "", errStep("release_missing")
 	}
 	defer file.Close()
-	if _, err := run(ctx, session, fill(receiveScript, "D", digest), file); err != nil {
+	// A WordPress website keeps the release's manifest at /source, whose
+	// version marks each page it makes (SERVER.md); other kinds leave it out.
+	exclude, files := " --exclude=autobuild-release.json", release.Files
+	if release.Release.Kind == kindWP && release.Manifest != nil {
+		exclude, files = "", append(append([]manifestFile{}, release.Files...), *release.Manifest)
+	}
+	if _, err := run(ctx, session, fill(receiveScript, "D", digest, "EXCLUDE", exclude), file); err != nil {
 		return "", err
 	}
-	count := fmt.Sprint(len(release.Files))
-	if _, err := run(ctx, session, fill(verifyScript, "D", digest, "COUNT", count), bytes.NewReader(checksumLines(release.Files))); err != nil {
+	count := fmt.Sprint(len(files))
+	if _, err := run(ctx, session, fill(verifyScript, "D", digest, "COUNT", count), bytes.NewReader(checksumLines(files))); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("%d files", len(release.Files)), nil
@@ -833,9 +895,9 @@ func (m *Manager) checkSite(ctx context.Context, r record, host string, release 
 	if err != nil {
 		return "", errStep("refused_address")
 	}
-	// A static site must answer / with its index.html; a Node app must answer
-	// /health (any answer with status 200).
-	path, want, node := "/", "", release.Release.Kind == kindNode
+	// A static site must answer / with its index.html; a Node app or a
+	// WordPress website must answer /health (any answer with status 200).
+	path, want, node := "/", "", appKind(release.Release.Kind)
 	if node {
 		path = "/health"
 	}
@@ -966,7 +1028,11 @@ const (
 // cookies or credentials; the same headers sent by anyone else are removed.
 // Such a running Node app's own server reaches the same host on the inside
 // listener (BF-08b2), known by its network's range in inside/<site>.caddy,
-// for a connection's status read alone, marked as the server asking.
+// for a connection's status read alone, marked as the server asking. A
+// WordPress website is its container too, and a stopped one answers a plain
+// 503; such a running website's contact form hands its messages to the same
+// host on the inside listener (Repo C WORDPRESS_WEBSITES.md §13.2), unmarked,
+// as a visitor's message is, with the site's own address as their Origin.
 func caddyfileFor(r record, site, host, relayHost string) string {
 	hosts, kinds, paused, relays := map[string]string{}, map[string]string{}, map[string]bool{}, map[string]string{}
 	inside := map[string]bool{}
@@ -975,8 +1041,8 @@ func caddyfileFor(r record, site, host, relayHost string) string {
 		paused[s.Name] = s.State == siteStopped
 		if served(s) {
 			hosts[s.Name] = s.Host
-			// Exactly the sites whose matcher insideScript writes (nodeNetworks).
-			inside[s.Name] = siteKind(s) == kindNode && siteNamePattern.MatchString(s.Name)
+			// Exactly the sites whose matchers insideScript writes (withNetworks).
+			inside[s.Name] = appKind(siteKind(s)) && siteNamePattern.MatchString(s.Name)
 		}
 		if relayHost != "" && relayCredentialPattern.MatchString(s.Relay) {
 			relays[s.Name] = s.Relay
@@ -1000,6 +1066,12 @@ func caddyfileFor(r record, site, host, relayHost string) string {
 			serve = "\trespond \"This app is paused.\" 503\n"
 		case kinds[name] == kindNode:
 			serve = "\treverse_proxy autobuild-app-" + name + ":8080 {\n\t\theader_up Origin " + originFrom + " " + originTo + "\n\t}\n"
+		case kinds[name] == kindWP && paused[name]:
+			serve = "\trespond \"This website is paused.\" 503\n"
+		case kinds[name] == kindWP:
+			// WordPress needs no header of its own: its nginx tells PHP every
+			// request is HTTPS, and it makes every address with SITE_URL.
+			serve = "\treverse_proxy autobuild-app-" + name + ":8080\n"
 		}
 		if credential, ok := relays[name]; ok && !paused[name] {
 			serve = "\trequest_header -X-Autobuild-Site\n\trequest_header -X-Autobuild-Host\n\trequest_header -X-Autobuild-Client\n\trequest_header -X-Autobuild-Caller\n" +
@@ -1014,6 +1086,15 @@ func caddyfileFor(r record, site, host, relayHost string) string {
 	for _, name := range names {
 		credential, ok := relays[name]
 		if !ok || paused[name] || !inside[name] {
+			continue
+		}
+		if kinds[name] == kindWP {
+			// A contact message, bounded above the relay's own 8 KB, passed
+			// without X-Autobuild-Caller: the relay takes it as a visitor's.
+			fmt.Fprintf(&servers, "\timport inside/%s.caddy\n\thandle @contact_%s {\n\t\trequest_body {\n\t\t\tmax_size 16KB\n\t\t}\n"+
+				"\t\treverse_proxy https://%s {\n\t\t\theader_up Host %s\n\t\t\theader_up X-Autobuild-Site %s\n\t\t\theader_up X-Autobuild-Host %s\n"+
+				"\t\t\theader_up X-Autobuild-Client {remote_host}\n\t\t\theader_up -Cookie\n\t\t\theader_up -Authorization\n\t\t}\n\t}\n",
+				name, name, relayHost, relayHost, credential, hosts[name])
 			continue
 		}
 		proxy := fmt.Sprintf("\t\treverse_proxy https://%s {\n\t\t\theader_up Host %s\n"+
@@ -1034,7 +1115,8 @@ func caddyfileFor(r record, site, host, relayHost string) string {
 }
 
 // The front door's inside listener (BF-08b2): plain http on a port never
-// published, which a Node app reaches on its own network.
+// published, which a Node app or a WordPress website reaches on its own
+// network.
 const (
 	insidePort  = 8089
 	insideRelay = "http://autobuild-frontdoor:8089"
@@ -1381,9 +1463,9 @@ func (m *Manager) readJSON(dir, name string, v any) error {
 }
 
 // The scripts. Each value in them (@D@ a release digest, @N@ a site name,
-// @COUNT@ a number, @LIST@ digests, @NETS@ site names) is checked by ABCP
-// against a narrow pattern before it is put in; nothing else from a request
-// reaches a server.
+// @COUNT@ a number, @LIST@ digests, @NETS@ and @WPNETS@ site names,
+// @EXCLUDE@ fixed) is checked by ABCP against a narrow pattern before it is
+// put in; nothing else from a request reaches a server.
 const (
 	dockerHost = `[ -S "/run/user/$(id -u)/docker.sock" ] && export DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"`
 
@@ -1398,7 +1480,7 @@ umask 022
 R="$HOME/autobuild/releases"
 rm -rf "$R/.@D@.part"
 mkdir "$R/.@D@.part"
-tar -x -f - -C "$R/.@D@.part" --no-same-owner --no-same-permissions --exclude=autobuild-release.json
+tar -x -f - -C "$R/.@D@.part" --no-same-owner --no-same-permissions@EXCLUDE@
 `
 	verifyScript = `set -eu
 cd "$HOME/autobuild/releases/.@D@.part"
@@ -1427,17 +1509,27 @@ mv "$C/Caddyfile.next" "$C/Caddyfile"
 	// insideScript writes, for each Node site (@NETS@), the matchers the front
 	// door's inside listener knows its app's server by (BF-08b2): its
 	// network's range, and only a connection's status read or, for the app's
-	// own AI answers (Repo C SUPPORT_AGENTS A1), a post to /__autobuild/ai. A
-	// site whose network is not found gets a range nothing comes from. Both
-	// front-door scripts run it before Caddy reads the Caddyfile that imports
-	// these, so a Caddyfile naming a matcher always finds it.
+	// own AI answers (Repo C SUPPORT_AGENTS A1), a post to /__autobuild/ai;
+	// for each WordPress website (@WPNETS@), its network's range and only a
+	// contact message, a post to /__autobuild/contact. A site whose network is
+	// not found gets a range nothing comes from. Both front-door scripts run
+	// it before Caddy reads the Caddyfile that imports these, so a Caddyfile
+	// naming a matcher always finds it.
 	insideScript = `I="$HOME/autobuild/frontdoor/config/inside"
 mkdir -p "$I"
-for n in @NETS@; do
-  range=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "autobuild-net-$n" </dev/null 2>/dev/null | tr -s ' ' '\n' |
+subnet() {
+  range=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "autobuild-net-$1" </dev/null 2>/dev/null | tr -s ' ' '\n' |
     grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$' | head -n 1 || true)
   [ -n "$range" ] || range=255.255.255.255/32
+}
+for n in @NETS@; do
+  subnet "$n"
   printf '@from_%s {\n\tremote_ip %s\n\tmethod GET\n\tpath_regexp ^/__autobuild/connect/[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9_-]+$\n}\n@ai_%s {\n\tremote_ip %s\n\tmethod POST\n\tpath /__autobuild/ai\n}\n' "$n" "$range" "$n" "$range" > "$I/.$n.caddy.next"
+  mv "$I/.$n.caddy.next" "$I/$n.caddy"
+done
+for n in @WPNETS@; do
+  subnet "$n"
+  printf '@contact_%s {\n\tremote_ip %s\n\tmethod POST\n\tpath /__autobuild/contact\n}\n' "$n" "$range" > "$I/.$n.caddy.next"
   mv "$I/.$n.caddy.next" "$I/$n.caddy"
 done
 `
@@ -1456,8 +1548,8 @@ else
     -v "$A/sites:/srv/sites:ro" -v "$A/releases:/srv/releases:ro" \
     ` + FrontDoorImage + ` caddy run --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
 fi
-# The front door joins each Node app's network, @NETS@ being their sites.
-for n in @NETS@; do
+# The front door joins each app's network: @NETS@ the Node apps, @WPNETS@ the WordPress websites.
+for n in @NETS@ @WPNETS@; do
   docker inspect -f '{{json .NetworkSettings.Networks}}' autobuild-frontdoor | grep -q "\"autobuild-net-$n\"" ||
     docker network connect "autobuild-net-$n" autobuild-frontdoor
 done
