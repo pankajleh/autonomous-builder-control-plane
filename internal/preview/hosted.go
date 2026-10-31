@@ -26,8 +26,11 @@ import (
 // version at a time on the governed preview runtime, with the key's own data volume, no time limit, and restarts by
 // the controller. Hosted instances use no preview slots.
 const (
-	// MaxHostedRunning is the owner's pilot limit of keys running at once.
+	// MaxHostedRunning is the owner's pilot limit of keys running at once, used unless SetMaxRunning gives another
+	// (abcp serve --hosted-max-running; the owner raised it to 20 on 2026-10-31, matching the Product API's own limit).
 	MaxHostedRunning = 5
+	// maxHostedRunningCeiling bounds what SetMaxRunning takes.
+	maxHostedRunningCeiling = 200
 	// hostedRestartLimit automatic restarts in an hour leave the key FAILED until it is started again.
 	hostedRestartLimit = 3
 	hostedNightly      = 24 * time.Hour
@@ -117,6 +120,28 @@ type Hosting struct {
 	offsiteFile     string
 	offsiteEndpoint func(bucket, region string) string
 	offsiteClient   *http.Client
+	// maxRunning, when set, replaces MaxHostedRunning as the limit of keys running at once.
+	maxRunning int
+}
+
+// SetMaxRunning sets the limit of keys running at once; a value outside 1 to 200 keeps MaxHostedRunning. A key already
+// running is never stopped by a lower limit: only a new start is refused.
+func (h *Hosting) SetMaxRunning(n int) {
+	h.mu.Lock()
+	if n >= 1 && n <= maxHostedRunningCeiling {
+		h.maxRunning = n
+	} else {
+		h.maxRunning = 0
+	}
+	h.mu.Unlock()
+}
+
+// runningLimit is the limit of keys running at once; h.mu must be held.
+func (h *Hosting) runningLimit() int {
+	if h.maxRunning > 0 {
+		return h.maxRunning
+	}
+	return MaxHostedRunning
 }
 
 // NewHosting starts the hosted instances of a preview service's runtime. It runs after the preview service has
@@ -430,7 +455,7 @@ func (h *Hosting) StartHosted(ctx context.Context, p serviceapi.Principal, autho
 		h.mu.Unlock()
 		return empty, serviceapi.ErrHostedConflict
 	}
-	if h.running(k) >= MaxHostedRunning {
+	if h.running(k) >= h.runningLimit() {
 		h.mu.Unlock()
 		return empty, serviceapi.ErrHostedCapacity
 	}
@@ -445,7 +470,7 @@ func (h *Hosting) StartHosted(ctx context.Context, p serviceapi.Principal, autho
 	if h.closed || h.ctx.Err() != nil {
 		return empty, serviceapi.ErrPreviewUnavailable
 	}
-	if h.running(k) >= MaxHostedRunning {
+	if h.running(k) >= h.runningLimit() {
 		return empty, serviceapi.ErrHostedCapacity
 	}
 	st = k.state
