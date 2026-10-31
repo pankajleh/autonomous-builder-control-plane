@@ -35,9 +35,11 @@ import (
 
 // The kit's server images, by digest (Repo C tools/wp-site-kit, built and run
 // by wp-site-kit.yml's server job exactly as these scripts run them, and
-// published from main: the images of Repo C 168dbff, #918, W5a).
+// published from main). The server is Repo C 8922d40's (#939, SP1: the kit's
+// plugin 1.2.0, whose `page set` the pages operation runs); the database is
+// still Repo C 168dbff's (#918, W5a), unchanged since.
 const (
-	WordPressServerImage  = "ghcr.io/pankajleh/autobuild-wp-server@sha256:e43cf36bff1be641b053e98856f1c3612924992a00f465c5eda2696cafa1d778"
+	WordPressServerImage  = "ghcr.io/pankajleh/autobuild-wp-server@sha256:ee9b1eb00c84b1ad7fec49627a633372e8f1d41810800a91688a67584fb20ab2"
 	WordPressMariaDBImage = "ghcr.io/pankajleh/autobuild-wp-mariadb@sha256:ad91266b3362c723d2bc7386a052e41ef0bb5e60231e977b2f540da89901e99e"
 )
 
