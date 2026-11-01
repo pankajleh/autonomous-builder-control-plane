@@ -36,6 +36,10 @@ type TargetV1 struct {
 	Preflight          *TargetPreflightV1 `json:"preflight,omitempty"`
 	// BackupsOffServer is true for a target whose backups are each also copied off it (Repo C BF-14.4d d1).
 	BackupsOffServer bool `json:"backups_off_server,omitempty"`
+	// Provider and Region are where a bought server is (Repo C HOSTING_REGIONS_AND_DATA_LAWS R2): its backups' copies go
+	// to the bucket of that region's legal area. Absent for a person's own server and for one bought before R2.
+	Provider string `json:"provider,omitempty"`
+	Region   string `json:"region,omitempty"`
 }
 
 // TargetsV1 lists every target, oldest first.
@@ -52,6 +56,11 @@ type TargetCreateV1 struct {
 	// BackupsOffServer copies each backup taken on the target off it too, to the hosted backups' bucket (Repo C
 	// BF14_4_YOUR_OWN_CLOUD_ACCOUNT.md §17.1: servers Autobuild bought for a person; never a person's own server).
 	BackupsOffServer bool `json:"backups_off_server,omitempty"`
+	// Provider and Region name where a bought server is ("digitalocean", "lon1"), and are required with
+	// BackupsOffServer (Repo C HOSTING_REGIONS_AND_DATA_LAWS R2): the server is refused (ErrTargetBackupsArea) unless the
+	// server backups' settings name a bucket for that region's legal area, and its copies go only there.
+	Provider string `json:"provider,omitempty"`
+	Region   string `json:"region,omitempty"`
 }
 
 // TargetConfirmV1 is the fingerprint the owner checked on the server.
@@ -114,6 +123,9 @@ var (
 	ErrTargetFingerprintMismatch = errors.New("target fingerprint mismatch")
 	ErrTargetLimit               = errors.New("target limit reached")
 	ErrTargetUnavailable         = errors.New("target unavailable")
+	// ErrTargetBackupsArea refuses a bought server whose region's legal area has no backups bucket (R2): its backups
+	// are never copied to another area.
+	ErrTargetBackupsArea = errors.New("target backups area unready")
 )
 
 // TargetsSchemaV1 names the GET /v1/targets answer.
@@ -235,6 +247,8 @@ func (s *Server) writeTargetError(w http.ResponseWriter, id string, err error) {
 		s.writeError(w, http.StatusConflict, ErrorV1{Code: "target_fingerprint_mismatch", Message: "fingerprint does not match the host key the server presented", RequestID: id})
 	case errors.Is(err, ErrTargetLimit):
 		s.writeError(w, http.StatusConflict, ErrorV1{Code: "target_limit", Message: "the target limit is reached", RequestID: id})
+	case errors.Is(err, ErrTargetBackupsArea):
+		s.writeError(w, http.StatusConflict, ErrorV1{Code: "backups_area_unready", Message: "the server's legal area has no backups bucket", RequestID: id})
 	default:
 		s.writeError(w, http.StatusServiceUnavailable, ErrorV1{Code: "target_unavailable", Message: "targets are unavailable", RequestID: id, Retryable: true})
 	}

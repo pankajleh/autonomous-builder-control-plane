@@ -221,23 +221,26 @@ PY
 
 // Backups copied off a server Autobuild bought for a person (Repo C BF14_4_YOUR_OWN_CLOUD_ACCOUNT.md §17.1, BF-14.4d d1).
 // A target created with backups_off_server has each backup also copied to
-// s3://<bucket>/hosted/servers/<target>/<site>/<backup>.dump, in the hosted backups' bucket, with the key of their
-// settings file (--hosted-offsite-file, BF-10b), which may write and read under hosted/ and nothing else. ABCP signs an
-// upload address for that one object (Signature Version 4 in the query, uploadExpiry) and the server uploads the backup
-// to it itself; ABCP then reads the copy's size back with the key. No key reaches the server, and the address can put
-// that one object until it expires. A bought server never gets the instance role: the role may read every backup in the
-// bucket, other people's included.
+// s3://<bucket>/<prefix><target>/<site>/<backup>.dump, in the bucket of its region's legal area (areas.go, R2: India's is
+// the hosted backups' bucket, prefix hosted/servers/, as before), with the key of the hosted backups' settings file
+// (--hosted-offsite-file, BF-10b), which may write and read under hosted/ in each area's bucket and nothing else. ABCP
+// signs an upload address for that one object (Signature Version 4 in the query, uploadExpiry) and the server uploads
+// the backup to it itself; ABCP then reads the copy's size back with the key. No key reaches the server, and the address
+// can put that one object until it expires. A bought server never gets the instance role: the role may read every
+// backup in the bucket, other people's included.
 
-// uploadSettings is the hosted backups' settings file: the bucket and the key that may write under hosted/.
+// uploadSettings is the hosted backups' settings file: its bucket (the hosted apps', and India's) and the key that may
+// write under hosted/. Prefix is set from the server's legal area, never read from the file.
 type uploadSettings struct {
 	Bucket          string `json:"bucket"`
 	Region          string `json:"region"`
 	AccessKeyID     string `json:"access_key_id"`
 	SecretAccessKey string `json:"secret_access_key"`
+	Prefix          string `json:"-"`
 }
 
 const (
-	// uploadExpiry bounds an upload address's life: long enough for a backup to upload from India to Mumbai's S3.
+	// uploadExpiry bounds an upload address's life: long enough for a backup to upload from the server to its area's bucket.
 	uploadExpiry = 15 * time.Minute
 	// uploadsMaxBytes bounds the settings file.
 	uploadsMaxBytes = 4096
@@ -246,7 +249,7 @@ const (
 var (
 	uploadKeyID  = regexp.MustCompile(`^(AKIA|ASIA)[A-Z0-9]{16}$`)
 	uploadSecret = regexp.MustCompile(`^[A-Za-z0-9/+=]{40}$`)
-	uploadURL    = regexp.MustCompile(`^https?://[A-Za-z0-9.:-]+/hosted/servers/[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9-]+\.(dump|uploads\.tar)\?[A-Za-z0-9%&=._-]+$`)
+	uploadURL    = regexp.MustCompile(`^https?://[A-Za-z0-9.:-]+/hosted/([a-z0-9-]+/)*[a-z0-9-]+/[a-z0-9-]+/[A-Za-z0-9-]+\.(dump|uploads\.tar)\?[A-Za-z0-9%&=._-]+$`)
 )
 
 // SetUploadsFile names the hosted backups' private settings file (mode 0600), whose key signs the upload addresses of the
@@ -257,8 +260,9 @@ func (m *Manager) SetUploadsFile(path string) {
 	m.mu.Unlock()
 }
 
-// uploadsFor answers the settings to copy a target's backups off it with, when the target asked for that and the settings
-// file is valid; the file is read afresh each time, so a change needs no restart.
+// uploadsFor answers the hosted backups' key to copy a target's backups off it with, when the target asked for that and
+// the settings file is valid; the file is read afresh each time, so a change needs no restart. Where the copies go is the
+// server's legal area's bucket (copier, areas.go).
 func (m *Manager) uploadsFor(key string) (uploadSettings, bool) {
 	m.mu.Lock()
 	path := m.uploadsFile
@@ -289,14 +293,14 @@ func (m *Manager) copyUploaded(ctx context.Context, session remote, key, site, i
 	if !keyPattern.MatchString(key) || !siteNamePattern.MatchString(site) || !backupIDPattern.MatchString(id) {
 		return "kept on the server only"
 	}
-	endpoint := m.s3Endpoint
-	if endpoint == "" {
-		endpoint = "https://" + s.Bucket + ".s3." + s.Region + ".amazonaws.com"
+	if !prefixPattern.MatchString(s.Prefix) {
+		return m.noteOffsite(key, site, id, serviceapi.BackupOffsiteV1{At: m.stamp(), Detail: whyNoAreaBucket})
 	}
+	endpoint := m.bucketURL(s.Bucket, s.Region)
 	copied := serviceapi.BackupOffsiteV1{At: m.stamp()}
 	var addresses []string
 	for _, file := range m.backupFiles(key, site, id) {
-		object := "hosted/servers/" + key + "/" + site + "/" + file
+		object := s.Prefix + key + "/" + site + "/" + file
 		address := presignPut(endpoint, object, s, m.now(), uploadExpiry)
 		if !uploadURL.MatchString(address) {
 			copied.Detail = "the upload address could not be made"
@@ -321,6 +325,17 @@ func (m *Manager) copyUploaded(ctx context.Context, session remote, key, site, i
 	}
 	copied.OK, copied.Detail = true, strings.Join(addresses, ", ")
 	return m.noteOffsite(key, site, id, copied)
+}
+
+// bucketURL is S3's virtual-hosted address of a bucket in its region; tests give their own, per bucket or for all.
+func (m *Manager) bucketURL(bucket, region string) string {
+	switch {
+	case m.bucketEndpoint != nil:
+		return m.bucketEndpoint(bucket, region)
+	case m.s3Endpoint != "":
+		return m.s3Endpoint
+	}
+	return "https://" + bucket + ".s3." + region + ".amazonaws.com"
 }
 
 // presignPut is an address that may put one object until it expires (Signature Version 4 in the query, the payload

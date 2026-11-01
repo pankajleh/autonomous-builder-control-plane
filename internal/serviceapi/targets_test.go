@@ -32,9 +32,9 @@ func (t *testTargets) Target(_ context.Context, key string) (TargetV1, error) {
 func (t *testTargets) CreateTarget(_ context.Context, key string, c TargetCreateV1) (TargetV1, error) {
 	t.calls = append(t.calls, "create:"+key+":"+c.Address)
 	if c.BackupsOffServer {
-		t.calls = append(t.calls, "backups_off_server")
+		t.calls = append(t.calls, "backups_off_server:"+c.Provider+":"+c.Region)
 		off := sampleTarget
-		off.BackupsOffServer = true
+		off.BackupsOffServer, off.Provider, off.Region = true, c.Provider, c.Region
 		return off, t.err
 	}
 	return sampleTarget, t.err
@@ -77,9 +77,10 @@ func TestTargetsAreRegisteredConfirmedCheckedAndRemovedWithTheirGrant(t *testing
 	if r := call(s, http.MethodGet, "/v1/targets/host-1", ""); r.Code != http.StatusOK || strings.Contains(r.Body.String(), "backups_off_server") {
 		t.Fatalf("get = %d %s", r.Code, r.Body.String())
 	}
-	// A server bought for a person (Repo C BF-14.4d d1): its backups are copied off it, and the answer says so.
-	if r := call(s, http.MethodPut, "/v1/targets/srv-0123456789ab", `{"address":"13.232.1.3","backups_off_server":true}`); r.Code != http.StatusCreated ||
-		!strings.Contains(r.Body.String(), `"backups_off_server":true`) || !slices.Contains(backend.calls, "backups_off_server") {
+	// A server bought for a person (Repo C BF-14.4d d1): its backups are copied off it, to the bucket of its region's
+	// legal area (R2), and the answer says so and where it is.
+	if r := call(s, http.MethodPut, "/v1/targets/srv-0123456789ab", `{"address":"13.232.1.3","backups_off_server":true,"provider":"digitalocean","region":"lon1"}`); r.Code != http.StatusCreated ||
+		!strings.Contains(r.Body.String(), `"backups_off_server":true,"provider":"digitalocean","region":"lon1"`) || !slices.Contains(backend.calls, "backups_off_server:digitalocean:lon1") {
 		t.Fatalf("create a bought server = %d %s %v", r.Code, r.Body.String(), backend.calls)
 	}
 	if r := call(s, http.MethodPost, "/v1/targets/host-1/preflight", ""); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"outcome":"checked"`) {
@@ -91,7 +92,7 @@ func TestTargetsAreRegisteredConfirmedCheckedAndRemovedWithTheirGrant(t *testing
 	if r := call(s, http.MethodDelete, "/v1/targets/host-1", ""); r.Code != http.StatusNoContent {
 		t.Fatalf("delete = %d", r.Code)
 	}
-	want := []string{"list", "create:host-1:13.232.1.2", "get:host-1", "create:srv-0123456789ab:13.232.1.3", "backups_off_server", "preflight:host-1",
+	want := []string{"list", "create:host-1:13.232.1.2", "get:host-1", "create:srv-0123456789ab:13.232.1.3", "backups_off_server:digitalocean:lon1", "preflight:host-1",
 		"confirm:host-1:SHA256:abc", "delete:host-1"}
 	if strings.Join(backend.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v", backend.calls)
@@ -100,6 +101,8 @@ func TestTargetsAreRegisteredConfirmedCheckedAndRemovedWithTheirGrant(t *testing
 		{http.MethodPut, "/v1/targets/host-1", ""},
 		{http.MethodPut, "/v1/targets/host-1", `{"address":"13.232.1.2","key":"x"}`},
 		{http.MethodPut, "/v1/targets/host-1", `{"address":5}`},
+		{http.MethodPut, "/v1/targets/host-1", `{"address":"13.232.1.2","backups_off_server":true,"region":7}`},
+		{http.MethodPut, "/v1/targets/host-1", `{"address":"13.232.1.2","backups_off_server":true,"area":"UK"}`},
 		{http.MethodPut, "/v1/targets/Host_1", `{"address":"13.232.1.2"}`},
 		{http.MethodPut, "/v1/targets/host-1", `{"address":"` + strings.Repeat("a", 5000) + `"}`},
 		{http.MethodPost, "/v1/targets/host-1/confirm", ""},
@@ -133,6 +136,7 @@ func TestTargetsNeedTheirGrantAndMapErrorsToStableCodes(t *testing.T) {
 		ErrTargetExists:              {http.StatusConflict, "target_exists"},
 		ErrTargetFingerprintMismatch: {http.StatusConflict, "target_fingerprint_mismatch"},
 		ErrTargetLimit:               {http.StatusConflict, "target_limit"},
+		ErrTargetBackupsArea:         {http.StatusConflict, "backups_area_unready"},
 		ErrTargetUnavailable:         {http.StatusServiceUnavailable, "target_unavailable"},
 	} {
 		backend.err = err

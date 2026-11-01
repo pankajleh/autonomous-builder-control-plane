@@ -211,6 +211,10 @@ func (f *deployFixture) uploads(t *testing.T) (*fakeAWS, string) {
 		t.Fatal(err)
 	}
 	f.m.SetUploadsFile(settings)
+	// R2: the fixture's target was bought before R2 and names no region, so its copies go to India's bucket, the hosted
+	// backups' own, as before (areas.go).
+	f.areas(t, `{"areas":{"IN":{"bucket":"autobuild-bf14-backups-123456789012","region":"ap-south-1","prefix":"hosted/servers/"}},`+
+		`"regions":{"aws":{"ap-south-1":"IN","eu-west-2":"UK"},"digitalocean":{"blr1":"IN","lon1":"UK"}},"unplaced":"IN"}`)
 	r, err := f.m.read(f.key)
 	if err != nil {
 		t.Fatal(err)
@@ -220,6 +224,17 @@ func (f *deployFixture) uploads(t *testing.T) (*fakeAWS, string) {
 		t.Fatal(err)
 	}
 	return aws, settings
+}
+
+// areas writes the server backups' settings file (R2, areas.go), private, and names it; it answers its path.
+func (f *deployFixture) areas(t *testing.T, settings string) string {
+	t.Helper()
+	path := filepath.Join(filepath.Dir(f.m.dir), "server-backups.json")
+	if err := os.WriteFile(path, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.m.SetAreasFile(path)
+	return path
 }
 
 func (f *deployFixture) offsite(t *testing.T) *fakeAWS {
@@ -398,9 +413,11 @@ func TestABoughtServersBackupIsUploadedToAnAddressForThatObjectOnly(t *testing.T
 	r.BackupsOffServer = false
 	_ = f.m.write(r)
 	plain := f.backup("crm", "req-backup-4")
-	// A target asks for it when it is created, and its record and answer keep it.
-	bought, err := f.m.CreateTarget(context.Background(), "srv-00000000000b", serviceapi.TargetCreateV1{Address: "13.232.1.2", BackupsOffServer: true})
-	if r, _ := f.m.read("srv-00000000000b"); err != nil || !bought.BackupsOffServer || !r.BackupsOffServer {
+	// A target asks for it when it is created, with where it is (R2), and its record and answer keep both.
+	bought, err := f.m.CreateTarget(context.Background(), "srv-00000000000b", serviceapi.TargetCreateV1{Address: "13.232.1.2", BackupsOffServer: true,
+		Provider: "aws", Region: "ap-south-1"})
+	if r, _ := f.m.read("srv-00000000000b"); err != nil || !bought.BackupsOffServer || !r.BackupsOffServer || bought.Provider != "aws" || bought.Region != "ap-south-1" ||
+		r.Provider != "aws" || r.Region != "ap-south-1" {
 		t.Fatalf("a bought server = %+v %v", bought, err)
 	}
 	if got := f.backupOf("crm", plain.BackupID); got.Offsite != nil {

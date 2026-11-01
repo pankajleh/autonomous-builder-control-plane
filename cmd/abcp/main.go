@@ -812,6 +812,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	appRelayURL := flags.String("app-relay-url", "", "optional loopback http origin of the app relay (the preview gateway) that previews' apps ask Autobuild through (BF-08b)")
 	appRelayTokenFile := flags.String("app-relay-token-file", "", "protected file holding the token the app relay knows this controller by (BF-08b)")
 	hostedOffsiteFile := flags.String("hosted-offsite-file", "", "optional private file (mode 0600) naming the bucket and the key that copy each hosted backup off the host (BF-10b)")
+	serverBackupsFile := flags.String("server-backups-file", "", "optional private file (mode 0600) naming each legal area's bucket for bought servers' backups and each region's legal area (Repo C HOSTING_REGIONS_AND_DATA_LAWS R2); without it a bought server is refused")
 	hostedMaxRunning := flags.Int("hosted-max-running", preview.MaxHostedRunning, "the most hosted instances running at once (1 to 200)")
 	evictionInterval := flags.Duration("worktree-eviction-interval", eviction.DefaultInterval, "how often to evict retained governed worktrees (0 disables eviction)")
 	evictionIdle := flags.Duration("worktree-eviction-idle", eviction.DefaultIdle, "evict a finished run's worktree after this long without a live activity stream (0 disables the rule)")
@@ -833,7 +834,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file> [--account-lane-ask-model <model>] [--account-lane-ask-timeout <duration>]] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--hosted-max-running <n>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder> [--stack-osv-root <folder>]] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file> [--account-lane-ask-model <model>] [--account-lane-ask-timeout <duration>]] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--server-backups-file <private-file>] [--hosted-max-running <n>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder> [--stack-osv-root <folder>]] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
@@ -1019,6 +1020,9 @@ func serveCommand(args []string, stderr io.Writer) int {
 		}
 		// The hosted backups' key also signs the upload addresses of servers bought for people (Repo C BF-14.4d d1).
 		manager.SetUploadsFile(*hostedOffsiteFile)
+		// Each bought server's copies go to its region's legal area's bucket, and nowhere else (docs/plans/server-backups-areas.md).
+		manager.SetAreasFile(*serverBackupsFile)
+		fmt.Fprintf(stderr, "abcp server backups areas=%s\n", manager.AreasWithBuckets())
 		targets, deployments, targetManager = manager, manager, manager
 		go manager.Nightly(ctx)
 	}
