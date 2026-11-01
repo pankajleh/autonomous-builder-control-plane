@@ -30,6 +30,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/openmodel"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
@@ -307,6 +308,8 @@ type Runner struct {
 	finalization  FinalizationHook
 	snapshots     SnapshotCoordinator
 	parallelRuns  int
+	// openModelOptions are the open-model start's seams; zero is live.
+	openModelOptions openmodel.StartOptions
 }
 
 // New constructs an EP-002 runner from validated authority and explicit
@@ -485,7 +488,26 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	// worktree run releases once Ralphex has created its worktree.
 	var repositoryLease *repositoryExecutionLease
 	var slots *executionSlots
+	// An open-model engine (Repo C design note OPEN_MODEL_ENGINES) is readied
+	// first, before a run slot or the repository lease is taken, so a build
+	// that waits for its provider holds up no other build: its key is read,
+	// one of its model's build slots taken (held until Ralphex exits), the
+	// provider asked when the manifest says so, and the model's Codex home
+	// written. A provider that cannot take the build by its start deadline
+	// fails it here, or leaves it to start on the manifest's fallback; once
+	// Ralphex runs, the engine never changes.
+	var openModel *openmodel.Start
+	var openModelUnavailable *openmodel.UnavailableError
+	defer func() {
+		if openModel != nil {
+			runErr = errors.Join(runErr, openModel.Release())
+		}
+	}()
 	acquireLease := func() error {
+		var err error
+		if openModel, openModelUnavailable, err = r.beginOpenModel(ctx); err != nil {
+			return err
+		}
 		if !repositoryExecutionLeasingSupported() {
 			return nil
 		}
@@ -622,6 +644,10 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
+	openModelEvidence, err := r.applyOpenModel(configDir, &invocation, openModel, openModelUnavailable)
+	if err != nil {
+		return r.fail(ctx, result, domain.StateAuthorityValidated, "open-model-engine", err, nil)
+	}
 	// An engine lane (Repo C design note A6) replaces the inherited settings of
 	// its engine for this build only. It is read now, so a changed or removed
 	// file stops the build before the engine starts; only its name, SHA-256 and
@@ -646,6 +672,12 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	}
 	environment := ralphexEnvironment(r.governed.Executor().Executor, r.capsule)
 	startEvidence := map[string]any{"argv": argv, "timeout": r.governed.Ralphex().Timeout, "environment_policy": ralphexEnvironmentPolicy}
+	if openModelEvidence != nil {
+		startEvidence["open_model"] = openModelEvidence
+	}
+	if openModel != nil {
+		environment = openModel.Environment(environment)
+	}
 	if lane != nil {
 		environment = lane.Environment(environment)
 		startEvidence["engine_lane"], startEvidence["engine_lane_sha256"], startEvidence["engine_lane_keys"] = lane.Name, lane.SHA256, lane.Keys()
@@ -712,6 +744,10 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if slots != nil {
 		processErr = errors.Join(processErr, slots.Close())
 		slots = nil
+	}
+	if openModel != nil {
+		processErr = errors.Join(processErr, openModel.Release())
+		openModel = nil
 	}
 	if invocation.Bounds != nil {
 		if finishErr := r.controller.FinishRalphexInvocationV1(reservation); finishErr != nil {
@@ -950,6 +986,63 @@ func (r *Runner) invocation(configDir, executionPlanPath string) (ralphex.Invoca
 		invocation.SourceSHA = runtime.SourceSHA
 	}
 	return invocation, nil
+}
+
+// beginOpenModel readies a build whose manifest names an open-model provider
+// (openmodel.Begin). When the provider cannot take the build before its start
+// deadline and the manifest names a fallback, it answers why, and the build
+// starts on the fallback; any other failure fails the build. It answers
+// nothing for a manifest without a provider.
+func (r *Runner) beginOpenModel(ctx context.Context) (*openmodel.Start, *openmodel.UnavailableError, error) {
+	policy := r.governed.Executor()
+	if policy.Provider == nil {
+		return nil, nil, nil
+	}
+	provider := *policy.Provider
+	start, err := openmodel.Begin(ctx, provider, policy.TaskModel, r.openModelOptions)
+	if err != nil {
+		var unavailable *openmodel.UnavailableError
+		if errors.As(err, &unavailable) && provider.OnUnavailable == openmodel.UnavailableFallback && provider.Fallback != nil && ctx.Err() == nil {
+			return nil, unavailable, nil
+		}
+		return nil, nil, err
+	}
+	return start, nil, nil
+}
+
+// applyOpenModel sets a readied open-model build's invocation and answers what
+// its start records: the provider's id for the task and the review, at the
+// manifest's levels or else the model's default (a part with no level gets a
+// Ralphex configuration that sends none); or, when the provider could not
+// take it, the fallback's models and levels on the controller's own Codex.
+func (r *Runner) applyOpenModel(configDir string, invocation *ralphex.Invocation, start *openmodel.Start, unavailable *openmodel.UnavailableError) (map[string]any, error) {
+	policy := r.governed.Executor()
+	if policy.Provider == nil {
+		return nil, nil
+	}
+	if start == nil {
+		if unavailable == nil || policy.Provider.Fallback == nil {
+			return nil, errors.New("OPEN_MODEL_ENGINE_UNAVAILABLE: the open-model engine was not readied")
+		}
+		fallback := *policy.Provider.Fallback
+		if fallback.ReviewModel == "" {
+			// Ralphex would otherwise review on its own default model.
+			fallback.ReviewModel = fallback.TaskModel
+		}
+		invocation.TaskModel, invocation.TaskEffort = fallback.TaskModel, fallback.TaskEffort
+		invocation.ReviewModel, invocation.ReviewEffort = fallback.ReviewModel, fallback.ReviewEffort
+		return openmodel.FallbackEvidence(*policy.Provider, policy.TaskModel, fallback, unavailable), nil
+	}
+	invocation.TaskModel, invocation.ReviewModel = start.Model.ID, start.Model.ID
+	invocation.TaskEffort, invocation.ReviewEffort = start.Model.Effort(policy.TaskEffort), start.Model.Effort(policy.ReviewEffort)
+	if invocation.TaskEffort == "" || invocation.ReviewEffort == "" {
+		// Ralphex's own default level (high) would otherwise reach Codex for a
+		// part that names none; an empty one sends none.
+		if err := os.WriteFile(filepath.Join(configDir, "config"), []byte("codex_reasoning_effort =\n"), 0o600); err != nil {
+			return nil, fmt.Errorf("write the Ralphex configuration for %s: %w", start.Model.Name, err)
+		}
+	}
+	return start.Evidence(), nil
 }
 
 func (r *Runner) prepareValidationSpec(configDir string) (string, error) {
@@ -1896,7 +1989,10 @@ func validateOperationAuthority(governed authority.Authority) (authority.Context
 		return authority.ContextCapsuleManifest{}, fmt.Errorf("context capsule policy version %q cannot authorize governed execution; %s or activated %s is required", verified.PolicyVersion, contextcapsule.PolicyVersionV2, contextcapsule.PolicyVersionV3)
 	}
 	policy := governed.Executor()
-	if strings.EqualFold(strings.TrimSpace(policy.Executor), "codex") {
+	// An open-model engine's levels are the ones its model accepts, which the
+	// authority already checked (Repo C design note OPEN_MODEL_ENGINES); the
+	// controller's own Codex runs at xhigh only.
+	if strings.EqualFold(strings.TrimSpace(policy.Executor), "codex") && policy.Provider == nil {
 		if policy.TaskEffort != "xhigh" {
 			return authority.ContextCapsuleManifest{}, fmt.Errorf("Codex task_effort must be xhigh, got %q", policy.TaskEffort)
 		}
