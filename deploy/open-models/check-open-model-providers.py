@@ -23,14 +23,18 @@ PROVIDERS = {
     "together": {"base_url": "https://api.together.xyz/v1", "key": "together-api-key"},
     "groq": {"base_url": "https://api.groq.com/openai/v1", "key": "groq-api-key"},
 }
-# Trial candidates (revised 2026-11-01): name, id pattern, origin, role, levels to try, default level.
+# Trial candidates (revised 2026-11-01, from Together's serverless list: no Mistral, Gemma or Llama served): name, id pattern, origin, role, levels to try, default level.
 # Origin is the country of the company that made the model. CN models are price and quality benchmarks on QA's app
 # only, never customers' data, unless the owner chooses otherwise in writing.
 CANDIDATES = {
     "together": [
         ("gpt-oss-120b", r"(?i)^openai/gpt-oss-120b$", "US", "production-candidate", ["low", "medium", "high"], "high"),
         ("nemotron-3.5-super", r"(?i)nemotron.*3\.5.*super", "US", "production-candidate", [], ""),
-        ("devstral", r"(?i)mistral.*(devstral|codestral)", "FR", "production-candidate", [], ""),
+        ("beam-1.0", r"(?i)^reflection/beam-1\.0", "US", "production-candidate", [], ""),
+        ("muse-spark-open", r"(?i)muse-spark-open", "US", "production-candidate", [], ""),
+        # Free on Together; PrismML (US) compressed it from Alibaba's Qwen, so a benchmark like the CN models.
+        ("bonsai-27b", r"(?i)ternary-bonsai-27b", "US", "free-qwen-based", [], ""),
+        ("devstral", r"(?i)mistral.*(devstral|codestral)", "FR", "watch", [], ""),
         ("gemma-4-31b", r"(?i)gemma-?4.*31b", "US", "watch", [], ""),
         ("llama-4-maverick", r"(?i)llama-?4-maverick", "US", "watch", [], ""),
         ("glm-5.3", r"(?i)glm-5\.3$", "CN", "benchmark-only", [], ""),
