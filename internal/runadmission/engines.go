@@ -2,6 +2,7 @@ package runadmission
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/enginelane"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/openmodel"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
 
@@ -24,7 +26,7 @@ var laneModelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$
 // AI_KEYS_AND_MODELS §9.5): what its manifest runs, and whether its lane file
 // or the controller's own sign-in holds credentials. Lane files are read again
 // and sign-in files looked for on each call; no value leaves the controller.
-func (c *Controller) Engines(context.Context) (serviceapi.EnginesV1, error) {
+func (c *Controller) Engines(ctx context.Context) (serviceapi.EnginesV1, error) {
 	if c == nil {
 		return serviceapi.EnginesV1{SchemaVersion: EnginesSchemaV1, Engines: []serviceapi.EngineV1{}}, nil
 	}
@@ -39,7 +41,7 @@ func (c *Controller) Engines(context.Context) (serviceapi.EnginesV1, error) {
 	}
 	out := serviceapi.EnginesV1{SchemaVersion: EnginesSchemaV1, Engines: make([]serviceapi.EngineV1, 0, len(ids))}
 	for _, id := range ids {
-		engine := engineOf(id, c.profiles[id].template.Executor, getenv)
+		engine := engineOfContext(ctx, id, c.profiles[id].template.Executor, getenv)
 		if choices := c.profiles[id].configuration.ExecutorChoices; choices != nil {
 			engine.Choices = &serviceapi.EngineChoicesV1{Models: slices.Clone(choices.Models), Efforts: slices.Clone(choices.Efforts)}
 		}
@@ -51,9 +53,16 @@ func (c *Controller) Engines(context.Context) (serviceapi.EnginesV1, error) {
 // engineOf describes one profile's engine. Ready means its credentials are in
 // place, not that the vendor accepts them.
 func engineOf(profileID string, policy authority.ExecutorPolicy, getenv func(string) string) serviceapi.EngineV1 {
+	return engineOfContext(context.Background(), profileID, policy, getenv)
+}
+
+func engineOfContext(ctx context.Context, profileID string, policy authority.ExecutorPolicy, getenv func(string) string) serviceapi.EngineV1 {
 	engine := serviceapi.EngineV1{
 		ProfileID: profileID, Executor: policy.Executor,
 		TaskModel: policy.TaskModel, TaskEffort: policy.TaskEffort, ReviewModel: policy.ReviewModel, ReviewEffort: policy.ReviewEffort,
+	}
+	if policy.Provider != nil {
+		return openModelEngine(ctx, engine, *policy.Provider, policy.TaskModel)
 	}
 	if policy.Lane != "" {
 		engine.Access, engine.Lane = "lane", policy.Lane
@@ -137,4 +146,45 @@ func regularFile(path string) bool {
 	}
 	info, err := os.Lstat(path)
 	return err == nil && info.Mode().IsRegular()
+}
+
+// openModelEngine describes an open-model engine (Repo C design note
+// OPEN_MODEL_ENGINES) in the shape Repo C already reads: a lane named after
+// the provider, the provider's id of the task's model as the lane's model,
+// and readiness from the key file with the lanes' reasons (a missing file is
+// "lane_no_key", one that cannot be used "lane_unreadable"). The provider's
+// own answer, when the manifest asks for it, is reported beside, never in
+// Ready.
+func openModelEngine(ctx context.Context, engine serviceapi.EngineV1, provider openmodel.Provider, taskModel string) serviceapi.EngineV1 {
+	engine.Access, engine.Lane = "lane", provider.ID
+	model, known := provider.Model(taskModel)
+	if known && laneModelPattern.MatchString(model.ID) {
+		engine.LaneModel = model.ID
+	}
+	described := &serviceapi.EngineProviderV1{ID: provider.ID, BaseURL: provider.BaseURL, WireAPI: provider.WireAPI, OnUnavailable: provider.OnUnavailable}
+	if described.OnUnavailable == "" {
+		described.OnUnavailable = openmodel.UnavailableWait
+	}
+	for _, offered := range provider.Models {
+		described.Models = append(described.Models, serviceapi.EngineProviderModelV1{
+			Name: offered.Name, ID: offered.ID, Origin: offered.Origin, ContextWindow: offered.ContextWindow,
+			Efforts: slices.Clone(offered.Efforts), DefaultEffort: offered.DefaultEffort, MaxConcurrentBuilds: offered.Slots(),
+		})
+	}
+	engine.Provider = described
+	key, err := openmodel.ReadKey(provider.KeyFile)
+	switch {
+	case errors.Is(err, openmodel.ErrKeyMissing):
+		engine.Reason = "lane_no_key"
+		return engine
+	case err != nil:
+		engine.Reason = "lane_unreadable"
+		return engine
+	}
+	engine.Ready = true
+	if provider.CheckModels && known {
+		check := openmodel.CachedCheck(ctx, nil, provider, model, key)
+		described.Check = &serviceapi.EngineProviderCheckV1{Status: check.Status, HTTPStatus: check.HTTPStatus, CheckedAt: check.CheckedAt}
+	}
+	return engine
 }

@@ -21,6 +21,7 @@ import (
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/enginelane"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/openmodel"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
@@ -239,6 +240,11 @@ type ExecutorPolicy struct {
 	// neither; a template without a lane keeps the inherited environment.
 	Lane     string `json:"lane,omitempty"`
 	LaneFile string `json:"lane_file,omitempty"`
+	// Provider runs Codex on an OpenAI-compatible provider (Repo C design note
+	// OPEN_MODEL_ENGINES): task_model names one of its models, the review
+	// runs on the same model, and the levels are the ones that model accepts.
+	// Never with a lane; omitted, every manifest keeps its digest.
+	Provider *openmodel.Provider `json:"provider,omitempty"`
 }
 
 // WorktreePolicy records how Ralphex should isolate the governed run.
@@ -495,7 +501,9 @@ func (a Authority) Ralphex() RalphexManifest {
 
 // Executor returns the executor/model/effort policy.
 func (a Authority) Executor() ExecutorPolicy {
-	return a.manifest.Executor
+	policy := a.manifest.Executor
+	policy.Provider = policy.Provider.Clone()
+	return policy
 }
 
 // TemplateCopy returns the template the run must start from, if it names one.
@@ -599,6 +607,9 @@ func validateGovernanceAdmission(manifest Manifest, controller *governancev3.Con
 	}
 	if manifest.Executor.Executor != "codex" || manifest.Executor.TaskEffort != "xhigh" || manifest.Executor.ReviewEffort != "xhigh" {
 		return errors.New("EXECUTION_BOUNDS_INVALID: V3 requires Codex task and review effort exactly xhigh")
+	}
+	if manifest.Executor.Provider != nil {
+		return errors.New("EXECUTION_BOUNDS_INVALID: V3 runs on the controller's own Codex, never an open-model provider")
 	}
 	wall, _ := time.ParseDuration(bounds.WallClockTimeout)
 	manifestTimeout, _ := time.ParseDuration(manifest.Ralphex.Timeout)
@@ -962,6 +973,36 @@ func canonicalizeExecutorPolicy(policy *ExecutorPolicy) error {
 			return fmt.Errorf("%s must not contain ':'", field)
 		}
 	}
+	if policy.Provider != nil {
+		return validateProviderPolicy(*policy)
+	}
+	return nil
+}
+
+// validateProviderPolicy checks an open-model engine (Repo C design note
+// OPEN_MODEL_ENGINES): Codex only, never with a lane, a task model the
+// provider offers by name, the review on that same model, and the levels that
+// model accepts. It reads no file: the key is read when a build starts.
+func validateProviderPolicy(policy ExecutorPolicy) error {
+	if policy.Executor != "codex" {
+		return errors.New("executor.provider runs the Codex executor only")
+	}
+	if policy.Lane != "" {
+		return errors.New("executor.provider and executor.lane are not given together")
+	}
+	if err := policy.Provider.Validate(); err != nil {
+		return err
+	}
+	model, ok := policy.Provider.Model(policy.TaskModel)
+	if !ok {
+		return errors.New("executor.task_model must name one of executor.provider.models")
+	}
+	if policy.ReviewModel != "" {
+		return errors.New("executor.review_model is left out for executor.provider: the review runs on the task's model")
+	}
+	if !model.Accepts(policy.TaskEffort) || !model.Accepts(policy.ReviewEffort) {
+		return fmt.Errorf("executor.task_effort and executor.review_effort must be levels %s accepts", model.Name)
+	}
 	return nil
 }
 
@@ -1092,6 +1133,7 @@ func validateFileHash(path, expected string) (string, error) {
 func cloneManifest(input Manifest) Manifest {
 	clone := input
 	clone.Repository = cloneRepository(input.Repository)
+	clone.Executor.Provider = input.Executor.Provider.Clone()
 	if input.ContextCapsule != nil {
 		binding := *input.ContextCapsule
 		clone.ContextCapsule = &binding

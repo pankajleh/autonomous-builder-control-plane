@@ -315,7 +315,16 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 			return loadedProfile{}, err
 		}
 	}
-	if err := validateExecutorChoices(configuration.ExecutorChoices, governed.Executor().Executor); err != nil {
+	// An open-model profile offers its models' levels, not the controller's
+	// Codex's xhigh alone.
+	choiceExecutor := governed.Executor().Executor
+	if governed.Executor().Provider != nil {
+		choiceExecutor = "open-model"
+	}
+	if err := validateExecutorChoices(configuration.ExecutorChoices, choiceExecutor); err != nil {
+		return loadedProfile{}, err
+	}
+	if err := validateProviderChoices(configuration.ExecutorChoices, governed.Executor()); err != nil {
 		return loadedProfile{}, err
 	}
 	manifest = governed.Manifest()
@@ -1213,6 +1222,36 @@ func validateExecutorChoices(choices *ExecutorChoicesV1, executor string) error 
 			return errors.New("a Codex profile may offer only the xhigh reasoning level")
 		}
 		seen["effort:"+effort] = true
+	}
+	return nil
+}
+
+// validateProviderChoices checks an open-model profile's allowlist (Repo C
+// design note OPEN_MODEL_ENGINES): every model it offers is one of the
+// provider's, and each of them accepts the manifest's task and review levels
+// and every level offered, so any pick an admission makes is one the
+// authority admits. A profile without a provider is not checked here.
+func validateProviderChoices(choices *ExecutorChoicesV1, policy authority.ExecutorPolicy) error {
+	if policy.Provider == nil || choices == nil {
+		return nil
+	}
+	models := choices.Models
+	if len(models) == 0 {
+		models = []string{policy.TaskModel}
+	}
+	for _, name := range models {
+		model, ok := policy.Provider.Model(name)
+		if !ok {
+			return errors.New("an open-model profile offers only its provider's models")
+		}
+		if !model.Accepts(policy.TaskEffort) || !model.Accepts(policy.ReviewEffort) {
+			return errors.New("every model an open-model profile offers must accept the manifest's levels")
+		}
+		for _, effort := range choices.Efforts {
+			if !model.Accepts(effort) {
+				return errors.New("every model an open-model profile offers must accept every level it offers")
+			}
+		}
 	}
 	return nil
 }

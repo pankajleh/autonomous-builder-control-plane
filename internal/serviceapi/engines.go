@@ -32,6 +32,43 @@ type EngineV1 struct {
 	// Choices are the models and reasoning levels a run admission may pick for
 	// this profile's task (step 4b); omitted when it offers none.
 	Choices *EngineChoicesV1 `json:"choices,omitempty"`
+	// Provider describes an open-model engine (Repo C design note
+	// OPEN_MODEL_ENGINES): Codex on an OpenAI-compatible provider, whose id is
+	// also the profile's lane. Omitted for every other profile.
+	Provider *EngineProviderV1 `json:"provider,omitempty"`
+}
+
+// EngineProviderV1 is an open-model engine's provider, as the profile's
+// manifest names it. It carries no key and no file path.
+type EngineProviderV1 struct {
+	ID            string                  `json:"id"`
+	BaseURL       string                  `json:"base_url"`
+	WireAPI       string                  `json:"wire_api"`
+	OnUnavailable string                  `json:"on_unavailable"`
+	Models        []EngineProviderModelV1 `json:"models"`
+	// Check is the provider's own word on the key and the task's model, from
+	// its /models (cached for minutes), when the manifest asks for it. It
+	// never changes Ready, which says only that the key is in place.
+	Check *EngineProviderCheckV1 `json:"check,omitempty"`
+}
+
+// EngineProviderModelV1 is one model an open-model engine may run.
+type EngineProviderModelV1 struct {
+	Name                string   `json:"name"`
+	ID                  string   `json:"id"`
+	Origin              string   `json:"origin"`
+	ContextWindow       int      `json:"context_window"`
+	Efforts             []string `json:"efforts,omitempty"`
+	DefaultEffort       string   `json:"default_effort,omitempty"`
+	MaxConcurrentBuilds int      `json:"max_concurrent_builds"`
+}
+
+// EngineProviderCheckV1 is one answer of a provider's /models: "ok",
+// "key_refused", "model_missing" or "unavailable".
+type EngineProviderCheckV1 struct {
+	Status     string `json:"status"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+	CheckedAt  string `json:"checked_at,omitempty"`
 }
 
 // EngineChoicesV1 is a profile's allowlist, as its configuration lists it.

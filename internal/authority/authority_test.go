@@ -14,6 +14,7 @@ import (
 
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/openmodel"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 )
 
@@ -334,6 +335,74 @@ func TestAnEngineLaneIsNamedWithItsFileOrNotAtAll(t *testing.T) {
 		edit(&invalid.Executor)
 		if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "executor.lane") {
 			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func openModelProvider() *openmodel.Provider {
+	return &openmodel.Provider{
+		ID: "together", BaseURL: "https://api.together.xyz/v1", KeyFile: "/home/devagent/runtime/secrets/together-api-key",
+		WireAPI: "responses", CodexHome: "/home/devagent/.codex/lanes/together",
+		Models: []openmodel.Model{
+			{Name: "gpt-oss-120b", ID: "openai/gpt-oss-120b", Origin: "US", ContextWindow: 131072, Efforts: []string{"low", "medium", "high"}},
+			{Name: "devstral", ID: "mistralai/Devstral-Small-2", Origin: "FR", ContextWindow: 131072},
+		},
+	}
+}
+
+func TestAnOpenModelEngineRunsCodexOnOneOfItsModelsAtTheLevelsItAccepts(t *testing.T) {
+	manifest := fixtureManifest(t)
+	open := cloneManifest(manifest)
+	open.Executor = ExecutorPolicy{Executor: "codex", TaskModel: "gpt-oss-120b", TaskEffort: "high", ReviewEffort: "high", Provider: openModelProvider()}
+	governed, err := New(open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if governed.SHA256() == plain.SHA256() || !strings.Contains(string(governed.CanonicalJSON()), `"provider":{"id":"together"`) {
+		t.Fatal("the provider is not part of the authority")
+	}
+	if strings.Contains(string(plain.CanonicalJSON()), "provider") {
+		t.Fatal("a manifest without a provider changed its canonical form")
+	}
+	// The authority hands out copies: changing one changes nothing it holds.
+	copy := governed.Executor()
+	copy.Provider.Models[0].Efforts[0] = "xhigh"
+	copy.Provider.BaseURL = "https://elsewhere.example/v1"
+	manifestCopy := governed.Manifest()
+	manifestCopy.Executor.Provider.Models[1].ID = "changed"
+	if got := governed.Executor().Provider; got.BaseURL != "https://api.together.xyz/v1" || got.Models[0].Efforts[0] != "low" || got.Models[1].ID != "mistralai/Devstral-Small-2" {
+		t.Fatalf("the authority's provider changed through a copy: %+v", got)
+	}
+	plainModel := cloneManifest(open)
+	plainModel.Executor.TaskModel, plainModel.Executor.TaskEffort, plainModel.Executor.ReviewEffort = "devstral", "", ""
+	if _, err := New(plainModel); err != nil {
+		t.Fatalf("a model that takes no level was refused: %v", err)
+	}
+	ownDefault := cloneManifest(open)
+	ownDefault.Executor.TaskEffort, ownDefault.Executor.ReviewEffort = "", ""
+	if _, err := New(ownDefault); err != nil {
+		t.Fatalf("a model at its own default level was refused: %v", err)
+	}
+	for name, edit := range map[string]func(*ExecutorPolicy){
+		"claude":                 func(p *ExecutorPolicy) { p.Executor = "claude" },
+		"with a lane":            func(p *ExecutorPolicy) { p.Lane, p.LaneFile = "codex-api", "/home/devagent/lanes/codex-api.env" },
+		"an unknown model":       func(p *ExecutorPolicy) { p.TaskModel = "gpt-6-astra" },
+		"the provider's own id":  func(p *ExecutorPolicy) { p.TaskModel = "openai/gpt-oss-120b" },
+		"a review model":         func(p *ExecutorPolicy) { p.ReviewModel = "devstral" },
+		"a level it refuses":     func(p *ExecutorPolicy) { p.TaskEffort = "xhigh" },
+		"a review level refused": func(p *ExecutorPolicy) { p.ReviewEffort = "xhigh" },
+		"a level on a plain one": func(p *ExecutorPolicy) { p.TaskModel = "devstral" },
+		"the chat wire API":      func(p *ExecutorPolicy) { p.Provider.WireAPI = "chat" },
+		"plain http":             func(p *ExecutorPolicy) { p.Provider.BaseURL = "http://api.together.xyz/v1" },
+	} {
+		invalid := cloneManifest(open)
+		edit(&invalid.Executor)
+		if _, err := New(invalid); err == nil {
+			t.Errorf("%s was accepted", name)
 		}
 	}
 }
