@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
+	runctl "github.com/pankajleh/autonomous-builder-control-plane/internal/run"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/strictjson"
@@ -46,6 +47,12 @@ type Config struct {
 	// ParallelRuns is how many runs of a repository may execute at once (design note docs/plans/parallel-builds.md).
 	// Zero or one keeps them one at a time; launched runs are told the number with --parallel-runs.
 	ParallelRuns int
+	// Wall is the build wall every launched run starts in (Repo C design note BUILD_ISOLATION.md, phase 1). It is
+	// probed at start and before the first build after it; without it, or while its probe fails, every admission and
+	// resume answers build_wall_unavailable and every engine reads not ready. No setting builds unwalled.
+	Wall *runctl.Wall
+	// WallProbeEvery is how long a passed probe holds before an admission probes again; zero is ten minutes.
+	WallProbeEvery time.Duration
 }
 
 type ProfileFileV1 struct {
@@ -164,10 +171,17 @@ type Controller struct {
 	parallelRuns int
 	// getenv reads the controller's environment for Engines; nil is os.Getenv.
 	getenv func(string) string
+	// The build wall and its probe's last answer (wall.go).
+	wall      *runctl.Wall
+	wallState *wallState
 }
 
 // runArgs is the argv of a launched run, with the parallel run count when runs may execute at once.
 func (c *Controller) runArgs(args []string) []string {
+	if c.wall != nil {
+		// The run loads the wall file again and refuses one that is not the file probed here.
+		args = append(args, "--build-wall-file", c.wall.Path(), "--build-wall-sha256", c.wall.SHA256())
+	}
 	if c.parallelRuns > 1 {
 		args = append(args, "--parallel-runs", strconv.Itoa(c.parallelRuns))
 	}

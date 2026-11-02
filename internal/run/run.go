@@ -310,6 +310,12 @@ type Runner struct {
 	parallelRuns  int
 	// openModelOptions are the open-model start's seams; zero is live.
 	openModelOptions openmodel.StartOptions
+	// wall walls every Ralphex run (SetBuildWall, or loaded from wallFile by
+	// Run, which must hold wallSHA256, the digest abcp serve probed); a runner
+	// with neither runs unwalled, which only tests do.
+	wall       *Wall
+	wallFile   string
+	wallSHA256 string
 }
 
 // New constructs an EP-002 runner from validated authority and explicit
@@ -614,6 +620,33 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		})
 	}
 
+	// A walled run (Repo C design note BUILD_ISOLATION.md, phase 1) gets its own folder and repository while the setup
+	// lease is held; the product repository is then needed only to bring its branch back, so the lease is let go.
+	var walled *walledRun
+	if r.wall == nil && r.wallFile != "" {
+		loaded, wallErr := LoadBuildWall(r.wallFile)
+		if wallErr == nil && loaded.SHA256() != r.wallSHA256 {
+			// abcp serve probed one wall file; a run never starts in another (the file changed since).
+			wallErr = fmt.Errorf("%w: the wall file is not the one abcp serve probed (sha256 %s, probed %s)", ErrBuildWallUnavailable, loaded.SHA256(), r.wallSHA256)
+		}
+		if wallErr != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", wallErr, nil)
+		}
+		r.wall = loaded
+	}
+	if r.wall != nil {
+		var wallErr error
+		if walled, wallErr = r.prepareWalledRun(ctx); wallErr != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", wallErr, nil)
+		}
+		if repositoryLease != nil {
+			if err := repositoryLease.Close(); err != nil {
+				return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", err, nil)
+			}
+			repositoryLease = nil
+		}
+	}
+
 	configDir, err := os.MkdirTemp("", "abcp-ralphex-config-")
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("create isolated Ralphex config directory: %w", err), nil)
@@ -628,8 +661,18 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 		}
 	}
-	executionPlanPath, cleanupExecutionPlan, err := r.prepareExecutionPlan(ctx, repositoryLease)
+	var executionPlanPath string
+	var cleanupExecutionPlan func() error
+	if walled != nil {
+		executionPlanPath, err = walled.executionPlan(ctx, r.governed.Plan())
+		cleanupExecutionPlan = walled.removePlanCopy
+	} else {
+		executionPlanPath, cleanupExecutionPlan, err = r.prepareExecutionPlan(ctx, repositoryLease)
+	}
 	if err != nil {
+		if cleanupExecutionPlan != nil {
+			err = errors.Join(err, cleanupExecutionPlan())
+		}
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
 	defer func() {
@@ -644,10 +687,6 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
-	openModelEvidence, err := r.applyOpenModel(configDir, &invocation, openModel, openModelUnavailable)
-	if err != nil {
-		return r.fail(ctx, result, domain.StateAuthorityValidated, "open-model-engine", err, nil)
-	}
 	// An engine lane (Repo C design note A6) replaces the inherited settings of
 	// its engine for this build only. It is read now, so a changed or removed
 	// file stops the build before the engine starts; only its name, SHA-256 and
@@ -661,6 +700,21 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		lane = &loaded
 		// Ralphex removes ANTHROPIC_API_KEY from Claude Code's environment unless asked to keep it.
 		_, invocation.PreserveAnthropicAPIKey = loaded.Settings["ANTHROPIC_API_KEY"]
+	}
+	// A walled run's engine gets a home in the run's folder (an open-model engine's configuration is written there)
+	// before its start is recorded, so the evidence names the home it runs with.
+	if walled != nil {
+		engine := r.governed.Executor().Executor
+		if openModel == nil && openModelUnavailable != nil {
+			engine = "codex"
+		}
+		if err := walled.prepareEngine(engine, lane, openModel); err != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", err, nil)
+		}
+	}
+	openModelEvidence, err := r.applyOpenModel(configDir, &invocation, openModel, openModelUnavailable)
+	if err != nil {
+		return r.fail(ctx, result, domain.StateAuthorityValidated, "open-model-engine", err, nil)
 	}
 	argv, err := invocation.Argv()
 	if err != nil {
@@ -682,6 +736,27 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		environment = lane.Environment(environment)
 		startEvidence["engine_lane"], startEvidence["engine_lane_sha256"], startEvidence["engine_lane_keys"] = lane.Name, lane.SHA256, lane.Keys()
 	}
+	commandArgv, commandCwd := argv, r.governed.Repository().Path
+	if walled != nil {
+		environment = walled.environment(environment)
+		wallArgs, err := walled.args(r.governed, configDir)
+		if err != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", err, nil)
+		}
+		if err := r.wall.Check(ctx, wallArgs); err != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", err, nil)
+		}
+		// Its wall starts, so the run's branch starts in the product repository, for every fetch back to fast-forward.
+		if err := walled.startBranch(ctx); err != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", err, nil)
+		}
+		isolation := r.wall.Evidence(wallArgs)
+		for key, value := range walled.evidence {
+			isolation[key] = value
+		}
+		startEvidence["isolation"] = isolation
+		commandArgv, commandCwd = append(append([]string{}, wallArgs...), argv...), walled.repository
+	}
 	if err := r.transition(ctx, domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner", startEvidence, nil); err != nil {
 		return result, err
 	}
@@ -692,8 +767,8 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	result.State = domain.StateImplementing
 
 	command := supervisor.Command{
-		Argv:    argv,
-		Cwd:     r.governed.Repository().Path,
+		Argv:    commandArgv,
+		Cwd:     commandCwd,
 		Env:     environment,
 		Timeout: ralphexTimeout,
 		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: r.ralphexArtifactName("ralphex-stdout.log"), Kind: "ralphex-stdout"},
@@ -715,6 +790,11 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		stopSetupWatch = r.releaseLeaseAfterWorktreeSetup(ctx, repositoryLease)
 		defer stopSetupWatch()
 	}
+	stopBringBack := func() {}
+	if walled != nil {
+		stopBringBack = walled.bringBackWhileRunning(ctx)
+		defer stopBringBack()
+	}
 	if invocation.Bounds != nil {
 		contained, ok := r.processes.(ContainedCommandRunner)
 		if !ok {
@@ -733,9 +813,14 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		process, processErr = r.processes.Run(ctx, command)
 	}
 	stopSetupWatch()
+	stopBringBack()
 	if cleanupExecutionPlan != nil {
 		processErr = errors.Join(processErr, cleanupExecutionPlan())
 		cleanupExecutionPlan = nil
+	}
+	// The branch is brought back once more after Ralphex exits, before acceptance reads it in the product repository.
+	if walled != nil {
+		processErr = errors.Join(processErr, walled.bringBackFinally(context.WithoutCancel(ctx)))
 	}
 	if repositoryLease != nil {
 		processErr = errors.Join(processErr, repositoryLease.Close())

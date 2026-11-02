@@ -25,7 +25,8 @@ type EngineV1 struct {
 	// Access is "sign-in" (the controller's own Codex or Claude sign-in) or
 	// "lane". Ready says its credentials are in place; it does not say the
 	// vendor accepts them. Reason says why not: "lane_unreadable",
-	// "lane_no_key" or "not_signed_in".
+	// "lane_no_key", "not_signed_in" or "build_wall_unavailable" (no build
+	// starts while the build wall cannot).
 	Access string `json:"access"`
 	Ready  bool   `json:"ready"`
 	Reason string `json:"reason,omitempty"`
@@ -81,6 +82,11 @@ type EngineChoicesV1 struct {
 type EnginesV1 struct {
 	SchemaVersion string     `json:"schema_version"`
 	Engines       []EngineV1 `json:"engines"`
+	// BuildIsolation is "bwrap-v1" while every build is walled and the wall
+	// starts (Repo C design note BUILD_ISOLATION.md, phase 1); omitted
+	// otherwise, when every engine reads ready false with the reason
+	// "build_wall_unavailable".
+	BuildIsolation string `json:"build_isolation,omitempty"`
 }
 
 // EngineCatalog answers the engines; it reads lane files and sign-in files'

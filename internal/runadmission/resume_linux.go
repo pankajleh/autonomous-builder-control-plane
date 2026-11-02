@@ -80,6 +80,9 @@ func (c *Controller) ResumeRun(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
+	if err := c.requireWall(ctx); err != nil {
+		return err
+	}
 	lock, acquired, err := acquireLaunchLock(c.launchesFD, runID)
 	if err != nil {
 		return serviceapi.ErrAdmissionUnavailable

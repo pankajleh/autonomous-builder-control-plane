@@ -1119,3 +1119,21 @@ func TestTheRelayAndTheCatalogArePartOfTheAuthorityOnlyWhenNamed(t *testing.T) {
 		}
 	}
 }
+
+// A walled run's read paths belong to the app its product task ID names, in canonical UUID form only: a word such as
+// "tasks" would make the folder holding every app's look like one app's.
+func TestIsolationReadPathsNameTheirAppByItsCanonicalUUID(t *testing.T) {
+	const app = "3b8f2c1e-5d4a-4e7b-9c2f-0a1b2c3d4e5f"
+	folder := "/runtime/builds/admission-1"
+	if err := validateIsolation(IsolationManifest{RunFolder: folder, ReadPaths: []string{"/vendor/versions/" + app}, ProductTaskID: app}, "admission-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateIsolation(IsolationManifest{RunFolder: folder}, "admission-1"); err != nil {
+		t.Fatalf("a run with no read paths needs no app: %v", err)
+	}
+	for _, task := range []string{"tasks", "", strings.ToUpper(app), app[:35], app + "0", "3b8f2c1e_5d4a_4e7b_9c2f_0a1b2c3d4e5f", "g" + app[1:]} {
+		if err := validateIsolation(IsolationManifest{RunFolder: folder, ReadPaths: []string{"/vendor/imports/tasks"}, ProductTaskID: task}, "admission-1"); err == nil {
+			t.Fatalf("read paths for the task %q were accepted", task)
+		}
+	}
+}

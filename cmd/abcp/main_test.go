@@ -26,6 +26,7 @@ import (
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
+	runctl "github.com/pankajleh/autonomous-builder-control-plane/internal/run"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 )
 
@@ -722,5 +723,58 @@ func TestParallelRunsMustBeOneToEight(t *testing.T) {
 			"--parallel-runs", value}, &stderr); code != 2 || !strings.Contains(stderr.String(), "parallel runs must be between 1 and 8") {
 			t.Fatalf("serve --parallel-runs %s = %d, %q", value, code, stderr.String())
 		}
+	}
+}
+
+func TestRunCommandNeverStartsABuildWithoutItsWall(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	// Every path is given except the wall file: the run refuses before it starts anything, whatever else fails first.
+	code := runCLI([]string{"run", "--manifest", filepath.Join(t.TempDir(), "manifest.json"), "--ledger", filepath.Join(t.TempDir(), "events.jsonl"),
+		"--evidence-root", filepath.Join(t.TempDir(), "evidence")}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("run without a wall file exited 0: %s", stderr.String())
+	}
+	var usage bytes.Buffer
+	runCLI([]string{"run"}, &stdout, &usage)
+	if !strings.Contains(usage.String(), "--build-wall-file") || !strings.Contains(usage.String(), "--build-wall-sha256") {
+		t.Fatalf("run usage does not name the wall file and its probed digest: %q", usage.String())
+	}
+}
+
+func TestBuildWallProbeChecksAWallFileWithoutStartingABuild(t *testing.T) {
+	write := func(bwrap string) string {
+		root := t.TempDir()
+		home := filepath.Join(root, "home")
+		if err := os.Mkdir(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := json.Marshal(runctl.BuildWallFileV1{SchemaVersion: 1, Bwrap: bwrap, BuildsRoot: filepath.Join(root, "builds"), Home: home,
+			System: []string{"/usr", "/etc"}, Canaries: []string{filepath.Join(root, "secrets")}})
+		path := filepath.Join(root, "build-wall.json")
+		writeCLIFile(t, path, data, 0o600)
+		return path
+	}
+	fake := filepath.Join(t.TempDir(), "bwrap")
+	writeCLIFile(t, fake, []byte("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'bubblewrap 0.9.0'; exit 0; fi\nexit 1\n"), 0o700)
+	var stdout, stderr bytes.Buffer
+	if code := runCLI([]string{"build-wall-probe", "--build-wall-file", write(fake)}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "build_wall_unavailable") {
+		t.Fatalf("probe of a wall that cannot start = %d %q", code, stderr.String())
+	}
+	if code := runCLI([]string{"build-wall-probe"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("probe without a wall file = %d", code)
+	}
+	bwrap, err := exec.LookPath("bwrap")
+	if err != nil {
+		t.Skip("bubblewrap is not installed")
+	}
+	bwrap, _ = filepath.EvalSymlinks(bwrap)
+	stdout.Reset()
+	stderr.Reset()
+	code := runCLI([]string{"build-wall-probe", "--build-wall-file", write(bwrap), "--canary", t.TempDir()}, &stdout, &stderr)
+	if code == 1 && strings.Contains(stderr.String(), "did not start") {
+		t.Skipf("bubblewrap cannot start a wall here: %s", stderr.String())
+	}
+	if code != 0 || !strings.Contains(stdout.String(), "build wall ready kind=bwrap-v1") {
+		t.Fatalf("probe of a real wall = %d %q %q", code, stdout.String(), stderr.String())
 	}
 }

@@ -74,6 +74,14 @@ var (
 	errRequestBodyTooLarge             = errors.New("request body exceeds limit")
 )
 
+var (
+	// ErrBuildWallUnavailable says the build wall cannot start (Repo C design note BUILD_ISOLATION.md, phase 1): no
+	// build is admitted, and none runs unwalled instead.
+	ErrBuildWallUnavailable = errors.New("build wall unavailable")
+	// ErrReadPathNotAccepted says a read path is not a real folder under a root the wall file allows.
+	ErrReadPathNotAccepted = errors.New("read path not accepted")
+)
+
 // CatalogReader is the complete durable dependency of Track-A HTTP routes.
 // In particular, it has no ledger-snapshot method.
 type CatalogReader interface {
@@ -191,6 +199,8 @@ type ServerConfig struct {
 	ChangeJobs ChangeJobController
 	// RequestLog, when set, gets one line per request with its X-Request-ID (Repo C design note REQUEST_IDS.md).
 	RequestLog io.Writer
+	// BuildIsolation, when set, says in GET /v1/capabilities whether builds are walled.
+	BuildIsolation BuildIsolationReporter
 }
 
 type Server struct {
@@ -307,6 +317,14 @@ type CapabilitiesV1 struct {
 	Cancel           bool `json:"cancel"`
 	Decision         bool `json:"decision"`
 	EvidenceDownload bool `json:"evidence_download"`
+	// BuildIsolation is "bwrap-v1" while every build is walled and the wall starts (Repo C design note
+	// BUILD_ISOLATION.md, phase 1); omitted otherwise.
+	BuildIsolation string `json:"build_isolation,omitempty"`
+}
+
+// BuildIsolationReporter answers the build wall's kind while it starts, "" otherwise.
+type BuildIsolationReporter interface {
+	BuildIsolation() string
 }
 
 type RunSummaryV1 struct {
@@ -459,11 +477,15 @@ func (s *Server) capabilities(writer http.ResponseWriter, request *http.Request,
 		s.writeError(writer, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid capabilities request", RequestID: requestID})
 		return
 	}
-	s.writeJSON(writer, http.StatusOK, CapabilitiesV1{
+	capabilities := CapabilitiesV1{
 		RunAdmission: s.reserved.RunAdmission != nil,
 		Cancel:       s.reserved.Actions != nil, Decision: s.reserved.Actions != nil,
 		EvidenceDownload: s.reserved.Evidence != nil,
-	})
+	}
+	if s.reserved.BuildIsolation != nil {
+		capabilities.BuildIsolation = s.reserved.BuildIsolation.BuildIsolation()
+	}
+	s.writeJSON(writer, http.StatusOK, capabilities)
 }
 
 func (s *Server) runRoute(writer http.ResponseWriter, request *http.Request, principal Principal, requestID string) {
@@ -988,6 +1010,10 @@ func (s *Server) writeDependencyError(writer http.ResponseWriter, requestID stri
 		status, apiError.Code, apiError.Message = http.StatusNotFound, "unknown_profile", "admission profile is not available"
 	case errors.Is(err, ErrRepositoryBaseMismatch):
 		status, apiError.Code, apiError.Message = http.StatusConflict, "repository_base_mismatch", "repository base does not match"
+	case errors.Is(err, ErrBuildWallUnavailable):
+		status, apiError.Code, apiError.Message, apiError.Retryable = http.StatusServiceUnavailable, "build_wall_unavailable", "builds are walled and the wall cannot start; no build starts until it can", true
+	case errors.Is(err, ErrReadPathNotAccepted):
+		status, apiError.Code, apiError.Message = http.StatusUnprocessableEntity, "read_path_not_accepted", "a read path is not a real folder under a root the build wall allows"
 	case errors.Is(err, ErrAdmissionUnavailable):
 		status, apiError.Code, apiError.Message, apiError.Retryable = http.StatusServiceUnavailable, "admission_unavailable", "run admission is temporarily unavailable", true
 	case errors.Is(err, ErrUnsafeAdmissionMaterialization):

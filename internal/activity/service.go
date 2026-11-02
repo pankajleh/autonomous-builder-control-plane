@@ -617,7 +617,7 @@ func (s *Service) noteEngagement(run string) {
 }
 
 func (s *Service) acquireSidecar(scope Scope) (*sharedSidecar, string) {
-	key := identity(scope.Repository, scope.Ralphex.BinaryPath, scope.Ralphex.BinarySHA256, scope.Ralphex.SourceSHA)
+	key := identity(scope.worktreeRepository(), scope.Ralphex.BinaryPath, scope.Ralphex.BinarySHA256, scope.Ralphex.SourceSHA)
 	s.mu.Lock()
 	if shared := s.sidecars[key]; shared != nil {
 		if shared.closing != nil {

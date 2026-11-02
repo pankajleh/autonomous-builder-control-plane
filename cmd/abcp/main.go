@@ -92,6 +92,8 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		return runCommand(args[1:], stdout, stderr)
 	case "serve":
 		return serveCommand(args[1:], stderr)
+	case "build-wall-probe":
+		return buildWallProbeCommand(args[1:], stdout, stderr)
 	case "stack-tool":
 		// The change jobs' run tool (docs/plans/change-jobs.md): an MCP server over stdio for the agent.
 		if len(args) != 3 || args[1] != "--socket" || !filepath.IsAbs(args[2]) {
@@ -523,6 +525,12 @@ func writeJSONOutput(writer io.Writer, value any) error {
 }
 
 func runCommand(args []string, stdout, stderr io.Writer) int {
+	// Nothing this run starts inherits a file it was given (abcp serve's launch lock is file 3): a build must not reach
+	// one from inside its wall. abcp run keeps its own copies.
+	if err := runctl.CloseInheritedFilesOnExec(); err != nil {
+		fmt.Fprintf(stderr, "build_wall_unavailable: mark inherited files close-on-exec: %v\n", err)
+		return 1
+	}
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	manifestPath := flags.String("manifest", "", "path to the governed authority manifest")
@@ -533,6 +541,8 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	workflowAuthorityConfigFile := flags.String("workflow-authority-config-file", "", "optional protected PostgreSQL workflow-authority config file")
 	resume := flags.Bool("resume", false, "re-enter a run paused at HUMAN_DECISION_REQUIRED from its recorded human decision")
 	parallelRuns := flags.Int("parallel-runs", 1, "how many runs of the repository may execute at once (1 to 8)")
+	buildWallFile := flags.String("build-wall-file", "", "protected build wall file every Ralphex run starts in (Repo C design note BUILD_ISOLATION.md); required")
+	buildWallSHA256 := flags.String("build-wall-sha256", "", "the SHA-256 of the wall file abcp serve probed; a run whose wall file is another is refused; required")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -541,7 +551,7 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *manifestPath == "" || *ledgerPath == "" || *evidenceRoot == "" {
-		fmt.Fprintln(stderr, "usage: abcp run --manifest <path> --ledger <path> --evidence-root <path> [--workflow-authority-config-file <protected-file>]")
+		fmt.Fprintln(stderr, "usage: abcp run --manifest <path> --ledger <path> --evidence-root <path> --build-wall-file <protected-file> --build-wall-sha256 <hex> [--workflow-authority-config-file <protected-file>]")
 		return 2
 	}
 
@@ -596,8 +606,18 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	// Every build runs inside its wall; there is no setting that runs one without it (Repo C design note
+	// BUILD_ISOLATION.md, decision 3A).
+	if *buildWallFile == "" || *buildWallSHA256 == "" {
+		fmt.Fprintln(stderr, "build_wall_unavailable: abcp run starts builds only inside a build wall abcp serve probed (--build-wall-file, --build-wall-sha256)")
+		return 1
+	}
 	runner, err := runctl.NewWithController(governed, events, artifacts, processes, controller)
 	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err := runner.SetBuildWallFile(*buildWallFile, *buildWallSHA256); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -826,6 +846,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	changeRoot := flags.String("change-root", "", "private folder (mode 0700) for change jobs: their records, patches, work and caches")
 	changeSourceRoot := flags.String("change-source-root", "", "folder where Repo C leaves the code a change job changes")
 	changeEngineFile := flags.String("change-engine-file", "", "protected file naming the change jobs' engine and its lane (docs/plans/change-jobs.md)")
+	buildWallFile := flags.String("build-wall-file", "", "protected build wall file (Repo C design note BUILD_ISOLATION.md): every build runs inside bubblewrap as it says; without it, or while its probe fails, no build is admitted (503 build_wall_unavailable)")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -834,7 +855,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file> [--account-lane-ask-model <model>] [--account-lane-ask-timeout <duration>]] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--server-backups-file <private-file>] [--hosted-max-running <n>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder> [--stack-osv-root <folder>]] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file> [--account-lane-ask-model <model>] [--account-lane-ask-timeout <duration>]] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--server-backups-file <private-file>] [--hosted-max-running <n>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder> [--stack-osv-root <folder>]] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>] [--build-wall-file <protected-file>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
@@ -866,16 +887,37 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer catalog.Close()
+	// The build wall (Repo C design note BUILD_ISOLATION.md, phase 1). A missing or refused wall file leaves the service
+	// running and refuses every build; it never builds unwalled.
+	var wall *runctl.Wall
+	if *buildWallFile != "" {
+		if wall, err = runctl.LoadBuildWall(*buildWallFile); err != nil {
+			fmt.Fprintf(stderr, "abcp build wall ready=false reason=%q\n", err.Error())
+			wall = nil
+		}
+	} else {
+		fmt.Fprintln(stderr, "abcp build wall ready=false reason=\"no --build-wall-file: no build is admitted\"")
+	}
+	if wall != nil {
+		activity.UseObserverWall(wall)
+	}
 	var admissions *runadmission.Controller
 	if *admissionProfileFile != "" {
 		admissions, err = runadmission.NewController(runadmission.Config{
-			ProfileFile: *admissionProfileFile, ServiceRoot: *serviceRoot, Catalog: catalog, ParallelRuns: *parallelRuns,
+			ProfileFile: *admissionProfileFile, ServiceRoot: *serviceRoot, Catalog: catalog, ParallelRuns: *parallelRuns, Wall: wall,
 		})
 		if err != nil {
 			fmt.Fprintln(stderr, "load run admission configuration")
 			return 1
 		}
 		defer admissions.Close()
+		if wall != nil {
+			if wallErr := admissions.BuildWallStatus(context.Background()); wallErr != nil {
+				fmt.Fprintf(stderr, "abcp build wall ready=false reason=%q\n", wallErr.Error())
+			} else {
+				fmt.Fprintf(stderr, "abcp build wall ready=true kind=%s bwrap=%q wall_file_sha256=%s\n", runctl.BuildIsolationKindV1, wall.Version(), wall.SHA256())
+			}
+		}
 	}
 	localReadService, err := readmodel.New(catalog, cursors)
 	if err != nil {
@@ -1090,8 +1132,9 @@ func serveCommand(args []string, stderr io.Writer) int {
 	}
 	// Only a controller with its profiles answers GET /v1/engines; without one the route says it is unsupported.
 	var engines serviceapi.EngineCatalog
+	var buildIsolation serviceapi.BuildIsolationReporter
 	if admissions != nil {
-		engines = admissions
+		engines, buildIsolation = admissions, admissions
 	}
 	server, err := serviceapi.NewServer(serviceapi.ServerConfig{
 		RequestLog:    stderr,
@@ -1103,6 +1146,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
 		RunAdmission: admissions, DevelopmentRunAdmission: admissions, Engines: engines, AccountLanes: accountLanes, Targets: targets,
 		Deployments: deployments, AppHealth: appHealth, StackJobs: stackJobs, ChangeJobs: changeJobs,
+		BuildIsolation: buildIsolation,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "construct service API")
@@ -1204,5 +1248,39 @@ func loadManifest(path string) (authority.Manifest, error) {
 }
 
 func usage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|governance-*-validate|governance-lease-issue|run|serve|recovery-inspect|recovery-resume>")
+	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|governance-*-validate|governance-lease-issue|run|serve|build-wall-probe|recovery-inspect|recovery-resume>")
+}
+
+// canaryFlags is a repeatable --canary.
+type canaryFlags []string
+
+func (c *canaryFlags) String() string     { return strings.Join(*c, ",") }
+func (c *canaryFlags) Set(v string) error { *c = append(*c, v); return nil }
+
+// buildWallProbeCommand loads a wall file and runs its start probe once, as abcp serve does at start, so a wall file can
+// be checked on the host before a restart (Repo C design note BUILD_ISOLATION.md, phase 1). It starts no build.
+func buildWallProbeCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("build-wall-probe", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	wallFile := flags.String("build-wall-file", "", "protected build wall file")
+	var canaries canaryFlags
+	flags.Var(&canaries, "canary", "a further path the probe must not find inside the wall (repeatable)")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *wallFile == "" {
+		fmt.Fprintln(stderr, "usage: abcp build-wall-probe --build-wall-file <protected-file> [--canary <path>]...")
+		return 2
+	}
+	wall, err := runctl.LoadBuildWall(*wallFile)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err := wall.Probe(context.Background(), canaries); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "build wall ready kind=%s bwrap=%q wall_file_sha256=%s\n", runctl.BuildIsolationKindV1, wall.Version(), wall.SHA256())
+	return 0
 }

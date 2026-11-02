@@ -3,8 +3,6 @@ package eviction
 import (
 	"context"
 	"errors"
-
-	"github.com/pankajleh/autonomous-builder-control-plane/internal/activity"
 )
 
 var (
@@ -114,7 +112,7 @@ func (s *Sweeper) release(ctx context.Context, run, reason string) (ReleaseResul
 	if !scope.Retain {
 		return ReleaseResult{Status: NotRetained}, nil
 	}
-	path, err := activity.WorktreePath(ctx, scope)
+	path, err := worktreePath(ctx, scope)
 	if err != nil {
 		return ReleaseResult{}, err
 	}
@@ -130,12 +128,18 @@ func (s *Sweeper) release(ctx context.Context, run, reason string) (ReleaseResul
 		return ReleaseResult{Status: AlreadyReleased, Record: record}, nil
 	}
 	if path == "" {
+		// A finished walled run's folder with no worktree goes too: nothing in it is kept.
+		if scope.RunFolder != "" {
+			if err := removeRunFolder(scope.RunFolder); err != nil {
+				return ReleaseResult{}, err
+			}
+		}
 		return ReleaseResult{Status: NoWorktree}, nil
 	}
-	if !inside(scope.Repository, path) {
+	if !inside(worktreeRepository(scope), path) {
 		return ReleaseResult{}, ErrIntegrity
 	}
-	bytes, err := size(path)
+	bytes, err := size(retainedFolder(scope, path))
 	if err != nil {
 		return ReleaseResult{}, err
 	}

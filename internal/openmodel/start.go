@@ -64,8 +64,11 @@ type Start struct {
 	// it; it serves until Release.
 	Relay    *Relay
 	relayLog *relayLog
-	key      Key
-	release  func() error
+	// logHome is the model's slot home, where the relay's log is kept; Home
+	// moves to the build's own folder when the build is walled (UseHome).
+	logHome string
+	key     Key
+	release func() error
 }
 
 // String names the build's engine; a Start never prints its key.
@@ -160,8 +163,16 @@ func Begin(ctx context.Context, p Provider, modelName string, options StartOptio
 		return fail(fmt.Errorf("OPEN_MODEL_ENGINE_HOME: %s/%s: %w", p.ID, model.Name, err))
 	}
 	sum := sha256.Sum256(config)
-	start.Home, start.ConfigSHA256, start.key = home, hex.EncodeToString(sum[:]), key
+	start.Home, start.ConfigSHA256, start.key, start.logHome = home, hex.EncodeToString(sum[:]), key, home
 	return start, nil
+}
+
+// baseURL is the address Codex is given: the build's relay, or the provider's.
+func (s *Start) baseURL() string {
+	if s.Relay != nil {
+		return s.Relay.URL()
+	}
+	return s.Provider.BaseURL
 }
 
 // relayIdentityAddress stands for the relay's address in the configuration a
@@ -271,10 +282,17 @@ func (s *Start) Evidence() map[string]any {
 	if s.Relay != nil {
 		evidence["relay"] = map[string]any{
 			"address": s.Relay.Address(), "upstream": s.Provider.BaseURL, "compat": append([]string{}, s.Model.Compat...),
-			"log": filepath.Join(s.Home, RelayLogFile),
+			"log": filepath.Join(s.logHomeOrHome(), RelayLogFile),
 		}
 	}
 	return evidence
+}
+
+func (s *Start) logHomeOrHome() string {
+	if s.logHome != "" {
+		return s.logHome
+	}
+	return s.Home
 }
 
 // FallbackEvidence answers what the run's start records when it runs on the

@@ -141,10 +141,31 @@ func startSidecar(ctx context.Context, scope Scope, root string) (*sidecar, erro
 	port := listener.Addr().(*net.TCPAddr).Port
 	listener.Close()
 	lifetime, cancel := context.WithCancel(ctx)
-	command := exec.CommandContext(lifetime, scope.Ralphex.BinaryPath, "--serve", "--host", "127.0.0.1", "--port", strconv.Itoa(port), "--watch", scope.Repository)
+	watch := scope.worktreeRepository()
+	argv := []string{scope.Ralphex.BinaryPath, "--serve", "--host", "127.0.0.1", "--port", strconv.Itoa(port), "--watch", watch}
+	walled := scope.RunFolder != ""
+	if walled {
+		// A walled run's progress folder is the build's to write: the provider reads it inside a wall of its own,
+		// which shows it the run's folder read-only, its pinned binary and its private runtime, and nothing else, so a
+		// link there leads nowhere. It keeps the host's loopback, where the controller reads it.
+		holder := observerWall.Load()
+		if holder == nil || holder.wall == nil {
+			cancel()
+			return nil, ErrUnavailable
+		}
+		prefix, err := holder.wall.ObserverArgs([]string{scope.RunFolder, scope.Ralphex.BinaryPath}, []string{runtimeDir}, true)
+		if err != nil {
+			cancel()
+			return nil, ErrUnavailable
+		}
+		argv = append(prefix, argv...)
+	}
+	command := exec.CommandContext(lifetime, argv[0], argv[1:]...)
 	command.Env = append(gitexec.Environment(), "HOME="+runtimeDir)
 	command.Dir = runtimeDir
-	pinExecutable(command, binary)
+	if !walled {
+		pinExecutable(command, binary)
+	}
 	// Both controller and child retain the runtime lease. Reconciliation must
 	// not remove runtime state while either process is still alive.
 	command.ExtraFiles = append(command.ExtraFiles, lease)
@@ -249,7 +270,7 @@ func correlate(scope Scope, list []session) (session, error) {
 		if started, err := time.Parse(time.RFC3339Nano, candidate.StartTime); err != nil || started.IsZero() {
 			return session{}, ErrIntegrity
 		}
-		expected := filepath.Join(scope.Repository, ".ralphex", "progress")
+		expected := filepath.Join(scope.worktreeRepository(), ".ralphex", "progress")
 		if candidate.DirPath != expected {
 			return session{}, ErrIntegrity
 		}
@@ -280,7 +301,7 @@ func sessionID(path string) string {
 // Only file identity/append continuity is inspected here; provider events are
 // obtained exclusively through the sidecar's SSE machine contract.
 func progressProof(scope Scope, selected session, previous *providerProof) (providerProof, error) {
-	dirPath := filepath.Join(scope.Repository, ".ralphex", "progress")
+	dirPath := filepath.Join(scope.worktreeRepository(), ".ralphex", "progress")
 	dir, err := openDirectory(dirPath)
 	if err != nil {
 		return providerProof{}, ErrIntegrity

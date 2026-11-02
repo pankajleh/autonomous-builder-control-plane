@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "bwrap": "/usr/bin/bwrap",
+  "builds_root": "/home/devagent/local-integration/repo-c-abcp/runtime/builds",
+  "home": "/home/devagent",
+  "system": [
+    "/usr",
+    "/etc",
+    "/run/systemd/resolve"
+  ],
+  "tools": [
+    "/home/devagent/.nvm",
+    "/home/devagent/.cache/ms-playwright",
+    "/home/devagent/.cache/node/corepack",
+    "/home/devagent/.local/share/pnpm/store/v10"
+  ],
+  "libraries": [
+    "/home/devagent/autobuild-vendor/templates",
+    "/home/devagent/autobuild-vendor/templates-mirror.git",
+    "/home/devagent/autobuild-vendor/library",
+    "/home/devagent/autobuild-vendor/forms",
+    "/home/devagent/autobuild-vendor/eol",
+    "/home/devagent/autobuild-vendor/node",
+    "/home/devagent/autobuild-vendor/expo",
+    "/home/devagent/autobuild-vendor/pwa",
+    "/home/devagent/autobuild-vendor/electron",
+    "/home/devagent/autobuild-vendor/extension",
+    "/home/devagent/autobuild-vendor/shopify",
+    "/home/devagent/autobuild-vendor/woo",
+    "/home/devagent/autobuild-vendor/woo-plugin",
+    "/home/devagent/autobuild-vendor/wp-site"
+  ],
+  "read_roots": [
+    {
+      "path": "/home/devagent/autobuild-vendor/versions"
+    },
+    {
+      "path": "/home/devagent/autobuild-vendor/brands",
+      "shared": true
+    },
+    {
+      "path": "/home/devagent/autobuild-vendor/chat-files"
+    },
+    {
+      "path": "/home/devagent/autobuild-vendor/imports"
+    },
+    {
+      "path": "/home/devagent/autobuild-vendor/site-reads"
+    },
+    {
+      "path": "/home/devagent/autobuild-vendor/standard-pages"
+    },
+    {
+      "path": "/home/devagent/autobuild-vendor/requirements"
+    },
+    {
+      "path": "/home/devagent/autobuild-vendor/assets"
+    }
+  ],
+  "canaries": [
+    "/home/devagent/local-integration/repo-c-abcp/runtime/secrets",
+    "/home/devagent/local-integration/repo-c-abcp/runtime/abcp-config",
+    "/home/devagent/local-integration/repo-c-abcp/runtime/open-models",
+    "/home/devagent/autobuild-code",
+    "/home/devagent/autobuild-vendor/change-sources",
+    "/home/devagent/autobuild-vendor/stack-sources",
+    "/home/devagent/autobuild-vendor/github",
+    "/home/devagent/autobuild-vendor/osv"
+  ]
+}
