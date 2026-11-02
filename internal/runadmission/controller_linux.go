@@ -55,6 +55,10 @@ type admissionAuthority struct {
 	executor *serviceapi.RunExecutorV1
 	// exactEdit is the exact replacements a product run makes with no builder, if any.
 	exactEdit *serviceapi.RunExactEditV1
+	// readPaths are the app's own folders a product build is shown inside its wall, if any; productTaskID is the app
+	// they belong to, which each names unless it is in a shared root.
+	readPaths     []string
+	productTaskID string
 }
 
 func productAdmissionAuthority(request serviceapi.RunAdmissionRequestV1) admissionAuthority {
@@ -73,6 +77,9 @@ func productAdmissionAuthority(request serviceapi.RunAdmissionRequestV1) admissi
 		template:  request.Template,
 		executor:  request.Executor,
 		exactEdit: request.ExactEdit,
+		// The app's own folders its wall shows it, and the app they are of.
+		readPaths:     request.ReadPaths,
+		productTaskID: request.ProductTaskID,
 	}
 }
 
@@ -168,6 +175,24 @@ func NewController(config Config) (*Controller, error) {
 		parallelRuns: config.ParallelRuns,
 	}
 	controller.start = startProcess
+	if config.Wall != nil {
+		// The probe looks for everything a build must never see: the service root, the profile file, and each
+		// profile's repository, ledger, evidence, template and workflow settings, besides the wall file's own canaries.
+		canaries := []string{config.ServiceRoot, profileFile}
+		for _, profile := range profiles {
+			canaries = append(canaries, profile.configuration.RepositoryPath, profile.ledgerRoot, profile.evidenceRoot,
+				profile.configuration.ManifestTemplatePath, profile.workflowAuthorityConfigPath)
+			if laneFile := profile.template.Executor.LaneFile; laneFile != "" {
+				canaries = append(canaries, laneFile)
+			}
+			if provider := profile.template.Executor.Provider; provider != nil {
+				canaries = append(canaries, provider.KeyFile, provider.CodexHome)
+			}
+		}
+		controller.wall = config.Wall
+		controller.wallState = newWallState(config.Wall, uniqueStrings(canaries), config.WallProbeEvery, config.Clock)
+		_ = controller.wallState.check(context.Background(), false)
+	}
 	return controller, nil
 }
 
@@ -407,6 +432,15 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 	if err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	}
+	// No build starts while its wall cannot (Repo C design note BUILD_ISOLATION.md §7, decision 3A).
+	if err := c.requireWall(ctx); err != nil {
+		return serviceapi.RunAdmissionResponseV1{}, err
+	}
+	if !bindingFound && len(admission.readPaths) > 0 {
+		if err := c.wall.ValidateReadPaths(admission.readPaths, admission.productTaskID); err != nil {
+			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrReadPathNotAccepted
+		}
+	}
 	lock, acquired, err := acquireLaunchLock(c.launchesFD, runID)
 	if err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
@@ -471,7 +505,14 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 				return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
 			}
 		}
-		manifestPath, materialized, materializeErr := materialize(profile, principal, admission, runID)
+		isolation := &authority.IsolationManifest{RunFolder: c.wall.RunFolder(runID)}
+		if len(admission.readPaths) > 0 {
+			if err := c.wall.ValidateReadPaths(admission.readPaths, admission.productTaskID); err != nil {
+				return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrReadPathNotAccepted
+			}
+			isolation.ReadPaths, isolation.ProductTaskID = append([]string(nil), admission.readPaths...), admission.productTaskID
+		}
+		manifestPath, materialized, materializeErr := materialize(profile, principal, admission, runID, isolation)
 		if materializeErr != nil {
 			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrUnsafeAdmissionMaterialization
 		}
@@ -893,7 +934,7 @@ func validateReceipt(receipt AdmissionReceiptV1, name string) error {
 	return nil
 }
 
-func materialize(profile loadedProfile, principal serviceapi.Principal, admission admissionAuthority, runID string) (string, runBinding, error) {
+func materialize(profile loadedProfile, principal serviceapi.Principal, admission admissionAuthority, runID string, isolation *authority.IsolationManifest) (string, runBinding, error) {
 	runIDSum := sha256.Sum256([]byte(runID))
 	handoffPath := ralphex.ExecutionPlanHandoffPrefixV1 + hex.EncodeToString(runIDSum[:]) + "/plan.md"
 	ignored, err := gitPathIgnored(profile.configuration.RepositoryPath, handoffPath)
@@ -947,7 +988,7 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, admissio
 		return "", runBinding{}, err
 	}
 	capsulePath := filepath.Join(runDirectory, "context-capsule.json")
-	manifestData, err := derivedManifestData(profile, admission.repositoryBaseSHA, runID, planPath, capsulePath, plan, capsuleData, admission.template, admission.executor, admission.exactEdit)
+	manifestData, err := derivedManifestData(profile, admission.repositoryBaseSHA, runID, planPath, capsulePath, plan, capsuleData, admission.template, admission.executor, admission.exactEdit, isolation)
 	if err != nil || len(manifestData) > MaxManifestTemplateBytes {
 		return "", runBinding{}, errors.New("derived manifest exceeds bounds")
 	}
@@ -1145,7 +1186,7 @@ func developmentAdmissionCapsuleSpecForIdentity(repositoryIdentity string, reque
 	}
 }
 
-func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPath, capsulePath string, plan, capsuleData []byte, template *serviceapi.RunTemplateV1, executor *serviceapi.RunExecutorV1, exactEdit *serviceapi.RunExactEditV1) ([]byte, error) {
+func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPath, capsulePath string, plan, capsuleData []byte, template *serviceapi.RunTemplateV1, executor *serviceapi.RunExecutorV1, exactEdit *serviceapi.RunExactEditV1, isolation *authority.IsolationManifest) ([]byte, error) {
 	manifest, err := cloneManifest(profile.template)
 	if err != nil {
 		return nil, err
@@ -1182,7 +1223,25 @@ func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPa
 		edit := exactEditManifest(*exactEdit)
 		manifest.ExactEdit = &edit
 	}
+	if isolation != nil {
+		if len(isolation.ReadPaths) == 0 {
+			isolation = &authority.IsolationManifest{RunFolder: isolation.RunFolder}
+		}
+		manifest.Isolation = isolation
+	}
 	return json.Marshal(manifest)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != "" && !seen[value] {
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 // exactEditManifest is the run authority's copy of a request's exact edit.

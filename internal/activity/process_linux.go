@@ -55,16 +55,47 @@ func ownsListener(pid, port int) bool {
 	if inode == "" {
 		return false
 	}
-	base := "/proc/" + strconv.Itoa(pid) + "/fd"
-	entries, err := os.ReadDir(base)
-	if err != nil {
-		return false
-	}
-	for _, entry := range entries {
-		target, err := os.Readlink(filepath.Join(base, entry.Name()))
-		if err == nil && target == "socket:["+inode+"]" {
-			return true
+	// A walled provider listens from inside its wall: a descendant of the started process, a few levels down.
+	for _, candidate := range descendants(pid, 4) {
+		base := "/proc/" + strconv.Itoa(candidate) + "/fd"
+		entries, err := os.ReadDir(base)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			target, err := os.Readlink(filepath.Join(base, entry.Name()))
+			if err == nil && target == "socket:["+inode+"]" {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// descendants answers pid and its descendants up to depth levels down, from /proc/<pid>/task/*/children.
+func descendants(pid, depth int) []int {
+	out := []int{pid}
+	level := []int{pid}
+	for ; depth > 0 && len(level) > 0; depth-- {
+		var next []int
+		for _, parent := range level {
+			tasks, err := os.ReadDir("/proc/" + strconv.Itoa(parent) + "/task")
+			if err != nil {
+				continue
+			}
+			for _, task := range tasks {
+				data, err := os.ReadFile("/proc/" + strconv.Itoa(parent) + "/task/" + task.Name() + "/children")
+				if err != nil {
+					continue
+				}
+				for _, field := range strings.Fields(string(data)) {
+					if child, err := strconv.Atoi(field); err == nil && child > 0 && len(out) < 64 {
+						out, next = append(out, child), append(next, child)
+					}
+				}
+			}
+		}
+		level = next
+	}
+	return out
 }

@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
@@ -142,6 +143,10 @@ func TestTheControllerListsEveryProfilesEngineInProfileOrder(t *testing.T) {
 		"local-p02-claude": {template: authority.Manifest{Executor: authority.ExecutorPolicy{Executor: "claude", TaskEffort: "xhigh"}}},
 		"local-p02":        {template: authority.Manifest{Executor: authority.ExecutorPolicy{Executor: "codex", TaskModel: "gpt-6-astra"}}},
 	}}
+	controller.wall, _ = testWall(t)
+	controller.wallState = newWallState(controller.wall, nil, 0, time.Now)
+	passWall(controller, nil)
+	_ = controller.wallState.check(context.Background(), false)
 	engines, err := controller.Engines(context.Background())
 	if err != nil || engines.SchemaVersion != "EnginesV1" || len(engines.Engines) != 2 {
 		t.Fatalf("engines = %+v, %v", engines, err)

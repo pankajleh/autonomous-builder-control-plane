@@ -5,6 +5,7 @@ package openmodel
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -87,6 +88,36 @@ func writeHomeFile(home, name string, data []byte) error {
 		os.Remove(temporary)
 		return fmt.Errorf("write the Codex home's %s: %w", name, err)
 	}
+	return nil
+}
+
+// UseHome moves the build's Codex configuration into home, a private folder
+// of the build's own run folder (Repo C design note BUILD_ISOLATION.md, phase
+// 1): its config.toml and the model's catalog are written there, the catalog
+// named there, and CODEX_HOME is home from then on. The relay's log stays in
+// the model's slot home, which the build is never shown.
+func (s *Start) UseHome(home string) error {
+	if s == nil || !filepath.IsAbs(home) || filepath.Clean(home) != home {
+		return errors.New("OPEN_MODEL_ENGINE_HOME: the build's own Codex home must be an absolute clean path")
+	}
+	if err := privateDirectory(home); err != nil {
+		return fmt.Errorf("OPEN_MODEL_ENGINE_HOME: %w", err)
+	}
+	catalog := CodexCatalogJSON(s.Provider, s.Model)
+	if catalog != nil {
+		if err := writeHomeFile(home, CatalogFile, catalog); err != nil {
+			return fmt.Errorf("OPEN_MODEL_ENGINE_HOME: %w", err)
+		}
+	}
+	config := configOf(s.Provider, s.Model, home, s.baseURL(), catalog)
+	if err := writeHomeFile(home, "config.toml", config); err != nil {
+		return fmt.Errorf("OPEN_MODEL_ENGINE_HOME: %w", err)
+	}
+	sum := sha256.Sum256(config)
+	if s.logHome == "" {
+		s.logHome = s.Home
+	}
+	s.Home, s.ConfigSHA256 = home, hex.EncodeToString(sum[:])
 	return nil
 }
 

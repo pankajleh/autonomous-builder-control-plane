@@ -45,6 +45,11 @@ type Manifest struct {
 	Worktree       WorktreePolicy          `json:"worktree"`
 	Acceptance     []AcceptanceCommand     `json:"acceptance"`
 	PolicyVersion  string                  `json:"policy_version"`
+
+	// Isolation is the run's build wall (Repo C design note BUILD_ISOLATION.md,
+	// phase 1): its own folder and the app's own folders it may read. Omitted
+	// for runs admitted before the wall, so their digests stay as they were.
+	Isolation *IsolationManifest `json:"isolation,omitempty"`
 }
 
 // ReviewRequirement binds one controller-selected component to the exact
@@ -111,6 +116,62 @@ func validateTemplateCopy(template TemplateCopyManifest) error {
 		return errors.New("template copy: invalid template identity")
 	}
 	return nil
+}
+
+// IsolationManifest names a walled run's own folder (<builds root>/<run id>,
+// where its repository, home, /tmp and engine home are) and the app's own
+// folders it is shown read-only. ABCP's wall file decides the roots both may
+// be under; the run checks them again before its wall starts. ProductTaskID
+// is the app the read paths are its own folders of: each, unless in a shared
+// root, names it as a whole component. It is given with read paths only.
+type IsolationManifest struct {
+	RunFolder     string   `json:"run_folder"`
+	ReadPaths     []string `json:"read_paths,omitempty"`
+	ProductTaskID string   `json:"product_task_id,omitempty"`
+}
+
+// MaxIsolationReadPaths bounds a run's read paths.
+const MaxIsolationReadPaths = 16
+
+func validateIsolation(isolation IsolationManifest, runID string) error {
+	if !filepath.IsAbs(isolation.RunFolder) || filepath.Clean(isolation.RunFolder) != isolation.RunFolder || filepath.Base(isolation.RunFolder) != runID {
+		return errors.New("isolation: run_folder must be an absolute clean path named after the run")
+	}
+	if len(isolation.ReadPaths) > MaxIsolationReadPaths {
+		return fmt.Errorf("isolation: at most %d read paths", MaxIsolationReadPaths)
+	}
+	seen := map[string]bool{}
+	for _, path := range isolation.ReadPaths {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" || strings.ContainsRune(path, 0) || len(path) > 4096 || seen[path] {
+			return errors.New("isolation: every read path must be a distinct absolute clean path")
+		}
+		seen[path] = true
+	}
+	if (len(isolation.ReadPaths) > 0 || isolation.ProductTaskID != "") && !CanonicalUUID(isolation.ProductTaskID) {
+		return errors.New("isolation: read paths name the app they belong to (product_task_id, a canonical UUID)")
+	}
+	return nil
+}
+
+// CanonicalUUID reports whether value is a UUID in canonical form: 36 characters, lowercase hexadecimal in groups of
+// 8, 4, 4, 4 and 12 joined by hyphens, as Repo C writes its task IDs.
+func CanonicalUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for index, c := range value {
+		switch index {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ExactEditManifest binds a run to exact replacements in the files of one
@@ -364,6 +425,12 @@ func newAuthority(input Manifest, controller *governancev3.ControllerV1) (Author
 		}
 	}
 
+	if manifest.Isolation != nil {
+		if err := validateIsolation(*manifest.Isolation, manifest.RunID); err != nil {
+			return Authority{}, err
+		}
+	}
+
 	binaryPath, err := canonicalFile(manifest.Ralphex.BinaryPath)
 	if err != nil {
 		return Authority{}, fmt.Errorf("ralphex binary path: %w", err)
@@ -520,6 +587,16 @@ func (a Authority) ExactEdit() (ExactEditManifest, bool) {
 		return ExactEditManifest{}, false
 	}
 	return ExactEditManifest{SourceSHA: a.manifest.ExactEdit.SourceSHA, Replacements: append([]ExactEditReplacement(nil), a.manifest.ExactEdit.Replacements...)}, true
+}
+
+// Isolation returns the run's build wall, when its authority names one.
+func (a Authority) Isolation() (IsolationManifest, bool) {
+	if a.manifest.Isolation == nil {
+		return IsolationManifest{}, false
+	}
+	isolation := *a.manifest.Isolation
+	isolation.ReadPaths = append([]string(nil), isolation.ReadPaths...)
+	return isolation, true
 }
 
 // Worktree returns the configured worktree policy.
@@ -1144,6 +1221,9 @@ func cloneManifest(input Manifest) Manifest {
 	}
 	if input.ExactEdit != nil {
 		clone.ExactEdit = &ExactEditManifest{SourceSHA: input.ExactEdit.SourceSHA, Replacements: append([]ExactEditReplacement(nil), input.ExactEdit.Replacements...)}
+	}
+	if input.Isolation != nil {
+		clone.Isolation = &IsolationManifest{RunFolder: input.Isolation.RunFolder, ReadPaths: append([]string(nil), input.Isolation.ReadPaths...), ProductTaskID: input.Isolation.ProductTaskID}
 	}
 	if input.MergeReview != nil {
 		policy := cloneReviewPolicy(*input.MergeReview)

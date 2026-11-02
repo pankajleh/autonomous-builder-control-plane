@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/activity"
@@ -172,14 +174,27 @@ const (
 
 func (s *Sweeper) inspect(ctx context.Context, run string) (candidate, outcome) {
 	scope, err := s.Binder.ResolveBinding(ctx, run)
-	if err != nil || !scope.Retain {
+	if err != nil {
 		return candidate{}, notRetained
 	}
-	path, err := activity.WorktreePath(ctx, scope)
+	if scope.RunFolder != "" {
+		// A walled run keeps nothing outside its folder: once that is gone (evicted, or never made) there is nothing
+		// to sweep.
+		if _, err := os.Lstat(scope.RunFolder); errors.Is(err, os.ErrNotExist) {
+			return candidate{}, notRetained
+		}
+		if s.removeFolderWithoutWorktree(ctx, run, scope) {
+			return candidate{}, notRetained
+		}
+	}
+	if !scope.Retain {
+		return candidate{}, notRetained
+	}
+	path, err := worktreePath(ctx, scope)
 	if err == nil && path == "" {
 		return candidate{}, notRetained
 	}
-	if err != nil || !inside(scope.Repository, path) {
+	if err != nil || !inside(worktreeRepository(scope), path) {
 		return candidate{}, unverified
 	}
 	if record, ok, err := s.Store.Read(run); err != nil {
@@ -211,10 +226,32 @@ func (s *Sweeper) inspect(ctx context.Context, run string) (candidate, outcome) 
 		c.kept = "preview"
 	}
 	c.Protected = c.kept != ""
-	if c.Bytes, err = size(path); err != nil {
+	if c.Bytes, err = size(retainedFolder(scope, path)); err != nil {
 		return candidate{}, unverified
 	}
 	return c, inspected
+}
+
+// removeFolderWithoutWorktree removes a finished walled run's folder that holds no worktree of the run: the run failed
+// before Ralphex made one (its wall, its engine, an early exit), or its worktree went (a profile that keeps none). Its
+// clone, home and caches would otherwise stay for ever, since only a worktree is retained or evicted. Its branch, if
+// it has one, is in the product repository. It answers whether the run needs nothing more from the sweeper.
+func (s *Sweeper) removeFolderWithoutWorktree(ctx context.Context, run string, scope activity.Scope) bool {
+	if _, err := os.Lstat(scope.RunFolder); err != nil {
+		return false
+	}
+	if terminal, _, err := s.finished(ctx, run); err != nil || !terminal {
+		return false
+	}
+	if path, err := worktreePath(ctx, scope); err != nil || path != "" {
+		return false
+	}
+	if err := removeRunFolder(scope.RunFolder); err != nil {
+		s.logf("abcp run folder removal failed run=%s class=%s", run, class(err))
+		return false
+	}
+	s.logf("abcp run folder removed run=%s reason=no-worktree", run)
+	return true
 }
 
 // finished reports whether the run reached a finished state, and when.
@@ -290,11 +327,84 @@ func removeWorktree(ctx context.Context, scope activity.Scope, path string) erro
 	if current == "" {
 		return nil
 	}
-	if current != path || !inside(scope.Repository, path) {
+	if current != path || !inside(worktreeRepository(scope), path) {
 		return ErrIntegrity
+	}
+	// A walled run's worktree is in its own repository in its own folder (Repo C design note BUILD_ISOLATION.md,
+	// phase 1): the folder goes whole, its repository, home and caches with it. Its branch is in the product
+	// repository already, and its checkpoints are pinned there.
+	if scope.RunFolder != "" {
+		return removeRunFolder(scope.RunFolder)
 	}
 	_, err = git(ctx, scope.Repository, "worktree", "remove", "--force", "--", path)
 	return err
+}
+
+// worktreePath is the run's worktree, "" when it has none. A walled run's is in its own repository in its folder: with
+// the folder or the repository not there (evicted, or never made whole) it has none; otherwise Git, inside the observer
+// wall, says.
+func worktreePath(ctx context.Context, scope activity.Scope) (string, error) {
+	if scope.RunFolder != "" {
+		for _, path := range []string{scope.RunFolder, filepath.Join(worktreeRepository(scope), ".git")} {
+			if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+				return "", nil
+			} else if err != nil {
+				return "", err
+			}
+		}
+	}
+	return activity.WorktreePath(ctx, scope)
+}
+
+// worktreeRepository is the repository that holds the run's worktree: a walled run's own, else the product's.
+func worktreeRepository(scope activity.Scope) string {
+	if scope.RunRepository != "" {
+		return scope.RunRepository
+	}
+	return scope.Repository
+}
+
+// retainedFolder is what a retained run keeps on disk: a walled run's whole folder, else its worktree.
+func retainedFolder(scope activity.Scope, worktree string) string {
+	if scope.RunFolder != "" {
+		return scope.RunFolder
+	}
+	return worktree
+}
+
+// removeRunFolder removes a walled run's folder, never through a link: the folder itself must be a real folder of this
+// user, and a folder in it the build left without write permission is opened without following links and made
+// writable first.
+func removeRunFolder(folder string) error {
+	info, err := os.Lstat(folder)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return ErrIntegrity
+	}
+	if resolved, err := filepath.EvalSymlinks(folder); err != nil || resolved != folder {
+		return ErrIntegrity
+	}
+	if err := os.RemoveAll(folder); err == nil {
+		return nil
+	}
+	_ = filepath.WalkDir(folder, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || !entry.IsDir() {
+			return nil
+		}
+		fd, openErr := syscall.Open(path, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		if openErr != nil {
+			return nil
+		}
+		_ = syscall.Fchmod(fd, 0o700)
+		_ = syscall.Close(fd)
+		return nil
+	})
+	return os.RemoveAll(folder)
 }
 
 func inside(repository, path string) bool {

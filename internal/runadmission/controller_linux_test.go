@@ -384,6 +384,7 @@ func TestAdmissionMaterializesV2InputsAndReplaysOrConflicts(t *testing.T) {
 		"--cgroup-root", filepath.Join(filepath.Dir(filepath.Dir(fixture.input)), "cgroup"),
 		"--service-root", fixture.service,
 		"--workflow-authority-config-file", filepath.Join(filepath.Dir(filepath.Dir(fixture.input)), "workflow-authority.json"),
+		"--build-wall-file", fixture.controller.wall.Path(), "--build-wall-sha256", fixture.controller.wall.SHA256(),
 	}) {
 		t.Fatalf("launch argv = %#v", starts)
 	}
@@ -624,7 +625,7 @@ func TestAdmissionRejectsRunSpecificIgnoredRalphexHandoffPath(t *testing.T) {
 	if err := os.Mkdir(service, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	controller, err := NewController(Config{ProfileFile: config, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog})
+	controller, err := withTestWall(t, Config{ProfileFile: config, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -972,7 +973,7 @@ func TestAdmissionUnboundReceiptDoesNotAdoptChangedPrivateProfile(t *testing.T) 
 	if err := fixture.controller.Close(); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := NewController(Config{
+	restarted, err := withTestWall(t, Config{
 		ProfileFile: filepath.Join(root, "admission-profiles.json"), ServiceRoot: fixture.service,
 		Executable: testExecutable(t), Catalog: fixture.catalog,
 	})
@@ -1107,7 +1108,7 @@ func TestAdmissionRegisteredExactReplaySurvivesPrivateProfileChange(t *testing.T
 	if err := fixture.controller.Close(); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := NewController(Config{
+	restarted, err := withTestWall(t, Config{
 		ProfileFile: filepath.Join(root, "admission-profiles.json"), ServiceRoot: fixture.service,
 		Executable: testExecutable(t), Catalog: fixture.catalog,
 	})
@@ -1145,7 +1146,7 @@ func TestAdmissionRegisteredExactReplaySurvivesPrivateProfileRemoval(t *testing.
 	if err := fixture.controller.Close(); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := NewController(Config{ProfileFile: profilePath, ServiceRoot: fixture.service, Executable: testExecutable(t), Catalog: fixture.catalog})
+	restarted, err := withTestWall(t, Config{ProfileFile: profilePath, ServiceRoot: fixture.service, Executable: testExecutable(t), Catalog: fixture.catalog})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1183,7 +1184,7 @@ func TestAdmissionBoundLaunchRequiresReconciliationAfterPrivateProfileChange(t *
 	if err := fixture.controller.Close(); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := NewController(Config{
+	restarted, err := withTestWall(t, Config{
 		ProfileFile: filepath.Join(root, "admission-profiles.json"), ServiceRoot: fixture.service,
 		Executable: testExecutable(t), Catalog: fixture.catalog,
 	})
@@ -1305,7 +1306,7 @@ func newEditedAdmissionFixture(t *testing.T, ignored bool, edit func(root string
 	if err := os.Mkdir(service, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	controller, err := NewController(Config{
+	controller, err := withTestWall(t, Config{
 		ProfileFile: config, ServiceRoot: service, Executable: testExecutable(t), Catalog: catalog,
 		Clock: func() time.Time { return time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC) },
 	})

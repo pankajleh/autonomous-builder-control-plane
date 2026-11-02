@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -84,6 +85,33 @@ type RunAdmissionRequestV1 struct {
 	// acceptance (Repo C design note BF01D_QUICK_EDIT.md §4.5). Omitted for every
 	// other build, so every request without it keeps its digest.
 	ExactEdit *RunExactEditV1 `json:"exact_edit,omitempty"`
+	// ReadPaths are the app's own folders the build is shown read-only inside
+	// its wall (Repo C design note BUILD_ISOLATION.md, phase 1): its earlier
+	// version, brand, chat files, imports, site reads, standard pages. Each is a
+	// real folder under a root ABCP's wall file allows. Omitted when the build
+	// reads none, so every request without it keeps its digest.
+	ReadPaths []string `json:"read_paths,omitempty"`
+}
+
+// MaxRunReadPaths bounds a run admission's read paths.
+const MaxRunReadPaths = 16
+
+// ValidateRunReadPaths checks read paths' form: at most MaxRunReadPaths,
+// each a distinct absolute clean path of at most 4096 bytes with no NUL.
+// Whether each is a real folder under an allowed root is the controller's.
+func ValidateRunReadPaths(paths []string) error {
+	if len(paths) > MaxRunReadPaths {
+		return errors.New("too many read paths")
+	}
+	seen := map[string]bool{}
+	for _, path := range paths {
+		if path == "" || path == "/" || !filepath.IsAbs(path) || filepath.Clean(path) != path || len(path) > 4096 ||
+			strings.ContainsRune(path, 0) || !utf8.ValidString(path) || seen[path] {
+			return errors.New("invalid read path")
+		}
+		seen[path] = true
+	}
+	return nil
 }
 
 // RunExactEditV1 starts from SourceSHA, the commit of the version being changed
@@ -272,6 +300,14 @@ func ValidateRunAdmissionRequestV1(request RunAdmissionRequestV1) error {
 			return errors.New("invalid exact edit")
 		}
 		if err := ValidateRunExactEditV1(*request.ExactEdit); err != nil {
+			return err
+		}
+	}
+	if request.ReadPaths != nil {
+		if len(request.ReadPaths) == 0 {
+			return errors.New("invalid read paths")
+		}
+		if err := ValidateRunReadPaths(request.ReadPaths); err != nil {
 			return err
 		}
 	}

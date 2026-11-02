@@ -52,3 +52,8 @@ func (*relayLog) Write([]byte) (int, error) {
 }
 
 func (*relayLog) Close() error { return nil }
+
+// UseHome is unsupported off Linux.
+func (*Start) UseHome(string) error {
+	return errors.New("OPEN_MODEL_ENGINE_HOME: unsupported on this platform")
+}

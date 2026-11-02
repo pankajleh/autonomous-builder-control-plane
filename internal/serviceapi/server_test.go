@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -355,6 +356,8 @@ func TestRunAdmissionStrictDecodeAndTypedErrors(t *testing.T) {
 		{ErrUnsafeAdmissionMaterialization, http.StatusInternalServerError, "unsafe_admission_materialization"},
 		{ErrExecutorChoiceNotAccepted, http.StatusUnprocessableEntity, "executor_choice_not_accepted"},
 		{ErrExactEditNotAccepted, http.StatusUnprocessableEntity, "exact_edit_not_accepted"},
+		{ErrBuildWallUnavailable, http.StatusServiceUnavailable, "build_wall_unavailable"},
+		{ErrReadPathNotAccepted, http.StatusUnprocessableEntity, "read_path_not_accepted"},
 	} {
 		controller.err = test.err
 		response := httptest.NewRecorder()
@@ -1543,6 +1546,49 @@ func TestPreviewMutationsRejectInvalidActorsAndCallerAuthority(t *testing.T) {
 					t.Fatal("invalid actor or caller authority reached controller", w.Code, w.Body.String())
 				}
 			}
+		}
+	}
+}
+
+type testBuildIsolation string
+
+func (b testBuildIsolation) BuildIsolation() string { return string(b) }
+
+func TestRunAdmissionCarriesTheAppsReadPathsAndCapabilitiesSayWhetherBuildsAreWalled(t *testing.T) {
+	controller := &testRunAdmissionController{response: RunAdmissionResponseV1{RunID: "admission-run-1", RunURL: "/v1/runs/admission-run-1"}}
+	server := newTestServer(t, &testCatalog{}, time.Now().UTC())
+	server.reserved.RunAdmission = controller
+	grantRunAdmission(server)
+	base := strings.TrimSuffix(validRunAdmissionJSON("request-1", "task"), "}")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, authenticatedRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(base+`,"read_paths":["/vendor/versions/task/v1/files","/vendor/brands/user/v2/brand"]}`))))
+	if response.Code != http.StatusAccepted || len(controller.request.ReadPaths) != 2 || controller.request.ReadPaths[1] != "/vendor/brands/user/v2/brand" {
+		t.Fatalf("admission with read paths = %d %q %v", response.Code, response.Body.String(), controller.request.ReadPaths)
+	}
+	tooMany := make([]string, MaxRunReadPaths+1)
+	for index := range tooMany {
+		tooMany[index] = fmt.Sprintf(`"/vendor/versions/%d"`, index)
+	}
+	for name, paths := range map[string]string{
+		"relative": `["vendor/x"]`, "unclean": `["/vendor/../secrets"]`, "twice": `["/v/a","/v/a"]`, "the root": `["/"]`,
+		"empty": `[]`, "too many": "[" + strings.Join(tooMany, ",") + "]", "not a list": `"/v/a"`,
+	} {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, authenticatedRequest(http.MethodPost, "/v1/runs", bytes.NewReader([]byte(base+`,"read_paths":`+paths+`}`))))
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("read paths %s = %d %q", name, response.Code, response.Body.String())
+		}
+	}
+	for want, reporter := range map[string]BuildIsolationReporter{`"build_isolation":"bwrap-v1"`: testBuildIsolation("bwrap-v1"), "": testBuildIsolation(""), " ": nil} {
+		server.reserved.BuildIsolation = reporter
+		capabilities := httptest.NewRecorder()
+		server.Handler().ServeHTTP(capabilities, authenticatedRequest(http.MethodGet, "/v1/capabilities", nil))
+		if strings.TrimSpace(want) == "" {
+			if strings.Contains(capabilities.Body.String(), "build_isolation") {
+				t.Fatalf("capabilities without a working wall = %q", capabilities.Body.String())
+			}
+		} else if !strings.Contains(capabilities.Body.String(), want) {
+			t.Fatalf("capabilities with a working wall = %q", capabilities.Body.String())
 		}
 	}
 }

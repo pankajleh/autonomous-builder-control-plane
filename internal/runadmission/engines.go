@@ -47,6 +47,12 @@ func (c *Controller) Engines(ctx context.Context) (serviceapi.EnginesV1, error) 
 		}
 		out.Engines = append(out.Engines, engine)
 	}
+	// No engine is ready while builds cannot be walled (Repo C design note BUILD_ISOLATION.md, decision 3A).
+	if out.BuildIsolation = c.BuildIsolation(); out.BuildIsolation == "" {
+		for index := range out.Engines {
+			out.Engines[index].Ready, out.Engines[index].Reason = false, "build_wall_unavailable"
+		}
+	}
 	return out, nil
 }
 
