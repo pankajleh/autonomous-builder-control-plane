@@ -1072,3 +1072,50 @@ func TestNewValidatesTheExactEdit(t *testing.T) {
 		}
 	}
 }
+
+// TestTheRelayAndTheCatalogArePartOfTheAuthorityOnlyWhenNamed: a provider
+// without relay, compat or codex_catalog keeps its canonical form (and so
+// every existing profile's digest); naming them changes the digest; an
+// unknown fix or compat without the relay is refused.
+func TestTheRelayAndTheCatalogArePartOfTheAuthorityOnlyWhenNamed(t *testing.T) {
+	manifest := fixtureManifest(t)
+	open := cloneManifest(manifest)
+	open.Executor = ExecutorPolicy{Executor: "codex", TaskModel: "gpt-oss-120b", TaskEffort: "high", ReviewEffort: "high", Provider: openModelProvider()}
+	plain, err := New(open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"relay"`, `"compat"`, `"codex_catalog"`} {
+		if strings.Contains(string(plain.CanonicalJSON()), key) {
+			t.Fatalf("a provider without %s names it in its canonical form", key)
+		}
+	}
+	relayed := cloneManifest(open)
+	relayed.Executor.Provider.Relay = true
+	relayed.Executor.Provider.Models[0].Compat = []string{openmodel.CompatDropNullReasoningContent, openmodel.CompatOutputAfterCall}
+	relayed.Executor.Provider.Models[0].CodexCatalog = &openmodel.CodexCatalog{ApplyPatch: true}
+	governed, err := New(relayed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if governed.SHA256() == plain.SHA256() || !strings.Contains(string(governed.CanonicalJSON()), `"compat":["drop_null_reasoning_content","output_after_call"],"codex_catalog":{"apply_patch":true}`) ||
+		!strings.Contains(string(governed.CanonicalJSON()), `"relay":true`) {
+		t.Fatalf("the relay is not part of the authority: %s", governed.CanonicalJSON())
+	}
+	copy := governed.Executor()
+	copy.Provider.Models[0].Compat[0] = "changed"
+	copy.Provider.Models[0].CodexCatalog.ApplyPatch = false
+	if got := governed.Executor().Provider.Models[0]; got.Compat[0] != openmodel.CompatDropNullReasoningContent || !got.CodexCatalog.ApplyPatch {
+		t.Fatal("the authority's compat list changed through a copy")
+	}
+	for name, edit := range map[string]func(*openmodel.Provider){
+		"an unknown fix":           func(p *openmodel.Provider) { p.Models[0].Compat = []string{"reorder"} },
+		"compat without the relay": func(p *openmodel.Provider) { p.Relay = false },
+	} {
+		invalid := cloneManifest(relayed)
+		edit(invalid.Executor.Provider)
+		if _, err := New(invalid); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}

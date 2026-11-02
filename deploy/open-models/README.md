@@ -65,6 +65,28 @@ budgets and acceptance stay exactly the host's), with this executor (Together sh
 }
 ```
 
+For Together, round 1's fixes and catalog entries come with it (Repo B `docs/plans/open-model-engines.md`, 2026-11-02):
+the provider says `"relay": true`, and each model its `compat` list and `codex_catalog` entry, for example
+
+```json
+{"name": "gpt-oss-120b", "id": "openai/gpt-oss-120b", "origin": "US", "context_window": 131072,
+ "efforts": ["low", "medium", "high"], "default_effort": "high", "max_concurrent_builds": 1,
+ "compat": ["drop_null_reasoning_content", "message_before_calls", "output_after_call"],
+ "codex_catalog": {"apply_patch": true}}
+```
+
+| Model | `compat` | `codex_catalog` |
+|---|---|---|
+| gpt-oss-120b | `drop_null_reasoning_content`, `message_before_calls`, `output_after_call` | `{"apply_patch": true}` |
+| nemotron-3.5-super, muse-spark-open, glm-5.3 | the same three | `{}` |
+| bonsai-27b | the same three and `drop_namespace_tools` | `{}` |
+| beam-1.0 | `chat_completions_bridge` | `{}` |
+| deepseek-v4.1-flash | the same three and `drop_medium_effort` | `{}` |
+
+`base_url` stays the provider's own (`https://api.together.xyz/v1`): each build starts its own relay on 127.0.0.1 and
+gives Codex that address. A models-file entry's own `compat` or `codex_catalog` wins over the script's table; a
+provider with neither (Groq) is written exactly as before.
+
 Groq's is the same with `"id": "groq"`, `"base_url": "https://api.groq.com/openai/v1"`, `groq-api-key`,
 `/home/devagent/.codex/lanes/groq` and `gpt-oss-120b` alone. The profile entry added to `profiles.json.open-models`
 is a copy of `local-p02` with `"profile_id": "local-p02-together"`, the new template, and
@@ -82,6 +104,41 @@ is a copy of `local-p02` with `"profile_id": "local-p02-together"`, the new temp
 
 **Off again:** put `profiles.json.pre-open-models` back and restart with no build running. The templates, homes and
 keys can stay; nothing reads them.
+
+## 4b. From the trial's Python relay to ABCP's (once #183 is on `main`)
+
+Round 1 ran through `runtime/open-models/together-responses-shim-v6.py` on 127.0.0.1:18996, named by the template's
+`base_url`. `R=/home/devagent/local-integration/repo-c-abcp/runtime`, `C=$R/abcp-config`, `<sha>` the merge commit.
+
+1. **Build** (restarts nothing): copy `$R/a-abcp-build-48f183a.sh` to `a-abcp-build-<sha>.sh` with the new worktree
+   and SHA, and add the real-Codex check, which calls no provider:
+   `ABCP_TEST_CODEX=/home/devagent/.nvm/versions/node/v24.19.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex go test -count=1 -run TestCodexBuildsThrough ./internal/openmodel/`
+   (two tests; `-v` shows they ran rather than skipped).
+2. **The template and profiles**, while the live ABCP keeps the template it read at its start:
+   ```text
+   cp -p $C/manifest-template-open-together.json $C/manifest-template-open-together.json.pre-abcp-relay
+   python3 <worktree>/deploy/open-models/make-open-model-profiles.py --models $R/open-models/trial-models.json --providers together
+   python3 <worktree>/deploy/open-models/make-open-model-profiles.py --models $R/open-models/trial-models.json --providers together --write --force
+   diff <(python3 -m json.tool $C/profiles.json) <(python3 -m json.tool $C/profiles.json.open-models)
+   ```
+   The dry run must show `base_url` `https://api.together.xyz/v1`, `"relay": true` and the table above; the diff
+   nothing (`local-p02-together` keeps its id, template and models; no other profile changes). The previous binary
+   refuses the new template's fields, so from here a start on it needs the `.pre-abcp-relay` copy back.
+3. **Restart** with no build running: copy `a-abcp-start-48f183a.sh` and `a-abcp-restart-48f183a-relay.sh` to
+   `<sha>` names (the new binary; the restart's check that the template names the relay becomes a check that
+   `"relay": true` is there, and its way back restores `.pre-abcp-relay` and starts 48f183a). Its refusals stay: a
+   build running, a stack or change job, a server session, bought servers being made or removed, a build request in
+   the last 5 minutes. Then `GET /v1/engines`: `local-p02-together` `ready: true`, `provider.check.status: ok`, and the
+   staged boot entry names the new start script.
+4. **Retire the Python relay** once nothing names it: `grep -l '127.0.0.1:18996' $C/*.json` finds nothing; then
+   `ss -ltnp | grep '127.0.0.1:18996'` gives its PID; `ps -o args= -p <pid>` must say
+   `together-responses-shim-v6.py`; `kill -TERM <pid>`; `ss -ltn | grep -c 18996` is 0. The boot entry never started
+   it, so nothing else changes. The next trial build shows its own relay's lines in
+   `/home/devagent/.codex/lanes/together/<model>-<hex>-1/relay.log` and none in `together-responses-shim.log`.
+
+**Back to the Python relay:** start it again (`cd $R/open-models && setsid nohup python3 together-responses-shim-v6.py
+18996 > together-responses-shim.log 2>&1 < /dev/null &`), put `.pre-abcp-relay` back, and restart with no build
+running (the new binary takes the old template too).
 
 ## 5. Repo C's live settings (`start-live-repo-c.py`)
 

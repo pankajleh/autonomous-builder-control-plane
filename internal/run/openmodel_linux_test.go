@@ -5,11 +5,15 @@ package run
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -201,4 +205,67 @@ func TestRunnerNeverFallsBackFromAKeyThatIsNotThere(t *testing.T) {
 	if ledgerData, _ := os.ReadFile(fixture.ledgerPath); strings.Contains(string(ledgerData), `"engine_used"`) {
 		t.Fatalf("a build that never started records an engine: %s", fmt.Sprint(len(ledgerData)))
 	}
+}
+
+// TestRunnerRunsAnOpenModelBuildThroughItsOwnRelay: on a provider whose
+// manifest asks for the relay, Ralphex's Codex home names the build's relay
+// on 127.0.0.1 and the model's catalog; a request through it reaches the
+// provider with the model's fix and the key Codex sent; the run's start
+// records the relay and the catalog; the relay is gone once the run ends.
+func TestRunnerRunsAnOpenModelBuildThroughItsOwnRelay(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("the stand-in Ralphex needs curl")
+	}
+	var mu sync.Mutex
+	var bodies []string
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies, keys = append(bodies, string(body)), append(keys, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer server.Close()
+	script := `#!/bin/sh
+base=$(sed -n 's/^base_url = "\(.*\)"$/\1/p' "$CODEX_HOME/config.toml")
+case "$base" in http://127.0.0.1:*/v1) ;; *) exit 50 ;; esac
+catalog=$(sed -n 's/^model_catalog_json = "\(.*\)"$/\1/p' "$CODEX_HOME/config.toml")
+[ "$catalog" = "$CODEX_HOME/model-catalog.json" ] || exit 51
+grep -q '"apply_patch_tool_type":"freeform"' "$catalog" || exit 52
+status=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GROQ_API_KEY" -H 'Content-Type: application/json' \
+  --data '{"model":"openai/gpt-oss-120b","input":[{"type":"reasoning","id":"rs_1","summary":[],"content":null}],"stream":true}' "$base/responses") || exit 53
+[ "$status" = 200 ] || exit 54
+` + commitCandidate
+	fixture, provider := openModelFixture(t, script, func(p *openmodel.Provider) {
+		p.BaseURL, p.Relay = server.URL+"/v1", true
+		p.Models[0].Compat = []string{openmodel.CompatDropNullReasoningContent}
+		p.Models[0].CodexCatalog = &openmodel.CodexCatalog{ApplyPatch: true}
+	})
+	if result := fixture.execute(t); !result.Accepted() {
+		t.Fatalf("a run through its relay was not accepted: %#v", result)
+	}
+	mu.Lock()
+	if len(bodies) != 1 || bodies[0] != `{"model":"openai/gpt-oss-120b","input":[{"type":"reasoning","id":"rs_1","summary":[]}],"stream":true}` || keys[0] != "Bearer "+openModelKey {
+		t.Fatalf("the provider got %q with %q", bodies, keys)
+	}
+	mu.Unlock()
+	ledgerData, err := os.ReadFile(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"relay":{"address":"127.0.0.1:`, `"compat":["drop_null_reasoning_content"]`, `"upstream":"` + server.URL + `/v1"`,
+		`"codex_catalog":{"apply_patch":true,`, `"slot":1`, `"codex_home":"` + provider.CodexHome + `/gpt-oss-120b-`} {
+		if !strings.Contains(string(ledgerData), want) {
+			t.Errorf("the run's start does not record %s", want)
+		}
+	}
+	_, after, _ := strings.Cut(string(ledgerData), `"relay":{"address":"`)
+	address, _, _ := strings.Cut(after, `"`)
+	if connection, err := net.DialTimeout("tcp", address, time.Second); err == nil {
+		connection.Close()
+		t.Errorf("the relay at %s outlived its run", address)
+	}
+	noKeyRecorded(t, filepath.Dir(fixture.ledgerPath), fixture.evidence, provider.CodexHome, fixture.authority.Repository().Path)
 }

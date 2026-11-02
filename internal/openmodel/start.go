@@ -7,6 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -36,6 +40,10 @@ type StartOptions struct {
 	SlotPoll time.Duration
 	Now      func() time.Time
 	Sleep    func(context.Context, time.Duration) error
+	// Run names the build in the relay's log lines.
+	Run string
+	// RelayTransport is how the relay reaches the provider (RelayOptions).
+	RelayTransport http.RoundTripper
 }
 
 // Start is a build that may run on its provider: its slot is held until
@@ -47,8 +55,17 @@ type Start struct {
 	ConfigSHA256  string
 	KeyFileSHA256 string
 	Preflight     *Check
-	key           Key
-	release       func() error
+	// Slot is the model's build slot the build holds (1 to its cap).
+	Slot int
+	// CatalogSHA256 is the SHA-256 of the model's Codex catalog file, empty
+	// without one.
+	CatalogSHA256 string
+	// Relay is the build's loopback relay, nil unless the provider asks for
+	// it; it serves until Release.
+	Relay    *Relay
+	relayLog *relayLog
+	key      Key
+	release  func() error
 }
 
 // String names the build's engine; a Start never prints its key.
@@ -81,7 +98,7 @@ func Begin(ctx context.Context, p Provider, modelName string, options StartOptio
 		return nil, fmt.Errorf("OPEN_MODEL_ENGINE_KEY: %s: %w", p.ID, err)
 	}
 	deadline := now().Add(p.StartTimeout())
-	release, err := AcquireSlot(ctx, SlotDir(p, model), model.Slots(), deadline, options.SlotPoll)
+	release, slot, err := AcquireNumberedSlot(ctx, SlotDir(p, model), model.Slots(), deadline, options.SlotPoll)
 	if errors.Is(err, ErrNoSlot) {
 		return nil, &UnavailableError{Provider: p.ID, Model: model.Name, Reason: ReasonBusy,
 			Detail: fmt.Sprintf("no build slot within %s (%d at a time)", p.StartTimeout(), model.Slots())}
@@ -89,7 +106,7 @@ func Begin(ctx context.Context, p Provider, modelName string, options StartOptio
 	if err != nil {
 		return nil, fmt.Errorf("OPEN_MODEL_ENGINE_SLOT: %s/%s: %w", p.ID, model.Name, err)
 	}
-	start := &Start{Provider: p, Model: model, KeyFileSHA256: key.SHA256(), release: release}
+	start := &Start{Provider: p, Model: model, KeyFileSHA256: key.SHA256(), Slot: slot, release: release}
 	fail := func(err error) (*Start, error) {
 		return nil, errors.Join(err, start.Release())
 	}
@@ -117,14 +134,78 @@ func Begin(ctx context.Context, p Provider, modelName string, options StartOptio
 	if err := ctx.Err(); err != nil {
 		return fail(context.Cause(ctx))
 	}
-	config := CodexConfig(p, model)
-	home := HomeFor(p, model, config)
-	if err := WriteHome(p.CodexHome, home, config); err != nil {
+	home, catalog := homeOf(p, model, slot)
+	var files []HomeFile
+	if catalog != nil {
+		files = append(files, HomeFile{Name: CatalogFile, Data: catalog})
+		sum := sha256.Sum256(catalog)
+		start.CatalogSHA256 = hex.EncodeToString(sum[:])
+	}
+	if err := WriteHomeFiles(p.CodexHome, home, files...); err != nil {
+		return fail(fmt.Errorf("OPEN_MODEL_ENGINE_HOME: %s/%s: %w", p.ID, model.Name, err))
+	}
+	baseURL := p.BaseURL
+	if p.Relay {
+		if start.relayLog, err = openRelayLog(home); err != nil {
+			return fail(fmt.Errorf("OPEN_MODEL_ENGINE_RELAY: %s/%s: %w", p.ID, model.Name, err))
+		}
+		start.Relay, err = StartRelay(p, model, RelayOptions{Transport: options.RelayTransport, Log: start.relayLog, Run: options.Run, Now: now})
+		if err != nil {
+			return fail(fmt.Errorf("OPEN_MODEL_ENGINE_RELAY: %s/%s: %w", p.ID, model.Name, err))
+		}
+		baseURL = start.Relay.URL()
+	}
+	config := configOf(p, model, home, baseURL, catalog)
+	if err := WriteHomeFiles(p.CodexHome, home, HomeFile{Name: "config.toml", Data: config}); err != nil {
 		return fail(fmt.Errorf("OPEN_MODEL_ENGINE_HOME: %s/%s: %w", p.ID, model.Name, err))
 	}
 	sum := sha256.Sum256(config)
 	start.Home, start.ConfigSHA256, start.key = home, hex.EncodeToString(sum[:]), key
 	return start, nil
+}
+
+// relayIdentityAddress stands for the relay's address in the configuration a
+// relay build's home is named after: the port changes with every build, the
+// home must not.
+const relayIdentityAddress = "http://127.0.0.1:0"
+
+// homeOf answers a build's Codex home and the model's catalog file (nil
+// without one). A build that talks to the provider directly and has no
+// catalog keeps the home of its configuration (HomeFor). Otherwise the home
+// is named after the configuration with the relay's address and the
+// catalog's path left out, and the catalog itself; and a relay build's home is
+// its slot's (<model>-<12 hex>-<slot>), since its config.toml names its own
+// relay's port: builds that overlap hold different slots, so they never
+// rewrite each other's file.
+func homeOf(p Provider, m Model, slot int) (string, []byte) {
+	catalog := CodexCatalogJSON(p, m)
+	if !p.Relay && catalog == nil {
+		return HomeFor(p, m, CodexConfig(p, m)), nil
+	}
+	baseURL, catalogPath := p.BaseURL, ""
+	if p.Relay {
+		upstream, _ := url.Parse(p.BaseURL)
+		baseURL = relayIdentityAddress + strings.TrimSuffix(upstream.Path, "/")
+	}
+	if catalog != nil {
+		catalogPath = "$CODEX_HOME/" + CatalogFile
+	}
+	identity := append(codexConfig(p, m, baseURL, catalogPath), catalog...)
+	home := HomeFor(p, m, identity)
+	if p.Relay {
+		home += "-" + strconv.Itoa(slot)
+	}
+	return home, catalog
+}
+
+// configOf answers the build's config.toml in that home, with Codex's
+// base_url at baseURL and the catalog's path when there is one.
+func configOf(p Provider, m Model, home, baseURL string, catalog []byte) []byte {
+	catalogPath := ""
+	if catalog != nil {
+		catalogPath = filepath.Join(home, CatalogFile)
+	}
+	return codexConfig(p, m, baseURL, catalogPath)
 }
 
 // Environment answers base for Ralphex and Codex on the provider: without the
@@ -134,14 +215,27 @@ func (s *Start) Environment(base []string) []string {
 	return Environment(base, map[string]string{"CODEX_HOME": s.Home, s.Provider.EnvKey(): s.key.Value()})
 }
 
-// Release gives the build slot back; once is enough, more are harmless.
+// Release stops the build's relay and gives its slot back; once is enough,
+// more are harmless.
 func (s *Start) Release() error {
-	if s == nil || s.release == nil {
+	if s == nil {
 		return nil
 	}
-	release := s.release
-	s.release = nil
-	return release()
+	var err error
+	if s.Relay != nil {
+		err = s.Relay.Close()
+		s.Relay = nil
+	}
+	if s.relayLog != nil {
+		err = errors.Join(err, s.relayLog.Close())
+		s.relayLog = nil
+	}
+	if s.release != nil {
+		release := s.release
+		s.release = nil
+		err = errors.Join(err, release())
+	}
+	return err
 }
 
 // Evidence answers what the run's start records: the provider, model and
@@ -165,6 +259,20 @@ func (s *Start) Evidence() map[string]any {
 	}
 	if s.Preflight != nil {
 		evidence["preflight"] = map[string]any{"status": s.Preflight.Status, "attempts": s.Preflight.Attempts}
+	}
+	if s.Slot != 0 {
+		evidence["slot"] = s.Slot
+	}
+	if s.CatalogSHA256 != "" {
+		evidence["codex_catalog"] = map[string]any{
+			"sha256": s.CatalogSHA256, "apply_patch": s.Model.CodexCatalog.ApplyPatch, "tool_output_tokens": s.Model.CodexCatalog.toolOutputTokens(),
+		}
+	}
+	if s.Relay != nil {
+		evidence["relay"] = map[string]any{
+			"address": s.Relay.Address(), "upstream": s.Provider.BaseURL, "compat": append([]string{}, s.Model.Compat...),
+			"log": filepath.Join(s.Home, RelayLogFile),
+		}
 	}
 	return evidence
 }

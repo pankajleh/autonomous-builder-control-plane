@@ -116,6 +116,11 @@ type Provider struct {
 	// exponential backoff; the defaults when zero.
 	RequestMaxRetries int `json:"request_max_retries,omitempty"`
 	StreamMaxRetries  int `json:"stream_max_retries,omitempty"`
+	// Relay puts ABCP's loopback relay between Codex and the provider for
+	// each build (relay.go): it listens on 127.0.0.1 for that build only,
+	// forwards to BaseURL and nowhere else, and applies to the build's model
+	// exactly the fixes its Compat names. Codex's base_url is the relay's.
+	Relay bool `json:"relay,omitempty"`
 }
 
 // Model is one model a provider build may run.
@@ -143,6 +148,26 @@ type Model struct {
 	// MaxConcurrentBuilds is how many builds may run on it at once, across
 	// every profile that shares the provider's CodexHome; 1 when 0.
 	MaxConcurrentBuilds int `json:"max_concurrent_builds,omitempty"`
+	// Compat names the relay's fixes for this model (compat.go), each a
+	// workaround proved against the provider: a request shape it refused
+	// before the fix and took after. It needs the provider's Relay.
+	Compat []string `json:"compat,omitempty"`
+	// CodexCatalog gives Codex an entry for the model in its model catalog
+	// (catalog.go), so Codex stops treating it with fallback metadata.
+	CodexCatalog *CodexCatalog `json:"codex_catalog,omitempty"`
+}
+
+// CodexCatalog is what a model's entry in Codex's model catalog
+// (model_catalog_json) says beyond what the model's other fields give.
+type CodexCatalog struct {
+	// ApplyPatch makes Codex offer its apply_patch tool, a freeform
+	// ("custom") tool that edits files, which Codex's base prompt tells every
+	// model to use. Only for a model whose provider takes the custom tool type.
+	ApplyPatch bool `json:"apply_patch,omitempty"`
+	// ToolOutputTokens is how much of a tool's output Codex hands the model,
+	// in tokens: DefaultToolOutputTokens when 0 (Codex's own models' limit;
+	// its fallback for an unknown model is 10,000 bytes).
+	ToolOutputTokens int `json:"tool_output_tokens,omitempty"`
 }
 
 // Fallback is the controller's own Codex sign-in, as the Codex profiles run it.
@@ -162,6 +187,11 @@ func (p *Provider) Clone() *Provider {
 	clone.Models = make([]Model, len(p.Models))
 	for index, model := range p.Models {
 		model.Efforts = slices.Clone(model.Efforts)
+		model.Compat = slices.Clone(model.Compat)
+		if model.CodexCatalog != nil {
+			catalog := *model.CodexCatalog
+			model.CodexCatalog = &catalog
+		}
 		clone.Models[index] = model
 	}
 	if p.Fallback != nil {
@@ -198,10 +228,16 @@ func (p Provider) Validate() error {
 	if len(p.Models) == 0 || len(p.Models) > MaxModels {
 		return fmt.Errorf("executor.provider.models must list 1 to %d models", MaxModels)
 	}
+	if p.Relay && p.WireAPI != WireResponses {
+		return errors.New(`executor.provider.relay needs wire_api "responses"`)
+	}
 	names, ids := map[string]bool{}, map[string]bool{}
 	for index, model := range p.Models {
 		if err := model.validate(); err != nil {
 			return fmt.Errorf("executor.provider.models[%d] %w", index, err)
+		}
+		if len(model.Compat) != 0 && !p.Relay {
+			return fmt.Errorf("executor.provider.models[%d] compat needs executor.provider.relay", index)
 		}
 		if names[model.Name] || ids[model.ID] {
 			return fmt.Errorf("executor.provider.models[%d] repeats a name or an id", index)
@@ -265,6 +301,18 @@ func (m Model) validate() error {
 	}
 	if m.MaxConcurrentBuilds < 0 || m.MaxConcurrentBuilds > 8 {
 		return errors.New("max_concurrent_builds must be 1 to 8")
+	}
+	if err := validCompat(m.Compat); err != nil {
+		return err
+	}
+	if m.CodexCatalog != nil {
+		tokens := m.CodexCatalog.ToolOutputTokens
+		if tokens != 0 && (tokens < MinToolOutputTokens || tokens > MaxToolOutputTokens || tokens > m.ContextWindow/4) {
+			return fmt.Errorf("codex_catalog.tool_output_tokens must be %d to %d and at most a quarter of context_window", MinToolOutputTokens, MaxToolOutputTokens)
+		}
+		if m.CodexCatalog.ApplyPatch && slices.Contains(m.Compat, CompatChatBridge) {
+			return errors.New("codex_catalog.apply_patch is refused with compat " + CompatChatBridge + ": the bridge carries function tools only")
+		}
 	}
 	return nil
 }
@@ -368,20 +416,38 @@ func (p Provider) streamMaxRetries() int {
 // gives the provider, the model's context, and keeps the key from the
 // commands Codex runs. Every value in it has been validated, so it is quoted
 // as a TOML basic string without escapes.
-func CodexConfig(p Provider, m Model) []byte {
+//
+// This is the file for a build that talks to the provider directly and gives
+// Codex no catalog entry; configOf (start.go) answers every build's.
+func CodexConfig(p Provider, m Model) []byte { return codexConfig(p, m, p.BaseURL, "") }
+
+// codexConfig answers config.toml with Codex's base_url at baseURL (the
+// provider's, or the build's relay) and, when catalogPath is not empty,
+// model_catalog_json naming the model's catalog file.
+func codexConfig(p Provider, m Model, baseURL, catalogPath string) []byte {
 	provider := p.CodexProviderID()
 	var b strings.Builder
 	b.WriteString("# Written by ABCP for the open-model engine " + p.ID + "/" + m.Name + " (Repo C design note OPEN_MODEL_ENGINES).\n")
 	b.WriteString("# ABCP rewrites this file before each build on it; edit the profile's manifest instead.\n")
+	if p.Relay {
+		compat := "none"
+		if len(m.Compat) != 0 {
+			compat = strings.Join(m.Compat, ", ")
+		}
+		b.WriteString("# base_url is this build's ABCP relay on 127.0.0.1, to " + p.BaseURL + " only; its fixes: " + compat + ".\n")
+	}
 	b.WriteString("model = " + quote(m.ID) + "\n")
 	b.WriteString("model_provider = " + quote(provider) + "\n")
 	b.WriteString("model_context_window = " + strconv.Itoa(m.ContextWindow) + "\n")
 	b.WriteString("model_auto_compact_token_limit = " + strconv.Itoa(m.CompactAt()) + "\n")
 	b.WriteString("model_reasoning_summary = \"none\"\n")
 	b.WriteString("web_search = \"disabled\"\n")
+	if catalogPath != "" {
+		b.WriteString("model_catalog_json = " + quote(catalogPath) + "\n")
+	}
 	b.WriteString("\n[model_providers." + provider + "]\n")
 	b.WriteString("name = " + quote(p.ID+" (ABCP open-model engine)") + "\n")
-	b.WriteString("base_url = " + quote(p.BaseURL) + "\n")
+	b.WriteString("base_url = " + quote(baseURL) + "\n")
 	b.WriteString("env_key = " + quote(p.EnvKey()) + "\n")
 	b.WriteString("wire_api = " + quote(p.WireAPI) + "\n")
 	b.WriteString("requires_openai_auth = false\n")
