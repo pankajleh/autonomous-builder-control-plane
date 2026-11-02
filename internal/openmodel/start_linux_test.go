@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -267,4 +268,170 @@ func TestABuildThatCannotBeginReleasesItsSlotAndSaysWhy(t *testing.T) {
 		t.Fatalf("a slot was kept by a build that never began: %v", err)
 	}
 	last.Release()
+}
+
+// relayProvider is testProvider on the relay to a stand-in for Together, with
+// gpt-oss-120b's compat list and catalog entry.
+func relayProvider(t *testing.T, baseURL string) Provider {
+	t.Helper()
+	provider := testProvider(t)
+	provider.ID, provider.BaseURL, provider.Relay = "together", baseURL, true
+	provider.Models[0].Compat = []string{CompatDropNullReasoningContent, CompatMessageBeforeCalls, CompatOutputAfterCall}
+	provider.Models[0].CodexCatalog = &CodexCatalog{ApplyPatch: true}
+	if err := provider.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return provider
+}
+
+// TestARelayBuildRunsThroughItsOwnRelayFromItsSlotsHome: a build on the relay
+// writes the model's catalog and a config.toml whose base_url is its relay,
+// in its slot's home; the relay serves until the build gives its slot back;
+// the next build in that slot keeps the home with its own relay's port.
+func TestARelayBuildRunsThroughItsOwnRelayFromItsSlotsHome(t *testing.T) {
+	fake := &fakeTogether{}
+	server := httptest.NewServer(fake)
+	defer server.Close()
+	provider := relayProvider(t, server.URL+"/v1")
+	start, err := Begin(context.Background(), provider, "gpt-oss-120b", StartOptions{Run: "run-7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer start.Release()
+	model := provider.Models[0]
+	home, catalog := homeOf(provider, model, 1)
+	if start.Home != home || !strings.HasPrefix(filepath.Base(home), "gpt-oss-120b-") || !strings.HasSuffix(home, "-1") || len(filepath.Base(home)) != len("gpt-oss-120b-")+12+2 || start.Slot != 1 {
+		t.Fatalf("home %s (want %s), slot %d", start.Home, home, start.Slot)
+	}
+	config, _ := os.ReadFile(filepath.Join(home, "config.toml"))
+	written, _ := os.ReadFile(filepath.Join(home, CatalogFile))
+	if string(config) != string(configOf(provider, model, home, start.Relay.URL(), catalog)) || string(written) != string(catalog) {
+		t.Fatalf("config.toml =\n%s", config)
+	}
+	for _, line := range []string{
+		`base_url = "http://` + start.Relay.Address() + `/v1"`,
+		`model_catalog_json = "` + filepath.Join(home, CatalogFile) + `"`,
+		"# base_url is this build's ABCP relay on 127.0.0.1, to " + server.URL + "/v1 only; its fixes: drop_null_reasoning_content, message_before_calls, output_after_call.",
+	} {
+		if !strings.Contains(string(config), line+"\n") {
+			t.Errorf("config.toml lacks %s", line)
+		}
+	}
+	for _, name := range []string{"config.toml", CatalogFile, RelayLogFile} {
+		if info, err := os.Lstat(filepath.Join(home, name)); err != nil || info.Mode().Perm() != 0o600 {
+			t.Errorf("%s: %v %v", name, info, err)
+		}
+	}
+
+	// Codex's request reaches the provider through the relay, fixed.
+	request := codexRequest("openai/gpt-oss-120b", withInput(codexOpening(), reasoningItem("rs_1"), call("call_1"), said("m", "x"), output("call_1")), nil)
+	response, err := http.Post(start.Relay.URL()+"/responses", "application/json", strings.NewReader(string(request)))
+	if err != nil || response.StatusCode != http.StatusOK || len(fake.requests) != 1 || togetherRefusal(fake.requests[0].body) != "" {
+		t.Fatalf("through the relay: %v %v", response, err)
+	}
+	response.Body.Close()
+	var logged []byte
+	for deadline := time.Now().Add(2 * time.Second); !strings.Contains(string(logged), "\n") && time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		logged, _ = os.ReadFile(filepath.Join(home, RelayLogFile))
+	}
+	if !strings.Contains(string(logged), " abcp open-model relay run=run-7 together/gpt-oss-120b POST /v1/responses model=openai/gpt-oss-120b status=200 fixes=drop_null_reasoning_content:1,message_before_calls:1 ") {
+		t.Fatalf("relay.log = %s", logged)
+	}
+	evidence := start.Evidence()
+	relay, _ := evidence["relay"].(map[string]any)
+	codexCatalog, _ := evidence["codex_catalog"].(map[string]any)
+	if relay["address"] != start.Relay.Address() || relay["upstream"] != server.URL+"/v1" || fmt.Sprint(relay["compat"]) != fmt.Sprint(model.Compat) ||
+		relay["log"] != filepath.Join(home, RelayLogFile) || codexCatalog["apply_patch"] != true || codexCatalog["tool_output_tokens"] != 10000 ||
+		len(fmt.Sprint(codexCatalog["sha256"])) != 64 || evidence["slot"] != 1 || evidence["codex_home"] != home {
+		t.Fatalf("evidence = %v", evidence)
+	}
+	if strings.Contains(fmt.Sprint(evidence), testKey) || strings.Contains(fmt.Sprint(evidence), provider.KeyFile) {
+		t.Fatal("the evidence names the key or its file")
+	}
+
+	address := start.Relay.Address()
+	if err := start.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if connection, err := net.DialTimeout("tcp", address, time.Second); err == nil {
+		connection.Close()
+		t.Fatal("the relay still answers after the build gave its slot back")
+	}
+	again, err := Begin(context.Background(), provider, "gpt-oss-120b", StartOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Release()
+	rewritten, _ := os.ReadFile(filepath.Join(home, "config.toml"))
+	if again.Home != home || !strings.Contains(string(rewritten), `base_url = "http://`+again.Relay.Address()+`/v1"`) {
+		t.Fatalf("the next build in the slot: home %s, config\n%s", again.Home, rewritten)
+	}
+	filepath.Walk(provider.CodexHome, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsRegular() {
+			if data, _ := os.ReadFile(path); strings.Contains(string(data), testKey) {
+				t.Errorf("%s holds the key", path)
+			}
+		}
+		return nil
+	})
+}
+
+func TestEachSlotAndEachConfigurationOfARelayModelHasAHomeOfItsOwn(t *testing.T) {
+	provider := relayProvider(t, "https://api.together.xyz/v1")
+	model := provider.Models[0]
+	one, _ := homeOf(provider, model, 1)
+	two, _ := homeOf(provider, model, 2)
+	if one == two || strings.TrimSuffix(one, "-1") != strings.TrimSuffix(two, "-2") {
+		t.Fatalf("slots 1 and 2: %s, %s", one, two)
+	}
+	changed := model
+	changed.Compat = []string{CompatDropNullReasoningContent}
+	tokens := model
+	tokens.CodexCatalog = &CodexCatalog{ApplyPatch: true, ToolOutputTokens: 20000}
+	for name, other := range map[string]Model{"another compat list": changed, "another catalog entry": tokens} {
+		if home, _ := homeOf(provider, other, 1); home == one {
+			t.Errorf("%s shares the home", name)
+		}
+	}
+	// Without the relay, a catalog entry still gets a home of its own
+	// configuration and catalog, with no slot in its name; without either,
+	// the home is #181's.
+	direct := provider
+	direct.Relay = false
+	direct.Models = []Model{{Name: model.Name, ID: model.ID, Origin: model.Origin, ContextWindow: model.ContextWindow, CodexCatalog: model.CodexCatalog}}
+	home, catalog := homeOf(direct, direct.Models[0], 1)
+	config := string(configOf(direct, direct.Models[0], home, direct.BaseURL, catalog))
+	if strings.HasSuffix(home, "-1") || catalog == nil || !strings.Contains(config, `base_url = "https://api.together.xyz/v1"`) ||
+		!strings.Contains(config, `model_catalog_json = "`+home+`/model-catalog.json"`) || strings.Contains(config, "relay") {
+		t.Fatalf("a direct build with a catalog: %s\n%s", home, config)
+	}
+	direct.Models[0].CodexCatalog = nil
+	if home, catalog := homeOf(direct, direct.Models[0], 3); home != HomeFor(direct, direct.Models[0], CodexConfig(direct, direct.Models[0])) || catalog != nil {
+		t.Fatalf("a plain build's home moved: %s", home)
+	}
+}
+
+func TestTheRelaysLogMovesAsideWhenItGrows(t *testing.T) {
+	home := t.TempDir()
+	log, err := openRelayLog(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	line := []byte(strings.Repeat("x", 1023) + "\n")
+	for written := 0; written <= MaxRelayLogBytes; written += len(line) {
+		if _, err := log.Write(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old, errOld := os.Stat(filepath.Join(home, RelayLogFile+".1"))
+	current, errCurrent := os.Stat(filepath.Join(home, RelayLogFile))
+	if errOld != nil || errCurrent != nil || old.Size() > MaxRelayLogBytes || current.Size() == 0 || current.Mode().Perm() != 0o600 {
+		t.Fatalf("relay.log.1 %v %v, relay.log %v %v", old, errOld, current, errCurrent)
+	}
+	link := filepath.Join(t.TempDir(), "linked")
+	os.Symlink(filepath.Join(home, RelayLogFile), filepath.Join(filepath.Dir(link), RelayLogFile))
+	if _, err := openRelayLog(filepath.Dir(link)); err == nil {
+		t.Fatal("the relay wrote its log through a link")
+	}
 }

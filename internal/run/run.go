@@ -999,7 +999,9 @@ func (r *Runner) beginOpenModel(ctx context.Context) (*openmodel.Start, *openmod
 		return nil, nil, nil
 	}
 	provider := *policy.Provider
-	start, err := openmodel.Begin(ctx, provider, policy.TaskModel, r.openModelOptions)
+	options := r.openModelOptions
+	options.Run = r.governed.RunID()
+	start, err := openmodel.Begin(ctx, provider, policy.TaskModel, options)
 	if err != nil {
 		var unavailable *openmodel.UnavailableError
 		if errors.As(err, &unavailable) && provider.OnUnavailable == openmodel.UnavailableFallback && provider.Fallback != nil && ctx.Err() == nil {

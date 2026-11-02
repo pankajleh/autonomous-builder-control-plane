@@ -9,6 +9,13 @@ binary, budgets, validation and acceptance stay exactly the host's):
   - profile entries local-p02-<provider> (and local-p02-node-<provider>): copies of local-p02 (and local-p02-node)
     naming the new template and offering the provider's models by name (executor_choices.models).
 
+Each Together model also gets, from round 1 of the trial (Repo C OPEN_MODEL_ENGINES §9.1, the server's
+runtime/open-models/round1-results.md and probe-*.log), its "compat" list (the fixes ABCP's relay applies to its
+requests; the provider then says "relay": true) and a "codex_catalog" entry (Codex's model catalog: apply_patch where
+the provider takes Codex's freeform tool, tool output cut at 10,000 tokens instead of 10,000 bytes). A models file may
+give a model's own "compat" or "codex_catalog", which then wins. A provider with no compat list and no catalog entry is
+written exactly as before.
+
 Without --write it prints what it would write and changes nothing. With --write it writes the templates (0600; it
 refuses to replace one unless --force) and profiles.json.open-models (0600): the live profiles.json with the new
 entries added. It never writes profiles.json itself. Put that file in place during an announced ABCP restart with no
@@ -25,6 +32,42 @@ KINDS = {"web": ("manifest-template.json", "local-p02", "manifest-template-open-
 # How many builds may run on one model at once. Groq's base limits (8K tokens a minute) cannot carry one build; on
 # its paid plan one build at a time is the start.
 SLOTS = {"together": 1, "groq": 1}
+# The relay's fixes per model, from round 1's probes (400 before, 200 after) and builds; names are ABCP's
+# (internal/openmodel/compat.go). drop_null_reasoning_content: Together refuses its own reasoning item back with
+# "content": null ("untagged enum ResponseInput", gpt-oss-120b's first build). message_before_calls: an assistant message
+# after a call in one turn is refused, "invalid_tool_messages" (probe-nemotron.log, probe-muse.log). output_after_call:
+# parallel calls with their outputs after both are refused the same way (probe-nemotron2.log). drop_namespace_tools:
+# Bonsai's endpoint refuses the "namespace" tool type (probe-bonsai.log). chat_completions_bridge: Beam needs each turn's
+# reasoning back, which Together's /responses never sends; its /chat/completions takes reasoning_content
+# (probe-beam*.log, e2e-beam.log). drop_medium_effort: DeepSeek refuses the "medium" effort Together fills in for an
+# empty reasoning object (probe-deepseek.log, probe-deepseek2.log).
+TURNS = ["drop_null_reasoning_content", "message_before_calls", "output_after_call"]
+COMPAT = {
+    "together": {
+        "gpt-oss-120b": TURNS,
+        "nemotron-3.5-super": TURNS,
+        "muse-spark-open": TURNS,
+        "glm-5.3": TURNS,
+        "bonsai-27b": TURNS + ["drop_namespace_tools"],
+        "beam-1.0": ["chat_completions_bridge"],
+        "deepseek-v4.1-flash": TURNS + ["drop_medium_effort"],
+    },
+}
+# Codex's model catalog per model: every round-1 model gets an entry (tool output at 10,000 tokens, spawn_agent naming
+# the build's model only); apply_patch only where the provider took Codex's freeform ("custom") tool type:
+# gpt-oss-120b (probe-custom-tool.log: custom text 200, custom grammar 200). Bonsai's endpoint lists no custom type, and
+# the chat bridge carries function tools only.
+CATALOG = {
+    "together": {
+        "gpt-oss-120b": {"apply_patch": True},
+        "nemotron-3.5-super": {},
+        "muse-spark-open": {},
+        "glm-5.3": {},
+        "bonsai-27b": {},
+        "beam-1.0": {},
+        "deepseek-v4.1-flash": {},
+    },
+}
 
 
 def provider_block(provider, entry, secrets, lanes, preflight):
@@ -36,14 +79,25 @@ def provider_block(provider, entry, secrets, lanes, preflight):
             out["efforts"] = list(model["efforts"])
         if model.get("default_effort"):
             out["default_effort"] = model["default_effort"]
+        compat = model.get("compat", COMPAT.get(provider, {}).get(model["name"], []))
+        if compat:
+            out["compat"] = list(compat)
+        catalog = model.get("codex_catalog", CATALOG.get(provider, {}).get(model["name"]))
+        if catalog is not None:
+            out["codex_catalog"] = dict(catalog)
         models.append(out)
     if not models:
         raise SystemExit(f"{provider}: the models file lists no model")
-    return {
+    block = {
         "id": provider, "base_url": entry["base_url"], "key_file": f"{secrets}/{provider}-api-key", "wire_api": "responses",
         "codex_home": f"{lanes}/{provider}", "models": models, "preflight": preflight, "check_models": True,
         "queue_timeout": "20m", "on_unavailable": "wait",
     }
+    if any(m.get("compat") for m in models):
+        if not entry["base_url"].startswith("https://"):
+            raise SystemExit(f"{provider}: the relay forwards to the provider's own https base_url, not {entry['base_url']}")
+        block["relay"] = True
+    return block
 
 
 def write_private(path: Path, value, force: bool):
