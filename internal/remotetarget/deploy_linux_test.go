@@ -100,7 +100,8 @@ func newLocalRemote(t *testing.T) *localRemote {
 	// reset link not sent. A website's kit is 1.2.0, or what $S/c-<name>.kit
 	// says; its container's /scratch/autobuild-pages is $S/pages-<name>; its
 	// page set keeps each page as $S/page-<name>-<slug>, which $S/page-<slug>.edited
-	// makes kept and $S/page-<slug>.refused refused, as the kit does.
+	// makes kept and $S/page-<slug>.refused refused, as the kit does; $S/page-<slug>.replaces
+	// answers its footer link "replaced", as the kit's plugin 1.3.0 does for a translation.
 	fake := `#!/bin/sh
 echo "$@" >> "$HOME/docker.log"
 S="$HOME/.docker"
@@ -190,6 +191,7 @@ case "$1" in
         if [ -f "$S/page-$slug.edited" ]; then printf '{"slug":"%s","page":"kept","why":"edited in WordPress since it was last imported or set","footer":"none"}\n' "$slug"; exit 0; fi
         kept="$S/page-$n-$slug"; page=created; footer=added
         if [ -f "$kept" ]; then footer=there; if cmp -s "$kept" "$src"; then page=unchanged; else page=updated; fi; fi
+        [ -f "$S/page-$slug.replaces" ] && footer=replaced
         cp "$src" "$kept"
         echo "Warning: a line WP-CLI may print first" >&2
         printf '{"slug":"%s","page":"%s","why":"","footer":"%s"}\n' "$slug" "$page" "$footer" ;;

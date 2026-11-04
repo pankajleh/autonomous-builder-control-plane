@@ -32,11 +32,12 @@ type PageFile struct {
 }
 
 const (
-	// MaxPageFiles, MaxPageFileBytes and MaxPageFilesBytes bound one set of page files: at most 20 files, each at most
-	// 256 KiB and at most 1 MiB in all.
-	MaxPageFiles      = 20
+	// MaxPageFiles, MaxPageFileBytes and MaxPageFilesBytes bound one set of page files: at most 32 files, each at most
+	// 256 KiB and at most 2 MiB in all (a WordPress website's pages, at most 18, beside its Site details' file and the
+	// pictures it names, at most 5 of 150 KB, Repo C WORDPRESS_WEBSITES §14).
+	MaxPageFiles      = 32
 	MaxPageFileBytes  = 256 << 10
-	MaxPageFilesBytes = 1 << 20
+	MaxPageFilesBytes = 2 << 20
 	// MaxPageFilesRequestBytes bounds a request that carries page files: their whole base64 and 64 KiB more for names
 	// and the request's other fields. It is the one bound above MaxRequestBodyBytes besides a release's and an account
 	// lane's question.

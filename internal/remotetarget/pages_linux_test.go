@@ -47,6 +47,24 @@ func pageOf(op serviceapi.OperationV1, file string) serviceapi.SitePageV1 {
 	return serviceapi.SitePageV1{}
 }
 
+// Repo C STANDARD_PAGES.md §25 (the kit's plugin 1.3.0): a translation's footer link put in its English page's place is
+// answered "replaced", and read as the page's footer like the others.
+func TestATranslationsFooterLinkReplacedInItsEnglishPagesPlaceIsRead(t *testing.T) {
+	f := newDeployFixture(t)
+	f.deployWP(f.putWP("one"), "blog", testHost, testAdmin, "req-blog-first")
+	if err := os.WriteFile(f.dockerState("page-privacy-policy-de.replaces"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	german := `{"format":"autobuild-page-set/1","slug":"privacy-policy-de","content":"DATENSCHUTZ-WORDS"}`
+	op := f.setPages("blog", "req-pages-de01", pageFiles("privacy-policy-de.json", german, "privacy-policy.json", privacyPage))
+	if p := pageOf(op, "privacy-policy-de.json"); op.State != opSucceeded || p.Outcome != "created" || p.Footer != "replaced" || p.Detail != "" {
+		t.Fatalf("german = %+v (operation %+v)", p, op)
+	}
+	if p := pageOf(op, "privacy-policy.json"); p.Outcome != "created" || p.Footer != "added" {
+		t.Fatalf("english = %+v", p)
+	}
+}
+
 // SP1b (Repo C STANDARD_PAGES.md §14): a WordPress website's page files go on with a backup first, each set with the
 // kit's command in the site's container; a page edited in WordPress is kept and a file the kit refuses is refused, and
 // neither fails the operation. The files never reach a script, a record or a step, and leave the container after.

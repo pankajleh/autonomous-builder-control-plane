@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,9 +46,10 @@ func TestPageFilesAreNamedBoundedJSONObjectsInOneCanonicalSpelling(t *testing.T)
 	big := `{"x":"` + strings.Repeat("a", MaxPageFileBytes-7) + `"}`
 	var many, heavy []PageFileV1
 	for i := 0; i <= MaxPageFiles; i++ {
-		many = append(many, pageFile(string(rune('a'+i))+".json", "{}"))
+		many = append(many, pageFile(fmt.Sprintf("p%02d.json", i), "{}"))
 	}
-	for i := 0; i < 5; i++ {
+	// One file more than the most bytes hold, each as big as a file may be.
+	for i := 0; i <= MaxPageFilesBytes/MaxPageFileBytes; i++ {
 		heavy = append(heavy, pageFile(string(rune('a'+i))+".json", `{"x":"`+strings.Repeat("a", MaxPageFileBytes-8)+`"}`))
 	}
 	for name, set := range map[string][]PageFileV1{
@@ -80,7 +82,7 @@ func TestPageFilesAreNamedBoundedJSONObjectsInOneCanonicalSpelling(t *testing.T)
 	if _, err := DecodePageFiles(many[:MaxPageFiles]); err != nil {
 		t.Fatal("the most files", err)
 	}
-	if _, err := DecodePageFiles(heavy[:4]); err != nil {
+	if _, err := DecodePageFiles(heavy[:MaxPageFilesBytes/MaxPageFileBytes]); err != nil {
 		t.Fatal("the most bytes", err)
 	}
 }
