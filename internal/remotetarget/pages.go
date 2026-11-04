@@ -19,7 +19,7 @@ import (
 // kit's plugin set the page (`wp autobuild-site page set <name less .json>
 // <file> --format=json`, Repo C tools/wp-site-kit SERVER.md), and answers what
 // each file came to. ABCP never reads the files: they are named files of at
-// most 256 KiB each, 1 MiB in all (serviceapi.DecodePageFiles); only the
+// most 256 KiB each, 2 MiB in all (serviceapi.DecodePageFiles); only the
 // kit's one-line answer is read. A page the person edited in WordPress is kept
 // by the kit, and a file the kit refuses is answered refused: neither fails
 // the operation. The files stay in ABCP's memory while the operation runs and
@@ -40,10 +40,11 @@ const (
 var kitVersionPattern = regexp.MustCompile(`^([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})$`)
 
 // The kit's answers (its `page set --format=json`): what it did with the
-// page, and with its footer link.
+// page, and with its footer link ("replaced" since the kit's plugin 1.3.0: a
+// translation's link put in its English page's place, Repo C STANDARD_PAGES §25).
 var (
 	pageOutcomes  = map[string]bool{"created": true, "updated": true, "unchanged": true, "kept": true}
-	footerResults = map[string]bool{"none": true, "there": true, "added": true, "full": true}
+	footerResults = map[string]bool{"none": true, "there": true, "added": true, "full": true, "replaced": true}
 )
 
 // pagesSteps are a pages operation's steps.

@@ -210,7 +210,7 @@ type SitePagesRequestV1 struct {
 // what the kit's command answered, "created", "updated", "unchanged" or "kept"
 // (left as the site has it, Why saying why, as the kit words it), or
 // "refused" when the command did not set it (Detail is its last line of
-// error). Footer is the footer link's: "none", "there", "added" or "full";
+// error). Footer is the footer link's: "none", "there", "added", "full" or "replaced";
 // empty when refused. One file kept or refused never fails the operation.
 type SitePageV1 struct {
 	File    string `json:"file"`
