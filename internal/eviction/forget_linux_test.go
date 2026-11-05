@@ -15,10 +15,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/activity"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/readmodel"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/runadmission"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/serviceapi"
 )
@@ -481,23 +484,80 @@ func (f *forgetFixture) blobGoneAfterGC(t *testing.T) bool {
 	return err != nil
 }
 
+// bindingCatalog is the run registration activity.Resolver checks a binding against.
+type bindingCatalog struct {
+	registration runtimecatalog.RunRegistrationV1
+}
+
+func (c bindingCatalog) ReadRun(run string) (runtimecatalog.RunRegistrationV1, error) {
+	if run != c.registration.RunID {
+		return runtimecatalog.RunRegistrationV1{}, os.ErrNotExist
+	}
+	return c.registration, nil
+}
+
+// admitExactEdit writes the fixture's run's admission as admission writes an exact edit's since builds were walled (its
+// manifest naming a run folder that is never made) and answers the real resolver of it.
+func (f *forgetFixture) admitExactEdit(t *testing.T) activity.Resolver {
+	t.Helper()
+	if err := os.Chmod(f.root, 0o700); err != nil { // the service root is private
+		t.Fatal(err)
+	}
+	plan := []byte("# Words changed\nProject: project-1\nAdmission-ID: " + testRun + "\n\nthe person's words\n")
+	write(t, filepath.Join(f.scope.Inputs, "plan.md"), string(plan))
+	manifest := authority.Manifest{RunID: testRun,
+		Repository: authority.RepositoryManifest{Path: f.scope.Repository, Identity: f.scope.RepositoryIdentity, StartSHA: f.base},
+		Plan:       authority.PlanManifest{Path: filepath.Join(f.scope.Inputs, "plan.md"), SHA256: digestOf(string(plan))},
+		Worktree:   authority.WorktreePolicy{Enabled: true, Branch: f.scope.Branch, Retain: true},
+		Ralphex:    authority.RalphexManifest{BinaryPath: "/usr/bin/false", BinarySHA256: strings.Repeat("a", 64), SourceSHA: strings.Repeat("b", 40)},
+		Isolation:  &authority.IsolationManifest{RunFolder: filepath.Join(f.root, "builds", testRun)},
+		ExactEdit:  &authority.ExactEditManifest{SourceSHA: f.base, Replacements: []authority.ExactEditReplacement{{Path: "feature.md", BaseBlob: strings.Repeat("c", 40), Find: "a", Replace: "b"}}}}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(f.scope.Inputs, "manifest.json"), string(data))
+	identity := runtimecatalog.RepositoryIdentityDigest(f.scope.RepositoryIdentity)
+	registration := runtimecatalog.RunRegistrationV1{Kind: "RunRegistrationV1", RunID: testRun, AuthorityDigest: digestOf(string(data)), RepositoryIdentityDigest: identity,
+		CanonicalLedgerPath: filepath.Join(f.root, "ledger", testRun, "events.jsonl"), CanonicalEvidenceRoot: filepath.Join(f.root, "evidence", testRun)}
+	binding := runadmission.AdmissionBindingV1{Kind: "AdmissionBindingV1", SchemaVersion: 1, RunID: testRun, AuthorityDigest: registration.AuthorityDigest,
+		RepositoryPath: f.scope.Repository, RepositoryIdentity: f.scope.RepositoryIdentity, RepositoryIdentityDigest: identity, InputDirectory: ".abcp-input",
+		PlanPath: filepath.Join(f.scope.Inputs, "plan.md"), ManifestPath: filepath.Join(f.scope.Inputs, "manifest.json"),
+		LedgerRoot: filepath.Join(f.root, "ledger"), CanonicalLedgerPath: registration.CanonicalLedgerPath,
+		EvidenceRoot: filepath.Join(f.root, "evidence"), CanonicalEvidenceRoot: registration.CanonicalEvidenceRoot}
+	if data, err = json.Marshal(binding); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(f.root, "admissions", "fixture.binding.json"), string(data))
+	return activity.Resolver{Root: f.root, Catalog: bindingCatalog{registration}}
+}
+
 // An exact edit never runs in the wall: its worktree is in the product repository at the builder's place, though its
 // admission named a run folder (never made). The forget finds it, records both, removes both, and its blob goes at gc:
-// with the binding as it was (the run folder in the scope) and as it is now (the run folder ignored for an exact edit).
+// with the binding as it was (the run folder in the scope), as it is now (the run folder ignored for an exact edit), and
+// through the real resolver of the run's admission.
 func TestForgetRemovesAnExactEditsWorktreeInTheProductRepository(t *testing.T) {
-	for _, binding := range []string{"run folder named", "run folder ignored"} {
+	for _, binding := range []string{"run folder named", "run folder ignored", "resolver"} {
 		t.Run(binding, func(t *testing.T) {
 			f := newForgetFixture(t, false)
 			f.scope.ExactEdit = true
 			folder := filepath.Join(f.root, "builds", testRun)
-			if binding == "run folder named" {
+			s := f.sweeper()
+			switch binding {
+			case "run folder named":
 				f.scope.RunFolder, f.scope.RunRepository = folder, filepath.Join(folder, "repo")
+			case "resolver":
+				resolver := f.admitExactEdit(t)
+				if scope, err := resolver.ResolveBinding(context.Background(), testRun); err != nil || !scope.ExactEdit || scope.RunFolder != "" {
+					t.Fatalf("the exact edit's binding = %+v, %v", scope, err)
+				}
+				s.Binder = resolver
 			}
-			result, err := f.sweeper().Forget(context.Background(), testRun, "app-deleted", forgetRequest)
+			result, err := s.Forget(context.Background(), testRun, "app-deleted", forgetRequest)
 			if err != nil || result.Status != Forgotten {
 				t.Fatalf("forget = %+v, %v", result, err)
 			}
-			if result.Record.Worktree != f.worktree || result.Record.RunFolder != f.scope.RunFolder {
+			if result.Record.Worktree != f.worktree || result.Record.RunFolder != f.scope.RunFolder || result.Record.Inputs != f.scope.Inputs {
 				t.Fatalf("record worktree=%q run_folder=%q, want %q and %q", result.Record.Worktree, result.Record.RunFolder, f.worktree, f.scope.RunFolder)
 			}
 			if exists(f.worktree) {
@@ -648,5 +708,23 @@ func TestAnUnreadableForgetRecordIsAnErrorToARelease(t *testing.T) {
 	f.finishedAt = now.Add(-30 * 24 * time.Hour)
 	if evicted, err := s.Sweep(context.Background()); err != nil || len(evicted) != 0 || !exists(f.worktree) {
 		t.Fatalf("sweep with an unreadable record = %+v, %v", evicted, err)
+	}
+}
+
+// Through the fixed binding, an exact edit's retained worktree in the product repository is the sweep's like any
+// unwalled run's: an idle one is evicted (before, its binding named a run folder never made, and the sweep never saw it).
+func TestTheSweepEvictsAnExactEditsWorktree(t *testing.T) {
+	f := newForgetFixture(t, false)
+	if err := f.store.Remove(testRun); err != nil { // the fixture's earlier eviction
+		t.Fatal(err)
+	}
+	s := f.sweeper()
+	s.Binder = f.admitExactEdit(t)
+	evicted, err := s.Sweep(context.Background())
+	if err != nil || len(evicted) != 1 || evicted[0].Worktree != f.worktree {
+		t.Fatalf("sweep = %+v, %v", evicted, err)
+	}
+	if exists(f.worktree) {
+		t.Fatal("the exact edit's idle worktree is still there")
 	}
 }
