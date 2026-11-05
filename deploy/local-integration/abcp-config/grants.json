@@ -5,6 +5,7 @@
       "required_authorities": [
         "preview.control",
         "worktree.release",
+        "run.forget",
         "hosting.control",
         "accounts.control",
         "targets.control"

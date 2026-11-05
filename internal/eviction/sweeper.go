@@ -19,12 +19,14 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/activity"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/readmodel"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 )
 
 type Runs interface {
 	ListRuns(after string, limit int) ([]runtimecatalog.RunRegistrationV1, bool, error)
+	ReadRun(run string) (runtimecatalog.RunRegistrationV1, error)
 }
 type Binder interface {
 	ResolveBinding(ctx context.Context, run string) (activity.Scope, error)
@@ -35,9 +37,18 @@ type States interface {
 type Activity interface {
 	Engagement(run string) (streaming bool, last time.Time)
 	Checkpoints(ctx context.Context, run string) ([]string, error)
+	// ForgetActivity removes a forgotten run's activity.
+	ForgetActivity(run string) error
 }
 type Previews interface {
 	Live(run string) bool
+	// ForgetPreviews ends a forgotten run's previews and removes their sources.
+	ForgetPreviews(ctx context.Context, run string) error
+}
+
+// Ledgers opens a run's registered ledger to append to it (a forgotten run's RUN_FORGOTTEN).
+type Ledgers interface {
+	WithExistingWritableLedgerAndSnapshot(ctx context.Context, run string, operation func(*ledger.JSONLLedger, func() (readmodel.Snapshot, error)) error) error
 }
 
 // Finished states whose governed worktree is no longer used by the run. A run
@@ -50,7 +61,7 @@ var finished = map[domain.State]bool{
 const maxRuns = 20000
 
 type Sweeper struct {
-	// mu serialises sweeps and product-requested releases.
+	// mu serialises sweeps, product-requested releases and forgets.
 	mu       sync.Mutex
 	Policy   Policy
 	Store    *Store
@@ -59,7 +70,10 @@ type Sweeper struct {
 	States   States
 	Activity Activity
 	Previews Previews
-	Now      func() time.Time
+	// Forgets and Ledgers serve product-requested forgets (forget.go); without them a forget is refused.
+	Forgets *ForgetStore
+	Ledgers Ledgers
+	Now     func() time.Time
 	// Started is the idle baseline for runs not used since this process
 	// started: a restart never shortens a worktree's idle window.
 	Started time.Time
@@ -173,6 +187,11 @@ const (
 )
 
 func (s *Sweeper) inspect(ctx context.Context, run string) (candidate, outcome) {
+	if sealed, err := s.forgetSealed(run); sealed || err != nil {
+		// A forgotten run is the forget's to finish: an eviction would pin refs its record does not name. One whose
+		// record cannot be read is left alone too.
+		return candidate{}, notRetained
+	}
 	scope, err := s.Binder.ResolveBinding(ctx, run)
 	if err != nil {
 		return candidate{}, notRetained
@@ -254,12 +273,30 @@ func (s *Sweeper) removeFolderWithoutWorktree(ctx context.Context, run string, s
 	return true
 }
 
+// RunFinished reports whether the run reached a finished state; a run whose state cannot be read is not finished. The
+// nightly clean-up ages only a finished run's session logs (housekeeping.Nightly.Finished).
+func (s *Sweeper) RunFinished(run string) bool {
+	if !runtimecatalog.ValidIdentifier(run) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	terminal, _, err := s.finished(ctx, run)
+	return err == nil && terminal
+}
+
 // finished reports whether the run reached a finished state, and when.
 func (s *Sweeper) finished(ctx context.Context, run string) (bool, time.Time, error) {
 	snapshot, err := s.States.Snapshot(ctx, run)
 	if err != nil {
 		return false, time.Time{}, err
 	}
+	terminal, at := finishedIn(snapshot)
+	return terminal, at, nil
+}
+
+// finishedIn reports whether the snapshot's run reached a finished state, and when.
+func finishedIn(snapshot readmodel.Snapshot) (bool, time.Time) {
 	state := snapshot.Projection.CurrentState
 	var at time.Time
 	for i := len(snapshot.Events) - 1; i >= 0; i-- {
@@ -273,7 +310,7 @@ func (s *Sweeper) finished(ctx context.Context, run string) (bool, time.Time, er
 			}
 		}
 	}
-	return finished[domain.State(state)] && !at.IsZero(), at, nil
+	return finished[domain.State(state)] && !at.IsZero(), at
 }
 
 func (s *Sweeper) evict(ctx context.Context, c candidate, reason string, now time.Time) (RecordV1, error) {
@@ -372,9 +409,9 @@ func retainedFolder(scope activity.Scope, worktree string) string {
 	return worktree
 }
 
-// removeRunFolder removes a walled run's folder, never through a link: the folder itself must be a real folder of this
-// user, and a folder in it the build left without write permission is opened without following links and made
-// writable first.
+// removeRunFolder removes a walled run's folder (or another folder of a run's: its inputs, its worktree, its engine
+// sessions), never through a link: the folder itself must be a real folder of this user, and a folder in it the build
+// left without write permission is opened without following links and made writable first.
 func removeRunFolder(folder string) error {
 	info, err := os.Lstat(folder)
 	if errors.Is(err, os.ErrNotExist) {
@@ -435,10 +472,17 @@ func size(root string) (int64, error) {
 	return total, err
 }
 
+// gitWaitDelay is how long an interrupted Git has to stop on SIGTERM before it is killed.
+const gitWaitDelay = 10 * time.Second
+
 func git(ctx context.Context, repository string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repository}, args...)...)
+	// An interrupted Git is asked to stop (it then removes the lock files it holds, such as packed-refs.lock) and is
+	// killed only if it has not within gitWaitDelay: a killed one leaves its locks, and every later ref change fails.
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = gitWaitDelay
 	cmd.Env = gitexec.Environment()
 	var out bytes.Buffer
 	cmd.Stdout = &out

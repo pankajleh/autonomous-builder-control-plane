@@ -112,6 +112,14 @@ func (s *Service) Close() error {
 	}
 	return nil
 }
+
+// ForgetActivity removes a forgotten run's activity (Store.Forget). Without a store it cannot, and says so.
+func (s *Service) ForgetActivity(run string) error {
+	if s == nil || s.store == nil {
+		return ErrUnavailable
+	}
+	return s.store.Forget(run)
+}
 func apiError(err error) error {
 	if err == nil {
 		return nil

@@ -28,6 +28,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/eviction"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/housekeeping"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/preview"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/readmodel"
@@ -847,6 +848,11 @@ func serveCommand(args []string, stderr io.Writer) int {
 	changeSourceRoot := flags.String("change-source-root", "", "folder where Repo C leaves the code a change job changes")
 	changeEngineFile := flags.String("change-engine-file", "", "protected file naming the change jobs' engine and its lane (docs/plans/change-jobs.md)")
 	buildWallFile := flags.String("build-wall-file", "", "protected build wall file (Repo C design note BUILD_ISOLATION.md): every build runs inside bubblewrap as it says; without it, or while its probe fails, no build is admitted (503 build_wall_unavailable)")
+	var gcRepositories, sessionLogs, laneSessionLogs stringList
+	flags.Var(&gcRepositories, "git-gc-repository", "a product repository to git gc --prune=14.days.ago nightly, under nice, ionice and its execution lock, so a forgotten run's objects go (Repo C APP_DELETION.md §4; repeatable; none by default)")
+	flags.Var(&sessionLogs, "session-logs-dir", "an engine session folder (named sessions or projects) people use too, such as ~/.codex/sessions or ~/.claude/projects: only finished builds' logs older than 30 days are removed nightly (runs/<run>/, build-named project folders, codex exec logs of a build's working folder), never a person's own sessions or memory/ (Repo C APP_DELETION.md decision 11; repeatable; none by default)")
+	flags.Var(&laneSessionLogs, "lane-session-logs-dir", "a build lane's own engine session folder (named sessions or projects): everything in it older than 30 days is removed nightly, a change job's sessions included, but an unfinished build's logs and memory/ (Repo C APP_DELETION.md decision 11; repeatable; none by default)")
+	nightlyAt := flags.String("nightly-at", housekeeping.DefaultAt, "UTC time of day (HH:MM) of the nightly git gc and session-log sweep")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -855,12 +861,37 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 || *serviceRoot == "" || *tokenFile == "" || *principalID == "" || *cursorKeyFile == "" || *grantsFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file> [--account-lane-ask-model <model>] [--account-lane-ask-timeout <duration>]] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--server-backups-file <private-file>] [--hosted-max-running <n>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder> [--stack-osv-root <folder>]] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>] [--build-wall-file <protected-file>]")
+		fmt.Fprintln(stderr, "usage: abcp serve --service-root <path> --listen <loopback-ip:port> --token-file <path> --principal-id <id> --cursor-key-file <path> --authority-grants-file <path> [--admission-profile-file <protected-file>] [--preview-profile-file <protected-file>] [--account-lanes-file <protected-file> [--account-lane-ask-model <model>] [--account-lane-ask-timeout <duration>]] [--targets-dir <private-folder>] [--site-relay-host <host>] [--app-relay-url <loopback-origin> --app-relay-token-file <protected-file>] [--hosted-offsite-file <private-file>] [--server-backups-file <private-file>] [--hosted-max-running <n>] [--stack-profiles-file <protected-file> --stack-source-root <folder> --stack-root <private-folder> [--stack-osv-root <folder>]] [--change-root <private-folder> --change-source-root <folder> --change-engine-file <protected-file>] [--build-wall-file <protected-file>] [--git-gc-repository <repository>]... [--session-logs-dir <sessions-folder>]... [--lane-session-logs-dir <sessions-folder>]... [--nightly-at <HH:MM>]")
 		return 2
 	}
 	if *evictionInterval < 0 || *evictionIdle < 0 || *evictionMaxAge < 0 || *evictionQuota < 0 {
 		fmt.Fprintln(stderr, "worktree eviction settings must not be negative")
 		return 2
+	}
+	nightly := &housekeeping.Nightly{Repositories: gcRepositories, SessionLogs: sessionLogs, LaneSessionLogs: laneSessionLogs, Lock: runctl.LockRepository, Now: time.Now, Log: stderr}
+	at, err := housekeeping.ParseAt(*nightlyAt)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	nightly.At = at
+	for _, repository := range gcRepositories {
+		if err := housekeeping.ValidateRepository(repository); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+	}
+	named := map[string]bool{}
+	for _, folder := range append(append([]string{}, sessionLogs...), laneSessionLogs...) {
+		if err := housekeeping.ValidateSessionLogs(folder); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		if named[folder] {
+			fmt.Fprintln(stderr, "a session folder is named twice: name it with --session-logs-dir or --lane-session-logs-dir, once")
+			return 2
+		}
+		named[folder] = true
 	}
 	if err := serviceapi.ValidateLoopbackAddress(*listen); err != nil {
 		fmt.Fprintln(stderr, err)
@@ -971,6 +1002,11 @@ func serveCommand(args []string, stderr io.Writer) int {
 		return 1
 	}
 	activityService.SetEvictions(evictions.Fact)
+	forgets, err := eviction.OpenForgetStore(*serviceRoot)
+	if err != nil {
+		fmt.Fprintln(stderr, "open run forget store safely")
+		return 1
+	}
 	var previewOptions []preview.Option
 	if *appRelayURL != "" || *appRelayTokenFile != "" {
 		token, tokenErr := serviceapi.ReadProtectedToken(*appRelayTokenFile)
@@ -1021,10 +1057,18 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Policy: eviction.Policy{Idle: *evictionIdle, MaxAge: *evictionMaxAge, QuotaBytes: *evictionQuota},
 		Store:  evictions, Runs: catalog, Binder: activity.Resolver{Root: *serviceRoot, Catalog: catalog},
 		States: readService, Activity: activityService, Previews: previewService,
+		Forgets: forgets, Ledgers: readService,
 		Now: time.Now, Started: time.Now(), Log: stderr,
 	}
 	if *evictionInterval > 0 {
 		go sweeper.Run(ctx, *evictionInterval)
+	}
+	nightly.Finished = sweeper.RunFinished
+	// The nightly clean-up (Repo C APP_DELETION.md §4, decision 11): git gc of the product repositories named, and engine
+	// session logs older than 30 days in the session folders named. Nothing is named by default.
+	if nightly.Enabled() {
+		fmt.Fprintf(stderr, "abcp nightly clean-up at=%s UTC repositories=%d session-folders=%d lane-session-folders=%d\n", *nightlyAt, len(gcRepositories), len(sessionLogs), len(laneSessionLogs))
+		go nightly.Run(ctx)
 	}
 	// Account lanes (docs/plans/account-lanes.md): without the file the routes say they are unsupported. A signed-in Claude
 	// lane answers an administrator's own app one question at a time (docs/plans/account-lane-ask.md).
@@ -1141,6 +1185,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Activity:      activityService,
 		Preview:       previewService,
 		Worktrees:     eviction.API{Sweeper: sweeper},
+		Forget:        eviction.API{Sweeper: sweeper},
 		Hosting:       hosting,
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
@@ -1251,11 +1296,11 @@ func usage(writer io.Writer) {
 	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|governance-*-validate|governance-lease-issue|run|serve|build-wall-probe|recovery-inspect|recovery-resume>")
 }
 
-// canaryFlags is a repeatable --canary.
-type canaryFlags []string
+// stringList is a repeatable flag: --canary, --git-gc-repository, --session-logs-dir, --lane-session-logs-dir.
+type stringList []string
 
-func (c *canaryFlags) String() string     { return strings.Join(*c, ",") }
-func (c *canaryFlags) Set(v string) error { *c = append(*c, v); return nil }
+func (c *stringList) String() string     { return strings.Join(*c, ",") }
+func (c *stringList) Set(v string) error { *c = append(*c, v); return nil }
 
 // buildWallProbeCommand loads a wall file and runs its start probe once, as abcp serve does at start, so a wall file can
 // be checked on the host before a restart (Repo C design note BUILD_ISOLATION.md, phase 1). It starts no build.
@@ -1263,7 +1308,7 @@ func buildWallProbeCommand(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("build-wall-probe", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	wallFile := flags.String("build-wall-file", "", "protected build wall file")
-	var canaries canaryFlags
+	var canaries stringList
 	flags.Var(&canaries, "canary", "a further path the probe must not find inside the wall (repeatable)")
 	if err := flags.Parse(args); err != nil {
 		return 2

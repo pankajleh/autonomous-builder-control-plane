@@ -51,12 +51,17 @@ type Service struct {
 	resolver SourceResolver
 	checkout Materializer
 	// pageFiles keeps each preview's page files, beside the sources.
-	pageFiles           PageFiles
-	runtime             Runtime
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	workers             map[string]context.CancelFunc
-	keptLocks           map[string]*sync.Mutex
+	pageFiles PageFiles
+	runtime   Runtime
+	ctx       context.Context
+	cancel    context.CancelFunc
+	workers   map[string]context.CancelFunc
+	keptLocks map[string]*sync.Mutex
+	// forgotten are the runs ForgetPreviews was asked for: no preview of one is created after it looked, though the
+	// request passed the route's check before the forget was sealed. After a restart the sealed record refuses it.
+	forgotten map[string]bool
+	// stopPending are the previews a forget ended whose containers were not yet stopped: the next call stops them.
+	stopPending         map[string]bool
 	wg                  sync.WaitGroup
 	now                 func() time.Time
 	closed, unavailable bool
@@ -103,7 +108,7 @@ func newService(parent context.Context, root string, profiles map[string]Preview
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
-	s := &Service{store: store, profiles: profiles, resolver: resolver, checkout: checkout, pageFiles: PageFiles{Root: filepath.Join(root, "pages")}, runtime: runtime, ctx: ctx, cancel: cancel, workers: map[string]context.CancelFunc{}, keptLocks: map[string]*sync.Mutex{}, now: now}
+	s := &Service{store: store, profiles: profiles, resolver: resolver, checkout: checkout, pageFiles: PageFiles{Root: filepath.Join(root, "pages")}, runtime: runtime, ctx: ctx, cancel: cancel, workers: map[string]context.CancelFunc{}, keptLocks: map[string]*sync.Mutex{}, forgotten: map[string]bool{}, stopPending: map[string]bool{}, now: now}
 	// Restart never resumes candidate execution. Reconcile all objects carrying
 	// this private root's namespace, including objects created before a crash.
 	cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -193,6 +198,10 @@ func (s *Service) CreatePreview(ctx context.Context, p serviceapi.Principal, aut
 		s.mu.Unlock()
 		return empty, serviceapi.ErrPreviewUnavailable
 	}
+	if s.forgotten[run] {
+		s.mu.Unlock()
+		return empty, serviceapi.ErrRunForgotten
+	}
 	if v, ok, err := s.replay(key, d); ok {
 		s.mu.Unlock()
 		return v, err
@@ -222,6 +231,10 @@ func (s *Service) CreatePreview(ctx context.Context, p serviceapi.Principal, aut
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.forgotten[run] {
+		// The run was forgotten while its source was resolved: ForgetPreviews has looked already.
+		return empty, serviceapi.ErrRunForgotten
+	}
 	if v, ok, err := s.replay(key, d); ok {
 		return v, err
 	}
@@ -610,6 +623,80 @@ func (s *Service) ForgetPreviewData(ctx context.Context, p serviceapi.Principal,
 		return empty, serviceapi.ErrPreviewUnavailable
 	}
 	return v, nil
+}
+
+// ForgetPreviews ends every live preview of a forgotten run, waits until each one's worker has stopped its containers, and
+// removes every preview's source checkout and page files of the run (Repo C design note APP_DELETION.md §4). From then
+// on no preview of the run is created. The previews' records stay, as ids, states and times. Calling it again stops
+// again whatever an earlier call could not stop, and does nothing more. An app's kept Try it data is the product's to
+// forget (ForgetPreviewData), not the run's.
+func (s *Service) ForgetPreviews(ctx context.Context, run string) error {
+	s.mu.Lock()
+	if s.closed || s.store.broken || ctx.Err() != nil {
+		s.mu.Unlock()
+		return ErrUnavailable
+	}
+	s.forgotten[run] = true
+	var ids, held []string
+	for id, v := range s.store.records {
+		if v.RunID != run {
+			continue
+		}
+		ids = append(ids, id)
+		if !terminal(v.Status) {
+			if s.store.append(ended(v, "STOPPED", s.now()), nil) != nil {
+				s.unavailable = true
+				s.mu.Unlock()
+				return ErrUnavailable
+			}
+			s.stopPending[id] = true
+		}
+		if s.stopPending[id] {
+			held = append(held, id)
+		}
+		if cancel := s.workers[id]; cancel != nil {
+			cancel()
+		}
+	}
+	s.mu.Unlock()
+	sort.Strings(ids)
+	deadline := time.Now().Add(60 * time.Second)
+	for _, id := range ids {
+		for {
+			s.mu.Lock()
+			_, running := s.workers[id]
+			s.mu.Unlock()
+			if !running {
+				break
+			}
+			if time.Now().After(deadline) || ctx.Err() != nil {
+				return ErrUnavailable
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	sort.Strings(held)
+	for _, id := range held {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := s.runtime.Stop(stopCtx, id)
+		cancel()
+		if err != nil {
+			// Still pending: the next call stops it again.
+			return ErrUnavailable
+		}
+		s.mu.Lock()
+		delete(s.stopPending, id)
+		s.mu.Unlock()
+	}
+	for _, id := range ids {
+		if err := s.checkout.Remove(id); err != nil {
+			return ErrUnavailable
+		}
+		if err := s.pageFiles.Remove(id); err != nil {
+			return ErrUnavailable
+		}
+	}
+	return nil
 }
 
 // keptLock serializes, for one app, starting a kept-data preview and forgetting its data.

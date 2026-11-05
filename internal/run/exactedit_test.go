@@ -3,6 +3,7 @@ package run
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -247,5 +248,127 @@ func TestCheckoutExactEditUsesTheBuildersWorktreePlace(t *testing.T) {
 	}
 	if err := removeExactEditWorktree(context.Background(), repository, path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The ledger, which a forget keeps (Repo C design note APP_DELETION.md §4), carries none of the person's words or file
+// names: not an exact edit's file, its words or their replacement, whether the edit is accepted, stopped by its check or
+// refused. A refusal's words are in the run's failure-reason evidence, which a forget removes.
+func TestAnExactEditsLedgerCarriesNoWordsOrFileNames(t *testing.T) {
+	files := map[string]string{}
+	for path, contents := range versionFiles {
+		files[path] = contents
+	}
+	files["pages/about-the-chef.html"] = "<p>Chef Marisol cooks every night</p>\n"
+	aboutTheChef := func(find string) func(string, *authority.ExactEditManifest) {
+		return func(repository string, edit *authority.ExactEditManifest) {
+			edit.Replacements[0] = authority.ExactEditReplacement{Path: "pages/about-the-chef.html",
+				BaseBlob: blobAt(t, repository, edit.SourceSHA, "pages/about-the-chef.html"), Find: find, Replace: "Chef Anaïs Okonkwo"}
+		}
+	}
+	for _, test := range []struct {
+		name  string
+		find  string
+		check string
+		state domain.State
+	}{
+		{"accepted", "Chef Marisol", "Okonkwo", domain.StateBranchAccepted},
+		{"stopped by its check", "Chef Marisol", "Marisol", domain.StateFailed},
+		{"refused", "Chef Bartholomew", "Okonkwo", domain.StateFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, _ := exactEditFixture(t, files, aboutTheChef(test.find), commandPath(t, "grep"), "-rq", test.check, ".")
+			result, err := fixture.runner(t).Run(context.Background())
+			if result.State != test.state {
+				t.Fatalf("state = %s, %v", result.State, err)
+			}
+			data, err := os.ReadFile(fixture.ledgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, word := range []string{"about-the-chef", "Marisol", "Bartholomew", "Okonkwo", "Anaïs", "Chef"} {
+				if strings.Contains(string(data), word) {
+					t.Fatalf("the ledger carries %q:\n%s", word, data)
+				}
+			}
+			if test.name == "refused" {
+				if !strings.Contains(string(data), `"reason":"EXACT_EDIT_DOES_NOT_APPLY"`) {
+					t.Fatalf("the refusal's ledger reason is not its code:\n%s", data)
+				}
+				text, err := os.ReadFile(filepath.Join(fixture.evidence, fixture.authority.RunID(), FailureReasonEvidenceName))
+				if err != nil || !strings.Contains(string(text), "pages/about-the-chef.html: the text is not found") {
+					t.Fatalf("the failure-reason evidence = %q, %v", text, err)
+				}
+			}
+		})
+	}
+}
+
+func TestLedgerReasonIsAFixedCode(t *testing.T) {
+	for _, test := range []struct {
+		source    string
+		cause     error
+		cancelled bool
+		want      string
+	}{
+		{"exact-edit", fmt.Errorf("%w: secret/path.md: the text is not found", ErrExactEditDoesNotApply), false, "EXACT_EDIT_DOES_NOT_APPLY"},
+		{"build-wall", errors.New("the wall file /x is not the one probed"), false, "BUILD_WALL_FAILED"},
+		{"acceptance-controller", context.Canceled, true, "ACCEPTANCE_CONTROLLER_CANCELLED"},
+		{"Not A Source", errors.New("x"), false, "RUN_FAILED"},
+	} {
+		if got := ledgerReason(test.source, test.cause, test.cancelled); got != test.want {
+			t.Fatalf("ledgerReason(%q, %v) = %q, want %q", test.source, test.cause, got, test.want)
+		}
+	}
+}
+
+// Acceptance that could not run (here its command is not there, as a path names it) leaves the run
+// VALIDATION_UNAVAILABLE with a fixed reason in the ledger; the error's words, with the path, go to the evidence.
+func TestAcceptanceUnavailableKeepsItsWordsOutOfTheLedger(t *testing.T) {
+	fixture, _ := exactEditFixture(t, versionFiles, nil, "/nonexistent/about-the-chef-check")
+	result, err := fixture.runner(t).Run(context.Background())
+	if result.State != domain.StateValidationUnavailable {
+		t.Fatalf("state = %s, %v", result.State, err)
+	}
+	data, err := os.ReadFile(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "about-the-chef") || !strings.Contains(string(data), `"reason":"ACCEPTANCE_UNAVAILABLE"`) {
+		t.Fatalf("the ledger:\n%s", data)
+	}
+	text, err := os.ReadFile(filepath.Join(fixture.evidence, fixture.authority.RunID(), FailureReasonEvidenceName))
+	if err != nil || !strings.Contains(string(text), "/nonexistent/about-the-chef-check") {
+		t.Fatalf("the failure-reason evidence = %q, %v", text, err)
+	}
+}
+
+// A failure-reason body is never overwritten: a stop whose name is taken (an earlier stop of the run whose transition
+// did not land) writes the next name, and its transition names it.
+func TestAFailureReasonTakesTheNextFreeName(t *testing.T) {
+	fixture, _ := exactEditFixture(t, versionFiles, func(_ string, edit *authority.ExactEditManifest) {
+		edit.Replacements[0].Find = "Order now"
+	}, commandPath(t, "grep"), "-q", "Reserve", "index.html")
+	earlier := filepath.Join(fixture.evidence, fixture.authority.RunID(), FailureReasonEvidenceName)
+	if err := os.MkdirAll(filepath.Dir(earlier), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(earlier, []byte("an earlier stop\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := fixture.runner(t).Run(context.Background())
+	if result.State != domain.StateFailed {
+		t.Fatalf("state = %s", result.State)
+	}
+	if text, err := os.ReadFile(earlier); err != nil || string(text) != "an earlier stop\n" {
+		t.Fatalf("the earlier body = %q, %v", text, err)
+	}
+	text, err := os.ReadFile(filepath.Join(filepath.Dir(earlier), "failure-reason-2.txt"))
+	if err != nil || !strings.Contains(string(text), "the text is not found") {
+		t.Fatalf("the next body = %q, %v", text, err)
+	}
+	data, err := os.ReadFile(fixture.ledgerPath)
+	if err != nil || !strings.Contains(string(data), "failure-reason-2.txt") {
+		t.Fatalf("the FAILED transition does not name the next body: %v\n%s", err, data)
 	}
 }

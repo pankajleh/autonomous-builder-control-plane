@@ -163,8 +163,11 @@ type PreviewController interface {
 }
 
 type ServerConfig struct {
-	Preview                 PreviewController
-	Worktrees               WorktreeReleaser
+	Preview   PreviewController
+	Worktrees WorktreeReleaser
+	// Forget, when set, answers POST /v1/runs/{run}/forget for a service principal granted run.forget, and makes a
+	// forgotten run's activity, timeline, evidence and previews answer 410 run_forgotten (Repo C APP_DELETION.md §4).
+	Forget                  RunForgetter
 	Hosting                 HostingController
 	Activity                ActivityReader
 	Authenticator           Authenticator
@@ -504,6 +507,8 @@ func (s *Server) runRoute(writer http.ResponseWriter, request *http.Request, pri
 		s.runPreviews(writer, request, principal, requestID, runID, parts[2:])
 	case len(parts) == 3 && parts[1] == "worktree" && parts[2] == "release":
 		s.runWorktreeRelease(writer, request, principal, requestID, runID)
+	case len(parts) == 2 && parts[1] == "forget":
+		s.runForget(writer, request, principal, requestID, runID)
 	case len(parts) == 2 && parts[1] == "activity":
 		s.runActivity(writer, request, requestID, runID)
 	case len(parts) == 3 && parts[1] == "activity" && parts[2] == "stream":
@@ -586,7 +591,7 @@ func (s *Server) runTimeline(writer http.ResponseWriter, request *http.Request, 
 		s.writeDependencyError(writer, requestID, ErrUnsupportedCapability)
 		return
 	}
-	if !s.requireRegisteredRun(writer, requestID, runID) {
+	if !s.requireRegisteredRun(writer, requestID, runID) || !s.refuseForgotten(writer, requestID, runID) {
 		return
 	}
 	response, err := s.reserved.Timeline.ReadTimeline(request.Context(), runID, page)
@@ -611,7 +616,7 @@ func (s *Server) runEvidence(writer http.ResponseWriter, request *http.Request, 
 		s.writeDependencyError(writer, requestID, ErrUnsupportedCapability)
 		return
 	}
-	if !s.requireRegisteredRun(writer, requestID, runID) {
+	if !s.requireRegisteredRun(writer, requestID, runID) || !s.refuseForgotten(writer, requestID, runID) {
 		return
 	}
 	if err := s.acquireEvidenceBuffer(request.Context()); err != nil {
@@ -636,7 +641,7 @@ func (s *Server) runEvidenceDownload(writer http.ResponseWriter, request *http.R
 		s.writeDependencyError(writer, requestID, ErrUnsupportedCapability)
 		return
 	}
-	if !s.requireRegisteredRun(writer, requestID, runID) {
+	if !s.requireRegisteredRun(writer, requestID, runID) || !s.refuseForgotten(writer, requestID, runID) {
 		return
 	}
 	if err := s.acquireEvidenceBuffer(request.Context()); err != nil {
@@ -976,6 +981,10 @@ func (s *Server) writeDependencyError(writer http.ResponseWriter, requestID stri
 		status, apiError.Code, apiError.Message = http.StatusConflict, "setup_pending", "the app has no setup token yet: start it again"
 	case errors.Is(err, ErrRunNotFinished):
 		status, apiError.Code, apiError.Message = http.StatusConflict, "run_not_finished", "run is not finished"
+	case errors.Is(err, ErrRunOnHold):
+		status, apiError.Code, apiError.Message = http.StatusConflict, "run_on_hold", "run is on hold"
+	case errors.Is(err, ErrRunForgotten):
+		status, apiError.Code, apiError.Message = http.StatusGone, "run_forgotten", "run is forgotten"
 	case errors.Is(err, ErrPreviewProfile):
 		status, apiError.Code, apiError.Message = http.StatusNotFound, "unknown_preview_profile", "preview profile is not available"
 	case errors.Is(err, ErrPreviewPagesRefused):
@@ -1108,7 +1117,7 @@ func (s *Server) runActivity(w http.ResponseWriter, r *http.Request, id, run str
 		s.writeDependencyError(w, id, ErrInvalidCursor)
 		return
 	}
-	if !s.requireRegisteredRun(w, id, run) {
+	if !s.requireRegisteredRun(w, id, run) || !s.refuseForgotten(w, id, run) {
 		return
 	}
 	if s.reserved.Activity == nil {
@@ -1127,7 +1136,7 @@ func (s *Server) runActivityStream(w http.ResponseWriter, r *http.Request, id, r
 		s.writeDependencyError(w, id, ErrInvalidCursor)
 		return
 	}
-	if !s.requireRegisteredRun(w, id, run) {
+	if !s.requireRegisteredRun(w, id, run) || !s.refuseForgotten(w, id, run) {
 		return
 	}
 	if s.reserved.Activity == nil {
@@ -1215,7 +1224,7 @@ func (s *Server) runPreviews(w http.ResponseWriter, r *http.Request, principal P
 		s.writeDependencyError(w, id, ErrDependencyNotFound)
 		return
 	}
-	if !s.requireRegisteredRun(w, id, run) {
+	if !s.requireRegisteredRun(w, id, run) || !s.refuseForgotten(w, id, run) {
 		return
 	}
 	if s.reserved.Preview == nil {
