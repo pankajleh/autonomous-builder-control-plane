@@ -44,6 +44,9 @@ type Scope struct {
 	// Repository. Repository stays the product repository, where the run's
 	// branch is brought back and previews read it.
 	RunFolder, RunRepository string
+	// Inputs is the run's admitted input folder in Repository (<input directory>/<run>: its plan, capsule and
+	// manifest), which a forgotten run's binding loses with it.
+	Inputs string
 }
 
 // worktreeRepository is the repository that holds the run's worktree, branch as
@@ -227,7 +230,7 @@ func (r Resolver) resolveBinding(ctx context.Context, run string) (Scope, error)
 		}
 		break
 	}
-	scope := Scope{RunID: run, Repository: b.RepositoryPath, RepositoryIdentity: b.RepositoryIdentity, Project: project, Branch: manifest.Worktree.Branch, Base: manifest.Repository.StartSHA, AuthorityDigest: reg.AuthorityDigest, Ralphex: manifest.Ralphex, Retain: manifest.Worktree.Retain, ExactEdit: manifest.ExactEdit != nil}
+	scope := Scope{RunID: run, Repository: b.RepositoryPath, RepositoryIdentity: b.RepositoryIdentity, Project: project, Branch: manifest.Worktree.Branch, Base: manifest.Repository.StartSHA, AuthorityDigest: reg.AuthorityDigest, Ralphex: manifest.Ralphex, Retain: manifest.Worktree.Retain, ExactEdit: manifest.ExactEdit != nil, Inputs: admittedDir}
 	if isolation := manifest.Isolation; isolation != nil {
 		if !filepath.IsAbs(isolation.RunFolder) || filepath.Clean(isolation.RunFolder) != isolation.RunFolder || filepath.Base(isolation.RunFolder) != run {
 			return fail("manifest-isolation")

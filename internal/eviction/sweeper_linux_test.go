@@ -90,6 +90,11 @@ func (f *fixture) Checkpoints(context.Context, string) ([]string, error) {
 	return []string{f.checkpoint}, nil
 }
 func (f *fixture) Live(string) bool { return f.live }
+func (f *fixture) ReadRun(run string) (runtimecatalog.RunRegistrationV1, error) {
+	return runtimecatalog.RunRegistrationV1{RunID: run}, nil
+}
+func (f *fixture) ForgetActivity(string) error                  { return nil }
+func (f *fixture) ForgetPreviews(context.Context, string) error { return nil }
 func (f *fixture) sweeper() *Sweeper {
 	return &Sweeper{Policy: DefaultPolicy(), Store: f.store, Runs: f, Binder: f, States: f, Activity: f, Previews: f,
 		Now: func() time.Time { return now }, Started: now.Add(-48 * time.Hour)}

@@ -78,18 +78,27 @@ func (r RecordV1) validate() error {
 type Store struct{ dir string }
 
 func OpenStore(serviceRoot string) (*Store, error) {
-	dir := filepath.Join(serviceRoot, "evictions")
+	dir, err := openRecordDirectory(serviceRoot, "evictions")
+	if err != nil {
+		return nil, err
+	}
+	return &Store{dir: dir}, nil
+}
+
+// openRecordDirectory makes, or opens, <service-root>/<name>: a real folder of this user, private to it.
+func openRecordDirectory(serviceRoot, name string) (string, error) {
+	dir := filepath.Join(serviceRoot, name)
 	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return nil, fmt.Errorf("create eviction store: %w", err)
+		return "", fmt.Errorf("create %s store: %w", name, err)
 	}
 	info, err := os.Lstat(dir)
 	if err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
-		return nil, ErrIntegrity
+		return "", ErrIntegrity
 	}
 	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Geteuid() {
-		return nil, ErrIntegrity
+		return "", ErrIntegrity
 	}
-	return &Store{dir: dir}, nil
+	return dir, nil
 }
 
 func (s *Store) path(run string) (string, error) {
@@ -105,24 +114,37 @@ func (s *Store) Read(run string) (RecordV1, bool, error) {
 	if err != nil {
 		return RecordV1{}, false, err
 	}
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if errors.Is(err, os.ErrNotExist) {
-		return RecordV1{}, false, nil
+	data, ok, err := readRecordFile(path, maxRecordBytes)
+	if err != nil || !ok {
+		return RecordV1{}, false, err
 	}
-	if err != nil {
-		return RecordV1{}, false, ErrIntegrity
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > maxRecordBytes {
-		return RecordV1{}, false, ErrIntegrity
-	}
-	data, err := io.ReadAll(io.LimitReader(file, maxRecordBytes+1))
 	var record RecordV1
-	if err != nil || len(data) > maxRecordBytes || strictjson.Decode(data, &record) != nil || record.RunID != run || record.validate() != nil {
+	if strictjson.Decode(data, &record) != nil || record.RunID != run || record.validate() != nil {
 		return RecordV1{}, false, ErrIntegrity
 	}
 	return record, true, nil
+}
+
+// readRecordFile reads a private record (a regular file of at most limit bytes, readable by this user alone, never
+// through a link), or ok=false when there is none.
+func readRecordFile(path string, limit int64) ([]byte, bool, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, ErrIntegrity
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > limit {
+		return nil, false, ErrIntegrity
+	}
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil || int64(len(data)) > limit {
+		return nil, false, ErrIntegrity
+	}
+	return data, true, nil
 }
 
 // Fact returns the reason and time of the run's sealed eviction. An unreadable
@@ -149,7 +171,21 @@ func (s *Store) Write(record RecordV1) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(s.dir, ".record-*")
+	return writeRecordFile(s.dir, path, data)
+}
+
+// Remove removes the run's eviction record, because the run is forgotten: nothing is left for it to explain.
+func (s *Store) Remove(run string) error {
+	path, err := s.path(run)
+	if err != nil {
+		return err
+	}
+	return removeRecordFile(s.dir, path)
+}
+
+// writeRecordFile durably replaces path in dir with data (temp file, fsync, rename, dir fsync).
+func writeRecordFile(dir, path string, data []byte) error {
+	tmp, err := os.CreateTemp(dir, ".record-*")
 	if err != nil {
 		return err
 	}
@@ -166,7 +202,19 @@ func (s *Store) Write(record RecordV1) error {
 	if err = os.Rename(tmp.Name(), path); err != nil {
 		return err
 	}
-	dir, err := os.Open(s.dir)
+	return syncDirectory(dir)
+}
+
+// removeRecordFile removes path in dir durably; an absent one is removed already.
+func removeRecordFile(dir, path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDirectory(dir)
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
 	if err != nil {
 		return err
 	}

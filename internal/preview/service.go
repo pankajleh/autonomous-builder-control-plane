@@ -612,6 +612,70 @@ func (s *Service) ForgetPreviewData(ctx context.Context, p serviceapi.Principal,
 	return v, nil
 }
 
+// ForgetPreviews ends every live preview of a forgotten run, waits until each one's worker has stopped its containers, and
+// removes every preview's source checkout and page files of the run (Repo C design note APP_DELETION.md §4). The
+// previews' records stay, as ids, states and times. Calling it again does nothing more. An app's kept Try it data is
+// the product's to forget (ForgetPreviewData), not the run's.
+func (s *Service) ForgetPreviews(ctx context.Context, run string) error {
+	s.mu.Lock()
+	if s.closed || s.store.broken || ctx.Err() != nil {
+		s.mu.Unlock()
+		return ErrUnavailable
+	}
+	var ids, held []string
+	for id, v := range s.store.records {
+		if v.RunID != run {
+			continue
+		}
+		ids = append(ids, id)
+		if !terminal(v.Status) {
+			if s.store.append(ended(v, "STOPPED", s.now()), nil) != nil {
+				s.unavailable = true
+				s.mu.Unlock()
+				return ErrUnavailable
+			}
+			held = append(held, id)
+		}
+		if cancel := s.workers[id]; cancel != nil {
+			cancel()
+		}
+	}
+	s.mu.Unlock()
+	sort.Strings(ids)
+	deadline := time.Now().Add(60 * time.Second)
+	for _, id := range ids {
+		for {
+			s.mu.Lock()
+			_, running := s.workers[id]
+			s.mu.Unlock()
+			if !running {
+				break
+			}
+			if time.Now().After(deadline) || ctx.Err() != nil {
+				return ErrUnavailable
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	for _, id := range held {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := s.runtime.Stop(stopCtx, id)
+		cancel()
+		if err != nil {
+			return ErrUnavailable
+		}
+	}
+	for _, id := range ids {
+		if err := s.checkout.Remove(id); err != nil {
+			return ErrUnavailable
+		}
+		if err := s.pageFiles.Remove(id); err != nil {
+			return ErrUnavailable
+		}
+	}
+	return nil
+}
+
 // keptLock serializes, for one app, starting a kept-data preview and forgetting its data.
 func (s *Service) keptLock(task string) *sync.Mutex {
 	s.mu.Lock()

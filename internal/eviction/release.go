@@ -10,6 +10,8 @@ var (
 	ErrRunNotFinished = errors.New("run is not finished")
 	// ErrInvalidReason rejects a release reason the product may not request.
 	ErrInvalidReason = errors.New("invalid worktree release reason")
+	// ErrRunForgotten refuses to release a forgotten run's worktree: the forget removes it.
+	ErrRunForgotten = errors.New("run is forgotten")
 )
 
 // Release outcomes.
@@ -78,6 +80,8 @@ func (s *Sweeper) ReleaseRepository(ctx context.Context, identity, reason string
 			switch {
 			case errors.Is(err, ErrRunNotFinished):
 				result.Unfinished++
+			case errors.Is(err, ErrRunForgotten):
+				// The forget removes its worktree.
 			case err != nil:
 				result.Failed++
 				s.logf("abcp worktree release failed run=%s reason=%s class=%s", reg.RunID, reason, class(err))
@@ -95,6 +99,9 @@ func (s *Sweeper) ReleaseRepository(ctx context.Context, identity, reason string
 }
 
 func (s *Sweeper) release(ctx context.Context, run, reason string) (ReleaseResult, error) {
+	if s.forgetSealed(run) {
+		return ReleaseResult{}, ErrRunForgotten
+	}
 	scope, err := s.Binder.ResolveBinding(ctx, run)
 	if err != nil {
 		return ReleaseResult{}, err

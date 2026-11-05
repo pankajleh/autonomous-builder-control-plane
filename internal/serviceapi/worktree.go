@@ -88,9 +88,15 @@ func (s *Server) mayReleaseWorktrees(principal Principal) bool {
 }
 
 func (s *Server) readReleaseBody(w http.ResponseWriter, r *http.Request, id string, into any) bool {
+	return s.readSmallCommand(w, r, id, "invalid worktree release request", into)
+}
+
+// readSmallCommand reads a POST with no query and a strict JSON body of at most 1 KiB into into, or answers 400 with
+// message.
+func (s *Server) readSmallCommand(w http.ResponseWriter, r *http.Request, id, message string, into any) bool {
 	data, err := io.ReadAll(io.LimitReader(r.Body, 1025))
 	if r.Method != http.MethodPost || r.URL.RawQuery != "" || err != nil || len(data) == 0 || len(data) > 1024 || decodeStrictJSON(data, into) != nil {
-		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid worktree release request", RequestID: id})
+		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: message, RequestID: id})
 		return false
 	}
 	return true
@@ -110,7 +116,7 @@ func (s *Server) runWorktreeRelease(w http.ResponseWriter, r *http.Request, prin
 		s.writeError(w, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid worktree release request", RequestID: id})
 		return
 	}
-	if !s.requireRegisteredRun(w, id, run) {
+	if !s.requireRegisteredRun(w, id, run) || !s.refuseForgotten(w, id, run) {
 		return
 	}
 	if s.reserved.Worktrees == nil {

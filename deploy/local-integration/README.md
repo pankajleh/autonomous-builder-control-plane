@@ -21,7 +21,7 @@ python3 tools/operator/check_local_integration_config.py [--live <dir>]
 | `manifest-template.json` | Demo-product governed manifest template; pins the Ralphex binary, executor policy, worktree retention and acceptance |
 | `manifest-template-development.json` | Repo C development manifest template |
 | `preview-profiles.json` | BP-02 preview profiles: `demo-v1` (demo product) and `web-v1` (Repo C) |
-| `grants.json` | Authority grants for the `repo-c-service` principal: `preview.control`, `worktree.release` for product-requested worktree release (#53), and `hosting.control` for hosted instances (#63, B9.2.1) |
+| `grants.json` | Authority grants for the `repo-c-service` principal: `preview.control`, `worktree.release` for product-requested worktree release (#53), `run.forget` for forgetting a deleted app's runs (Repo C `APP_DELETION.md` D1), and `hosting.control` for hosted instances (#63, B9.2.1) |
 
 Both preview profiles are static busybox `httpd` servers. `/bin/httpd` is the busybox path (`/usr/sbin/httpd` is the Alpine path and exits 127). The health path is `/README.md` because busybox `httpd` has no directory index. `web-v1` serves Repo C sources as static files only; a real web/API preview of Repo C needs an approved offline image and its own profile.
 
@@ -92,3 +92,20 @@ A preview of an evicted run is still created from the pinned ref. Do not delete 
 Repo C releases a finished run's worktree immediately when a task is closed: `POST /v1/runs/{run}/worktree/release` with reason `task-closed`. A future tenant deletion can release a whole repository: `POST /v1/worktrees/release` with reason `tenant-deleted`. Both need the `worktree.release` grant. A run that is still executing is refused with `409 run_not_finished`.
 
 Every eviction, whether by policy or by release, appears in the run's activity as a `WORKSPACE`/`RELEASED` event. Deploy the Repo C version that accepts this event before this ABCP version.
+
+### Forgetting a run (Repo C `APP_DELETION.md` §4, D1)
+
+When an app or an account is deleted, Repo C forgets each of the app's finished runs: `POST /v1/runs/{run}/forget` with `{"schema_version":1,"reason":"app-deleted"|"account-deleted","request_id":"<lowercase UUID>"}` (strict JSON, at most 1 KiB, no query). It needs the `run.forget` grant (anyone else `403 authority_denied`). An unknown run is `404 not_found`; a run not finished (one paused for a human decision included) is `409 run_not_finished`; a run on hold is `409 run_on_hold`. The answer is `200` `RunForgetV1`: `run_id`, `status` (`FORGOTTEN` for the request that sealed the forget and its replays, `ALREADY_FORGOTTEN` for any other), `reason`, `request_id` and `forgotten_at` of the sealing request, and `refs_removed` (each `ref` with its `sha`).
+
+ABCP first writes `<service-root>/forgotten/<run>.json` (mode `0600`): the run, reason, request id, time, every ref to remove with its SHA, the run's paths, its engine session folders and the hash manifest of its evidence bodies. Then it ends the run's previews and removes their sources; removes its worktree (a walled run's whole folder) and prunes the worktree list; deletes `refs/heads/abcp/<run>` and every `refs/abcp/<kind>/<run>/…` with their reflogs, each only while it names the recorded SHA (a moved ref stops the forget); removes `.abcp-input/<run>/` and any plan copy, the progress logs whose header names the run's branch, the eviction record, every file under `evidence/<run>/` (the folder stays), the engine session folders the run's ledger names (`…/runs/<run>`) and its activity log; and appends `RUN_FORGOTTEN` (reason, request id and counts only) to its ledger. An interrupted forget is finished by the next call; the sweep and releases leave a forgotten run alone. Kept: the ledger, the registration, the admission receipts and the record. A forgotten run's activity, timeline, evidence, previews and worktree release answer `410 run_forgotten`; its detail and events still answer.
+
+**A hold.** An operator holds a run by creating `<service-root>/holds/<run>` (any file; write the reason in it). A held run is refused with `409 run_on_hold`; removing the file lifts the hold. A forget already sealed is finished whatever is held after.
+
+**The nightly clean-up.** `abcp serve` runs it at `--nightly-at` (UTC, default `23:17`), only for what is named:
+
+```text
+--git-gc-repository /home/devagent/local-integration/repo-c-abcp/runtime/product-repo
+--session-logs-dir /home/devagent/.codex/sessions  --session-logs-dir /home/devagent/.claude/projects
+```
+
+Each repository gets `nice -n 19 ionice -c 3 -t git gc --quiet --prune=14.days.ago` under its execution lock (`abcp-ralphex-execution.lock`, waiting up to 30 minutes for a run's setup), so a forgotten run's objects go within 14 days of its refs while a running build's new objects are kept. Each session folder (named `sessions` or `projects`, so an engine home with its sign-in is never swept) loses its files older than 30 days and its empty folders unchanged for 30 days. One line each in the service log: `abcp nightly git gc …` and `abcp nightly session logs … removed=<n>`.

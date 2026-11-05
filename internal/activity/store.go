@@ -492,6 +492,32 @@ func (s *Store) Append(run, registration string, event Event) (Event, error) {
 	return event, nil
 }
 
+// Forget removes the run's activity log and its anchor, because the run is forgotten (Repo C design note
+// APP_DELETION.md §4): the titles and details the build's progress gave are the person's app. The run stays in the
+// initialization registry, so its log is never made again: a later load of it fails closed. An absent log is not an
+// error.
+func (s *Store) Forget(run string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || runtimecatalog.ValidateIdentifier(run) != nil {
+		return ErrUnavailable
+	}
+	if err := s.checkNamespace(); err != nil {
+		return err
+	}
+	path := s.path(run)
+	for _, name := range []string{path, path + ".anchor.json"} {
+		if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return ErrIntegrity
+		}
+	}
+	delete(s.cache, run)
+	if s.dir.Sync() != nil {
+		return ErrIntegrity
+	}
+	return nil
+}
+
 func providerSourceKey(event Event) string {
 	if event.SourceKind != "RALPHEX_PROGRESS" || event.SourceSessionID == "" || event.SourceEventID == "" {
 		return ""
