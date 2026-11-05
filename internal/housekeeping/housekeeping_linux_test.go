@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -136,14 +137,20 @@ func writeAged(t *testing.T, root string, files map[string]time.Time, data func(
 	}
 }
 
-func codexLog(cwd string) string {
-	return `{"timestamp":"2026-09-01T10:00:00Z","type":"session_meta","payload":{"id":"S1","cwd":"` + cwd + `","originator":"codex_exec"}}` + "\n" +
+func codexLog(cwd string) string { return codexLogBy(cwd, "codex_exec") }
+
+// codexLogBy is a Codex log as the originator wrote it: codex_exec for codex exec (a build), codex_cli_rs for a person's
+// interactive session.
+func codexLogBy(cwd, originator string) string {
+	return `{"timestamp":"2026-09-01T10:00:00Z","type":"session_meta","payload":{"id":"S1","timestamp":"2026-09-01T10:00:00Z","cwd":"` + cwd +
+		`","originator":"` + originator + `","cli_version":"0.157.1","instructions":"` + strings.Repeat("i", 40<<10) + `"}}` + "\n" +
 		`{"type":"response_item","payload":{"text":"the prompts"}}` + "\n"
 }
 
-// Only finished builds' session logs older than 30 days go: a walled build's runs/<run>/ (its memory/ kept), a build's
+// In a folder people use too (BuildsOnly), only finished builds' session logs older than 30 days go: a walled build's runs/<run>/ (its memory/ kept), a build's
 // Claude Code project folder from before builds were walled, and a Codex log whose first record names a build's working
-// folder. A running build's folder, newer logs, a person's own sessions and memory/, and anything a link names stay.
+// folder (codex exec's). A running build's folder, newer logs, a person's own sessions (one started in a build's folder
+// among them) and memory/, and anything a link names stay.
 func TestRemoveOldSessionLogs(t *testing.T) {
 	base := t.TempDir()
 	now := time.Date(2026, 11, 5, 23, 17, 0, 0, time.UTC)
@@ -160,6 +167,7 @@ func TestRemoveOldSessionLogs(t *testing.T) {
 		"2026/09/01/rollout-build-src.jsonl":                  longAgo, // the same, in a folder of its working folder: gone
 		"2026/09/01/rollout-running.jsonl":                    longAgo, // a running build's: stays
 		"2026/09/01/rollout-own.jsonl":                        longAgo, // a person's own: stays
+		"2026/09/01/rollout-own-in-build.jsonl":               longAgo, // a person's own, started in a build's folder: stays
 		"2026/09/01/notes.txt":                                longAgo,
 		"archived/rollout-x.jsonl":                            longAgo,
 	}
@@ -173,6 +181,8 @@ func TestRemoveOldSessionLogs(t *testing.T) {
 			return codexLog(buildFolder + runningRun)
 		case "rollout-own.jsonl":
 			return codexLog("/home/devagent/notes")
+		case "rollout-own-in-build.jsonl":
+			return codexLogBy(buildFolder+finishedRun, "codex_cli_rs")
 		}
 		return "the prompts\n"
 	})
@@ -211,9 +221,9 @@ func TestRemoveOldSessionLogs(t *testing.T) {
 		}
 	}
 
-	removed, err := RemoveOldSessionLogs(codex, now, SessionLogsMaxAge, finishedOnly)
-	if err != nil || removed != 3 {
-		t.Fatalf("codex: removed %d, %v", removed, err)
+	swept, err := RemoveOldSessionLogs(codex, now, SessionLogsMaxAge, BuildsOnly, finishedOnly)
+	if err != nil || swept.Removed != 3 || swept.Skipped != 0 {
+		t.Fatalf("codex: %+v, %v", swept, err)
 	}
 	for name := range codexFiles {
 		gone := map[string]bool{"runs/" + finishedRun + "/2026/09/01/rollout-a.jsonl": true, "2026/09/01/rollout-build.jsonl": true, "2026/09/01/rollout-build-src.jsonl": true}[name]
@@ -229,9 +239,9 @@ func TestRemoveOldSessionLogs(t *testing.T) {
 		t.Fatal("a folder holding a new log was removed")
 	}
 
-	removed, err = RemoveOldSessionLogs(claude, now, SessionLogsMaxAge, finishedOnly)
-	if err != nil || removed != 4 {
-		t.Fatalf("claude: removed %d, %v", removed, err)
+	swept, err = RemoveOldSessionLogs(claude, now, SessionLogsMaxAge, BuildsOnly, finishedOnly)
+	if err != nil || swept.Removed != 4 {
+		t.Fatalf("claude: %+v, %v", swept, err)
 	}
 	for name := range claudeFiles {
 		gone := strings.HasSuffix(name, "/s1.jsonl") || strings.HasSuffix(name, "/s2.jsonl") || strings.HasSuffix(name, "/s3.jsonl")
@@ -255,16 +265,16 @@ func TestRemoveOldSessionLogs(t *testing.T) {
 	}
 	// Without a way to tell a finished run, nothing is aged.
 	writeAged(t, claude, map[string]time.Time{slug(finishedRun) + "/s6.jsonl": longAgo}, func(string) string { return "x\n" })
-	if removed, err := RemoveOldSessionLogs(claude, now, SessionLogsMaxAge, nil); err != nil || removed != 0 {
-		t.Fatalf("no finished runs: removed %d, %v", removed, err)
+	if swept, err := RemoveOldSessionLogs(claude, now, SessionLogsMaxAge, BuildsOnly, nil); err != nil || swept.Removed != 0 {
+		t.Fatalf("no finished runs: %+v, %v", swept, err)
 	}
 	for _, bad := range []string{filepath.Join(base, ".codex"), "relative/sessions", filepath.Join(base, ".claude")} {
-		if _, err := RemoveOldSessionLogs(bad, now, SessionLogsMaxAge, finishedOnly); err == nil {
+		if _, err := RemoveOldSessionLogs(bad, now, SessionLogsMaxAge, LaneFolder, finishedOnly); err == nil {
 			t.Fatalf("%s was swept", bad)
 		}
 	}
-	if removed, err := RemoveOldSessionLogs(filepath.Join(base, "none", "projects"), now, SessionLogsMaxAge, finishedOnly); err != nil || removed != 0 {
-		t.Fatalf("a missing folder: %d, %v", removed, err)
+	if swept, err := RemoveOldSessionLogs(filepath.Join(base, "none", "projects"), now, SessionLogsMaxAge, LaneFolder, finishedOnly); err != nil || swept.Removed != 0 {
+		t.Fatalf("a missing folder: %+v, %v", swept, err)
 	}
 }
 
@@ -310,7 +320,7 @@ func TestSessionSweepNeverFollowsASwappedFolder(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	sweeps := 0
 	for ; time.Now().Before(deadline); sweeps++ {
-		RemoveOldSessionLogs(root, time.Now(), SessionLogsMaxAge, finishedOnly)
+		RemoveOldSessionLogs(root, time.Now(), SessionLogsMaxAge, LaneFolder, finishedOnly)
 		if _, err := os.Lstat(victim); err != nil {
 			stop.Store(true)
 			<-done
@@ -330,8 +340,217 @@ func TestSessionSweepLeavesARunningBuildsFolder(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "codex", "sessions")
 	longAgo := time.Now().Add(-90 * 24 * time.Hour)
 	writeAged(t, root, map[string]time.Time{"runs/" + runningRun + "/2026/08/01/rollout-a.jsonl": longAgo}, func(string) string { return "x\n" })
-	if removed, err := RemoveOldSessionLogs(root, time.Now(), SessionLogsMaxAge, finishedOnly); err != nil || removed != 0 {
-		t.Fatalf("removed %d, %v", removed, err)
+	for _, policy := range []SessionPolicy{BuildsOnly, LaneFolder} {
+		if swept, err := RemoveOldSessionLogs(root, time.Now(), SessionLogsMaxAge, policy, finishedOnly); err != nil || swept.Removed != 0 {
+			t.Fatalf("%s: %+v, %v", policy, swept, err)
+		}
+	}
+}
+
+// A build lane's own folder (LaneFolder) ages everything older than 30 days, a change job's sessions among it, but a
+// build's that has not finished (its runs/<run>, its project folder, its codex exec logs) and memory/.
+func TestALaneFolderAgesEverythingButARunningBuildsAndMemory(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 11, 5, 23, 17, 0, 0, time.UTC)
+	longAgo, recent := now.Add(-31*24*time.Hour), now.Add(-29*24*time.Hour)
+	slug := func(run string) string { return "-home-devagent-product-repo--ralphex-worktrees-abcp-" + run }
+	job := "-home-devagent-local-integration-repo-c-abcp-runtime-change-work-job-7"
+	claude := filepath.Join(base, "lanes", "claude-account-home", "projects")
+	claudeFiles := map[string]time.Time{
+		job + "/0b6c.jsonl":       longAgo, // a change job's transcript: gone
+		job + "/memory/MEMORY.md": longAgo,
+		job + "/1c7d.jsonl":       recent,
+		"runs/" + finishedRun + "/" + slug(finishedRun) + "/s.jsonl": longAgo, // gone
+		"runs/" + runningRun + "/" + slug(runningRun) + "/s.jsonl":   longAgo,
+		slug(runningRun) + "/s.jsonl":                                longAgo,
+		slug(finishedRun) + "/s.jsonl":                               longAgo, // gone
+		"memory/MEMORY.md":                                           longAgo,
+		"stray.txt":                                                  longAgo, // gone
+	}
+	writeAged(t, claude, claudeFiles, func(string) string { return "the change request\n" })
+	if err := os.Chtimes(filepath.Join(claude, job), longAgo, longAgo); err != nil {
+		t.Fatal(err)
+	}
+	swept, err := RemoveOldSessionLogs(claude, now, SessionLogsMaxAge, LaneFolder, finishedOnly)
+	if err != nil || swept.Removed != 4 || swept.Skipped != 0 {
+		t.Fatalf("claude lane: %+v, %v", swept, err)
+	}
+	for name := range claudeFiles {
+		gone := name == job+"/0b6c.jsonl" || name == "stray.txt" || strings.HasPrefix(name, slug(finishedRun)) || strings.HasPrefix(name, "runs/"+finishedRun)
+		if _, err := os.Lstat(filepath.Join(claude, name)); errors.Is(err, os.ErrNotExist) != gone {
+			t.Fatalf("claude lane %s: %v", name, err)
+		}
+	}
+	// The same folder under BuildsOnly keeps a change job's transcript.
+	writeAged(t, claude, map[string]time.Time{job + "/2d8e.jsonl": longAgo}, func(string) string { return "x\n" })
+	if _, err := RemoveOldSessionLogs(claude, now, SessionLogsMaxAge, BuildsOnly, finishedOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(claude, job, "2d8e.jsonl")); err != nil {
+		t.Fatal("BuildsOnly aged a change job's transcript")
+	}
+
+	codex := filepath.Join(base, "lanes", "codex-account-home", "sessions")
+	buildFolder := "/home/devagent/product-repo/.ralphex/worktrees/abcp/"
+	codexFiles := map[string]time.Time{
+		"2026/09/01/rollout-lane.jsonl":     longAgo, // the lane's own: gone
+		"2026/09/01/rollout-finished.jsonl": longAgo, // a finished build's: gone
+		"2026/09/01/rollout-running.jsonl":  longAgo, // a running build's: stays
+		"2026/10/10/rollout-new.jsonl":      recent,
+	}
+	writeAged(t, codex, codexFiles, func(name string) string {
+		switch filepath.Base(name) {
+		case "rollout-finished.jsonl":
+			return codexLog(buildFolder + finishedRun)
+		case "rollout-running.jsonl":
+			return codexLog(buildFolder + runningRun)
+		}
+		return codexLog("/home/devagent/lane")
+	})
+	swept, err = RemoveOldSessionLogs(codex, now, SessionLogsMaxAge, LaneFolder, finishedOnly)
+	if err != nil || swept.Removed != 2 {
+		t.Fatalf("codex lane: %+v, %v", swept, err)
+	}
+	for name := range codexFiles {
+		gone := name == "2026/09/01/rollout-lane.jsonl" || name == "2026/09/01/rollout-finished.jsonl"
+		if _, err := os.Lstat(filepath.Join(codex, name)); errors.Is(err, os.ErrNotExist) != gone {
+			t.Fatalf("codex lane %s: %v", name, err)
+		}
+	}
+}
+
+// failing makes the walk's open of each name in opens fail with errno, and its unlink of each name in unlinks, as a
+// build could make them fail in its own folder (or root not be able to stop), until the test ends.
+func failing(t *testing.T, opens map[string]syscall.Errno, unlinks map[string]syscall.Errno) {
+	t.Helper()
+	open, unlink := sysOpenat, sysUnlinkat
+	sysOpenat = func(dirfd int, path string, flags int, mode uint32) (int, error) {
+		if errno, ok := opens[path]; ok {
+			return -1, errno
+		}
+		return open(dirfd, path, flags, mode)
+	}
+	sysUnlinkat = func(dir *os.File, name string, flags int) error {
+		if errno, ok := unlinks[name]; ok && flags == 0 {
+			return errno
+		}
+		return unlink(dir, name, flags)
+	}
+	t.Cleanup(func() { sysOpenat, sysUnlinkat = open, unlink })
+}
+
+// One entry the walk cannot open or remove (a folder a build made unreadable, a file it swapped for a folder) is skipped
+// and counted; the rest of the folder is swept, and the first error is answered.
+func TestOneOddEntryDoesNotStopTheSweep(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "codex", "sessions")
+	longAgo := time.Now().Add(-90 * 24 * time.Hour)
+	var runs []string
+	for i := 0; i < 20; i++ {
+		run := "admission-" + strings.Repeat("0", 62) + strconv.Itoa(10+i)
+		runs = append(runs, run)
+		writeAged(t, root, map[string]time.Time{"runs/" + run + "/2026/08/01/rollout-a.jsonl": longAgo}, func(string) string { return "x\n" })
+	}
+	locked := filepath.Join(root, "runs", runs[7], "locked")
+	writeAged(t, root, map[string]time.Time{"runs/" + runs[7] + "/locked/rollout-b.jsonl": longAgo, "runs/" + runs[9] + "/swapped.jsonl": longAgo}, func(string) string { return "x\n" })
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o700) })
+	failing(t, map[string]syscall.Errno{"locked": syscall.EACCES}, map[string]syscall.Errno{"swapped.jsonl": syscall.EISDIR})
+	all := func(string) bool { return true }
+	swept, err := RemoveOldSessionLogs(root, time.Now(), SessionLogsMaxAge, LaneFolder, all)
+	if !(errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EISDIR)) || swept.Skipped != 2 || swept.Removed != len(runs) {
+		t.Fatalf("swept %+v, %v", swept, err)
+	}
+	for _, run := range runs {
+		if _, err := os.Lstat(filepath.Join(root, "runs", run, "2026", "08", "01", "rollout-a.jsonl")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s's old log stays after an odd entry elsewhere: %v", run, err)
+		}
+	}
+	var log bytes.Buffer
+	n := &Nightly{LaneSessionLogs: []string{root}, Finished: all, Now: time.Now, Log: &log}
+	n.Once(context.Background())
+	if !strings.Contains(log.String(), "policy=lane ok=false") || !strings.Contains(log.String(), "skipped=2 class=failed") {
+		t.Fatalf("log = %q", log.String())
+	}
+}
+
+// A folder a finished build left unreadable in its own session folder is made readable (0700) and swept.
+func TestAFinishedRunsUnreadableFolderIsMadeReadable(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "codex", "sessions")
+	longAgo := time.Now().Add(-90 * 24 * time.Hour)
+	writeAged(t, root, map[string]time.Time{"runs/" + finishedRun + "/locked/rollout-a.jsonl": longAgo}, func(string) string { return "x\n" })
+	locked := filepath.Join(root, "runs", finishedRun, "locked")
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	// As the build's user would be refused (root is not), the first open is refused.
+	refused := false
+	open := sysOpenat
+	sysOpenat = func(dirfd int, path string, flags int, mode uint32) (int, error) {
+		if path == "locked" && !refused {
+			refused = true
+			return -1, syscall.EACCES
+		}
+		return open(dirfd, path, flags, mode)
+	}
+	t.Cleanup(func() { sysOpenat = open })
+	swept, err := RemoveOldSessionLogs(root, time.Now(), SessionLogsMaxAge, BuildsOnly, finishedOnly)
+	if err != nil || swept.Removed != 1 || !refused {
+		t.Fatalf("swept %+v, %v (refused %t)", swept, err, refused)
+	}
+	if info, err := os.Lstat(locked); err == nil && info.Mode().Perm() != 0o700 {
+		t.Fatalf("the folder's mode is %v", info.Mode().Perm())
+	}
+}
+
+// A log's first record is read to its newline only, at most 1 MiB in.
+func TestFirstRecordReadsToTheFirstNewline(t *testing.T) {
+	dir := t.TempDir()
+	for name, data := range map[string]string{
+		"short":   "first\nsecond\n",
+		"long":    strings.Repeat("a", 100<<10) + "\n" + strings.Repeat("b", 3<<20),
+		"too":     strings.Repeat("c", (1<<20)+1) + "\n",
+		"no-line": "only",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	folder, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer folder.Close()
+	for name, want := range map[string]int{"short": 5, "long": 100 << 10, "too": -1, "no-line": -1} {
+		got, err := firstRecord(folder, name)
+		if err != nil || (want < 0 && got != nil) || (want >= 0 && len(got) != want) {
+			t.Fatalf("%s: %d bytes, %v", name, len(got), err)
+		}
+	}
+}
+
+// An interrupted gc is git, asked to stop with SIGTERM (so it removes its lock files), not killed outright.
+func TestAnInterruptedGCIsAskedToStop(t *testing.T) {
+	bin := t.TempDir()
+	mark := filepath.Join(bin, "stopped")
+	script := "#!/bin/sh\ntrap 'kill $pid; echo stopped > " + mark + "; exit 143' TERM\nsleep 30 &\npid=$!\nwait $pid\n"
+	if err := os.WriteFile(filepath.Join(bin, "nice"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	free := func(context.Context, string) (io.Closer, error) { return io.NopCloser(nil), nil }
+	started := time.Now()
+	if err := GC(ctx, t.TempDir(), free); err == nil {
+		t.Fatal("an interrupted gc succeeded")
+	}
+	if took := time.Since(started); took > gitWaitDelay {
+		t.Fatalf("gc took %s to stop", took)
+	}
+	if data, err := os.ReadFile(mark); err != nil || string(data) != "stopped\n" {
+		t.Fatalf("gc was not sent SIGTERM: %q, %v", data, err)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
@@ -32,6 +33,7 @@ const (
 	DefaultAt = "23:17"
 
 	gcTimeout         = 2 * time.Hour
+	gitWaitDelay      = 10 * time.Second
 	lockWait          = 30 * time.Minute
 	maxSessionEntries = 2_000_000
 )
@@ -41,12 +43,37 @@ var errInvalid = errors.New("housekeeping: invalid setting")
 // Locker takes a repository's execution lock and answers its release (run.LockRepository).
 type Locker func(ctx context.Context, repository string) (io.Closer, error)
 
+// SessionPolicy says what of a session folder the 30-day rule reaches.
+type SessionPolicy int
+
+const (
+	// BuildsOnly is the rule for a folder people use too (the server's own ~/.codex/sessions, the projects of the
+	// Claude config folder builds on the server's own sign-in use): only builds' logs in it age.
+	BuildsOnly SessionPolicy = iota
+	// LaneFolder is the rule for a build lane's own folder, which only ABCP's builds and change jobs write: everything in
+	// it ages but a build's that has not finished and memory/.
+	LaneFolder
+)
+
+func (p SessionPolicy) String() string {
+	if p == LaneFolder {
+		return "lane"
+	}
+	return "builds"
+}
+
+// SessionSweep counts one session folder's sweep: the files removed, and the entries it could not read or remove,
+// skipped (the first one's error is the sweep's).
+type SessionSweep struct{ Removed, Skipped int }
+
 // Nightly runs the clean-up once a day at At (time after midnight, UTC).
 type Nightly struct {
 	At           time.Duration
 	Repositories []string
-	SessionLogs  []string
-	Lock         Locker
+	// SessionLogs are folders people use too (BuildsOnly); LaneSessionLogs are build lanes' own (LaneFolder).
+	SessionLogs     []string
+	LaneSessionLogs []string
+	Lock            Locker
 	// Finished reports whether a run is finished; a run it cannot tell is not. Only a finished run's session logs
 	// are aged.
 	Finished func(run string) bool
@@ -84,7 +111,9 @@ func ValidateSessionLogs(path string) error {
 }
 
 // Enabled reports whether there is anything to do.
-func (n *Nightly) Enabled() bool { return len(n.Repositories) > 0 || len(n.SessionLogs) > 0 }
+func (n *Nightly) Enabled() bool {
+	return len(n.Repositories) > 0 || len(n.SessionLogs) > 0 || len(n.LaneSessionLogs) > 0
+}
 
 // Run runs Once at At every day until ctx ends.
 func (n *Nightly) Run(ctx context.Context) {
@@ -117,9 +146,14 @@ func (n *Nightly) Once(ctx context.Context) {
 		err := GC(ctx, repository, n.Lock)
 		n.logf("abcp nightly git gc repository=%q ok=%t took=%s%s", repository, err == nil, n.Now().Sub(started).Round(time.Second), failure(err))
 	}
-	for _, root := range n.SessionLogs {
-		removed, err := RemoveOldSessionLogs(root, n.Now(), SessionLogsMaxAge, n.Finished)
-		n.logf("abcp nightly session logs folder=%q ok=%t removed=%d%s", root, err == nil, removed, failure(err))
+	for _, folders := range []struct {
+		roots  []string
+		policy SessionPolicy
+	}{{n.SessionLogs, BuildsOnly}, {n.LaneSessionLogs, LaneFolder}} {
+		for _, root := range folders.roots {
+			swept, err := RemoveOldSessionLogs(root, n.Now(), SessionLogsMaxAge, folders.policy, n.Finished)
+			n.logf("abcp nightly session logs folder=%q policy=%s ok=%t removed=%d skipped=%d%s", root, folders.policy, err == nil, swept.Removed, swept.Skipped, failure(err))
+		}
 	}
 }
 
@@ -157,49 +191,55 @@ func GC(ctx context.Context, repository string, lock Locker) error {
 	defer held.Close()
 	gcCtx, cancel := context.WithTimeout(ctx, gcTimeout)
 	defer cancel()
-	// ionice -t runs git even where the idle class cannot be set; nice still applies.
+	// ionice -t runs git even where the idle class cannot be set; nice still applies. Both exec git, so an interrupted
+	// gc (ABCP stopping, or the 2 hours over) is git, asked to stop with SIGTERM, which removes its lock files (gc.pid,
+	// packed-refs.lock), and killed only if it has not within gitWaitDelay.
 	cmd := exec.CommandContext(gcCtx, "nice", "-n", "19", "ionice", "-c", "3", "-t", "git", "-C", repository, "gc", "--quiet", "--prune="+PruneGrace)
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = gitWaitDelay
 	cmd.Env = gitexec.Environment()
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	return cmd.Run()
 }
 
-// RemoveOldSessionLogs applies the 30-day rule (maxAge) to the builds' session logs in root, an engine's session
-// folder, and only to theirs (APP_DELETION.md decision 11: the lanes' folders, never a person's own sessions):
+// RemoveOldSessionLogs applies the 30-day rule (maxAge) in root, an engine's session folder, as policy says
+// (APP_DELETION.md decision 11). In every folder it reaches:
 //
 //   - runs/<run>/, a walled build's sessions (bound into its wall), of a run finished says is finished: a running
-//     build's folder is never walked, and a finished run's is removed by its forget;
+//     build's folder is never walked, and a forgotten run's is removed by its forget;
 //   - a Claude Code project folder named after a build's working folder (…-worktrees-abcp-admission-<id>…, a build
 //     from before builds were walled) of a finished run;
-//   - a Codex log in a dated folder (YYYY/MM/DD/rollout-….jsonl) whose first record says it ran in a build's working
-//     folder (…/worktrees/abcp/admission-<id>, the folder Repo C's meter ties it by) of a finished run.
+//   - a Codex log in a dated folder (YYYY/MM/DD/rollout-….jsonl) whose first record says codex exec ran it in a
+//     finished build's working folder (…/worktrees/abcp/admission-<id>, the folder Repo C's meter ties it by).
 //
-// In those, each file (or link, never followed) last changed before now-maxAge goes, then each folder left empty that
-// was last changed before then; a memory/ folder is never touched, nor anything else in root. The walk opens each folder
-// from its parent's descriptor without following links and removes only names in the folder it holds open, so a build
-// that swaps a folder for a link while it is walked can never lead it outside. It answers how many files it removed. A
-// root that is not there has nothing to remove.
-func RemoveOldSessionLogs(root string, now time.Time, maxAge time.Duration, finished func(run string) bool) (int, error) {
-	if err := ValidateSessionLogs(root); err != nil || maxAge <= 0 {
-		return 0, errInvalid
+// BuildsOnly reaches nothing else: a person's own sessions stay. LaneFolder reaches everything else in the folder too
+// (a change job's sessions, a lane's own), but a log or folder of a build that has not finished. A memory/ folder is
+// never touched. In what it reaches, each file (or link, never followed) last changed before now-maxAge goes, then each
+// folder left empty that was last changed before then. The walk opens each folder from its parent's descriptor without
+// following links and removes only names in the folder it holds open, so a build that swaps a folder for a link while it
+// is walked can never lead it outside. An entry it cannot read or remove is skipped and counted, and the walk goes on;
+// the first such error is answered with the counts. A root that is not there has nothing to remove.
+func RemoveOldSessionLogs(root string, now time.Time, maxAge time.Duration, policy SessionPolicy, finished func(run string) bool) (SessionSweep, error) {
+	if err := ValidateSessionLogs(root); err != nil || maxAge <= 0 || (policy != BuildsOnly && policy != LaneFolder) {
+		return SessionSweep{}, errInvalid
 	}
 	if finished == nil {
 		finished = func(string) bool { return false }
 	}
 	info, err := os.Lstat(root)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
+		return SessionSweep{}, nil
 	}
 	if err != nil {
-		return 0, err
+		return SessionSweep{}, err
 	}
 	if !info.IsDir() {
-		return 0, errInvalid
+		return SessionSweep{}, errInvalid
 	}
 	if resolved, err := filepath.EvalSymlinks(root); err != nil || resolved != root {
-		return 0, errInvalid
+		return SessionSweep{}, errInvalid
 	}
-	return removeOldSessionLogs(root, now.Add(-maxAge), finished)
+	return removeOldSessionLogs(root, now.Add(-maxAge), policy, finished)
 }
 
 var (
@@ -211,15 +251,18 @@ var (
 	digits      = regexp.MustCompile(`^[0-9]+$`)
 )
 
-// codexLogRun is the run whose working folder a Codex log's first record (session_meta) names, "" for none.
+// codexLogRun is the build run whose working folder a Codex log's first record (session_meta) names, "" for none. Only
+// codex exec's own logs (originator codex_exec, as Ralphex runs it) are a build's: a person's interactive session started
+// in a build's folder (codex_cli_rs) is not.
 func codexLogRun(first []byte) string {
 	var record struct {
 		Type    string `json:"type"`
 		Payload struct {
-			Cwd string `json:"cwd"`
+			Cwd        string `json:"cwd"`
+			Originator string `json:"originator"`
 		} `json:"payload"`
 	}
-	if json.Unmarshal(first, &record) != nil || record.Type != "session_meta" {
+	if json.Unmarshal(first, &record) != nil || record.Type != "session_meta" || record.Payload.Originator != "codex_exec" {
 		return ""
 	}
 	if m := buildFolder.FindStringSubmatch(record.Payload.Cwd); m != nil {

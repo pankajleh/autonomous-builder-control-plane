@@ -321,3 +321,54 @@ func TestLedgerReasonIsAFixedCode(t *testing.T) {
 		}
 	}
 }
+
+// Acceptance that could not run (here its command is not there, as a path names it) leaves the run
+// VALIDATION_UNAVAILABLE with a fixed reason in the ledger; the error's words, with the path, go to the evidence.
+func TestAcceptanceUnavailableKeepsItsWordsOutOfTheLedger(t *testing.T) {
+	fixture, _ := exactEditFixture(t, versionFiles, nil, "/nonexistent/about-the-chef-check")
+	result, err := fixture.runner(t).Run(context.Background())
+	if result.State != domain.StateValidationUnavailable {
+		t.Fatalf("state = %s, %v", result.State, err)
+	}
+	data, err := os.ReadFile(fixture.ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "about-the-chef") || !strings.Contains(string(data), `"reason":"ACCEPTANCE_UNAVAILABLE"`) {
+		t.Fatalf("the ledger:\n%s", data)
+	}
+	text, err := os.ReadFile(filepath.Join(fixture.evidence, fixture.authority.RunID(), FailureReasonEvidenceName))
+	if err != nil || !strings.Contains(string(text), "/nonexistent/about-the-chef-check") {
+		t.Fatalf("the failure-reason evidence = %q, %v", text, err)
+	}
+}
+
+// A failure-reason body is never overwritten: a stop whose name is taken (an earlier stop of the run whose transition
+// did not land) writes the next name, and its transition names it.
+func TestAFailureReasonTakesTheNextFreeName(t *testing.T) {
+	fixture, _ := exactEditFixture(t, versionFiles, func(_ string, edit *authority.ExactEditManifest) {
+		edit.Replacements[0].Find = "Order now"
+	}, commandPath(t, "grep"), "-q", "Reserve", "index.html")
+	earlier := filepath.Join(fixture.evidence, fixture.authority.RunID(), FailureReasonEvidenceName)
+	if err := os.MkdirAll(filepath.Dir(earlier), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(earlier, []byte("an earlier stop\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := fixture.runner(t).Run(context.Background())
+	if result.State != domain.StateFailed {
+		t.Fatalf("state = %s", result.State)
+	}
+	if text, err := os.ReadFile(earlier); err != nil || string(text) != "an earlier stop\n" {
+		t.Fatalf("the earlier body = %q, %v", text, err)
+	}
+	text, err := os.ReadFile(filepath.Join(filepath.Dir(earlier), "failure-reason-2.txt"))
+	if err != nil || !strings.Contains(string(text), "the text is not found") {
+		t.Fatalf("the next body = %q, %v", text, err)
+	}
+	data, err := os.ReadFile(fixture.ledgerPath)
+	if err != nil || !strings.Contains(string(data), "failure-reason-2.txt") {
+		t.Fatalf("the FAILED transition does not name the next body: %v\n%s", err, data)
+	}
+}

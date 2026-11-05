@@ -432,11 +432,37 @@ func removeForgottenRefs(ctx context.Context, record ForgetRecordV1) error {
 
 // productWorktree is the run's worktree in the product repository, "" when it has none there. Git says where the run's
 // branch is checked out; a worktree off its branch, or one Git no longer lists, is still the run's at Ralphex's path
-// for it.
+// for it. A worktree Git lists whose folder is gone (one a prune keeps, as it keeps a locked one) is the run's too: its
+// path is recorded, and the removal unlocks and prunes it.
 func productWorktree(ctx context.Context, scope activity.Scope) (string, error) {
+	// A worktree whose folder is gone is no longer Git's to keep listed; prune drops it (all such, the run's or not),
+	// which removes nothing but Git's own note of a folder that is not there.
+	if _, err := git(ctx, scope.Repository, "worktree", "prune"); err != nil {
+		return "", err
+	}
+	listed, err := listedWorktrees(ctx, ForgetRecordV1{Repository: scope.Repository, RunID: scope.RunID})
+	if err != nil {
+		return "", err
+	}
+	missing, present := "", false
+	for _, path := range listed {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			present = true
+		} else if cleanAbsolute(path) && inside(scope.Repository, path) && filepath.Base(path) == scope.RunID {
+			missing = path
+		}
+	}
+	if !present && missing != "" {
+		return missing, nil
+	}
 	product := scope
 	product.RunFolder, product.RunRepository = "", ""
 	path, err := activity.WorktreePath(ctx, product)
+	if len(listed) > 0 && !present && err != nil {
+		// Only a folder Git lists and that is gone holds the run's branch, at a place a record cannot name: no worktree
+		// to record; the removal still unlocks and prunes it, and fails while Git lists it.
+		path, err = "", nil
+	}
 	if err != nil || path != "" {
 		return path, err
 	}

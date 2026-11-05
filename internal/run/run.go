@@ -28,6 +28,7 @@ import (
 	contextcapsule "github.com/pankajleh/autonomous-builder-control-plane/internal/context"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/domain"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/enginelane"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/gitexec"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
@@ -970,9 +971,9 @@ func (r *Runner) acceptBranch(ctx context.Context, result Result, implementation
 		result.State = domain.StateCancelled
 		result.FailureReason = ctx.Err().Error()
 		payload := map[string]any{
-			"status": accepted.Status(), "reason": result.FailureReason,
+			"status": accepted.Status(), "reason": ledgerReason("acceptance-controller", ctx.Err(), true),
 		}
-		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateCancelled, "acceptance-controller", payload, acceptanceRefs); err != nil {
+		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateCancelled, "acceptance-controller", payload, r.withFailureWords(result.FailureReason, acceptanceRefs)); err != nil {
 			return result, errors.Join(acceptanceErr, err)
 		}
 		return result, cleanupErr
@@ -983,9 +984,11 @@ func (r *Runner) acceptBranch(ctx context.Context, result Result, implementation
 		if result.FailureReason == "" {
 			result.FailureReason = acceptanceErr.Error()
 		}
+		// The reason's words can carry Git's or a process's error, with paths: the ledger keeps a code, the evidence the
+		// words.
 		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateValidationUnavailable, "acceptance-controller", map[string]any{
-			"status": accepted.Status(), "reason": result.FailureReason,
-		}, acceptanceRefs); err != nil {
+			"status": accepted.Status(), "reason": "ACCEPTANCE_UNAVAILABLE",
+		}, r.withFailureWords(result.FailureReason, acceptanceRefs)); err != nil {
 			return result, errors.Join(acceptanceErr, err)
 		}
 		return result, fmt.Errorf("run branch acceptance: %w", acceptanceErr)
@@ -996,9 +999,9 @@ func (r *Runner) acceptBranch(ctx context.Context, result Result, implementation
 		// The built branch did not pass its acceptance checks: the request was
 		// built and checked, and building it again the same way ends the same.
 		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateFailed, "acceptance-controller", map[string]any{
-			"status": accepted.Status(), "reason": result.FailureReason,
+			"status": accepted.Status(), "reason": "ACCEPTANCE_FAILED",
 			"failure_class": string(blocker.ClassTaskNotCompleted), "retryability": string(blocker.RetryableAfterChange),
-		}, acceptanceRefs); err != nil {
+		}, r.withFailureWords(result.FailureReason, acceptanceRefs)); err != nil {
 			return result, err
 		}
 		return result, nil
@@ -1803,9 +1806,13 @@ func (r *Runner) cancel(ctx context.Context, result Result, from domain.State, s
 	return result, nil
 }
 
-// FailureReasonEvidenceName is the evidence body that keeps a failed or cancelled run's cause in words, for the
-// operator. A forget removes it with the run's other evidence bodies, its hash kept.
+// FailureReasonEvidenceName is the evidence body that keeps a failed, cancelled or unvalidated run's cause in words,
+// for the operator; a later one of the same run is failure-reason-2.txt, -3 and so on (evidence is never overwritten).
+// A forget removes them with the run's other evidence bodies, their hashes kept.
 const FailureReasonEvidenceName = "failure-reason.txt"
+
+// maxFailureReasons bounds the failure-reason bodies of one run.
+const maxFailureReasons = 16
 
 var ledgerSource = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
 
@@ -1827,17 +1834,34 @@ func ledgerReason(source string, cause error, cancelled bool) string {
 	return step + "_FAILED"
 }
 
-// withFailureText writes the cause's text as the run's failure-reason evidence and answers refs with it. The evidence
-// is the operator's account of the stop; a run that cannot write it still stops, with refs as they were.
+// withFailureText writes the cause's text as the run's failure-reason evidence and answers refs with it, under the
+// first of its names not taken (an earlier stop whose transition did not land keeps its own). The evidence is the
+// operator's account of the stop; a run that cannot write it still stops, with refs as they were.
 func (r *Runner) withFailureText(cause error, refs []ledger.EvidenceRef) []ledger.EvidenceRef {
 	if r.artifacts == nil || cause == nil {
 		return refs
 	}
-	ref, err := r.artifacts.WriteBytes(FailureReasonEvidenceName, "failure-reason", []byte(cause.Error()+"\n"))
-	if err != nil {
+	return r.withFailureWords(cause.Error(), refs)
+}
+
+func (r *Runner) withFailureWords(text string, refs []ledger.EvidenceRef) []ledger.EvidenceRef {
+	if r.artifacts == nil || text == "" {
 		return refs
 	}
-	return append(append([]ledger.EvidenceRef{}, refs...), ref)
+	for i := 1; i <= maxFailureReasons; i++ {
+		name := FailureReasonEvidenceName
+		if i > 1 {
+			name = fmt.Sprintf("failure-reason-%d.txt", i)
+		}
+		ref, err := r.artifacts.WriteBytes(name, "failure-reason", []byte(text+"\n"))
+		if err == nil {
+			return append(append([]ledger.EvidenceRef{}, refs...), ref)
+		}
+		if !errors.Is(err, evidence.ErrArtifactExists) {
+			return refs
+		}
+	}
+	return refs
 }
 
 func (r *Runner) writeJSON(name, kind string, value any) (ledger.EvidenceRef, error) {

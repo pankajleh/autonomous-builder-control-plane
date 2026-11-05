@@ -728,3 +728,34 @@ func TestTheSweepEvictsAnExactEditsWorktree(t *testing.T) {
 		t.Fatal("the exact edit's idle worktree is still there")
 	}
 }
+
+// A worktree Git lists whose folder is gone (removed without a prune; locked, so a prune keeps it) never stops the
+// forget from sealing: it is pruned first, or recorded and unlocked and pruned, the run's blobs gone at gc. Unwalled and
+// an exact edit alike.
+func TestForgetSealsWhenTheWorktreesFolderIsGone(t *testing.T) {
+	for _, locked := range []bool{false, true} {
+		for _, exact := range []bool{false, true} {
+			f := newForgetFixture(t, false)
+			f.scope.ExactEdit = exact
+			if locked {
+				run(t, f.scope.Repository, "worktree", "lock", f.worktree)
+			}
+			if err := os.RemoveAll(f.worktree); err != nil {
+				t.Fatal(err)
+			}
+			result, err := f.sweeper().Forget(context.Background(), testRun, "app-deleted", forgetRequest)
+			if err != nil || result.Status != Forgotten {
+				t.Fatalf("locked=%t exact=%t: forget = %+v, %v", locked, exact, result, err)
+			}
+			if locked && result.Record.Worktree != f.worktree {
+				t.Fatalf("a locked worktree whose folder is gone is not recorded: %q", result.Record.Worktree)
+			}
+			if list := run(t, f.scope.Repository, "worktree", "list", "--porcelain"); strings.Contains(list, testRun) {
+				t.Fatalf("locked=%t exact=%t: Git still lists the worktree:\n%s", locked, exact, list)
+			}
+			if !f.blobGoneAfterGC(t) {
+				t.Fatalf("locked=%t exact=%t: the app's blob survives gc --prune=now", locked, exact)
+			}
+		}
+	}
+}
