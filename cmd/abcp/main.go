@@ -850,7 +850,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	buildWallFile := flags.String("build-wall-file", "", "protected build wall file (Repo C design note BUILD_ISOLATION.md): every build runs inside bubblewrap as it says; without it, or while its probe fails, no build is admitted (503 build_wall_unavailable)")
 	var gcRepositories, sessionLogs stringList
 	flags.Var(&gcRepositories, "git-gc-repository", "a product repository to git gc --prune=14.days.ago nightly, under nice, ionice and its execution lock, so a forgotten run's objects go (Repo C APP_DELETION.md §4; repeatable; none by default)")
-	flags.Var(&sessionLogs, "session-logs-dir", "an engine's session folder (named sessions or projects) whose logs older than 30 days are removed nightly (Repo C APP_DELETION.md decision 11; repeatable; none by default)")
+	flags.Var(&sessionLogs, "session-logs-dir", "a build lane's engine session folder (named sessions or projects) in which finished builds' logs older than 30 days are removed nightly: runs/<run>/, build-named project folders and Codex logs of a build's working folder, never a person's own sessions or memory/ (Repo C APP_DELETION.md decision 11; repeatable; none by default)")
 	nightlyAt := flags.String("nightly-at", housekeeping.DefaultAt, "UTC time of day (HH:MM) of the nightly git gc and session-log sweep")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -1056,6 +1056,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	if *evictionInterval > 0 {
 		go sweeper.Run(ctx, *evictionInterval)
 	}
+	nightly.Finished = sweeper.RunFinished
 	// The nightly clean-up (Repo C APP_DELETION.md §4, decision 11): git gc of the product repositories named, and engine
 	// session logs older than 30 days in the session folders named. Nothing is named by default.
 	if nightly.Enabled() {

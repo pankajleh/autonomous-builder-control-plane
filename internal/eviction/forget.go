@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/activity"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/readmodel"
@@ -43,9 +44,14 @@ var (
 	ErrRunOnHold = errors.New("run is on hold")
 	// ErrInvalidForget rejects a forget the product may not ask for.
 	ErrInvalidForget = errors.New("invalid run forget request")
+	// ErrForgetConflict refuses a request whose id sealed the run's forget with another reason: a conflicting replay.
+	ErrForgetConflict = errors.New("run forget request id conflicts")
 )
 
 const (
+	// forgetFinishTimeout bounds the removal once a forget is sealed. It runs apart from the request (which the server
+	// ends after 30 s), so a request that goes away never interrupts Git half way through a ref or a worktree.
+	forgetFinishTimeout  = 15 * time.Minute
 	maxForgetRecordBytes = 4 << 20
 	maxForgetArtifacts   = 20000
 	maxProgressEntries   = 100000
@@ -75,11 +81,13 @@ type ForgetRecordV1 struct {
 	Repository string `json:"repository"`
 	// Refs is every ref of the run to remove, each only while it still names its SHA.
 	Refs []serviceapi.ForgottenRefV1 `json:"refs"`
-	// Worktree is the run's worktree in Repository; "" for a walled run (its worktree is in RunFolder) or none.
+	// Worktree is the run's worktree in Repository, "" when it has none there: a run admitted before builds were
+	// walled keeps it there, and so does an exact edit, which never runs in the wall whatever its manifest names.
 	Worktree string `json:"worktree"`
 	// Inputs is the run's admitted input folder (its plan, capsule and manifest).
 	Inputs string `json:"inputs"`
-	// RunFolder is a walled run's own folder; "" for a run admitted before builds were walled.
+	// RunFolder is the run folder its manifest names (admission names one for every run since builds were walled);
+	// "" for a run admitted before. A forget removes both it and Worktree.
 	RunFolder string `json:"run_folder"`
 	// Evidence is the run's evidence folder: its bodies go, the folder stays.
 	Evidence string `json:"evidence"`
@@ -248,30 +256,36 @@ func (s *Sweeper) Forget(ctx context.Context, run, reason, requestID string) (Fo
 	if err != nil {
 		return ForgetResult{}, err
 	}
+	if sealed && record.RequestID == requestID && record.Reason != reason {
+		return ForgetResult{}, ErrForgetConflict
+	}
 	if !sealed {
 		if record, err = s.sealForget(ctx, run, reason, requestID); err != nil {
 			return ForgetResult{}, err
 		}
 	}
-	if err := s.finishForget(ctx, record); err != nil {
+	// Sealed, the removal is the record's to finish, not the request's: it runs to its own deadline whether or not the
+	// request is still there, and a call that comes after it answers the same record.
+	finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), forgetFinishTimeout)
+	defer cancel()
+	if err := s.finishForget(finish, record); err != nil {
 		s.logf("abcp run forget unfinished run=%s class=%s", run, class(err))
 		return ForgetResult{}, err
 	}
 	status := AlreadyForgotten
-	if record.RequestID == requestID && record.Reason == reason {
+	if record.RequestID == requestID {
 		status = Forgotten
 	}
 	return ForgetResult{Status: status, Record: record}, nil
 }
 
 // forgetSealed reports whether the run's forget is sealed, so the sweep and releases leave it alone (they would pin
-// refs the record does not name). A record that cannot be read counts as sealed.
-func (s *Sweeper) forgetSealed(run string) bool {
+// refs the record does not name). A record folder that cannot be read is an error, never an answer.
+func (s *Sweeper) forgetSealed(run string) (bool, error) {
 	if s.Forgets == nil {
-		return false
+		return false, nil
 	}
-	sealed, err := s.Forgets.Sealed(run)
-	return sealed || err != nil
+	return s.Forgets.Sealed(run)
 }
 
 func (s *Sweeper) sealForget(ctx context.Context, run, reason, requestID string) (ForgetRecordV1, error) {
@@ -299,18 +313,11 @@ func (s *Sweeper) sealForget(ctx context.Context, run, reason, requestID string)
 	if err != nil {
 		return ForgetRecordV1{}, err
 	}
-	worktree := ""
-	if scope.RunFolder == "" {
-		if worktree, err = worktreePath(ctx, scope); err != nil {
-			return ForgetRecordV1{}, err
-		}
-		if worktree == "" {
-			// A worktree off its branch (or one Git no longer lists) is still the run's, at Ralphex's path for it.
-			conventional := filepath.Join(scope.Repository, ".ralphex", "worktrees", filepath.FromSlash(scope.Branch))
-			if _, err := os.Lstat(conventional); err == nil {
-				worktree = conventional
-			}
-		}
+	// The run's worktree in the product repository is looked for whatever run folder its manifest names: an exact
+	// edit is given one, but never runs in the wall, and keeps its worktree there (run.checkoutExactEdit).
+	worktree, err := productWorktree(ctx, scope)
+	if err != nil {
+		return ForgetRecordV1{}, err
 	}
 	artifacts, err := evidenceManifest(registration.CanonicalEvidenceRoot, run)
 	if err != nil {
@@ -423,8 +430,33 @@ func removeForgottenRefs(ctx context.Context, record ForgetRecordV1) error {
 	return nil
 }
 
-// removeForgottenWorktree removes the run's worktree: a walled run's whole folder, else its worktree in the product
-// repository (Git first, then whatever Git left, never through a link), and prunes the repository's worktree list.
+// productWorktree is the run's worktree in the product repository, "" when it has none there. Git says where the run's
+// branch is checked out; a worktree off its branch, or one Git no longer lists, is still the run's at Ralphex's path
+// for it.
+func productWorktree(ctx context.Context, scope activity.Scope) (string, error) {
+	product := scope
+	product.RunFolder, product.RunRepository = "", ""
+	path, err := activity.WorktreePath(ctx, product)
+	if err != nil || path != "" {
+		return path, err
+	}
+	conventional := conventionalWorktree(scope.Repository, scope.RunID)
+	if _, err := os.Lstat(conventional); err == nil {
+		return conventional, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	return "", nil
+}
+
+// conventionalWorktree is where Ralphex, and an exact edit, keep the run's worktree in repository.
+func conventionalWorktree(repository, run string) string {
+	return filepath.Join(repository, ".ralphex", "worktrees", "abcp", run)
+}
+
+// removeForgottenWorktree removes the run's folder and its worktree in the product repository (Git first, then
+// whatever Git left, never through a link), and prunes the repository's worktree list. It fails while Git still lists
+// a worktree of the run: its index would keep the run's objects through gc, and its branch could not be deleted.
 func removeForgottenWorktree(ctx context.Context, record ForgetRecordV1) error {
 	if record.RunFolder != "" {
 		if err := removeRunFolder(record.RunFolder); err != nil {
@@ -440,8 +472,55 @@ func removeForgottenWorktree(ctx context.Context, record ForgetRecordV1) error {
 			return err
 		}
 	}
-	_, err := git(ctx, record.Repository, "worktree", "prune")
-	return err
+	if _, err := git(ctx, record.Repository, "worktree", "prune"); err != nil {
+		return err
+	}
+	listed, err := listedWorktrees(ctx, record)
+	if err != nil || len(listed) == 0 {
+		return err
+	}
+	// Git does not prune a locked worktree whose folder is gone: unlock it, then prune again.
+	for _, path := range listed {
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			_, _ = git(ctx, record.Repository, "worktree", "unlock", "--", path)
+		}
+	}
+	if _, err := git(ctx, record.Repository, "worktree", "prune"); err != nil {
+		return err
+	}
+	if listed, err = listedWorktrees(ctx, record); err != nil {
+		return err
+	}
+	if len(listed) != 0 {
+		return ErrIntegrity
+	}
+	return nil
+}
+
+// listedWorktrees are the worktrees of the product repository that are the run's: at the record's worktree, at the
+// run's conventional place, or holding its branch.
+func listedWorktrees(ctx context.Context, record ForgetRecordV1) ([]string, error) {
+	out, err := git(ctx, record.Repository, "worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return nil, err
+	}
+	conventional := conventionalWorktree(record.Repository, record.RunID)
+	var listed []string
+	path := ""
+	for _, field := range strings.Split(out, "\x00") {
+		switch {
+		case strings.HasPrefix(field, "worktree "):
+			path = strings.TrimPrefix(field, "worktree ")
+			if path == conventional || (record.Worktree != "" && path == record.Worktree) {
+				listed = append(listed, path)
+			}
+		case field == "branch refs/heads/abcp/"+record.RunID && path != "":
+			if len(listed) == 0 || listed[len(listed)-1] != path {
+				listed = append(listed, path)
+			}
+		}
+	}
+	return listed, nil
 }
 
 // removeForgottenInputs removes the run's admitted inputs and the plan copy Ralphex was given in the product repository

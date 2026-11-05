@@ -469,3 +469,184 @@ func TestForgetRecordRejectsForeignPathsAndRefs(t *testing.T) {
 		}
 	}
 }
+
+// blobGoneAfterGC reports whether the fixture's feature.md blob, which only this run's refs and worktree reached, is gone
+// once the repository is collected with no grace.
+func (f *forgetFixture) blobGoneAfterGC(t *testing.T) bool {
+	t.Helper()
+	repo := f.scope.Repository
+	blob := run(t, repo, "rev-parse", f.checkpoint+":feature.md")
+	run(t, repo, "-c", "gc.reflogExpire=now", "-c", "gc.reflogExpireUnreachable=now", "gc", "--quiet", "--prune=now")
+	_, err := git(context.Background(), repo, "cat-file", "-e", blob)
+	return err != nil
+}
+
+// An exact edit never runs in the wall: its worktree is in the product repository at the builder's place, though its
+// admission named a run folder (never made). The forget finds it, records both, removes both, and its blob goes at gc:
+// with the binding as it was (the run folder in the scope) and as it is now (the run folder ignored for an exact edit).
+func TestForgetRemovesAnExactEditsWorktreeInTheProductRepository(t *testing.T) {
+	for _, binding := range []string{"run folder named", "run folder ignored"} {
+		t.Run(binding, func(t *testing.T) {
+			f := newForgetFixture(t, false)
+			f.scope.ExactEdit = true
+			folder := filepath.Join(f.root, "builds", testRun)
+			if binding == "run folder named" {
+				f.scope.RunFolder, f.scope.RunRepository = folder, filepath.Join(folder, "repo")
+			}
+			result, err := f.sweeper().Forget(context.Background(), testRun, "app-deleted", forgetRequest)
+			if err != nil || result.Status != Forgotten {
+				t.Fatalf("forget = %+v, %v", result, err)
+			}
+			if result.Record.Worktree != f.worktree || result.Record.RunFolder != f.scope.RunFolder {
+				t.Fatalf("record worktree=%q run_folder=%q, want %q and %q", result.Record.Worktree, result.Record.RunFolder, f.worktree, f.scope.RunFolder)
+			}
+			if exists(f.worktree) {
+				t.Fatalf("the exact edit's worktree, with the app's files, is still there: %s", f.worktree)
+			}
+			if list := run(t, f.scope.Repository, "worktree", "list", "--porcelain"); strings.Contains(list, testRun) {
+				t.Fatalf("Git still lists the worktree:\n%s", list)
+			}
+			if !f.blobGoneAfterGC(t) {
+				t.Fatal("the app's blob survives gc --prune=now")
+			}
+			if !exists(filepath.Join(f.scope.Repository, ".ralphex", "worktrees", "abcp", otherRun, "other.md")) {
+				t.Fatal("another run's worktree was removed")
+			}
+		})
+	}
+}
+
+// Git does not prune a locked worktree whose folder is gone, and its index keeps the run's objects through gc: the
+// forget unlocks and prunes it.
+func TestForgetPrunesALockedWorktreeWhoseFolderIsGone(t *testing.T) {
+	f := newForgetFixture(t, false)
+	s := f.sweeper()
+	s.mu.Lock()
+	sealed, err := s.sealForget(context.Background(), testRun, "app-deleted", forgetRequest)
+	s.mu.Unlock()
+	if err != nil || sealed.Worktree != f.worktree {
+		t.Fatalf("seal = %+v, %v", sealed, err)
+	}
+	run(t, f.scope.Repository, "worktree", "lock", "--reason", "kept", f.worktree)
+	if err := os.RemoveAll(f.worktree); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := f.sweeper().Forget(context.Background(), testRun, "app-deleted", forgetRequest); err != nil || result.Status != Forgotten {
+		t.Fatalf("forget = %+v, %v", result, err)
+	}
+	if list := run(t, f.scope.Repository, "worktree", "list", "--porcelain"); strings.Contains(list, testRun) {
+		t.Fatalf("Git still lists the locked worktree:\n%s", list)
+	}
+	if !f.blobGoneAfterGC(t) {
+		t.Fatal("the app's blob survives gc --prune=now")
+	}
+}
+
+// A worktree of the run's branch Git still lists after the removal (here made at another place after the record was
+// sealed) stops the forget: it is not FORGOTTEN, and its branch is not deleted under it.
+func TestForgetFailsWhileGitStillListsAWorktreeOfTheRun(t *testing.T) {
+	f := newForgetFixture(t, false)
+	s := f.sweeper()
+	s.mu.Lock()
+	_, err := s.sealForget(context.Background(), testRun, "app-deleted", forgetRequest)
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(t, f.scope.Repository, "worktree", "remove", "--force", f.worktree)
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	run(t, f.scope.Repository, "worktree", "add", "--quiet", elsewhere, f.scope.Branch)
+	if _, err := f.sweeper().Forget(context.Background(), testRun, "app-deleted", forgetRequest); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("forget with the run's branch checked out elsewhere = %v", err)
+	}
+	run(t, f.scope.Repository, "rev-parse", "--verify", "refs/heads/"+f.scope.Branch)
+	if len(f.ledgerEvents(t, RunForgottenEvent)) != 0 {
+		t.Fatal("RUN_FORGOTTEN was appended to an unfinished forget")
+	}
+}
+
+// Once sealed, the removal runs apart from the request: a request that has gone away (its context cancelled) does not
+// interrupt it.
+func TestASealedForgetIsFinishedWhenTheRequestHasGone(t *testing.T) {
+	f := newForgetFixture(t, false)
+	s := f.sweeper()
+	s.mu.Lock()
+	_, err := s.sealForget(context.Background(), testRun, "app-deleted", forgetRequest)
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := f.sweeper().Forget(gone, testRun, "app-deleted", forgetRequest)
+	if err != nil || result.Status != Forgotten {
+		t.Fatalf("forget = %+v, %v", result, err)
+	}
+	if exists(f.worktree) || len(f.ledgerEvents(t, RunForgottenEvent)) != 1 {
+		t.Fatal("the forget was not finished")
+	}
+	if out := run(t, f.scope.Repository, "for-each-ref", "--format=%(refname)", "refs/heads/abcp/"+testRun); out != "" {
+		t.Fatalf("the run's branch is still there: %s", out)
+	}
+}
+
+// An interrupted Git is asked to stop with SIGTERM, so it removes its lock files, and not killed outright.
+func TestAnInterruptedGitIsAskedToStop(t *testing.T) {
+	bin := t.TempDir()
+	mark := filepath.Join(bin, "stopped")
+	script := "#!/bin/sh\ntrap 'kill $pid; echo stopped > " + mark + "; exit 143' TERM\nsleep 30 &\npid=$!\nwait $pid\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := git(ctx, t.TempDir(), "update-ref", "-d", "refs/heads/x"); err == nil {
+		t.Fatal("an interrupted git succeeded")
+	}
+	if took := time.Since(started); took > gitWaitDelay {
+		t.Fatalf("git took %s to stop", took)
+	}
+	if data, err := os.ReadFile(mark); err != nil || string(data) != "stopped\n" {
+		t.Fatalf("git was not sent SIGTERM: %q, %v", data, err)
+	}
+}
+
+// The same request id with another reason is a conflicting replay, refused without changing anything.
+func TestForgetRefusesTheSameRequestWithAnotherReason(t *testing.T) {
+	f := newForgetFixture(t, false)
+	if _, err := f.sweeper().Forget(context.Background(), testRun, "app-deleted", forgetRequest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.sweeper().Forget(context.Background(), testRun, "account-deleted", forgetRequest); !errors.Is(err, ErrForgetConflict) {
+		t.Fatalf("a conflicting replay = %v", err)
+	}
+	api := API{Sweeper: f.sweeper()}
+	if _, err := api.ForgetRun(context.Background(), serviceapi.Principal{}, testRun, serviceapi.RunForgetRequestV1{SchemaVersion: 1, Reason: "account-deleted", RequestID: forgetRequest}); !errors.Is(err, serviceapi.ErrRequestIDConflict) {
+		t.Fatalf("the API answers a conflicting replay with %v", err)
+	}
+	if replay, err := api.ForgetRun(context.Background(), serviceapi.Principal{}, testRun, serviceapi.RunForgetRequestV1{SchemaVersion: 1, Reason: "app-deleted", RequestID: forgetRequest}); err != nil || replay.Status != Forgotten {
+		t.Fatalf("the replay = %+v, %v", replay, err)
+	}
+}
+
+// A forget record that cannot be read is an error to a release (500), never 410 for a run that may not be forgotten;
+// the sweep leaves the run alone.
+func TestAnUnreadableForgetRecordIsAnErrorToARelease(t *testing.T) {
+	f := newForgetFixture(t, false)
+	if err := os.Mkdir(filepath.Join(f.root, "forgotten", testRun+".json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := f.sweeper()
+	if _, err := s.Release(context.Background(), testRun, ReasonTaskClosed); err == nil || errors.Is(err, ErrRunForgotten) {
+		t.Fatalf("release with an unreadable record = %v", err)
+	}
+	if _, err := (API{Sweeper: s}).ReleaseRunWorktree(context.Background(), serviceapi.Principal{}, testRun, serviceapi.WorktreeReleaseRequestV1{SchemaVersion: 1, Reason: ReasonTaskClosed}); !errors.Is(err, serviceapi.ErrInternalDurableSubstrate) {
+		t.Fatalf("the API answers %v", err)
+	}
+	f.finishedAt = now.Add(-30 * 24 * time.Hour)
+	if evicted, err := s.Sweep(context.Background()); err != nil || len(evicted) != 0 || !exists(f.worktree) {
+		t.Fatalf("sweep with an unreadable record = %+v, %v", evicted, err)
+	}
+}

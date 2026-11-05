@@ -187,8 +187,9 @@ const (
 )
 
 func (s *Sweeper) inspect(ctx context.Context, run string) (candidate, outcome) {
-	if s.forgetSealed(run) {
-		// A forgotten run is the forget's to finish: an eviction would pin refs its record does not name.
+	if sealed, err := s.forgetSealed(run); sealed || err != nil {
+		// A forgotten run is the forget's to finish: an eviction would pin refs its record does not name. One whose
+		// record cannot be read is left alone too.
 		return candidate{}, notRetained
 	}
 	scope, err := s.Binder.ResolveBinding(ctx, run)
@@ -270,6 +271,18 @@ func (s *Sweeper) removeFolderWithoutWorktree(ctx context.Context, run string, s
 	}
 	s.logf("abcp run folder removed run=%s reason=no-worktree", run)
 	return true
+}
+
+// RunFinished reports whether the run reached a finished state; a run whose state cannot be read is not finished. The
+// nightly clean-up ages only a finished run's session logs (housekeeping.Nightly.Finished).
+func (s *Sweeper) RunFinished(run string) bool {
+	if !runtimecatalog.ValidIdentifier(run) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	terminal, _, err := s.finished(ctx, run)
+	return err == nil && terminal
 }
 
 // finished reports whether the run reached a finished state, and when.
@@ -459,10 +472,17 @@ func size(root string) (int64, error) {
 	return total, err
 }
 
+// gitWaitDelay is how long an interrupted Git has to stop on SIGTERM before it is killed.
+const gitWaitDelay = 10 * time.Second
+
 func git(ctx context.Context, repository string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repository}, args...)...)
+	// An interrupted Git is asked to stop (it then removes the lock files it holds, such as packed-refs.lock) and is
+	// killed only if it has not within gitWaitDelay: a killed one leaves its locks, and every later ref change fails.
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = gitWaitDelay
 	cmd.Env = gitexec.Environment()
 	var out bytes.Buffer
 	cmd.Stdout = &out

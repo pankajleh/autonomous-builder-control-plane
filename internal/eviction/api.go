@@ -61,6 +61,8 @@ func apiError(err error) error {
 		return serviceapi.ErrRunOnHold
 	case errors.Is(err, ErrRunForgotten):
 		return serviceapi.ErrRunForgotten
+	case errors.Is(err, ErrForgetConflict):
+		return serviceapi.ErrRequestIDConflict
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return err
 	}

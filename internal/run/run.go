@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -575,7 +576,7 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 			}
 			result.State = domain.StateFailed
 			result.FailureReason = validationErr.Error()
-			if appendErr := r.transition(ctx, domain.StateRunCreated, domain.StateFailed, "authority-validator", map[string]any{"reason": validationErr.Error()}, []ledger.EvidenceRef{authorityRef}); appendErr != nil {
+			if appendErr := r.transition(ctx, domain.StateRunCreated, domain.StateFailed, "authority-validator", map[string]any{"reason": ledgerReason("authority-validator", validationErr, false)}, r.withFailureText(validationErr, []ledger.EvidenceRef{authorityRef})); appendErr != nil {
 				return result, errors.Join(validationErr, appendErr)
 			}
 			return result, fmt.Errorf("validate pinned authority: %w", validationErr)
@@ -1787,7 +1788,7 @@ func validateTransitionProvenance(value TransitionProvenance) error {
 func (r *Runner) fail(ctx context.Context, result Result, from domain.State, source string, cause error, refs []ledger.EvidenceRef) (Result, error) {
 	result.State = domain.StateFailed
 	result.FailureReason = cause.Error()
-	if err := r.transition(ctx, from, domain.StateFailed, source, map[string]any{"reason": cause.Error()}, refs); err != nil {
+	if err := r.transition(ctx, from, domain.StateFailed, source, map[string]any{"reason": ledgerReason(source, cause, false)}, r.withFailureText(cause, refs)); err != nil {
 		return result, errors.Join(cause, err)
 	}
 	return result, cause
@@ -1796,10 +1797,47 @@ func (r *Runner) fail(ctx context.Context, result Result, from domain.State, sou
 func (r *Runner) cancel(ctx context.Context, result Result, from domain.State, source string, cause error, refs []ledger.EvidenceRef) (Result, error) {
 	result.State = domain.StateCancelled
 	result.FailureReason = cause.Error()
-	if err := r.transition(ctx, from, domain.StateCancelled, source, map[string]any{"reason": cause.Error()}, refs); err != nil {
+	if err := r.transition(ctx, from, domain.StateCancelled, source, map[string]any{"reason": ledgerReason(source, cause, true)}, r.withFailureText(cause, refs)); err != nil {
 		return result, errors.Join(cause, err)
 	}
 	return result, nil
+}
+
+// FailureReasonEvidenceName is the evidence body that keeps a failed or cancelled run's cause in words, for the
+// operator. A forget removes it with the run's other evidence bodies, its hash kept.
+const FailureReasonEvidenceName = "failure-reason.txt"
+
+var ledgerSource = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+
+// ledgerReason is the reason a FAILED or CANCELLED transition records in the ledger: a fixed code from the step that
+// stopped the run, never the cause's text, which can carry the person's words or file names (an exact edit's names the
+// file it could not change). The ledger is kept when a run is forgotten, so none of its payloads may (Repo C design
+// note APP_DELETION.md §4); the text is kept in the run's failure-reason evidence instead (withFailureText).
+func ledgerReason(source string, cause error, cancelled bool) string {
+	if errors.Is(cause, ErrExactEditDoesNotApply) {
+		return "EXACT_EDIT_DOES_NOT_APPLY"
+	}
+	step := "RUN"
+	if ledgerSource.MatchString(source) {
+		step = strings.ToUpper(strings.ReplaceAll(source, "-", "_"))
+	}
+	if cancelled {
+		return step + "_CANCELLED"
+	}
+	return step + "_FAILED"
+}
+
+// withFailureText writes the cause's text as the run's failure-reason evidence and answers refs with it. The evidence
+// is the operator's account of the stop; a run that cannot write it still stops, with refs as they were.
+func (r *Runner) withFailureText(cause error, refs []ledger.EvidenceRef) []ledger.EvidenceRef {
+	if r.artifacts == nil || cause == nil {
+		return refs
+	}
+	ref, err := r.artifacts.WriteBytes(FailureReasonEvidenceName, "failure-reason", []byte(cause.Error()+"\n"))
+	if err != nil {
+		return refs
+	}
+	return append(append([]ledger.EvidenceRef{}, refs...), ref)
 }
 
 func (r *Runner) writeJSON(name, kind string, value any) (ledger.EvidenceRef, error) {

@@ -99,7 +99,9 @@ func (s *Sweeper) ReleaseRepository(ctx context.Context, identity, reason string
 }
 
 func (s *Sweeper) release(ctx context.Context, run, reason string) (ReleaseResult, error) {
-	if s.forgetSealed(run) {
+	if sealed, err := s.forgetSealed(run); err != nil {
+		return ReleaseResult{}, err
+	} else if sealed {
 		return ReleaseResult{}, ErrRunForgotten
 	}
 	scope, err := s.Binder.ResolveBinding(ctx, run)

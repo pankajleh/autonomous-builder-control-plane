@@ -1,18 +1,19 @@
 // Package housekeeping runs ABCP's nightly clean-up (Repo C design note APP_DELETION.md §4 and decision 11): a git gc
 // of each product repository named, so the objects only a forgotten run's refs reached go once their grace has passed,
-// and the removal of engine session logs older than 30 days from the session folders named, for the logs no run's
-// records tie to it (a forget removes those).
+// and the removal of finished builds' engine session logs older than 30 days from the session folders named (a forget
+// removes a forgotten run's at once).
 package housekeeping
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -46,8 +47,11 @@ type Nightly struct {
 	Repositories []string
 	SessionLogs  []string
 	Lock         Locker
-	Now          func() time.Time
-	Log          io.Writer
+	// Finished reports whether a run is finished; a run it cannot tell is not. Only a finished run's session logs
+	// are aged.
+	Finished func(run string) bool
+	Now      func() time.Time
+	Log      io.Writer
 }
 
 // ParseAt reads a time of day "HH:MM" (UTC) as the time after midnight.
@@ -70,7 +74,8 @@ func ValidateRepository(path string) error {
 }
 
 // ValidateSessionLogs accepts an engine's session folder: an absolute, clean path named sessions (Codex's) or projects
-// (Claude Code's), so a mistyped engine home, with its sign-in and settings, is never swept.
+// (Claude Code's), so a mistyped engine home, with its sign-in and settings, is never named. Even so, only the builds'
+// logs in it are aged (RemoveOldSessionLogs).
 func ValidateSessionLogs(path string) error {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || (filepath.Base(path) != "sessions" && filepath.Base(path) != "projects") {
 		return fmt.Errorf("%w: a session folder is an absolute, clean path named sessions or projects", errInvalid)
@@ -113,7 +118,7 @@ func (n *Nightly) Once(ctx context.Context) {
 		n.logf("abcp nightly git gc repository=%q ok=%t took=%s%s", repository, err == nil, n.Now().Sub(started).Round(time.Second), failure(err))
 	}
 	for _, root := range n.SessionLogs {
-		removed, err := RemoveOldSessionLogs(root, n.Now(), SessionLogsMaxAge)
+		removed, err := RemoveOldSessionLogs(root, n.Now(), SessionLogsMaxAge, n.Finished)
 		n.logf("abcp nightly session logs folder=%q ok=%t removed=%d%s", root, err == nil, removed, failure(err))
 	}
 }
@@ -159,13 +164,27 @@ func GC(ctx context.Context, repository string, lock Locker) error {
 	return cmd.Run()
 }
 
-// RemoveOldSessionLogs removes, under root, each file (or link, never followed) last changed before now-maxAge, then
-// each folder left empty that was last changed before then, deepest first; never root itself. A folder changed since,
-// such as a running build's session folder, stays. It answers how many files it removed. A root that is not there has
-// nothing to remove.
-func RemoveOldSessionLogs(root string, now time.Time, maxAge time.Duration) (int, error) {
+// RemoveOldSessionLogs applies the 30-day rule (maxAge) to the builds' session logs in root, an engine's session
+// folder, and only to theirs (APP_DELETION.md decision 11: the lanes' folders, never a person's own sessions):
+//
+//   - runs/<run>/, a walled build's sessions (bound into its wall), of a run finished says is finished: a running
+//     build's folder is never walked, and a finished run's is removed by its forget;
+//   - a Claude Code project folder named after a build's working folder (…-worktrees-abcp-admission-<id>…, a build
+//     from before builds were walled) of a finished run;
+//   - a Codex log in a dated folder (YYYY/MM/DD/rollout-….jsonl) whose first record says it ran in a build's working
+//     folder (…/worktrees/abcp/admission-<id>, the folder Repo C's meter ties it by) of a finished run.
+//
+// In those, each file (or link, never followed) last changed before now-maxAge goes, then each folder left empty that
+// was last changed before then; a memory/ folder is never touched, nor anything else in root. The walk opens each folder
+// from its parent's descriptor without following links and removes only names in the folder it holds open, so a build
+// that swaps a folder for a link while it is walked can never lead it outside. It answers how many files it removed. A
+// root that is not there has nothing to remove.
+func RemoveOldSessionLogs(root string, now time.Time, maxAge time.Duration, finished func(run string) bool) (int, error) {
 	if err := ValidateSessionLogs(root); err != nil || maxAge <= 0 {
 		return 0, errInvalid
+	}
+	if finished == nil {
+		finished = func(string) bool { return false }
 	}
 	info, err := os.Lstat(root)
 	if errors.Is(err, os.ErrNotExist) {
@@ -180,54 +199,36 @@ func RemoveOldSessionLogs(root string, now time.Time, maxAge time.Duration) (int
 	if resolved, err := filepath.EvalSymlinks(root); err != nil || resolved != root {
 		return 0, errInvalid
 	}
-	cutoff := now.Add(-maxAge)
-	removed, entries := 0, 0
-	var folders []string
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		if entries++; entries > maxSessionEntries {
-			return errInvalid
-		}
-		if path == root {
-			return nil
-		}
-		if entry.IsDir() {
-			folders = append(folders, path)
-			return nil
-		}
-		if !entry.Type().IsRegular() && entry.Type()&fs.ModeSymlink == 0 {
-			return nil
-		}
-		info, err := entry.Info()
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if info.ModTime().Before(cutoff) {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-			removed++
-		}
-		return nil
-	})
-	if err != nil {
-		return removed, err
+	return removeOldSessionLogs(root, now.Add(-maxAge), finished)
+}
+
+var (
+	// buildProject is a Claude Code project folder named after a build's working folder: the folder's path with every
+	// character but a letter or a digit made "-".
+	buildProject = regexp.MustCompile(`-worktrees-abcp-(admission-[0-9a-f]{64})(?:-|$)`)
+	// buildFolder is a build's working folder, as a Codex log's first record names it.
+	buildFolder = regexp.MustCompile(`/worktrees/abcp/(admission-[0-9a-f]{64})(?:/|$)`)
+	digits      = regexp.MustCompile(`^[0-9]+$`)
+)
+
+// codexLogRun is the run whose working folder a Codex log's first record (session_meta) names, "" for none.
+func codexLogRun(first []byte) string {
+	var record struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Cwd string `json:"cwd"`
+		} `json:"payload"`
 	}
-	for i := len(folders) - 1; i >= 0; i-- {
-		info, err := os.Lstat(folders[i])
-		if err != nil || !info.IsDir() || !info.ModTime().Before(cutoff) {
-			continue
-		}
-		// A folder that still holds anything is not removed.
-		_ = os.Remove(folders[i])
+	if json.Unmarshal(first, &record) != nil || record.Type != "session_meta" {
+		return ""
 	}
-	return removed, nil
+	if m := buildFolder.FindStringSubmatch(record.Payload.Cwd); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// datedFolder reports whether name is a Codex dated folder's name at depth (1: YYYY, 2: MM, 3: DD).
+func datedFolder(name string, depth int) bool {
+	return digits.MatchString(name) && len(name) == map[int]int{1: 4, 2: 2, 3: 2}[depth]
 }
