@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -40,6 +41,9 @@ type Service struct {
 	// worktreeMissing records when a run's governed worktree was first seen
 	// missing after a provider proof, bounding the finish transition grace.
 	worktreeMissing map[string]time.Time
+	// registrationUnreadable records when a run's record was first found
+	// unreadable in the catalog, bounding registrationRetryWindow.
+	registrationUnreadable map[string]time.Time
 	// worktreeBound records, per run, the worktree path ABCP last bound, so a
 	// worktree still listed there but off the run's branch can be told apart
 	// from one that is gone.
@@ -193,12 +197,21 @@ func (s *Service) refresh(ctx context.Context, run, registration string) (Scope,
 		if ctx.Err() != nil || s.stopping() {
 			return Scope{}, context.Canceled
 		}
+		// A run record the catalog could not read for a moment, for example while
+		// its lock is held past LockTimeout as the disk is slow, is retried within
+		// a bounded window. Recorded at once, the marker made every checkpoint of
+		// the run ineligible for preview (Repo C, 2026-11-05: a run whose record
+		// could not be read once, during a deploy, could never be opened).
+		if errors.Is(err, errRegistrationUnreadable) && s.registrationUnreadableFor(run) < registrationRetryWindow {
+			return Scope{}, nil
+		}
 		s.diagnose(run, "binding-unavailable", err)
-		if err = s.appendUnknown(run, registration, "binding-unavailable", "Implementation detail unavailable"); err != nil {
+		if err = s.appendUnknown(run, registration, "binding-unavailable", BindingUnavailableTitle); err != nil {
 			return Scope{}, err
 		}
 		return Scope{}, nil
 	}
+	s.registrationReadable(run)
 	if proceed, err := s.worktreeReturned(ctx, run, registration, scope); err != nil || !proceed {
 		return Scope{}, err
 	}
@@ -267,6 +280,40 @@ func (s *Service) worktreePending(run, registration string, snapshot readmodel.S
 		}
 	}
 	return !admitted.IsZero() && s.now().Sub(admitted) < worktreeTransitionWindow
+}
+
+// registrationRetryWindow bounds how long a run's record may stay unreadable in
+// the catalog before the binding-unavailable marker. The catalog lock is held
+// for at most a few fsyncs; a minute covers a slow disk and still fails closed
+// when the record stays unreadable.
+const registrationRetryWindow = time.Minute
+
+// errRegistrationUnreadable is an unavailable binding whose run record the
+// catalog could not read: retried within registrationRetryWindow.
+var errRegistrationUnreadable = fmt.Errorf("%w: run registration unreadable", ErrUnavailable)
+
+// registrationUnreadableFor returns how long the run's record has been observed
+// unreadable, recording the first observation.
+func (s *Service) registrationUnreadableFor(run string) time.Duration {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.registrationUnreadable == nil {
+		s.registrationUnreadable = map[string]time.Time{}
+	}
+	first, seen := s.registrationUnreadable[run]
+	if !seen {
+		s.registrationUnreadable[run] = now
+		return 0
+	}
+	return now.Sub(first)
+}
+
+// registrationReadable ends a run's unreadable-record window once it resolves.
+func (s *Service) registrationReadable(run string) {
+	s.mu.Lock()
+	delete(s.registrationUnreadable, run)
+	s.mu.Unlock()
 }
 
 // worktreeMissingFor returns how long the run's worktree has been observed

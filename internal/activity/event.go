@@ -222,6 +222,15 @@ func normalizeLedger(f ledger.Event, now time.Time) (Event, bool) {
 // Runtime still resolves a checkpoint past it (preview.providerGap).
 const ProviderGapTitle = "Implementation detail replay gap"
 
+// BindingUnavailableTitle is the title of the controller marker recorded when a
+// run's binding stays unresolved (refresh). Other markers may share the title;
+// BindingUnavailableID names this one exactly.
+const BindingUnavailableTitle = "Implementation detail unavailable"
+
+// BindingUnavailableID is the activity identity of a run's binding-unavailable
+// marker, as unknown writes it.
+func BindingUnavailableID(run string) string { return identity(run, "unknown", "binding-unavailable") }
+
 func unknown(run, key, title string, now time.Time) Event {
 	e := baseEvent(run, now)
 	e.Category, e.Status, e.Title = "WARNING", "UNKNOWN", title
