@@ -136,3 +136,35 @@ func TestAWalledRunsWorktreeIsReadInsideAWallAndItsCheckpointWaitsForTheProductB
 		t.Fatalf("the control did not run the filter, so the test proves nothing: %v", err)
 	}
 }
+
+func TestAnExactEditIsReadInTheProductRepositoryAlthoughItsAdmissionNamedARunFolder(t *testing.T) {
+	f := newBindingFixture(t)
+	// Admission names a run folder for every run since builds were walled, an exact edit's too, but an exact edit never
+	// runs in it: its worktree is the product repository's, where newBindingFixture made it.
+	folder := filepath.Join(filepath.Dir(f.repo), "builds", f.run)
+	f.manifest.Isolation = &authority.IsolationManifest{RunFolder: folder}
+	f.manifest.ExactEdit = &authority.ExactEditManifest{SourceSHA: f.manifest.Repository.StartSHA, Replacements: []authority.ExactEditReplacement{{Path: "source", BaseBlob: strings.Repeat("c", 40), Find: "a", Replace: "b"}}}
+	f.saveManifest(t)
+	observerWall.Store(nil)
+	t.Cleanup(func() { observerWall.Store(nil) })
+	resolver := Resolver{f.root, f.catalog}
+	scope, err := resolver.Resolve(context.Background(), f.run)
+	if err != nil || !scope.ExactEdit || scope.RunFolder != "" || scope.RunRepository != "" || scope.Worktree != f.worktree || scope.Repository != f.repo {
+		t.Fatalf("an exact edit's scope = %+v, %v", scope, err)
+	}
+	// Its commit on the branch is a checkpoint, read with no observer wall.
+	os.WriteFile(filepath.Join(f.worktree, "source"), []byte("changed\n"), 0o600)
+	command(t, f.worktree, "add", ".")
+	command(t, f.worktree, "commit", "-qm", "words changed")
+	head := command(t, f.worktree, "rev-parse", "HEAD")
+	event, ok := checkpoint(context.Background(), scope, testTime)
+	if !ok || event.CheckpointSHA != head {
+		t.Fatalf("an exact edit's checkpoint = %+v %t", event, ok)
+	}
+	// A run that is not an exact edit and names a run folder is still read as walled.
+	f.manifest.ExactEdit = nil
+	f.saveManifest(t)
+	if scope, err := resolver.ResolveBinding(context.Background(), f.run); err != nil || scope.RunFolder != folder {
+		t.Fatalf("a walled run's binding = %+v, %v", scope, err)
+	}
+}

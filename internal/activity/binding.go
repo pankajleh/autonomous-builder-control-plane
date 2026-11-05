@@ -235,7 +235,13 @@ func (r Resolver) resolveBinding(ctx context.Context, run string) (Scope, error)
 		if !filepath.IsAbs(isolation.RunFolder) || filepath.Clean(isolation.RunFolder) != isolation.RunFolder || filepath.Base(isolation.RunFolder) != run {
 			return fail("manifest-isolation")
 		}
-		scope.RunFolder, scope.RunRepository = isolation.RunFolder, filepath.Join(isolation.RunFolder, "repo")
+		// An exact edit starts no builder and never runs in its wall (run.Runner returns before a walled run's folder
+		// is made): its branch and worktree are the product repository's, as before builds were walled, although its
+		// admission named a run folder. Reading it as walled found no worktree, so its activity recorded the binding as
+		// unavailable and its version could never be previewed or listed (Repo C PREVIEW_EDITOR.md, F1).
+		if !scope.ExactEdit {
+			scope.RunFolder, scope.RunRepository = isolation.RunFolder, filepath.Join(isolation.RunFolder, "repo")
+		}
 	}
 	return scope, nil
 }
