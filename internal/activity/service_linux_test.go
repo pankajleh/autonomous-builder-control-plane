@@ -167,6 +167,80 @@ func TestNonTerminalBindingFailureRemainsUnknown(t *testing.T) {
 	}
 }
 
+// A run record the catalog cannot read for a moment (its lock held past
+// LockTimeout) is retried for registrationRetryWindow before the marker, which
+// would otherwise make every checkpoint of the run ineligible for preview.
+func TestUnreadableRegistrationIsRetriedForABoundedWindow(t *testing.T) {
+	s, facts := testService(t)
+	catalog := s.resolver.Catalog.(*fakeCatalog)
+	facts.events = []ledger.Event{{EventID: "pending", StateTo: domain.StateBranchAcceptancePending, Timestamp: testTime}}
+	now := testTime
+	s.now = func() time.Time { return now }
+	registration, err := s.registration("run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// From here the catalog refuses the run's record, as when its lock is held
+	// past LockTimeout. refresh is called directly: a paged read may also start
+	// a collector that reads the record in the background.
+	catalog.busy = func(run string, _ int) error {
+		if run == "run" {
+			return runtimecatalog.ErrBusy
+		}
+		return nil
+	}
+	marked := func() bool {
+		t.Helper()
+		if _, err := s.refresh(context.Background(), "run", registration); err != nil {
+			t.Fatal(err)
+		}
+		events, _, _, err := s.store.read("run", registration, 0, MaxPageSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range events {
+			if e.Status == "UNKNOWN" {
+				if e.ActivityID != BindingUnavailableID("run") || e.Title != BindingUnavailableTitle {
+					t.Fatalf("unexpected marker: %+v", e)
+				}
+				return true
+			}
+		}
+		return false
+	}
+	if marked() {
+		t.Fatal("an unreadable record was marked at once")
+	}
+	now = now.Add(registrationRetryWindow / 2)
+	if marked() {
+		t.Fatal("an unreadable record was marked within the window")
+	}
+	now = now.Add(registrationRetryWindow/2 + time.Second)
+	if !marked() {
+		t.Fatal("a record unreadable past the window did not fail closed")
+	}
+	if !errors.Is(errRegistrationUnreadable, ErrUnavailable) || diagnosticClass(atStep("registration", errRegistrationUnreadable)) != diagnosticClass(ErrUnavailable) {
+		t.Fatal("an unreadable record is not classed unavailable")
+	}
+}
+
+func TestRegistrationReadableAgainRestartsTheWindow(t *testing.T) {
+	s, _ := testService(t)
+	now := testTime
+	s.now = func() time.Time { return now }
+	if s.registrationUnreadableFor("run") != 0 {
+		t.Fatal("first observation")
+	}
+	now = now.Add(registrationRetryWindow)
+	if s.registrationUnreadableFor("run") != registrationRetryWindow {
+		t.Fatal("window not measured from the first observation")
+	}
+	s.registrationReadable("run")
+	if s.registrationUnreadableFor("run") != 0 {
+		t.Fatal("a readable record did not restart the window")
+	}
+}
+
 func TestActivityExtensionFailureDoesNotMutateFacts(t *testing.T) {
 	s, facts := testService(t)
 	facts.events = []ledger.Event{{EventID: "accepted", StateTo: domain.StateBranchAccepted, Timestamp: testTime}}

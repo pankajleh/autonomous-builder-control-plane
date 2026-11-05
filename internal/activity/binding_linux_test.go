@@ -19,9 +19,21 @@ import (
 
 type fakeCatalog struct {
 	runs map[string]runtimecatalog.RunRegistrationV1
+	// busy, when set, may fail a read by its number (1, 2, …) for the run.
+	busy  func(run string, call int) error
+	calls map[string]int
 }
 
 func (c *fakeCatalog) ReadRun(run string) (runtimecatalog.RunRegistrationV1, error) {
+	if c.busy != nil {
+		if c.calls == nil {
+			c.calls = map[string]int{}
+		}
+		c.calls[run]++
+		if err := c.busy(run, c.calls[run]); err != nil {
+			return runtimecatalog.RunRegistrationV1{}, err
+		}
+	}
 	if r, ok := c.runs[run]; ok {
 		return r, nil
 	}

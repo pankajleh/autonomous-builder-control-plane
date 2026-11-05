@@ -145,7 +145,13 @@ func (r Resolver) resolveBinding(ctx context.Context, run string) (Scope, error)
 	}
 	root.Close()
 	reg, err := r.Catalog.ReadRun(run)
-	if err != nil || reg.RunID != run {
+	if err != nil {
+		// The catalog could not give the run's record now, for example while its
+		// lock is held past runtimecatalog.LockTimeout (ErrBusy). The refresh
+		// retries that for a bounded window before it records a marker.
+		return Scope{}, atStep("registration", errRegistrationUnreadable)
+	}
+	if reg.RunID != run {
 		return fail("registration")
 	}
 	dir, err := privateDirectory(filepath.Join(r.Root, "admissions"), false)

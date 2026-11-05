@@ -144,6 +144,9 @@ func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, 
 	// an integrity/ambiguity marker invalidates the source, even after a match.
 	var selected activity.Event
 	found := 0
+	// The latest binding-unavailable marker's ordinal: a checkpoint observed after
+	// it was recorded with the binding resolved again (see bindingMarker).
+	marker := uint64(0)
 	cursor := ""
 	last := uint64(0)
 	seen := map[string]bool{}
@@ -157,8 +160,14 @@ func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, 
 			return fail()
 		}
 		for _, event := range page.Events {
-			if event.RunID != run || event.Ordinal <= last || event.Category == "UNKNOWN" || event.Status == "UNKNOWN" && !providerWarning(event) && !providerGap(event) {
+			if event.RunID != run || event.Ordinal <= last || event.Category == "UNKNOWN" {
 				return fail()
+			}
+			if event.Status == "UNKNOWN" && !providerWarning(event) && !providerGap(event) {
+				if !bindingMarker(run, event) {
+					return fail()
+				}
+				marker = event.Ordinal
 			}
 			last = event.Ordinal
 			if event.ActivityID == checkpoint {
@@ -176,6 +185,9 @@ func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, 
 		cursor = page.NextCursor
 	}
 	e := selected
+	if marker != 0 && e.Ordinal <= marker {
+		return fail()
+	}
 	if found != 1 || e.SchemaVersion != "ActivityEventV1" || e.AuthorityLevel != "ABCP_STATE" || e.Category != "CHECKPOINT" || e.Status != "AVAILABLE" || e.SourceKind != "ABCP_CHECKPOINT_OBSERVER" || !e.CheckpointClean || !gitSHA.MatchString(e.CheckpointSHA) || e.CheckpointSHA == scope.Base || e.ActivityID != jsonDigest([]string{run, "checkpoint", e.CheckpointSHA}) || e.SourceDigest != jsonDigest([]string{run, e.CheckpointSHA}) {
 		return fail()
 	}
@@ -218,6 +230,19 @@ func providerWarning(e activity.Event) bool {
 func providerGap(e activity.Event) bool {
 	return e.SchemaVersion == "ActivityEventV1" && e.AuthorityLevel == "PROVIDER_DETAIL" && e.SourceKind == "RALPHEX_PROGRESS" &&
 		e.Category == "WARNING" && e.Status == "UNKNOWN" && e.Title == activity.ProviderGapTitle
+}
+
+// bindingMarker is ABCP's own marker that a run's binding was unresolved for a
+// while (activity.BindingUnavailableID). ABCP records a checkpoint only from a
+// resolved binding and its worktree (activity's checkpoint observer), and git
+// verifies the checkpoint here, so a checkpoint observed after the marker is not
+// made ineligible by it; one observed before or at it still is. A run whose
+// binding failed once had otherwise become impossible to preview (Repo C,
+// 2026-11-05). Every other marker still makes the run ineligible.
+func bindingMarker(run string, e activity.Event) bool {
+	return e.SchemaVersion == "ActivityEventV1" && e.AuthorityLevel == "PROVIDER_DETAIL" && e.SourceKind == "RALPHEX_PROGRESS" &&
+		e.Category == "WARNING" && e.Status == "UNKNOWN" && e.Title == activity.BindingUnavailableTitle &&
+		e.ActivityID == activity.BindingUnavailableID(run) && e.SourceSessionID == "" && e.SourceEventID == ""
 }
 
 func repositoryIdentity(ctx context.Context, path, identity string) bool {
