@@ -115,3 +115,25 @@ ABCP first writes `<service-root>/forgotten/<run>.json` (mode `0600`): the run, 
 - **`--session-logs-dir`, a folder people use too**: the server's own `~/.codex/sessions` and the `projects` of the Claude config folder that builds on the server's own sign-in use (the wall file's home's `.claude`, `/home/devagent/.claude/projects`), where interactive sessions keep their transcripts and `memory/`. A lane whose file names no home of its own uses these. Only finished builds' logs older than 30 days go: `runs/<run>/` (a walled build's sessions), a Claude Code project folder named after a build's working folder (`…-worktrees-abcp-admission-<id>…`, from before builds were walled) and a Codex log in a dated folder that `codex exec` wrote in a build's working folder (`originator` `codex_exec`, `cwd` `…/worktrees/abcp/admission-<id>`). A person's own sessions (one started in a build's folder included) and `memory/` stay.
 
 A folder named twice refuses the start. An open-model provider's home (`~/.codex/lanes/<provider>`, whose `runs/<run>/` a forget removes) cannot be named. Each repository gets `nice -n 19 ionice -c 3 -t git gc --quiet --prune=14.days.ago` under its execution lock (`abcp-ralphex-execution.lock`, waiting up to 30 minutes for a run's setup), so a forgotten run's objects go within 14 days of its refs while a running build's new objects are kept; a gc ABCP stops is asked to with SIGTERM, so it leaves no lock. In what a session folder's rule reaches, files older than 30 days go, and folders left empty that were unchanged for 30 days. A running build's folder is never walked; the walk opens each folder from its parent without following links, so a build cannot lead it outside its folder; a folder a finished build left unreadable in its `runs/<run>/` is made readable (0700) first; an entry it still cannot read or remove is skipped and counted, and the rest is swept. One line each in the service log: `abcp nightly git gc …` and `abcp nightly session logs folder=… policy=lane|builds ok=… removed=<n> skipped=<n>` (`class=failed` when an entry was skipped).
+
+### A run that cannot be previewed after a moment's catalog wait (#190)
+
+Before #190, when the runtime catalog could not give a run's record for a moment while a collector batch was checking the run's binding (its lock held past 2 s, as while Repo C restarts and reads every run at once), ABCP recorded the run's `Implementation detail integrity failure` marker, and every preview of the run was refused with `409 preview_ineligible` for ever. ABCP now leaves such a moment to the activity refresh, which waits up to a minute before it records anything, so no new marker of this kind is written. A marker recorded before stays in the run's activity; an operator who has checked its cause lets the run be previewed again with a review file. Nothing is restarted.
+
+Write a review only when ABCP's own line for the marker names this step (the first command prints it; without it, stop), and only for that run. Run as `devagent`:
+
+```sh
+R=/home/devagent/local-integration/repo-c-abcp/runtime
+RUN=admission-<the full run id>
+grep -h "run=$RUN marker=provider-integrity step=revalidate-binding/registration " $R/abcp-*.log
+ORDINAL=$(python3 -I - "$R/service/activity/$(printf %s "$RUN" | sha256sum | cut -c1-64).jsonl" <<'PY'
+import json, sys
+found = [r["event"]["ordinal"] for r in map(json.loads, open(sys.argv[1])) if "event" in r and r["event"]["title"] == "Implementation detail integrity failure" and r["event"]["source_session_id"] == ""]
+assert len(found) == 1, found
+print(found[0])
+PY
+)
+(umask 077 && mkdir -p $R/service/marker-reviews && printf '{"kind":"ActivityMarkerReviewV1","schema_version":1,"run_id":"%s","marker":"provider-integrity","ordinal":%s,"step":"revalidate-binding/registration","reason":"%s"}\n' "$RUN" "$ORDINAL" "<why, e.g. catalog lock busy during the Repo C deploy of 2026-11-06>" > $R/service/marker-reviews/$RUN.json)
+```
+
+The preview resolver then reads `<service-root>/marker-reviews/<run>.json` (strict JSON; the folder `0700` and the file `0600`, both owned by the service user) and passes over that one marker, for checkpoints before and after it alike. It still checks the run's record, binding, manifest, capsule and plan, and the checkpoint in Git, as for any preview. A review naming another ordinal, run, marker or step, a review with no reason, and any other marker of the run still refuse the run. Removing the file refuses the run again.

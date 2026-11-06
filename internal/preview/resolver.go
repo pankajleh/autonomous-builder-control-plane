@@ -164,10 +164,15 @@ func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, 
 				return fail()
 			}
 			if event.Status == "UNKNOWN" && !providerWarning(event) && !providerGap(event) {
-				if !bindingMarker(run, event) {
+				switch {
+				case bindingMarker(run, event):
+					marker = event.Ordinal
+				case r.reviewedMarker(run, event):
+					// An operator found it was a run record the catalog could not
+					// give for a moment: it says nothing about any checkpoint.
+				default:
 					return fail()
 				}
-				marker = event.Ordinal
 			}
 			last = event.Ordinal
 			if event.ActivityID == checkpoint {
@@ -243,6 +248,53 @@ func bindingMarker(run string, e activity.Event) bool {
 	return e.SchemaVersion == "ActivityEventV1" && e.AuthorityLevel == "PROVIDER_DETAIL" && e.SourceKind == "RALPHEX_PROGRESS" &&
 		e.Category == "WARNING" && e.Status == "UNKNOWN" && e.Title == activity.BindingUnavailableTitle &&
 		e.ActivityID == activity.BindingUnavailableID(run) && e.SourceSessionID == "" && e.SourceEventID == ""
+}
+
+// MarkerReviewV1 is <service-root>/marker-reviews/<run>.json (mode 0600, in a 0700 folder), written by an operator: the
+// run's provider-integrity marker at Ordinal was, by ABCP's diagnostic line for it (`abcp activity marker … run=<run>
+// marker=provider-integrity step=revalidate-binding/registration`), a run record the catalog could not give for a moment,
+// not a failed check. Until this correction a collector batch recorded that as an integrity failure, which made every
+// checkpoint of the run ineligible for ever (2026-11-06: a Repo C deploy kept the catalog lock busy). Such a marker is
+// recorded no more (activity.refreshClassifies), so a review is only for a marker recorded before. Reason is for people.
+type MarkerReviewV1 struct {
+	Kind          string `json:"kind"`
+	SchemaVersion int    `json:"schema_version"`
+	RunID         string `json:"run_id"`
+	Marker        string `json:"marker"`
+	Ordinal       uint64 `json:"ordinal"`
+	Step          string `json:"step"`
+	Reason        string `json:"reason"`
+}
+
+const (
+	markerReviewKind     = "ActivityMarkerReviewV1"
+	markerReviewStep     = "revalidate-binding/registration"
+	maxMarkerReviewBytes = 4 << 10
+)
+
+// reviewedMarker reports whether e is the run's provider-integrity marker (its exact identity, title, kind and no source
+// IDs) and an operator's MarkerReviewV1 names exactly it: the run, the marker, its ordinal and the one step a review may
+// name. Anything else, a missing or unreadable review included, leaves the marker making the run ineligible.
+func (r Resolver) reviewedMarker(run string, e activity.Event) bool {
+	if e.SchemaVersion != "ActivityEventV1" || e.AuthorityLevel != "PROVIDER_DETAIL" || e.SourceKind != "RALPHEX_PROGRESS" ||
+		e.Category != "WARNING" || e.Status != "UNKNOWN" || e.Title != activity.ProviderIntegrityTitle ||
+		e.ActivityID != activity.ProviderIntegrityID(run) || e.SourceSessionID != "" || e.SourceEventID != "" || e.Ordinal == 0 {
+		return false
+	}
+	folder := filepath.Join(r.Root, "marker-reviews")
+	dir, err := privateDirectory(folder, false)
+	if err != nil {
+		return false
+	}
+	dir.Close()
+	data, err := readFile(filepath.Join(folder, run+".json"), maxMarkerReviewBytes, true)
+	if err != nil {
+		return false
+	}
+	var review MarkerReviewV1
+	return strictjson.Decode(data, &review) == nil && review.Kind == markerReviewKind && review.SchemaVersion == 1 &&
+		review.RunID == run && review.Marker == "provider-integrity" && review.Ordinal == e.Ordinal &&
+		review.Step == markerReviewStep && strings.TrimSpace(review.Reason) != ""
 }
 
 func repositoryIdentity(ctx context.Context, path, identity string) bool {

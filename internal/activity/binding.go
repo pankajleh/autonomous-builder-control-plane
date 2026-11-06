@@ -148,14 +148,17 @@ func (r Resolver) resolveBinding(ctx context.Context, run string) (Scope, error)
 	}
 	root.Close()
 	reg, err := r.Catalog.ReadRun(run)
-	if err != nil {
+	if err != nil && transientReadError(err) {
 		// The catalog could not give the run's record now, for example while its
 		// lock is held past runtimecatalog.LockTimeout (ErrBusy). The refresh
-		// retries that for a bounded window before it records a marker.
+		// retries that for a bounded window before it records a marker, and a
+		// collector batch leaves it to the refresh (collectBatch).
 		return Scope{}, atStep("registration", errRegistrationUnreadable)
 	}
-	if reg.RunID != run {
-		return fail("registration")
+	if err != nil || reg.RunID != run {
+		// A record the catalog refuses (integrity, absent) or one naming another
+		// run is not a moment's wait: it fails closed at once.
+		return fail("registration-record")
 	}
 	dir, err := privateDirectory(filepath.Join(r.Root, "admissions"), false)
 	if err != nil {
