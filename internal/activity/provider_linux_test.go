@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 )
 
 func testSidecar(server *httptest.Server) *sidecar {
@@ -529,6 +531,85 @@ func TestProviderBatchRejectsTrustChangesDuringRequest(t *testing.T) {
 				t.Fatal("rejected batch changed durable proof", proof, err)
 			}
 		})
+	}
+}
+
+// A run record the catalog cannot give for a moment while a batch revalidates
+// its binding (its lock held past LockTimeout, as during a Repo C deploy on
+// 2026-11-06) discards the batch and is left to refresh, with no integrity
+// marker; a record the catalog refuses, or one naming another run, is still an
+// integrity failure at once.
+func TestProviderBatchLeavesAMomentarilyUnreadableRecordToRefresh(t *testing.T) {
+	for _, scenario := range []string{"busy", "deadline", "refused", "absent", "other-run"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newBindingFixture(t)
+			selected := providerSession(t, f)
+			registration := jsonDigest(f.catalog.runs[f.run])
+			s := &Service{store: newStore(t), resolver: Resolver{f.root, f.catalog}, ctx: context.Background(), now: func() time.Time { return testTime }}
+			stored, err := s.store.Append(f.run, registration, provider(t, f.run, "existing"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/sessions" {
+					json.NewEncoder(w).Encode([]session{selected})
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				payload, _ := json.Marshal(ProviderEvent{Type: "task_end", Phase: "task", Text: "done", Timestamp: stamp(testTime)})
+				fmt.Fprintf(w, "id: 1\ndata: %s\n\n", payload)
+			}))
+			defer server.Close()
+			// The batch's only catalog read is its binding revalidation.
+			f.catalog.busy = func(string, int) error {
+				switch scenario {
+				case "busy":
+					return runtimecatalog.ErrBusy
+				case "deadline":
+					return context.DeadlineExceeded
+				case "refused":
+					return runtimecatalog.ErrIntegrity
+				case "absent":
+					return os.ErrNotExist
+				}
+				return nil
+			}
+			if scenario == "other-run" {
+				reg := f.catalog.runs[f.run]
+				reg.RunID = "admission-other"
+				f.catalog.runs[f.run] = reg
+			}
+			last := uint64(0)
+			err = s.collectBatch(f.scope, registration, testSidecar(server), &last)
+			transient := scenario == "busy" || scenario == "deadline"
+			if transient {
+				if err == nil || !refreshClassifies(err) || errors.Is(err, ErrIntegrity) || diagnosticStep(err) != "revalidate-binding/registration" {
+					t.Fatalf("a moment's unreadable record was not left to refresh: %v (step %q)", err, diagnosticStep(err))
+				}
+			} else if !errors.Is(err, ErrIntegrity) || refreshClassifies(err) || diagnosticStep(err) != "revalidate-binding/registration-record" {
+				t.Fatalf("a refused record did not fail closed: %v (step %q)", err, diagnosticStep(err))
+			}
+			events, _, _, err := s.store.read(f.run, registration, 0, 100)
+			if err != nil || len(events) != 1 || events[0] != stored || last != 0 {
+				t.Fatal("rejected batch changed events or resume position", events, last, err)
+			}
+			if proof, err := s.store.proof(f.run, registration); err != nil || proof != nil {
+				t.Fatal("rejected batch changed durable proof", proof, err)
+			}
+		})
+	}
+}
+
+func TestOnlyAnAbsentWorktreeOrAMomentsUnreadableRecordIsLeftToRefresh(t *testing.T) {
+	for _, err := range []error{atStep("worktree", errWorktreeMissing), atStep("revalidate-binding", atStep("registration", errRegistrationUnreadable))} {
+		if !refreshClassifies(err) {
+			t.Fatal("not left to refresh", err)
+		}
+	}
+	for _, err := range []error{ErrIntegrity, ErrUnavailable, atStep("registration-record", ErrUnavailable), annotate("revalidate-binding", atStep("registration", errRegistrationUnreadable), ErrIntegrity)} {
+		if refreshClassifies(err) {
+			t.Fatal("left to refresh", err)
+		}
 	}
 }
 

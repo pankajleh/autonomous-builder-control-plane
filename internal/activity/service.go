@@ -297,8 +297,21 @@ func (s *Service) worktreePending(run, registration string, snapshot readmodel.S
 const registrationRetryWindow = time.Minute
 
 // errRegistrationUnreadable is an unavailable binding whose run record the
-// catalog could not read: retried within registrationRetryWindow.
+// catalog could not read for a moment (runtimecatalog.ErrBusy, an interrupted
+// read): retried within registrationRetryWindow. A record the catalog refuses
+// is not this error.
 var errRegistrationUnreadable = fmt.Errorf("%w: run registration unreadable", ErrUnavailable)
+
+// refreshClassifies reports whether a collector batch's binding check failed in
+// a way only refresh decides: an absent worktree, or a run record the catalog
+// could not read for a moment. The batch is discarded, so nothing it read is
+// kept, and no marker is recorded for it. Recorded as an integrity failure, a
+// record unreadable for a moment (a Repo C deploy keeps the catalog lock busy:
+// 2026-11-06, 12:00:02 and 12:00:22 UTC) made every checkpoint of the run
+// ineligible for preview for ever.
+func refreshClassifies(err error) bool {
+	return errors.Is(err, errWorktreeMissing) || errors.Is(err, errRegistrationUnreadable)
+}
 
 // registrationUnreadableFor returns how long the run's record has been observed
 // unreadable, recording the first observation.
@@ -789,12 +802,13 @@ func (s *Service) collect(run, registration string, w *worker) {
 					// Shutdown stops the sidecar and cancels in-flight reads.
 					return
 				}
-				if errors.Is(err, errWorktreeMissing) {
-					// Refresh classifies an absent worktree on its next pass.
+				if refreshClassifies(err) {
+					// Refresh classifies an absent worktree, or a run record the
+					// catalog could not read, on its next pass.
 				} else if errors.Is(err, ErrIntegrity) {
 					providerFailed = true
 					s.diagnose(run, "provider-integrity", err)
-					if s.appendUnknown(run, registration, "provider-integrity", "Implementation detail integrity failure") != nil {
+					if s.appendUnknown(run, registration, "provider-integrity", ProviderIntegrityTitle) != nil {
 						return
 					}
 				} else if err != nil {
@@ -866,10 +880,11 @@ func (s *Service) collectBatch(scope Scope, registration string, sc *sidecar, la
 	// detail from this bounded batch.
 	current, err := s.resolver.Resolve(s.ctx, scope.RunID)
 	if err != nil {
-		if errors.Is(err, errWorktreeMissing) {
-			// The provider removes its worktree when it finishes. Discard this
-			// batch; refresh decides between expected cleanup, a bounded
-			// transition and a fail-closed marker.
+		if refreshClassifies(err) {
+			// The provider removes its worktree when it finishes, and the
+			// catalog may not give the run's record for a moment (its lock held
+			// past LockTimeout). Discard this batch; refresh decides between
+			// expected cleanup, a bounded wait and a fail-closed marker.
 			return atStep("revalidate-binding", err)
 		}
 		return annotate("revalidate-binding", err, ErrIntegrity)

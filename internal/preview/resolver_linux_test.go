@@ -464,3 +464,69 @@ func TestResolverTraversesPagesAndDistinguishesProviderWarnings(t *testing.T) {
 		})
 	}
 }
+
+// A provider-integrity marker that an operator reviewed as a run record the catalog could not give for a moment
+// (MarkerReviewV1) no longer makes the run ineligible, for a checkpoint before or after it. Without a review, or with
+// a review that does not name exactly that marker, the run stays ineligible, as for every other marker.
+func TestReviewedProviderIntegrityMarkerIsEligibleOnlyAsReviewed(t *testing.T) {
+	for _, scenario := range []string{"unreviewed", "reviewed-after", "reviewed-before", "other-ordinal", "other-step", "other-run", "other-marker", "no-reason", "unknown-field", "readable-review", "open-folder", "other-key", "another-marker-too"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newBindingFixture(t)
+			checkpoint := f.events.page.Events[0]
+			// The marker as activity writes it for a collector batch's failed check.
+			marker := activity.Event{SchemaVersion: "ActivityEventV1", RunID: f.run, Ordinal: 2, ActivityID: activity.ProviderIntegrityID(f.run), AuthorityLevel: "PROVIDER_DETAIL", Category: "WARNING", Status: "UNKNOWN", Title: activity.ProviderIntegrityTitle, SourceKind: "RALPHEX_PROGRESS", SourceDigest: strings.Repeat("d", 64)}
+			if scenario == "other-key" {
+				marker.ActivityID = strings.Repeat("c", 64)
+			}
+			events := []activity.Event{checkpoint, marker}
+			if scenario == "reviewed-before" {
+				marker.Ordinal, checkpoint.Ordinal = 1, 2
+				events = []activity.Event{marker, checkpoint}
+			}
+			if scenario == "another-marker-too" {
+				events = append(events, activity.Event{SchemaVersion: "ActivityEventV1", RunID: f.run, Ordinal: 3, ActivityID: strings.Repeat("e", 64), AuthorityLevel: "PROVIDER_DETAIL", Category: "WARNING", Status: "UNKNOWN", Title: "Implementation history rewritten", SourceKind: "RALPHEX_PROGRESS"})
+			}
+			f.events.page.Events = events
+			review := map[string]any{"kind": "ActivityMarkerReviewV1", "schema_version": 1, "run_id": f.run, "marker": "provider-integrity", "ordinal": marker.Ordinal, "step": "revalidate-binding/registration", "reason": "catalog lock busy during a Repo C deploy (503 ms=2000)"}
+			switch scenario {
+			case "other-ordinal":
+				review["ordinal"] = marker.Ordinal + 1
+			case "other-step":
+				review["step"] = "revalidate-scope"
+			case "other-run":
+				review["run_id"] = runadmission.DeriveRunID("gateway", "admit-2")
+			case "other-marker":
+				review["marker"] = "binding-unavailable"
+			case "no-reason":
+				review["reason"] = " "
+			case "unknown-field":
+				review["checkpoints"] = "all"
+			}
+			folder := filepath.Join(f.root, "marker-reviews")
+			if scenario != "unreviewed" {
+				mode := os.FileMode(0700)
+				if scenario == "open-folder" {
+					mode = 0755
+				}
+				if err := os.Mkdir(folder, mode); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(folder, mode); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(folder, f.run+".json")
+				writeJSON(t, path, review)
+				if scenario == "readable-review" {
+					if err := os.Chmod(path, 0644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			_, err := f.resolver().Resolve(context.Background(), f.run, checkpoint.ActivityID)
+			valid := scenario == "reviewed-after" || scenario == "reviewed-before"
+			if (err == nil) != valid {
+				t.Fatalf("eligibility: %v", err)
+			}
+		})
+	}
+}

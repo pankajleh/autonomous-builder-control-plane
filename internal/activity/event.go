@@ -231,6 +231,15 @@ const BindingUnavailableTitle = "Implementation detail unavailable"
 // marker, as unknown writes it.
 func BindingUnavailableID(run string) string { return identity(run, "unknown", "binding-unavailable") }
 
+// ProviderIntegrityTitle is the title of the controller marker recorded when a
+// collector batch fails an integrity check (collect). A run has at most one:
+// ProviderIntegrityID names it.
+const ProviderIntegrityTitle = "Implementation detail integrity failure"
+
+// ProviderIntegrityID is the activity identity of a run's provider-integrity
+// marker, as unknown writes it.
+func ProviderIntegrityID(run string) string { return identity(run, "unknown", "provider-integrity") }
+
 func unknown(run, key, title string, now time.Time) Event {
 	e := baseEvent(run, now)
 	e.Category, e.Status, e.Title = "WARNING", "UNKNOWN", title
