@@ -1,7 +1,6 @@
 package runfailure
 
 import (
-	"bufio"
 	"bytes"
 	"regexp"
 	"strconv"
@@ -139,11 +138,17 @@ func ReadRalphex(stdout, stderr []byte) Transcript {
 	return t
 }
 
+// scanLines calls line for each line of data, however long: a builder's streamed output can hold a line longer than
+// any scanner buffer, and the lines after it still count.
 func scanLines(data []byte, line func(string)) {
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	scanner.Buffer(make([]byte, 64<<10), 1<<20)
-	for scanner.Scan() {
-		line(scanner.Text())
+	for len(data) > 0 {
+		end := bytes.IndexByte(data, '\n')
+		if end < 0 {
+			line(string(data))
+			return
+		}
+		line(string(data[:end]))
+		data = data[end+1:]
 	}
 }
 

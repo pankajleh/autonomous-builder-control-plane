@@ -136,6 +136,14 @@ func TestPendingFollowsTheLastFailingCheck(t *testing.T) {
 	}
 }
 
+// A line longer than any scanner buffer does not hide the lines after it.
+func TestALongLineHidesNothingAfterIt(t *testing.T) {
+	stdout := strings.Repeat("x", 3<<20) + "\n[26-11-07 10:00:00] deterministic validation failed; returning evidence to model for one repair turn: validation unit exit 1: FAIL\n"
+	if transcript := ReadRalphex([]byte(stdout), nil); transcript.RepairTurns != 1 || transcript.Pending == nil || transcript.Pending.Check != "unit" {
+		t.Fatalf("transcript = %+v", transcript)
+	}
+}
+
 func TestDetailPayloadRoundTripsThroughTheLedgerAndRefusesAnythingElse(t *testing.T) {
 	code := 1
 	detail := Detail{Cause: CauseValidationFailed, Phase: PhaseImplementation, Check: "node-app-check", CheckState: CheckExited, CheckExitCode: &code,
