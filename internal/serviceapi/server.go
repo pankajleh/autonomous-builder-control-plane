@@ -193,6 +193,9 @@ type ServerConfig struct {
 	// AccountLanes, when set, answers /v1/account-lanes (step 4c) for a service
 	// principal granted accounts.control.
 	AccountLanes AccountLaneController
+	// LaneKeys, when set, answers GET /v1/lanes and PUT and DELETE /v1/lanes/{lane}/key (Repo C design note
+	// BUILD_ENGINE_RULES.md §9, slice 5; docs/plans/lane-keys.md) for a service principal granted lanes.control.
+	LaneKeys LaneKeyController
 	// Targets, when set, answers /v1/targets (Repo C design note
 	// BF14_PROVIDER_NEUTRAL_DEPLOYMENT.md, BF-14.1) for a service principal
 	// granted targets.control.
@@ -440,6 +443,8 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.engines(writer, request, requestID)
 	case "/v1/account-lanes":
 		s.accountLanes(writer, request, principal, requestID)
+	case "/v1/lanes":
+		s.lanes(writer, request, principal, requestID)
 	case "/v1/targets":
 		s.targets(writer, request, principal, requestID)
 	case "/v1/app-health/events":
@@ -469,6 +474,10 @@ func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		if strings.HasPrefix(request.URL.Path, "/v1/account-lanes/") {
 			s.accountLanes(writer, request, principal, requestID)
+			return
+		}
+		if strings.HasPrefix(request.URL.Path, "/v1/lanes/") {
+			s.lanes(writer, request, principal, requestID)
 			return
 		}
 		if strings.HasPrefix(request.URL.Path, "/v1/targets/") {
