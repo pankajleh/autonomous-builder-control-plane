@@ -329,7 +329,7 @@ func (r *Runner) runExactEdit(ctx context.Context, result Result, edit authority
 		return result, err
 	}
 	result.State = domain.StateImplementationCompleted
-	return r.acceptBranch(ctx, result, implementationRefs)
+	return r.acceptBranch(ctx, result, implementationRefs, false)
 }
 
 // applyExactEdit reads, writes and checks the edit's branch and checks it out

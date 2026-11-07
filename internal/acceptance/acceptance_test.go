@@ -104,6 +104,42 @@ func TestExecutorPassesAllRequiredCommandsAndCapturesEvidence(t *testing.T) {
 	assertMetadata(t, gitEvidence.MetadataRef.URI, "\"dirty\":false", "acceptance-policy-v1")
 }
 
+// R5: the second run on the same candidate writes its evidence beside the first run's, in the same store: every name
+// carries "-again", and nothing of the first is replaced.
+func TestASecondRunNamesItsEvidenceBesideTheFirst(t *testing.T) {
+	repository := newGitRepository(t)
+	commands := []authority.AcceptanceCommand{{Name: "unit tests", Class: "unit", Required: true, Timeout: "5s", Argv: helperArgv("pass", "unit output")}}
+	governed := newAuthority(t, repository, commands)
+	store := newEvidenceStore(t)
+	t.Setenv("GO_WANT_ACCEPTANCE_HELPER", "1")
+	target := acceptanceTarget(t, repository)
+	executor := acceptance.New(supervisor.New(), store)
+	first, err := executor.Run(context.Background(), governed, target)
+	if err != nil || !first.Passed() {
+		t.Fatal(err, first.FailureReason())
+	}
+	again, err := executor.Again().Run(context.Background(), governed, target)
+	if err != nil || !again.Passed() {
+		t.Fatalf("the second run on the same store: %v %s", err, again.FailureReason())
+	}
+	firstNames, againNames := map[string]bool{}, map[string]bool{}
+	for _, ref := range first.EvidenceRefs() {
+		firstNames[filepath.Base(ref.URI)] = true
+	}
+	for _, ref := range again.EvidenceRefs() {
+		name := filepath.Base(ref.URI)
+		if firstNames[name] || !strings.Contains(name, "-again.") {
+			t.Fatalf("the second run's evidence %q is not named beside the first's", name)
+		}
+		againNames[name] = true
+	}
+	for _, name := range []string{"acceptance-command-001-stdout-again.log", "acceptance-command-001-again.json", "acceptance-final-git-again.json"} {
+		if !againNames[name] {
+			t.Fatalf("no %s among %v", name, againNames)
+		}
+	}
+}
+
 func TestExecutorRejectsDirtyCheckoutAfterCommands(t *testing.T) {
 	repository := newGitRepository(t)
 	commands := []authority.AcceptanceCommand{{

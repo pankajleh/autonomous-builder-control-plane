@@ -77,6 +77,11 @@ type Result struct {
 	failureReason string
 }
 
+// UnavailableResult is the result of an acceptance that could not run at all, with its reason.
+func UnavailableResult(reason string) Result {
+	return Result{status: StatusUnavailable, failureReason: reason}
+}
+
 // Status returns the acceptance conclusion.
 func (r Result) Status() Status {
 	if r.status == StatusPass && !r.Passed() {
@@ -163,11 +168,28 @@ type Target struct {
 type Executor struct {
 	runner    CommandRunner
 	artifacts supervisor.ArtifactWriter
+	// suffix names a second run's evidence beside the first's ("-again", R5).
+	suffix string
 }
 
 // New returns an independent branch acceptance executor.
 func New(runner CommandRunner, artifacts supervisor.ArtifactWriter) *Executor {
 	return &Executor{runner: runner, artifacts: artifacts}
+}
+
+// Again is the executor of the acceptance's second run on the same candidate (R5, docs/plans/build-recovery.md §6): the
+// same commands and checks, its evidence named beside the first run's (acceptance-command-001-stdout-again.log).
+func (e *Executor) Again() *Executor {
+	return &Executor{runner: e.runner, artifacts: e.artifacts, suffix: "-again"}
+}
+
+// named is an evidence name of this run: base itself for a first run, else with the suffix before its extension.
+func (e *Executor) named(base string) string {
+	if e.suffix == "" {
+		return base
+	}
+	extension := filepath.Ext(base)
+	return strings.TrimSuffix(base, extension) + e.suffix + extension
 }
 
 // Run executes the commands frozen in governed authority. Required command
@@ -263,12 +285,12 @@ func (e *Executor) runCommand(ctx context.Context, repository string, environmen
 		Timeout: timeout,
 		Stdout: supervisor.EvidenceSink{
 			Writer: e.artifacts,
-			Name:   prefix + "-stdout.log",
+			Name:   e.named(prefix + "-stdout.log"),
 			Kind:   "acceptance-command-stdout",
 		},
 		Stderr: supervisor.EvidenceSink{
 			Writer: e.artifacts,
-			Name:   prefix + "-stderr.log",
+			Name:   e.named(prefix + "-stderr.log"),
 			Kind:   "acceptance-command-stderr",
 		},
 	})
@@ -297,7 +319,7 @@ func (e *Executor) writeCommandMetadata(record CommandResult) (ledger.EvidenceRe
 	if err != nil {
 		return ledger.EvidenceRef{}, fmt.Errorf("marshal acceptance command metadata: %w", err)
 	}
-	name := fmt.Sprintf("acceptance-command-%03d.json", record.Index)
+	name := e.named(fmt.Sprintf("acceptance-command-%03d.json", record.Index))
 	ref, err := e.artifacts.WriteBytes(name, "acceptance-command-metadata", data)
 	if err != nil {
 		return ledger.EvidenceRef{}, fmt.Errorf("publish acceptance command metadata: %w", err)
@@ -411,7 +433,7 @@ func (e *Executor) captureGit(ctx context.Context, repository, branch, expectedH
 	if err != nil {
 		return gitEvidence, fmt.Errorf("marshal final Git metadata: %w", err)
 	}
-	gitEvidence.MetadataRef, err = e.artifacts.WriteBytes("acceptance-final-git.json", "acceptance-final-git", metadata)
+	gitEvidence.MetadataRef, err = e.artifacts.WriteBytes(e.named("acceptance-final-git.json"), "acceptance-final-git", metadata)
 	if err != nil {
 		return gitEvidence, fmt.Errorf("publish final Git metadata: %w", err)
 	}
@@ -434,12 +456,12 @@ func (e *Executor) runGit(ctx context.Context, repository, label string, argv []
 		Env:  gitexec.Environment(),
 		Stdout: supervisor.EvidenceSink{
 			Writer: e.artifacts,
-			Name:   "acceptance-git-" + label + "-stdout.log",
+			Name:   e.named("acceptance-git-" + label + "-stdout.log"),
 			Kind:   "acceptance-git-stdout",
 		},
 		Stderr: supervisor.EvidenceSink{
 			Writer: e.artifacts,
-			Name:   "acceptance-git-" + label + "-stderr.log",
+			Name:   e.named("acceptance-git-" + label + "-stderr.log"),
 			Kind:   "acceptance-git-stderr",
 		},
 	})
