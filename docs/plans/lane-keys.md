@@ -1,6 +1,6 @@
 # Lane keys: a key entered on the page reaches builds
 
-Status: **built, not live.** One quiet restart takes it live, with `lanes.control` added to `grants.json`; no template
+Status: **built, not live** (#198). One quiet restart takes it live, with `lanes.control` added to `grants.json`; no template
 changes. Repo C design note `BUILD_ENGINE_RULES.md` §9, slice 5 (Repo B's half). Repo C wires the page's "Add key" to it
 afterwards.
 
