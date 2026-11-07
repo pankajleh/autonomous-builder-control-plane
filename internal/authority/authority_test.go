@@ -518,6 +518,43 @@ func TestNewValidatesTheFreshAttempts(t *testing.T) {
 	}
 }
 
+// R5: acceptance_reruns is 1 or omitted, and needs the run's own governed validation; omitted, the canonical form is as
+// before.
+func TestNewValidatesTheAcceptanceReruns(t *testing.T) {
+	plain, err := New(fixtureManifest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.AcceptanceReruns() != 0 || strings.Contains(string(plain.CanonicalJSON()), "acceptance_reruns") {
+		t.Fatal("a manifest without the field changed its canonical form")
+	}
+	allowed := func() Manifest {
+		manifest := fixtureManifest(t)
+		manifest.AcceptanceReruns = 1
+		manifest.Ralphex.LongRunningSubprocessMode = "orchestrator"
+		manifest.Ralphex.Validation = []RalphexValidationCommand{{ID: "unit", Argv: []string{"/bin/true"}, Timeout: "1m"}}
+		return manifest
+	}
+	governed, err := New(allowed())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if governed.AcceptanceReruns() != 1 || !strings.Contains(string(governed.CanonicalJSON()), `"acceptance_reruns":1`) {
+		t.Fatalf("canonical form: %s", governed.CanonicalJSON())
+	}
+	for name, edit := range map[string]func(*Manifest){
+		"two":           func(m *Manifest) { m.AcceptanceReruns = 2 },
+		"negative":      func(m *Manifest) { m.AcceptanceReruns = -1 },
+		"no validation": func(m *Manifest) { m.Ralphex.Validation, m.Ralphex.LongRunningSubprocessMode = nil, "" },
+	} {
+		manifest := allowed()
+		edit(&manifest)
+		if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "acceptance_reruns") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestNewValidatesTheTemplateCopy(t *testing.T) {
 	plain, err := New(fixtureManifest(t))
 	if err != nil {

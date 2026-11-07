@@ -57,6 +57,20 @@ type Transcript struct {
 	Pending *ValidationFailure
 	// FinalError is the error Ralphex ended with, from standard error.
 	FinalError string
+	// lastPassed is each governed check's last report: true for "validation completed successfully", false for a
+	// failure Ralphex reported after it (R5).
+	lastPassed map[string]bool
+}
+
+// ValidationPassed reports whether each of the governed checks ids was last reported passing by Ralphex: run, and not
+// failed since (R5, docs/plans/build-recovery.md §6). False when ids is empty.
+func (t Transcript) ValidationPassed(ids []string) bool {
+	for _, id := range ids {
+		if !t.lastPassed[id] {
+			return false
+		}
+	}
+	return len(ids) > 0
 }
 
 // maxCapturedOutput bounds the output kept while reading; Clean bounds it again.
@@ -64,7 +78,7 @@ const maxCapturedOutput = 64 << 10
 
 // ReadRalphex reads Ralphex's standard output and error.
 func ReadRalphex(stdout, stderr []byte) Transcript {
-	var t Transcript
+	t := Transcript{lastPassed: map[string]bool{}}
 	lastStarted := ""
 	var capturing *ValidationFailure
 	var captured strings.Builder
@@ -100,10 +114,12 @@ func ReadRalphex(stdout, stderr []byte) Transcript {
 			}
 			t.Pending = &failure
 			capturing = t.Pending
+			t.lastPassed[failure.Check] = false
 			lastStarted = ""
 		case strings.HasPrefix(message, reviewRepairPrefix) && strings.HasSuffix(message, "; invoking one model repair turn"):
 			t.RepairTurns++
 			t.Pending = &ValidationFailure{Check: lastStarted, Review: true}
+			t.lastPassed[lastStarted] = false
 			lastStarted = ""
 		case strings.HasPrefix(message, startedPrefix):
 			lastStarted = strings.TrimSpace(strings.TrimPrefix(message, startedPrefix))
@@ -115,6 +131,7 @@ func ReadRalphex(stdout, stderr []byte) Transcript {
 			if t.Pending != nil && t.Pending.Check == strings.TrimSpace(passed) {
 				t.Pending = nil
 			}
+			t.lastPassed[strings.TrimSpace(passed)] = true
 			lastStarted = ""
 		case message == retryLine:
 			t.TaskRetries++

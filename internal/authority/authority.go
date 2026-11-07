@@ -50,6 +50,12 @@ type Manifest struct {
 	// phase 1): its own folder and the app's own folders it may read. Omitted
 	// for runs admitted before the wall, so their digests stay as they were.
 	Isolation *IsolationManifest `json:"isolation,omitempty"`
+
+	// AcceptanceReruns (R5, docs/plans/build-recovery.md §6): 1 runs the final acceptance once more, on a fresh checkout
+	// of the same candidate, when a required command exits non-zero although the run's own governed validation passed
+	// on its last run; passing then, the branch is accepted with the first failure kept as FLAKY evidence. Omitted, a
+	// failing acceptance ends the run as before and the manifest keeps its digest.
+	AcceptanceReruns int `json:"acceptance_reruns,omitempty"`
 }
 
 // ReviewRequirement binds one controller-selected component to the exact
@@ -250,6 +256,9 @@ func validateExactEdit(edit ExactEditManifest) error {
 // MaxTaskRetryCount bounds ralphex.task_retry_count: each retry is one more builder session on a failing build (the
 // owner's spend for R2, 2026-11-07).
 const MaxTaskRetryCount = 3
+
+// MaxAcceptanceReruns bounds acceptance_reruns: the final acceptance once more, once (R5).
+const MaxAcceptanceReruns = 1
 
 // MaxFreshAttempts bounds ralphex.fresh_attempts: one more attempt, once (the owner's spend for R3, 2026-11-07).
 const MaxFreshAttempts = 1
@@ -620,6 +629,11 @@ func (a Authority) Worktree() WorktreePolicy {
 	return a.manifest.Worktree
 }
 
+// AcceptanceReruns is how often a failing final acceptance runs again (R5): 0 or 1.
+func (a Authority) AcceptanceReruns() int {
+	return a.manifest.AcceptanceReruns
+}
+
 // Acceptance returns a deep copy of the acceptance command policy.
 func (a Authority) Acceptance() []AcceptanceCommand {
 	return cloneAcceptance(a.manifest.Acceptance)
@@ -974,6 +988,12 @@ func validateRequired(manifest Manifest) error {
 	}
 	if !hasRequiredAcceptance {
 		return errors.New("at least one required acceptance command is required")
+	}
+	if manifest.AcceptanceReruns < 0 || manifest.AcceptanceReruns > MaxAcceptanceReruns {
+		return fmt.Errorf("acceptance_reruns must be %d, or omitted for none", MaxAcceptanceReruns)
+	}
+	if manifest.AcceptanceReruns > 0 && len(manifest.Ralphex.Validation) == 0 {
+		return errors.New("acceptance_reruns needs the run's own governed validation (ralphex.validation): a rerun is for a check that passed there")
 	}
 	if manifest.Repository.Identity != strings.TrimSpace(manifest.Repository.Identity) {
 		return errors.New("repository.identity must not contain surrounding whitespace")

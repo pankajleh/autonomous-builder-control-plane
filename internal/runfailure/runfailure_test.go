@@ -136,6 +136,31 @@ func TestPendingFollowsTheLastFailingCheck(t *testing.T) {
 	}
 }
 
+// R5 reads whether the run's own governed checks last passed: the Thali run's node-app-check failed last, so no; a run
+// whose checks failed and then passed again, yes; a check Ralphex never ran, no.
+func TestValidationPassedIsEachChecksLastReport(t *testing.T) {
+	thali := ReadRalphex([]byte(thaliStdout), []byte(thaliStderr))
+	if thali.ValidationPassed([]string{"product-sandbox-smoke", "node-app-check"}) || !thali.ValidationPassed([]string{"product-sandbox-smoke"}) {
+		t.Fatal("the Thali run's checks read as passed")
+	}
+	repaired := thaliStdout + "[26-11-07 10:31:00] validation started: product-sandbox-smoke\n" +
+		"[26-11-07 10:31:01] validation completed successfully: product-sandbox-smoke (1s)\n" +
+		"[26-11-07 10:31:01] validation started: node-app-check\n" +
+		"[26-11-07 10:32:10] validation completed successfully: node-app-check (69s)\n"
+	transcript := ReadRalphex([]byte(repaired), nil)
+	if !transcript.ValidationPassed([]string{"product-sandbox-smoke", "node-app-check"}) {
+		t.Fatal("checks that passed last read as failing")
+	}
+	if transcript.ValidationPassed([]string{"node-app-check", "lint"}) || transcript.ValidationPassed(nil) {
+		t.Fatal("a check never run, or none, read as passed")
+	}
+	review := repaired + "[26-11-07 10:40:00] validation started: node-app-check\n" +
+		"[26-11-07 10:41:00] deterministic validation failed after review pass 1; invoking one model repair turn\n"
+	if ReadRalphex([]byte(review), nil).ValidationPassed([]string{"node-app-check"}) {
+		t.Fatal("a check the review's repair turn was invoked for read as passed")
+	}
+}
+
 // A line longer than any scanner buffer does not hide the lines after it.
 func TestALongLineHidesNothingAfterIt(t *testing.T) {
 	stdout := strings.Repeat("x", 3<<20) + "\n[26-11-07 10:00:00] deterministic validation failed; returning evidence to model for one repair turn: validation unit exit 1: FAIL\n"

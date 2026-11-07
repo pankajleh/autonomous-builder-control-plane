@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/acceptance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/blocker"
@@ -122,10 +121,7 @@ func (r *Runner) acceptanceEnding(accepted acceptance.Result) (runfailure.Detail
 		if !command.Required || command.Process.Outcome == supervisor.OutcomeSucceeded {
 			continue
 		}
-		check := command.Name
-		if !runfailure.ValidCheck(check) {
-			check = fmt.Sprintf("acceptance-%d", command.Index)
-		}
+		check := acceptanceCheck(command)
 		detail.Check = check
 		switch command.Process.Outcome {
 		case supervisor.OutcomeTimedOut:
@@ -138,14 +134,8 @@ func (r *Runner) acceptanceEnding(accepted acceptance.Result) (runfailure.Detail
 			}
 			detail.CheckExitCode = &code
 		}
-		stderr, _ := readBoundedEvidenceTail(command.Process.StderrRef, runfailure.MaxEvidenceBytes*4)
-		stdout, _ := readBoundedEvidenceTail(command.Process.StdoutRef, runfailure.MaxEvidenceBytes*4)
-		output := strings.TrimSpace(string(stderr))
-		if out := strings.TrimSpace(string(stdout)); out != "" {
-			output = strings.TrimSpace(output + "\n" + out)
-		}
 		body.Check = check
-		body.CheckOutput, body.CheckOutputTruncated = runfailure.Clean(output, runfailure.MaxCheckOutputBytes)
+		body.CheckOutput, body.CheckOutputTruncated = runfailure.Clean(commandOutput(command), runfailure.MaxCheckOutputBytes)
 		break
 	}
 	if body.CheckOutput == "" {

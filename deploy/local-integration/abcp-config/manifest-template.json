@@ -41,6 +41,7 @@
     "enabled": true,
     "retain": true
   },
+  "acceptance_reruns": 1,
   "acceptance": [
     {
       "name": "product-verification",

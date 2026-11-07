@@ -4,8 +4,9 @@ Date: 2026-11-07
 
 Exact base: `add6f4e` (PR #191)
 
-Status: **R1 and R2 built in PR #193 (`1d69c32`, live since 2026-11-07 15:24 UTC); R3 built in PR #194; R2b and R4 to
-R7 designed below for the next PRs.** Repo C design note
+Status: **R1 and R2 built in PR #193 (`1d69c32`, live since 2026-11-07 15:24 UTC); R3 built in PR #194 (`c0aeb06`,
+live since 2026-11-07 16:38 UTC); R5 built in PR #195; R2b, R4, R6 and R7 designed below for the next PRs.** Repo C
+design note
 `BUILD_RELIABILITY.md` §5.6 is the proposal (Repo C P1122, PR #1137). The owner, 2026-11-07, on "Recovery in ABCP":
 "Yes, build it (Recommended)": each Repo B merge and each quiet ABCP restart for R1 to R7 is covered, at about US$30 a
 month of extra model spend on builds that fail.
@@ -181,13 +182,47 @@ pin in every manifest template and a quiet restart.
   attempt to the profile's declared fallback (`executor.provider.fallback` exists for an open-model engine that cannot
   start; a fallback for a running build is R3's attempt on another invocation). Which engine customers fall back to is
   Repo C's A2 build rules.
-- **R5, acceptance once more.** When final acceptance fails a check the run's own validation passed, run that acceptance
-  once more; passing, accept the branch with `FLAKY` in its evidence (and R1 records nothing); failing, R3's attempt.
+- **R5, acceptance once more: built, PR #195** (§6.1).
 - **R6, restarts.** A run that a restart interrupted (no terminal transition, its `abcp run` gone; or `INTERRUPTED`)
   resumes from its last commit as a fresh attempt (R3's machinery); admission answers `503` while the workflow database
   cannot be reached, never `202` and nothing (2026-10-17, `58cbcfac`).
 - **R7, a queue at admission.** A passing refusal (unavailable, busy) is accepted and queued, not refused, and starts
   when the cause clears; Repo C words the wait.
+
+### 6.1 R5: the final acceptance once more (built, PR #195)
+
+The case (Repo C `BUILD_RELIABILITY.md` §3.3 row 2, `e51a8b70`, 2026-11-06): the run's own check passed, ABCP's final
+acceptance then failed the same kit check on one test file (one that fails beside the others and passes alone), and the
+same app built 12 minutes later.
+
+`acceptance_reruns: 1` (top level of the manifest; needs `ralphex.validation`; omitted keeps every digest). When:
+
+- the run's own governed validation passed on its last run: Ralphex's `validation completed successfully: <id>` for each
+  of the manifest's `ralphex.validation` ids, none failing after (`runfailure.Transcript.ValidationPassed`, read from the
+  attempt's own Ralphex output), and
+- ABCP's final acceptance then fails a required command by its exit (`exited_nonzero`; not a timeout, a signal, a dirty
+  checkout or an acceptance that could not run),
+
+the acceptance runs once more, all its commands, on a fresh checkout of the same candidate (the same branch at the same
+commit, else the second run is unavailable: `VALIDATION_UNAVAILABLE`). Its evidence is named beside the first run's
+(`acceptance-command-001-stdout-again.log`, `acceptance-final-git-again.json`, the same kinds), so the last
+`acceptance-command-stdout` is the second run's, which is what Repo C's `StoppedChecks` and `TriedApp` read.
+
+- **Passing:** `BRANCH_ACCEPTED`, its payload `acceptance_runs: 2` and `acceptance_flaky: <check>` (R1's name for the
+  command), and `acceptance-flaky.json` (kind `acceptance-flaky`, `AcceptanceFlakyV1`: the words `FLAKY: failed, then
+  passed when run again`, the check, the first run's outcome and exit code, its output redacted and bounded as R1's). No
+  `failure_detail`: the run did not fail.
+- **Failing again:** `FAILED` as before (`ACCEPTANCE_FAILED`, R1's detail and body from the second run), with
+  `acceptance_runs: 2`.
+
+**Not built: a fresh attempt (R3) after the second failure.** A run that reached acceptance had a Ralphex that
+succeeded, so its progress file ends with a `Completed:` footer; Ralphex archives and truncates such a file when it starts
+again (`archiveAndTruncateCompleted`), and the activity collector refuses a truncated progress file (append-only proof),
+so the recovered build could not be previewed (the problem R3 avoids after a `Failed:` footer). It needs either the
+governance fork to append under ABCP after a `Completed:` footer too (with R2b's patch and re-pin), or the collector to
+accept a truncation whose archive holds the proven prefix byte for byte. Until then a second failure ends the run.
+
+**Spend:** one more acceptance run (minutes, no model) on a failing build only.
 
 ## 7. Going live (R1, R2)
 
@@ -243,3 +278,15 @@ pin in every manifest template and a quiet restart.
    moves the boot entry; on any failure it puts everything back and starts `1d69c32` again. Its `DRY=` mode runs every
    step on copies.
 5. **Check it live:** the next build's `EXECUTION_STARTING` evidence; a failing build's `RETRYING` and second attempt.
+
+## 9. Going live (R5)
+
+1. **Merge**, covered by the owner's answer of 2026-11-07; **build** on the host from the merge
+   (`$R/a-abcp-build-batch.sh <merge sha>`): the packages' tests, the wall tests (with
+   `TestAWalledRunsFlakyAcceptanceIsRunAgainOnTheProductBranch`, none skipped) and the Codex end-to-end tests.
+2. **Templates:** each product template in `profiles.json` (49) and the two Groq ones beside it staged as
+   `<name>.batch-new` with `"acceptance_reruns": 1` before its `"acceptance"` (`a-batch-stage.py`); `c0aeb06` refuses the
+   field, so they go in only while ABCP is down. `a-batch-validate.sh` reads them as both binaries read a template.
+3. **One quiet restart** (`a-abcp-restart-batch.sh`, the same waits, refusals and way back as R3's; `DRY=` on copies), with
+   whichever Repo B PRs of this batch are merged by then.
+4. **Check it live:** the next accepted build's `BRANCH_ACCEPTED` payload; a flaky acceptance's `acceptance_flaky`.

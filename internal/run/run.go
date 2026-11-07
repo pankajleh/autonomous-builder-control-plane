@@ -1013,15 +1013,16 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 			// BRANCH_ACCEPTED-equivalent authority require a derived exact-head C.
 			return result, nil
 		}
-		return r.acceptBranch(ctx, result, implementationRefs)
+		return r.acceptBranch(ctx, result, implementationRefs, r.ownValidationPassed(process))
 	}
 }
 
 // acceptBranch runs the branch acceptance of a run whose implementation has
 // completed: the candidate is checked out on its own, the acceptance commands
 // run on it, and the run ends BRANCH_ACCEPTED, FAILED, VALIDATION_UNAVAILABLE
-// or CANCELLED.
-func (r *Runner) acceptBranch(ctx context.Context, result Result, implementationRefs []ledger.EvidenceRef) (Result, error) {
+// or CANCELLED. ownValidation says the run's own governed checks last passed,
+// which lets a failing acceptance run once more when the profile allows it (R5).
+func (r *Runner) acceptBranch(ctx context.Context, result Result, implementationRefs []ledger.EvidenceRef, ownValidation bool) (Result, error) {
 	target, cleanup, err := r.prepareAcceptanceTarget(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -1049,6 +1050,20 @@ func (r *Runner) acceptBranch(ctx context.Context, result Result, implementation
 	result.Acceptance = accepted
 	acceptanceRefs := collectAcceptanceRefs(accepted)
 	acceptanceRefs = append(acceptanceRefs, candidateRef)
+	// R5: a required command the run's own validation passed fails by its exit; the acceptance runs once more, and its
+	// second run decides.
+	var flaky *acceptance.CommandResult
+	runs := 1
+	if failing, byExit := acceptanceFailedByExit(accepted); ctx.Err() == nil && acceptanceErr == nil && byExit &&
+		ownValidation && r.governed.AcceptanceReruns() > 0 {
+		again, againErr := r.acceptAgain(ctx, target)
+		accepted, acceptanceErr, runs = again, againErr, 2
+		result.Acceptance = accepted
+		acceptanceRefs = append(acceptanceRefs, collectAcceptanceRefs(accepted)...)
+		if againErr == nil && accepted.Passed() {
+			flaky = &failing
+		}
+	}
 	if ctx.Err() != nil {
 		result.State = domain.StateCancelled
 		result.FailureReason = ctx.Err().Error()
@@ -1068,9 +1083,9 @@ func (r *Runner) acceptBranch(ctx context.Context, result Result, implementation
 		}
 		// The reason's words can carry Git's or a process's error, with paths: the ledger keeps a code, the evidence the
 		// words.
-		payload, refs := r.withFailureDetail(map[string]any{
+		payload, refs := r.withFailureDetail(acceptanceRuns(map[string]any{
 			"status": accepted.Status(), "reason": "ACCEPTANCE_UNAVAILABLE",
-		}, r.failureDetail(runfailure.CauseAcceptanceUnavailable, runfailure.PhaseAcceptance), nil, acceptanceRefs)
+		}, runs), r.failureDetail(runfailure.CauseAcceptanceUnavailable, runfailure.PhaseAcceptance), nil, acceptanceRefs)
 		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateValidationUnavailable, "acceptance-controller", payload, r.withFailureWords(result.FailureReason, refs)); err != nil {
 			return result, errors.Join(acceptanceErr, err)
 		}
@@ -1082,19 +1097,27 @@ func (r *Runner) acceptBranch(ctx context.Context, result Result, implementation
 		// The built branch did not pass its acceptance checks: the request was
 		// built and checked, and building it again the same way ends the same.
 		detail, body := r.acceptanceEnding(accepted)
-		payload, refs := r.withFailureDetail(map[string]any{
+		payload, refs := r.withFailureDetail(acceptanceRuns(map[string]any{
 			"status": accepted.Status(), "reason": "ACCEPTANCE_FAILED",
 			"failure_class": string(blocker.ClassTaskNotCompleted), "retryability": string(blocker.RetryableAfterChange),
-		}, detail, body, acceptanceRefs)
+		}, runs), detail, body, acceptanceRefs)
 		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateFailed, "acceptance-controller", payload, r.withFailureWords(result.FailureReason, refs)); err != nil {
 			return result, err
 		}
 		return result, nil
 	}
 
-	if err := r.finalTransition(ctx, domain.StateBranchAcceptancePending, domain.StateBranchAccepted, "acceptance-controller", map[string]any{
-		"status": accepted.Status(),
-	}, acceptanceRefs); err != nil {
+	accept := map[string]any{"status": accepted.Status()}
+	if flaky != nil {
+		flakyRef, err := r.writeAcceptanceFlaky(*flaky)
+		if err != nil {
+			return r.fail(ctx, result, domain.StateBranchAcceptancePending, "acceptance-controller", err, acceptanceRefs)
+		}
+		acceptanceRefs = append(acceptanceRefs, flakyRef)
+		accept = acceptanceRuns(accept, runs)
+		accept["acceptance_flaky"] = acceptanceCheck(*flaky)
+	}
+	if err := r.finalTransition(ctx, domain.StateBranchAcceptancePending, domain.StateBranchAccepted, "acceptance-controller", accept, acceptanceRefs); err != nil {
 		return result, err
 	}
 	result.State = domain.StateBranchAccepted
