@@ -169,6 +169,11 @@ type Controller struct {
 	launchesFD   int
 	start        func(string, []string, *os.File) error
 	parallelRuns int
+	// R6 (docs/plans/build-recovery.md §6.2): workflowProbe reaches the profile's workflow database before a run is
+	// launched, and launchWait bounds how long admission waits for the launched run to register or exit, so a run that
+	// cannot open its database is answered 503, never 202 and nothing.
+	workflowProbe func(context.Context, string) error
+	launchWait    time.Duration
 	// getenv reads the controller's environment for Engines; nil is os.Getenv.
 	getenv func(string) string
 	// The build wall and its probe's last answer (wall.go).

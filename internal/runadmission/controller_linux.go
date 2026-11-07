@@ -175,6 +175,8 @@ func NewController(config Config) (*Controller, error) {
 		parallelRuns: config.ParallelRuns,
 	}
 	controller.start = startProcess
+	controller.workflowProbe = probeWorkflowAuthority
+	controller.launchWait = defaultLaunchWait
 	if config.Wall != nil {
 		// The probe looks for everything a build must never see: the service root, the profile file, and each
 		// profile's repository, ledger, evidence, template and workflow settings, besides the wall file's own canaries.
@@ -536,6 +538,13 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 	if launchAttempted {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrReconciliationRequired
 	}
+	// R6: a run that cannot reach its workflow database cannot start; it is refused as passing (503) before anything
+	// says it was launched, so the same request admits it once the database is back.
+	if c.workflowProbe != nil {
+		if err := c.workflowProbe(ctx, binding.WorkflowAuthorityConfigPath); err != nil {
+			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
+		}
+	}
 	if err := c.createAdmissionLaunchIntent(binding); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	}
@@ -555,7 +564,69 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 	if err := lock.Close(); err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
 	}
+	if err := c.awaitLaunch(ctx, runID, binding); err != nil {
+		return serviceapi.RunAdmissionResponseV1{}, err
+	}
 	return response, nil
+}
+
+// defaultLaunchWait bounds admission's wait for a launched run to register: well inside Repo C's 30-second request
+// timeout, and far longer than abcp run takes to open its workflow database (at most 5 s) and register.
+const defaultLaunchWait = 10 * time.Second
+
+// launchPoll is how often that wait looks.
+const launchPoll = 50 * time.Millisecond
+
+// awaitLaunch waits, at most launchWait, until the launched run registers or exits (R6). A run that registers is
+// admitted. A run that exits before it registers (it holds the launch lock for its whole life, so the lock comes free)
+// could not start, as when its workflow database could not be reached (58cbcfac, 2026-10-17): its launch intent is
+// cleared and the admission refused as passing (503), so the same request launches it again, instead of a 202 for a
+// run that never appears. A run still starting when the wait ends is admitted as before.
+func (c *Controller) awaitLaunch(ctx context.Context, runID string, binding AdmissionBindingV1) error {
+	deadline := time.Now().Add(c.launchWait)
+	for c.launchWait > 0 {
+		if registered, err := c.runRegistered(runID, binding.runBinding()); err != nil {
+			return err
+		} else if registered {
+			return nil
+		}
+		lock, acquired, err := acquireLaunchLock(c.launchesFD, runID)
+		if err != nil {
+			return serviceapi.ErrAdmissionUnavailable
+		}
+		if acquired {
+			defer lock.Close()
+			if registered, err := c.runRegistered(runID, binding.runBinding()); err != nil {
+				return err
+			} else if registered {
+				return nil
+			}
+			if err := c.clearAdmissionLaunchIntent(binding); err != nil {
+				return serviceapi.ErrReconciliationRequired
+			}
+			return serviceapi.ErrAdmissionUnavailable
+		}
+		if !time.Now().Before(deadline) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(launchPoll):
+		}
+	}
+	return nil
+}
+
+// probeWorkflowAuthority reaches the workflow database a profile's runs use, as abcp run will (at most 5 s), and lets
+// it go: nothing is read or written there.
+func probeWorkflowAuthority(ctx context.Context, path string) error {
+	backend, err := workflowauthoritypg.Open(ctx, path)
+	if err != nil {
+		return err
+	}
+	backend.Close()
+	return nil
 }
 
 func (c *Controller) registeredReplay(receipt AdmissionReceiptV1, principal serviceapi.Principal, admission admissionAuthority) (bool, error) {
