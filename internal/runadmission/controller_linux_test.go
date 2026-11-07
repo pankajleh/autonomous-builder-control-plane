@@ -1318,6 +1318,9 @@ func newEditedAdmissionFixture(t *testing.T, ignored bool, edit func(root string
 		principal:  serviceapi.Principal{PrincipalID: "repo-c-service", PrincipalType: serviceapi.PrincipalService, AuthnMethod: "test-v1"},
 		repository: repository, service: service, input: filepath.Join(repository, ".abcp-input"),
 	}
+	// Tests that do not name R6's database probe or launch wait admit as before: no database, no wait.
+	controller.workflowProbe = func(context.Context, string) error { return nil }
+	controller.launchWait = 0
 	controller.start = func(executable string, args []string, lock *os.File) error {
 		duplicate, err := syscall.Dup(int(lock.Fd()))
 		if err != nil {

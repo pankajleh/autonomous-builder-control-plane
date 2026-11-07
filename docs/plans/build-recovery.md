@@ -5,7 +5,8 @@ Date: 2026-11-07
 Exact base: `add6f4e` (PR #191)
 
 Status: **R1 and R2 built in PR #193 (`1d69c32`, live since 2026-11-07 15:24 UTC); R3 built in PR #194 (`c0aeb06`,
-live since 2026-11-07 16:38 UTC); R5 built in PR #195; R2b, R4, R6 and R7 designed below for the next PRs.** Repo C
+live since 2026-11-07 16:38 UTC); R5 built in PR #195; R6's 503 built in PR #196; R2b, R4, R6's resume and R7
+designed below for the next PRs.** Repo C
 design note
 `BUILD_RELIABILITY.md` §5.6 is the proposal (Repo C P1122, PR #1137). The owner, 2026-11-07, on "Recovery in ABCP":
 "Yes, build it (Recommended)": each Repo B merge and each quiet ABCP restart for R1 to R7 is covered, at about US$30 a
@@ -183,9 +184,7 @@ pin in every manifest template and a quiet restart.
   start; a fallback for a running build is R3's attempt on another invocation). Which engine customers fall back to is
   Repo C's A2 build rules.
 - **R5, acceptance once more: built, PR #195** (§6.1).
-- **R6, restarts.** A run that a restart interrupted (no terminal transition, its `abcp run` gone; or `INTERRUPTED`)
-  resumes from its last commit as a fresh attempt (R3's machinery); admission answers `503` while the workflow database
-  cannot be reached, never `202` and nothing (2026-10-17, `58cbcfac`).
+- **R6, restarts:** admission's `503` built, PR #196; the resume designed, its own PR (§6.2).
 - **R7, a queue at admission.** A passing refusal (unavailable, busy) is accepted and queued, not refused, and starts
   when the cause clears; Repo C words the wait.
 
@@ -223,6 +222,43 @@ governance fork to append under ABCP after a `Completed:` footer too (with R2b's
 accept a truncation whose archive holds the proven prefix byte for byte. Until then a second failure ends the run.
 
 **Spend:** one more acceptance run (minutes, no model) on a failing build only.
+
+### 6.2 R6: never 202 and nothing (built, PR #196); the resume (designed)
+
+**The case** (Repo C `BUILD_RELIABILITY.md` §3.3 row 11, `admission-58cbcfac…`, 2026-10-17 02:27 UTC): admission launched
+`abcp run` and answered `202`; `abcp run` could not open its workflow database and exited before it registered, so the
+run never appeared (`GET /v1/runs/<run>` still answers `404`) and a replay of the request is refused for reconciliation
+(its launch intent is kept).
+
+**Built:**
+
+- Before the launch intent is written, admission reaches the profile's workflow database as `abcp run` will
+  (`workflowauthoritypg.Open`, at most 5 s, then closed; nothing read or written). Unreachable: `503
+  admission_unavailable` (retryable), nothing launched, so the same request admits the run once the database is back.
+- After the launch, admission waits at most 10 s (`defaultLaunchWait`, inside Repo C's 30-second request timeout) for
+  the run to register or exit. `abcp run` holds the launch lock for its whole life, so a free lock means it exited. A
+  run that exits before it registers (the database lost in between, any early failure) has its launch intent cleared and
+  is answered `503 admission_unavailable`: the same request launches it again. A run that registers is answered `202`
+  as soon as it does (usually within a second or two); one still starting when the wait ends is answered `202` as before.
+
+Repo C already words `ADMISSION_UNAVAILABLE` ("the builder is restarting or busy: start the build again in a minute");
+R7 is for that press to need no one.
+
+**The resume (not built here, its own PR).** An ABCP restart does not interrupt a build: each `abcp run` is its own
+process, and `abcp serve` can stop and start beside it. What interrupts one is the host's restart (`4a40c064`,
+2026-10-16), an out-of-memory kill or a `kill`. On SIGTERM `abcp run` records `CANCELLED` with R1's `INTERRUPTED`, a state
+with no way out; on SIGKILL it records nothing and its catalog owner lease goes stale. A resume needs, each touching
+every run:
+
+1. a SIGTERM that is not an API cancel to record `RECOVERY_REQUIRED` (cause `INTERRUPTED`) instead of `CANCELLED`, so
+   the run can go on (`RECOVERY_REQUIRED → EXECUTION_STARTING` is allowed);
+2. `abcp serve`, at start and on a timer, to find registered runs that are not terminal and whose owner process is gone,
+   and relaunch each once (`abcp run --resume-interrupted`), which takes the catalog's ownership over (a new owner lease,
+   the cancel watcher, the action journal), records `RECOVERY_REQUIRED` first when the run stopped without it, and goes on
+   as R3's fresh attempt (the worktree removed inside the wall, `-fresh-N` evidence; Ralphex appends to a progress file
+   that ended `Failed:` or with no footer, so one session); a run interrupted in acceptance runs its acceptance again;
+3. bounds: one resume per run, a limit on resumes after a boot, none for a run its owner stopped;
+4. Repo C to read `RECOVERY_REQUIRED` as still preparing while ABCP resumes it (`journey.ts` counts it `PAUSED` today).
 
 ## 7. Going live (R1, R2)
 
@@ -279,7 +315,7 @@ accept a truncation whose archive holds the proven prefix byte for byte. Until t
    step on copies.
 5. **Check it live:** the next build's `EXECUTION_STARTING` evidence; a failing build's `RETRYING` and second attempt.
 
-## 9. Going live (R5)
+## 9. Going live (R5, R6)
 
 1. **Merge**, covered by the owner's answer of 2026-11-07; **build** on the host from the merge
    (`$R/a-abcp-build-batch.sh <merge sha>`): the packages' tests, the wall tests (with
@@ -288,5 +324,6 @@ accept a truncation whose archive holds the proven prefix byte for byte. Until t
    `<name>.batch-new` with `"acceptance_reruns": 1` before its `"acceptance"` (`a-batch-stage.py`); `c0aeb06` refuses the
    field, so they go in only while ABCP is down. `a-batch-validate.sh` reads them as both binaries read a template.
 3. **One quiet restart** (`a-abcp-restart-batch.sh`, the same waits, refusals and way back as R3's; `DRY=` on copies), with
-   whichever Repo B PRs of this batch are merged by then.
+   whichever Repo B PRs of this batch are merged by then. R6 (PR #196) changes no template: its binary refuses a launch
+   while the database is down and waits for the run to register.
 4. **Check it live:** the next accepted build's `BRANCH_ACCEPTED` payload; a flaky acceptance's `acceptance_flaky`.
