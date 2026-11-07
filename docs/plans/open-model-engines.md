@@ -4,8 +4,9 @@ Status: **built; on the host for the trial since 2026-11-01** (`local-p02-togeth
 127.0.0.1:18996). **#183 (2026-11-02) moves the relay into ABCP** with per-model `compat` lists and gives each model a
 Codex catalog entry (gpt-oss-120b gets `apply_patch`); not on until the switch-over below (one announced restart with
 no build running). **2026-11-07 adds `stop_at_first_call` and `custom_tool_as_function`** for gpt-oss-120b on
-Together (below); not live until its profile names them. A manifest without `relay`, `compat` or `codex_catalog` runs
-exactly as before. Repo C design note `OPEN_MODEL_ENGINES.md` (§9.1).
+Together (below); live since 2026-11-07 (`add6f4e`). **2026-11-07 also adds `drop_client_metadata` and `drop_include`**
+for gpt-oss-120b on Groq (below); not live until a Groq profile names them. A manifest without `relay`, `compat` or
+`codex_catalog` runs exactly as before. Repo C design note `OPEN_MODEL_ENGINES.md` (§9.1, §9.2).
 
 ## Why
 
@@ -386,6 +387,44 @@ back in the answer.
    the template's gpt-oss `compat` list), as `.new` beside the live file, with the live one kept.
 3. One announced ABCP restart with no build running, the `.new` in place.
 4. A one-file check through ABCP's real relay (about US$0.01), then one real build.
+
+## 2026-11-07: gpt-oss-120b on Groq (`drop_client_metadata`, `drop_include`)
+
+The owner said yes (2026-11-07) to one gpt-oss-120b build on Groq, on Groq's paid Developer plan, after a probe showed
+Groq stopping gpt-oss cleanly at its call (Repo C `OPEN_MODEL_ENGINES.md` §9.2). Groq's Responses API was then probed
+with Codex 0.163.0's own requests, as ABCP's relay sends them (real Codex through the relay to a loopback stand-in that
+streams as Groq does, the captured bodies cut to a few tools and short prompts so that each fitted the free plan's 8,000
+tokens a minute; `/tmp/groq-stage` on the host), one request a minute:
+
+| Request shape | Groq's answer | Fix |
+|---|---|---|
+| Codex's tools with the custom `apply_patch` | 400 `invalid JSON body` (no field named) | `custom_tool_as_function` |
+| Codex's tools with the `multi_agent_v1` namespace | 400 `invalid JSON body` | `drop_namespace_tools` |
+| `client_metadata` (Codex's turn metadata, on every request) | 400 ``unknown field `client_metadata` in request body`` | **`drop_client_metadata`** (new) |
+| `include: ["reasoning.encrypted_content"]` | 400 `Field 'include' is not supported` | **`drop_include`** (new) |
+| `store: false`, `prompt_cache_key`, `parallel_tool_calls: true`, `reasoning.effort` | 200 | none |
+| the replay: a reasoning item with its `reasoning_text` content and `encrypted_content: null`, calls with `id` and `status`, outputs, `apply_patch` as a function call | 200 | none |
+| a reasoning item with `content: null`; an assistant message between a call and its output; two calls before both outputs | 200 | none (no turn fix) |
+
+Each 200 answered as harmony expects: the reasoning streamed as `reasoning_text` deltas, one call, `response.completed`
+with the usage (cached tokens counted once the prefix repeats), so neither stream fix is needed. Groq validates a call
+against the tools it was given: a call of a tool not in the request ends the stream with an `error` and
+`response.failed` (`tool_use_failed`), which Codex retries.
+
+- **`drop_client_metadata`** and **`drop_include`** each leave out one top-level key of `POST …/responses`; every other
+  key, its order and every number go on byte for byte, and a request without the key is sent exactly as it came. They
+  sit after `drop_namespace_tools` in the relay's order and go with any other fix.
+- **gpt-oss-120b on Groq** gets `drop_namespace_tools`, `drop_client_metadata`, `drop_include`,
+  `custom_tool_as_function` and Codex's catalog entry with `apply_patch` (`make-open-model-profiles.py`). As on
+  Together the multi-agent tools stay invisible to it. Codex gives the model its reasoning back between calls, which
+  Together never could.
+- **Checks:** `compat_test.go` walks Codex's request through Groq's refusals one fix at a time (a stand-in with Groq's
+  words, `fakegroq_test.go`) and keeps every other byte; `TestCodexBuildsThroughTheRelayWithGptOssOnGroqsFixes` runs
+  the real Codex through the relay to that stand-in, which streams as Groq does: Codex applies `apply_patch` (the file is
+  written), and its replay reaches the provider with the reasoning's text and none of what Groq refuses.
+- **Going live:** merge; build (the real-Codex run now has five tests); stage the Groq templates and profiles as new
+  files; on the Developer plan, the one-file check through the real relay (about US$0.01); one announced restart with no
+  build running; one real build.
 
 ## Rollout
 

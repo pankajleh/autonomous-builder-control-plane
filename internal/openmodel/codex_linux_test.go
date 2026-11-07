@@ -386,6 +386,99 @@ func TestCodexBuildsThroughTheRelayWithGptOssOnTogethersFixes(t *testing.T) {
 	t.Logf("codex through the relay:\n%s\nrelay log:\n%s", output, logged)
 }
 
+// TestCodexBuildsThroughTheRelayWithGptOssOnGroqsFixes runs the real Codex
+// CLI through a build's relay with gpt-oss-120b's compat list on Groq to a
+// fake provider that refuses what Groq refused on 2026-11-07 (groqRefusal,
+// HTTP 400 with Groq's words) and otherwise answers as Groq streams gpt-oss:
+// its reasoning with the text, then one call, then response.completed with
+// the usage. The first answer calls apply_patch as the function the relay
+// offers ({"input": …}); Codex applies it as its own apply_patch (the file is
+// written), and its replay reaches the provider with the reasoning's text,
+// the call as a function call, and no client_metadata, include, custom tool
+// or namespace. Nothing is cut: Groq stops at the call itself.
+func TestCodexBuildsThroughTheRelayWithGptOssOnGroqsFixes(t *testing.T) {
+	binary := os.Getenv("ABCP_TEST_CODEX")
+	if binary == "" {
+		t.Skip("ABCP_TEST_CODEX names no Codex binary")
+	}
+	var mu sync.Mutex
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, `{"object":"list","data":[{"id":"openai/gpt-oss-120b","object":"model"}]}`)
+			return
+		}
+		body := readAll(t, r)
+		mu.Lock()
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+		if refusal := groqRefusal(body); refusal != "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": refusal, "type": "invalid_request_error"}})
+			return
+		}
+		reasoning := map[string]any{"type": "reasoning", "id": "resp_r1", "summary": []any{}, "content": []any{map[string]any{"type": "reasoning_text", "text": "Write hello.txt with apply_patch."}}}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if strings.Contains(string(body), `"type":"function_call_output"`) {
+			writeEvents(w, "resp_2", reasoning, map[string]any{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+				"content": []any{map[string]any{"type": "output_text", "text": "done", "annotations": []any{}}}})
+			return
+		}
+		writeEvents(w, "resp_1", reasoning, map[string]any{"type": "function_call", "id": "fc_p", "call_id": "fc_p", "status": "completed", "name": "apply_patch",
+			"arguments": `{"input":` + mustText("*** Begin Patch\n*** Add File: hello.txt\n+hi\n*** End Patch") + `}`})
+	}))
+	defer server.Close()
+
+	provider := testProvider(t)
+	provider.BaseURL, provider.Relay = server.URL+"/openai/v1", true
+	provider.Models[0].Compat = append([]string{}, groqCompat...)
+	provider.Models[0].CodexCatalog = &CodexCatalog{ApplyPatch: true}
+	if err := provider.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	start, err := Begin(context.Background(), provider, "gpt-oss-120b", StartOptions{Run: "codex-gpt-oss-groq"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer start.Release()
+	work := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, binary, "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox",
+		"-c", "features.multi_agent=true", "-c", "model_reasoning_effort=high", "Write hello.txt.")
+	command.Dir = work
+	command.Env = start.Environment([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir()})
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("codex: %v\n%s", err, output)
+	}
+	if written, err := os.ReadFile(filepath.Join(work, "hello.txt")); err != nil || string(written) != "hi\n" {
+		t.Fatalf("apply_patch did not write the file: %q, %v\n%s", written, err, output)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("the provider saw %d requests\n%s", len(bodies), output)
+	}
+	for index, body := range bodies {
+		if refusal := groqRefusal([]byte(body)); refusal != "" || strings.Contains(body, `"client_metadata"`) || strings.Contains(body, `"include"`) {
+			t.Errorf("request %d reached the provider as Groq refuses it: %s", index+1, refusal)
+		}
+	}
+	if !strings.Contains(bodies[1], `"content":[{"type":"reasoning_text","text":"Write hello.txt with apply_patch."}]`) ||
+		!strings.Contains(bodies[1], `"type":"function_call","call_id":"fc_p","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch`) ||
+		!strings.Contains(bodies[1], "Success. Updated the following files") {
+		t.Errorf("Codex's replay reached the provider as:\n%s", bodies[1])
+	}
+	logged, err := relayLogLines(filepath.Join(start.Home, RelayLogFile), 2)
+	if err != nil || strings.Count(string(logged), "drop_namespace_tools:1,drop_client_metadata:1,drop_include:1,custom_tool_as_function:") != 2 ||
+		strings.Contains(string(logged), " cut=") || strings.Contains(string(logged), "usage=lost") || strings.Contains(string(logged), testKey) {
+		t.Errorf("the relay's log = %s, %v", logged, err)
+	}
+	t.Logf("codex through the relay:\n%s\nrelay log:\n%s", output, logged)
+}
+
 // TestLiveCodexWritesOneFileThroughTheRelay is the go-live check of a relay
 // model on its real provider (about US$0.01 for gpt-oss-120b on Together).
 // With ABCP_TEST_CODEX naming Codex and ABCP_TEST_LIVE_TEMPLATE a manifest

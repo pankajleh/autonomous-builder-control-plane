@@ -13,9 +13,10 @@ import (
 // The relay's fixes, by the name a model's compat list gives them. Each one
 // is a workaround for a request shape Together AI's Responses API refused
 // from Codex 0.163.0 in round 1 of the trial (Repo C design note
-// OPEN_MODEL_ENGINES §9.1), proved by a probe that sent the exact request
-// before the fix (HTTP 400) and after it (HTTP 200). A fix changes only what
-// its name says; every other byte of the request goes on as Codex sent it.
+// OPEN_MODEL_ENGINES §9.1), or Groq's did on 2026-11-07, proved by a probe
+// that sent the exact request before the fix (HTTP 400) and after it (HTTP
+// 200). A fix changes only what its name says; every other byte of the
+// request goes on as Codex sent it.
 const (
 	// CompatDropNullReasoningContent removes `"content": null` from the
 	// reasoning items of a request's input. Together answers its own
@@ -70,14 +71,32 @@ const (
 	// token …" as an error event after HTTP 200), or the model writes on
 	// without the tool's result (more calls, an invented "done").
 	CompatStopAtFirstCall = "stop_at_first_call"
+	// CompatDropClientMetadata leaves out the request's top-level
+	// client_metadata, the turn metadata Codex 0.163.0 sends with every
+	// request (thread, turn, window, sandbox, workspaces), which Groq refuses
+	// ("unknown field `client_metadata` in request body", HTTP 400, the Groq
+	// probes of 2026-11-07). Nothing in the model's prompt changes.
+	CompatDropClientMetadata = "drop_client_metadata"
+	// CompatDropInclude leaves out the request's top-level include, where
+	// Codex asks for "reasoning.encrypted_content", which Groq refuses
+	// ("Field 'include' is not supported", HTTP 400). Groq streams the
+	// reasoning's text instead, and Codex sends that back as the reasoning
+	// item's content, which Groq takes.
+	CompatDropInclude = "drop_include"
 )
+
+// droppedFields are the top-level request keys each field fix leaves out.
+var droppedFields = []struct{ fix, key string }{
+	{CompatDropClientMetadata, "client_metadata"},
+	{CompatDropInclude, "include"},
+}
 
 // CompatFixes are the fixes in the order the relay applies them; the last
 // two before the bridge also change the streamed answer.
 var CompatFixes = []string{
 	CompatDropNullReasoningContent, CompatMessageBeforeCalls, CompatOutputAfterCall,
-	CompatDropMediumEffort, CompatDropNamespaceTools, CompatCustomToolAsFunction, CompatStopAtFirstCall,
-	CompatChatBridge,
+	CompatDropMediumEffort, CompatDropNamespaceTools, CompatDropClientMetadata, CompatDropInclude,
+	CompatCustomToolAsFunction, CompatStopAtFirstCall, CompatChatBridge,
 }
 
 // validCompat accepts distinct known fixes; the chat bridge keeps a turn's
@@ -328,6 +347,12 @@ func rewrite(body []byte, compat []string) ([]byte, Applied, []string, error) {
 		var count int
 		if request, count = dropNamespaceTools(request); count > 0 {
 			applied[CompatDropNamespaceTools] = count
+		}
+	}
+	for _, field := range droppedFields {
+		if _, present := request.get(field.key); present && has(field.fix) {
+			request = request.without(field.key)
+			applied[field.fix] = 1
 		}
 	}
 	var custom []string

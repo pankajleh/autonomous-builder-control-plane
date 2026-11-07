@@ -83,10 +83,12 @@ the provider says `"relay": true`, and each model its `compat` list and `codex_c
 | bonsai-27b | the same three and `drop_namespace_tools` | `{}` |
 | beam-1.0 | `chat_completions_bridge` | `{}` |
 | deepseek-v4.1-flash | the same three and `drop_medium_effort` | `{}` |
+| gpt-oss-120b on **Groq** | `drop_namespace_tools`, `drop_client_metadata`, `drop_include`, `custom_tool_as_function` (2026-11-07: Groq refuses Codex's custom and namespace tools, `client_metadata` and `include`; it stops at the call itself) | `{"apply_patch": true}` |
 
 `base_url` stays the provider's own (`https://api.together.xyz/v1`): each build starts its own relay on 127.0.0.1 and
 gives Codex that address. A models-file entry's own `compat` or `codex_catalog` wins over the script's table; a
-provider with neither (Groq) is written exactly as before.
+provider with neither is written exactly as before. Groq's base URL is `https://api.groq.com/openai/v1`: the relay keeps
+the provider's path (`http://127.0.0.1:<port>/openai/v1`).
 
 Groq's is the same with `"id": "groq"`, `"base_url": "https://api.groq.com/openai/v1"`, `groq-api-key`,
 `/home/devagent/.codex/lanes/groq` and `gpt-oss-120b` alone. The profile entry added to `profiles.json.open-models`
