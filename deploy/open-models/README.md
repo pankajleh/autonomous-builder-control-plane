@@ -71,13 +71,14 @@ the provider says `"relay": true`, and each model its `compat` list and `codex_c
 ```json
 {"name": "gpt-oss-120b", "id": "openai/gpt-oss-120b", "origin": "US", "context_window": 131072,
  "efforts": ["low", "medium", "high"], "default_effort": "high", "max_concurrent_builds": 1,
- "compat": ["drop_null_reasoning_content", "message_before_calls", "output_after_call"],
+ "compat": ["drop_null_reasoning_content", "message_before_calls", "output_after_call",
+            "stop_at_first_call", "custom_tool_as_function"],
  "codex_catalog": {"apply_patch": true}}
 ```
 
 | Model | `compat` | `codex_catalog` |
 |---|---|---|
-| gpt-oss-120b | `drop_null_reasoning_content`, `message_before_calls`, `output_after_call` | `{"apply_patch": true}` |
+| gpt-oss-120b | `drop_null_reasoning_content`, `message_before_calls`, `output_after_call`, `stop_at_first_call`, `custom_tool_as_function` (2026-11-07: Together does not stop gpt-oss at its call, and hides the custom `apply_patch`; Repo B `docs/plans/open-model-engines.md`) | `{"apply_patch": true}` |
 | nemotron-3.5-super, muse-spark-open, glm-5.3 | the same three | `{}` |
 | bonsai-27b | the same three and `drop_namespace_tools` | `{}` |
 | beam-1.0 | `chat_completions_bridge` | `{}` |
@@ -113,7 +114,7 @@ Round 1 ran through `runtime/open-models/together-responses-shim-v6.py` on 127.0
 1. **Build** (restarts nothing): copy `$R/a-abcp-build-48f183a.sh` to `a-abcp-build-<sha>.sh` with the new worktree
    and SHA, and add the real-Codex check, which calls no provider:
    `ABCP_TEST_CODEX=/home/devagent/.nvm/versions/node/v24.19.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex go test -count=1 -run TestCodexBuildsThrough ./internal/openmodel/`
-   (two tests; `-v` shows they ran rather than skipped).
+   (two tests; three since 2026-11-07; `-v` shows they ran rather than skipped).
 2. **The template and profiles**, while the live ABCP keeps the template it read at its start:
    ```text
    cp -p $C/manifest-template-open-together.json $C/manifest-template-open-together.json.pre-abcp-relay
@@ -139,6 +140,35 @@ Round 1 ran through `runtime/open-models/together-responses-shim-v6.py` on 127.0
 **Back to the Python relay:** start it again (`cd $R/open-models && setsid nohup python3 together-responses-shim-v6.py
 18996 > together-responses-shim.log 2>&1 < /dev/null &`), put `.pre-abcp-relay` back, and restart with no build
 running (the new binary takes the old template too).
+
+## 4c. gpt-oss-120b's stream fixes (2026-11-07, once on `main`)
+
+`stop_at_first_call` and `custom_tool_as_function` (Repo B `docs/plans/open-model-engines.md`, 2026-11-07) go into
+gpt-oss-120b's `compat` list in both Together templates. Nothing else changes; Codex's catalog entry stays
+`{"apply_patch": true}`. `R`, `C` and `<sha>` as in §4b.
+
+1. **Build** the merge (restarts nothing) and run the real-Codex checks there, as in §4b step 1 (three tests now).
+2. **Stage** the templates as `.new` beside the live ones (the live ABCP keeps the templates it read at its start):
+   ```text
+   cd $C
+   for f in manifest-template-open-together.json manifest-template-node-open-together.json; do
+     python3 -I -c 'import json,os,sys; p=sys.argv[1]; t=json.load(open(p)); m=next(m for m in t["executor"]["provider"]["models"] if m["name"]=="gpt-oss-120b"); m["compat"]+=[n for n in ("stop_at_first_call","custom_tool_as_function") if n not in m["compat"]]; f=os.fdopen(os.open(p+".new",os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600),"w"); json.dump(t,f,indent=2); f.write("\n"); f.close()' "$f"
+     diff <(python3 -m json.tool $f) <(python3 -m json.tool $f.new)
+   done
+   ```
+   Each diff must show the two names added to gpt-oss-120b's `compat` and nothing else. A binary before this change
+   refuses them ("compat names an unknown fix"), so they go in with the new binary only.
+3. **Restart** with no build running (an announced restart; the refusals of §4b step 3 apply): `cp -p` each live
+   template to `<name>.pre-gpt-oss-stop`, move each `.new` into its place (0600), start the new binary, and read
+   `GET /v1/engines`: `local-p02-together` `ready: true`.
+4. **One file through ABCP's real relay** (about US$0.01; it runs the worktree's code and needs no ABCP, so it may
+   also run before step 3 against a `.new` file):
+   `ABCP_TEST_CODEX=<codex as in §4b> ABCP_TEST_LIVE_TEMPLATE=$C/manifest-template-open-together.json ABCP_TEST_LIVE_MODEL=gpt-oss-120b go test -count=1 -v -run TestLiveCodexWritesOneFileThroughTheRelay ./internal/openmodel/`.
+   It passes when Codex wrote `hello.txt` (`hi`); its relay lines show `stop_at_first_call:1` and `cut=` where Together
+   ran past a call, and `usage=lost` with the estimate. It sends at most 12 requests, from a scratch Codex home.
+5. Then **one real build** on gpt-oss-120b.
+
+**Back:** put the `.pre-gpt-oss-stop` templates back and restart with no build running (the new binary takes them).
 
 ## 5. Repo C's live settings (`start-live-repo-c.py`)
 

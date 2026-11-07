@@ -252,3 +252,115 @@ func TestACompatListNamesKnownFixesOnlyOnTheRelay(t *testing.T) {
 		t.Errorf("the refusal of an unknown fix does not name the known ones: %v", unknown)
 	}
 }
+
+// customPatchTool is Codex 0.163.0's freeform apply_patch as its request
+// offers it (cap1 of the 2026-11-07 diagnosis), its grammar shortened.
+func customPatchTool() map[string]any {
+	return map[string]any{"type": "custom", "name": "apply_patch",
+		"description": "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+		"format":      map[string]any{"type": "grammar", "syntax": "lark", "definition": "start: begin_patch hunk+ end_patch"}}
+}
+
+// TestTheCustomToolGoesToTheProviderAsAFunction: with custom_tool_as_function
+// the custom apply_patch is offered as a function taking one string, input,
+// in its place among the tools; Codex's earlier custom call and its output
+// are replayed as a function call and its output, the arguments the input as
+// {"input": …}; a tool_choice naming it names the function. Every other key
+// and tool goes as it came, and the relay knows which names to turn back.
+func TestTheCustomToolGoesToTheProviderAsAFunction(t *testing.T) {
+	patch := "*** Begin Patch\n*** Add File: notes.txt\n+one\n*** End Patch\n"
+	customCall := map[string]any{"type": "custom_tool_call", "id": "fc_p", "status": "completed", "call_id": "call_p", "name": "apply_patch", "input": patch}
+	customOutput := map[string]any{"type": "custom_tool_call_output", "call_id": "call_p", "output": "Success. Updated the following files:\nA notes.txt\n"}
+	request := codexRequest("openai/gpt-oss-120b", withInput(codexOpening(), cleanReasoning("rs_1"), customCall, customOutput), func(r map[string]any) {
+		r["tools"] = append(codexTools()[:3:3], append([]any{customPatchTool()}, codexTools()[3:]...)...)
+		r["tool_choice"] = map[string]any{"type": "custom", "name": "apply_patch"}
+	})
+	fixed, applied, custom, err := rewrite(request, []string{CompatCustomToolAsFunction})
+	if err != nil || applied.String() != "custom_tool_as_function:4" || strings.Join(custom, ",") != "apply_patch" {
+		t.Fatalf("applied %s, custom %v, %v", applied, custom, err)
+	}
+	var got struct {
+		Tools      []map[string]any `json:"tools"`
+		Input      []map[string]any `json:"input"`
+		ToolChoice map[string]any   `json:"tool_choice"`
+	}
+	if err := json.Unmarshal(fixed, &got); err != nil {
+		t.Fatal(err)
+	}
+	tool := got.Tools[3]
+	parameters, _ := json.Marshal(tool["parameters"])
+	if len(got.Tools) != 9 || tool["type"] != "function" || tool["name"] != "apply_patch" || tool["strict"] != false ||
+		tool["description"] != applyPatchDescription || tool["format"] != nil ||
+		string(parameters) != `{"additionalProperties":false,"properties":{"input":{"description":"The entire patch in the apply_patch format.","type":"string"}},"required":["input"],"type":"object"}` {
+		t.Errorf("apply_patch went to the provider as %v", tool)
+	}
+	if got.Tools[2]["name"] != "request_user_input" || got.Tools[4]["name"] != "view_image" || got.Tools[5]["type"] != "namespace" {
+		t.Errorf("the other tools moved: %v", got.Tools)
+	}
+	replayed, _ := json.Marshal(got.Input[len(got.Input)-2:])
+	if string(replayed) != `[{"arguments":"{\"input\":\"*** Begin Patch\\n*** Add File: notes.txt\\n+one\\n*** End Patch\\n\"}","call_id":"call_p","name":"apply_patch","type":"function_call"},`+
+		`{"call_id":"call_p","output":"Success. Updated the following files:\nA notes.txt\n","type":"function_call_output"}]` {
+		t.Errorf("the custom call was replayed as %s", replayed)
+	}
+	if got.ToolChoice["type"] != "function" || got.ToolChoice["name"] != "apply_patch" {
+		t.Errorf("tool_choice = %v", got.ToolChoice)
+	}
+	if refusal := togetherRefusal(fixed); refusal != "" {
+		t.Errorf("Together's stand-in refuses the fixed request: %s", refusal)
+	}
+	// With the turn fixes too, the replayed call still counts as a call.
+	_, applied, _, _ = rewrite(request, []string{CompatDropNullReasoningContent, CompatMessageBeforeCalls, CompatOutputAfterCall, CompatCustomToolAsFunction})
+	if applied.String() != "custom_tool_as_function:4" {
+		t.Errorf("with the turn fixes: %s", applied)
+	}
+
+	// A custom tool whose name a function tool has too stays as it is; a
+	// request without a custom tool or item goes byte for byte.
+	clash := codexRequest("openai/gpt-oss-120b", codexOpening(), func(r map[string]any) {
+		r["tools"] = []any{customPatchTool(), map[string]any{"type": "function", "name": "apply_patch", "parameters": map[string]any{}}}
+	})
+	if same, applied, custom, _ := rewrite(clash, []string{CompatCustomToolAsFunction}); !bytes.Equal(same, clash) || len(applied) != 0 || custom != nil {
+		t.Errorf("a clashing custom tool was changed: %s %v", applied, custom)
+	}
+	plain := codexRequest("openai/gpt-oss-120b", withInput(codexOpening(), call("call_1"), output("call_1")), nil)
+	if same, applied, custom, _ := rewrite(plain, []string{CompatCustomToolAsFunction, CompatStopAtFirstCall}); !bytes.Equal(same, plain) || len(applied) != 0 || custom != nil {
+		t.Errorf("a request without a custom tool changed: %s %v", applied, custom)
+	}
+}
+
+// TestModelsWithoutTheNewFixesKeepTheirCustomTool: every other model's
+// fixes leave the custom tool and Codex's custom items exactly as they came.
+func TestModelsWithoutTheNewFixesKeepTheirCustomTool(t *testing.T) {
+	customCall := map[string]any{"type": "custom_tool_call", "call_id": "call_p", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch\n"}
+	customOutput := map[string]any{"type": "custom_tool_call_output", "call_id": "call_p", "output": "Success."}
+	request := codexRequest("openai/gpt-oss-120b", withInput(codexOpening(), customCall, customOutput), func(r map[string]any) {
+		r["tools"] = append(codexTools(), customPatchTool())
+	})
+	for _, compat := range [][]string{nil, {CompatDropNullReasoningContent, CompatMessageBeforeCalls, CompatOutputAfterCall}, {CompatStopAtFirstCall}} {
+		same, applied, custom, err := rewrite(request, compat)
+		if err != nil || !bytes.Equal(same, request) || applied.String() != "none" || custom != nil {
+			t.Errorf("%v changed the request: %s %v %v", compat, applied, custom, err)
+		}
+	}
+}
+
+func TestTheStreamFixesGoWithTheRelayButNotTheBridge(t *testing.T) {
+	relayed := func(compat ...string) error {
+		base := groq()
+		provider := base.Clone()
+		provider.Relay = true
+		provider.Models[0].Compat = compat
+		return provider.Validate()
+	}
+	if err := relayed(CompatDropNullReasoningContent, CompatMessageBeforeCalls, CompatOutputAfterCall, CompatStopAtFirstCall, CompatCustomToolAsFunction); err != nil {
+		t.Errorf("gpt-oss-120b's list was refused: %v", err)
+	}
+	if err := relayed(CompatCustomToolAsFunction); err != nil {
+		t.Errorf("custom_tool_as_function alone was refused: %v", err)
+	}
+	for _, compat := range [][]string{{CompatChatBridge, CompatStopAtFirstCall}, {CompatCustomToolAsFunction, CompatChatBridge}, {CompatStopAtFirstCall, CompatStopAtFirstCall}} {
+		if err := relayed(compat...); err == nil {
+			t.Errorf("%v was accepted", compat)
+		}
+	}
+}

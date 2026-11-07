@@ -24,10 +24,12 @@ import (
 // until the build gives its slot back. Codex's base_url is the relay's; the
 // relay sends each request on to the provider's base URL and nowhere else,
 // applies the build model's compat fixes to POST <base>/responses, and
-// streams every answer back unchanged, except a chat-bridged one. It never
-// reads or adds a key: Codex's own Authorization header goes on as it came.
-// It logs one line per request (the model, the path, the status, the fixes
-// it applied and how long it took), never a header, a key or a body.
+// streams every answer back unchanged, except a chat-bridged one and what a
+// stream fix changes (stream.go). It never reads or adds a key: Codex's own
+// Authorization header goes on as it came. It logs one line per request
+// (the model, the path, the status, the fixes it applied and how long it
+// took, and when a stream fix ended an answer early or its usage never came,
+// that and an estimate of its tokens), never a header, a key or a body.
 
 // MaxRelayBody bounds a request the relay reads, and a bridged answer.
 const MaxRelayBody = 64 << 20
@@ -150,6 +152,16 @@ type relayLine struct {
 	status                     int
 	applied                    Applied
 	started                    time.Time
+	// cut says what ended an answer at its first call (stop_at_first_call):
+	// the next item, an error or the stream's end.
+	cut string
+	// usageLost: a fixed stream ended without the provider's usage (it sends
+	// usage only in its last response.completed, which a cut or a broken
+	// stream never reaches), so the line gives an estimate in its place: the
+	// request sent, and the text, arguments and input the model streamed
+	// (its reasoning, which Together does not stream, is not in it).
+	usageLost                     bool
+	estimatedIn, estimatedVisible int
 }
 
 func (r *Relay) logLine(line relayLine) {
@@ -166,6 +178,12 @@ func (r *Relay) logLine(line relayLine) {
 	}
 	text += fmt.Sprintf(" %s/%s %s %s model=%s status=%d fixes=%s duration=%s", r.provider.ID, r.model.Name, line.method,
 		line.path, model, line.status, line.applied, time.Since(line.started).Round(time.Millisecond))
+	if line.cut != "" {
+		text += " cut=" + line.cut
+	}
+	if line.usageLost {
+		text += fmt.Sprintf(" usage=lost est_input_tokens=%d est_output_tokens=%d", line.estimatedIn, line.estimatedVisible)
+	}
 	if line.fault != "" {
 		text += " error=" + line.fault
 	}
@@ -187,6 +205,7 @@ func refuse(w http.ResponseWriter, status int, code, message string) {
 func (r *Relay) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	line := relayLine{method: request.Method, path: "-", applied: Applied{}, started: time.Now()}
 	defer func() { r.logLine(line) }()
+	var fix *streamFix
 	fail := func(status int, code, fault, message string) {
 		line.status, line.fault = status, fault
 		refuse(w, status, code, message)
@@ -221,7 +240,7 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 		line.model = r.model.ID
-		rewritten, applied, err := Rewrite(body, r.model.Compat)
+		rewritten, applied, custom, err := rewrite(body, r.model.Compat)
 		if err != nil {
 			fail(http.StatusBadRequest, "abcp_relay_request", "request_json", "the ABCP relay takes a JSON object")
 			return
@@ -233,8 +252,9 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 		body = rewritten
+		fix = newStreamFix(slices.Contains(r.model.Compat, CompatStopAtFirstCall), custom, r.options.IDs)
 	}
-	r.forward(w, request, body, &line)
+	r.forward(w, request, body, &line, fix)
 }
 
 // upstreamRequest answers the provider's request at that path (under the
@@ -254,9 +274,14 @@ func (r *Relay) upstreamRequest(ctx context.Context, method, requestPath, query 
 	return upstream, nil
 }
 
-// forward sends the request on and streams the answer back as it comes.
-func (r *Relay) forward(w http.ResponseWriter, request *http.Request, body []byte, line *relayLine) {
-	upstream, err := r.upstreamRequest(request.Context(), request.Method, request.URL.Path, request.URL.RawQuery, request.Header, body)
+// forward sends the request on and streams the answer back as it comes,
+// through the stream fix when one applies to a streamed answer.
+func (r *Relay) forward(w http.ResponseWriter, request *http.Request, body []byte, line *relayLine, fix *streamFix) {
+	// Cancelled when forward returns, so an answer the fix ended early
+	// closes the provider's stream.
+	ctx, cancel := context.WithCancel(request.Context())
+	defer cancel()
+	upstream, err := r.upstreamRequest(ctx, request.Method, request.URL.Path, request.URL.RawQuery, request.Header, body)
 	if err != nil {
 		line.status, line.fault = http.StatusBadGateway, "upstream_request"
 		refuse(w, http.StatusBadGateway, "abcp_relay_upstream", "the ABCP relay could not reach the provider")
@@ -278,6 +303,33 @@ func (r *Relay) forward(w http.ResponseWriter, request *http.Request, body []byt
 	w.WriteHeader(response.StatusCode)
 	line.status = response.StatusCode
 	flusher, _ := w.(http.Flusher)
+	if fix.active() && response.StatusCode == http.StatusOK && eventStream(response.Header) {
+		flush := func() {
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		err := fix.copyStream(w, flush, response.Body)
+		if fix.cut != "" {
+			line.applied[CompatStopAtFirstCall] = 1
+		}
+		if fix.converted > 0 {
+			line.applied[CompatCustomToolAsFunction] += fix.converted
+		}
+		line.cut = fix.cut
+		if fix.usage == nil {
+			line.usageLost, line.estimatedIn, line.estimatedVisible = true, estimatedTokens(len(body)), estimatedTokens(fix.visible)
+		}
+		switch {
+		case errors.Is(err, errClientGone) || (err != nil && request.Context().Err() != nil):
+			line.fault = "client_gone"
+		case errors.Is(err, errEventTooLarge):
+			line.fault = "upstream_event_too_large"
+		case err != nil:
+			line.fault = "upstream_cut"
+		}
+		return
+	}
 	buffer := make([]byte, 32<<10)
 	for {
 		n, readErr := response.Body.Read(buffer)
@@ -379,4 +431,9 @@ func (r *Relay) bridge(w http.ResponseWriter, request *http.Request, body []byte
 	if _, err := w.Write(data); err != nil {
 		line.fault = "client_gone"
 	}
+}
+
+// eventStream reports whether an answer is a server-sent event stream.
+func eventStream(header http.Header) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(header.Get("Content-Type"))), "text/event-stream")
 }

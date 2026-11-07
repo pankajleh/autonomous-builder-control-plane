@@ -40,11 +40,16 @@ SLOTS = {"together": 1, "groq": 1}
 # Bonsai's endpoint refuses the "namespace" tool type (probe-bonsai.log). chat_completions_bridge: Beam needs each turn's
 # reasoning back, which Together's /responses never sends; its /chat/completions takes reasoning_content
 # (probe-beam*.log, e2e-beam.log). drop_medium_effort: DeepSeek refuses the "medium" effort Together fills in for an
-# empty reasoning object (probe-deepseek.log, probe-deepseek2.log).
+# empty reasoning object (probe-deepseek.log, probe-deepseek2.log). stop_at_first_call and custom_tool_as_function, for
+# gpt-oss-120b alone (the diagnosis of 2026-11-07, /tmp/gptoss-diag on the host): Together does not stop gpt-oss at
+# harmony's <|call|>, so its parser fails after the call ("Parse error: Failed to process token …") or the model writes
+# on without the tool's result; and it leaves Codex's custom apply_patch out of what the model sees, so the model calls
+# a function apply_patch Codex cannot apply. The relay ends each answer at its first call and offers apply_patch as a
+# function, turning the call back into Codex's own.
 TURNS = ["drop_null_reasoning_content", "message_before_calls", "output_after_call"]
 COMPAT = {
     "together": {
-        "gpt-oss-120b": TURNS,
+        "gpt-oss-120b": TURNS + ["stop_at_first_call", "custom_tool_as_function"],
         "nemotron-3.5-super": TURNS,
         "muse-spark-open": TURNS,
         "glm-5.3": TURNS,
@@ -55,8 +60,9 @@ COMPAT = {
 }
 # Codex's model catalog per model: every round-1 model gets an entry (tool output at 10,000 tokens, spawn_agent naming
 # the build's model only); apply_patch only where the provider took Codex's freeform ("custom") tool type:
-# gpt-oss-120b (probe-custom-tool.log: custom text 200, custom grammar 200). Bonsai's endpoint lists no custom type, and
-# the chat bridge carries function tools only.
+# gpt-oss-120b (probe-custom-tool.log: custom text 200, custom grammar 200). Together takes the tool but never shows it
+# to the model, so gpt-oss-120b also has custom_tool_as_function (above); Codex must still offer the tool. Bonsai's
+# endpoint lists no custom type, and the chat bridge carries function tools only.
 CATALOG = {
     "together": {
         "gpt-oss-120b": {"apply_patch": True},

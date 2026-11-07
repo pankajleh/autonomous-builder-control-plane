@@ -50,17 +50,40 @@ const (
 	// Together fills in as "medium") or a "medium" effort, for a model that
 	// refuses medium ("reasoning_effort must be low, high, xhigh, max …").
 	CompatDropMediumEffort = "drop_medium_effort"
+	// CompatCustomToolAsFunction offers each "custom" (freeform) tool,
+	// Codex's apply_patch, to the provider as a function taking one string,
+	// input, and replays earlier custom_tool_call and custom_tool_call_output
+	// items as function_call and function_call_output; on a streamed answer
+	// the relay turns the model's call of that function back into the
+	// custom_tool_call Codex applies (stream.go). Together leaves custom tools
+	// out of what gpt-oss-120b sees and still answers 200, so the model
+	// called a function apply_patch with arguments of its own making
+	// ({"patch": …}, {"command": …}), which Codex cannot apply (Repo C
+	// OPEN_MODEL_ENGINES, the gpt-oss diagnosis of 2026-11-07).
+	CompatCustomToolAsFunction = "custom_tool_as_function"
+	// CompatStopAtFirstCall ends a streamed answer at its first tool call,
+	// which is what harmony's <|call|> means: once a call has started, the
+	// next item, an error or the stream's end closes it. Codex gets that call
+	// complete and a response.completed, and the relay closes the provider's
+	// stream (stream.go). Together's serving of gpt-oss-120b does not stop at
+	// <|call|>: its own parser then fails ("Parse error: Failed to process
+	// token …" as an error event after HTTP 200), or the model writes on
+	// without the tool's result (more calls, an invented "done").
+	CompatStopAtFirstCall = "stop_at_first_call"
 )
 
-// CompatFixes are the fixes in the order the relay applies them.
+// CompatFixes are the fixes in the order the relay applies them; the last
+// two before the bridge also change the streamed answer.
 var CompatFixes = []string{
 	CompatDropNullReasoningContent, CompatMessageBeforeCalls, CompatOutputAfterCall,
-	CompatDropMediumEffort, CompatDropNamespaceTools, CompatChatBridge,
+	CompatDropMediumEffort, CompatDropNamespaceTools, CompatCustomToolAsFunction, CompatStopAtFirstCall,
+	CompatChatBridge,
 }
 
 // validCompat accepts distinct known fixes; the chat bridge keeps a turn's
 // calls together itself, so the two reorderings never go with it (they
-// would split the turn and its reasoning).
+// would split the turn and its reasoning), and it makes its own answer from
+// function tools only, so neither stream fix goes with it.
 func validCompat(compat []string) error {
 	seen := map[string]bool{}
 	for _, name := range compat {
@@ -75,10 +98,14 @@ func validCompat(compat []string) error {
 	if seen[CompatChatBridge] && (seen[CompatMessageBeforeCalls] || seen[CompatOutputAfterCall]) {
 		return errors.New("compat " + CompatChatBridge + " keeps a turn's calls together itself: it is refused with " + CompatMessageBeforeCalls + " or " + CompatOutputAfterCall)
 	}
+	if seen[CompatChatBridge] && (seen[CompatStopAtFirstCall] || seen[CompatCustomToolAsFunction]) {
+		return errors.New("compat " + CompatChatBridge + " makes its own answer from function tools: it is refused with " + CompatStopAtFirstCall + " or " + CompatCustomToolAsFunction)
+	}
 	return nil
 }
 
-// Applied counts what the fixes changed in one request, by fix.
+// Applied counts what the fixes changed in one request (and, for the stream
+// fixes, in its answer), by fix.
 type Applied map[string]int
 
 // String lists the fixes that changed something, in the relay's order, as
@@ -238,17 +265,25 @@ func (i item) inTurn() bool {
 }
 
 // Rewrite applies a model's fixes to a POST <base>/responses body, other than
-// the chat bridge (chatbridge.go). It answers the body to send: the very
-// bytes it was given when no fix changed anything. A body that is not a
-// JSON object is answered as an error; the relay refuses it.
+// the chat bridge (chatbridge.go) and what the stream fixes do to the answer
+// (stream.go). It answers the body to send: the very bytes it was given when
+// no fix changed anything. A body that is not a JSON object is answered as
+// an error; the relay refuses it.
 func Rewrite(body []byte, compat []string) ([]byte, Applied, error) {
+	rewritten, applied, _, err := rewrite(body, compat)
+	return rewritten, applied, err
+}
+
+// rewrite is Rewrite that also answers the custom tools it offered as
+// functions, whose calls the answer turns back.
+func rewrite(body []byte, compat []string) ([]byte, Applied, []string, error) {
 	request, err := parseObject(body)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	applied := Applied{}
 	has := func(name string) bool { return slices.Contains(compat, name) }
-	if raw, ok := request.get("input"); ok && (has(CompatDropNullReasoningContent) || has(CompatMessageBeforeCalls) || has(CompatOutputAfterCall)) {
+	if raw, ok := request.get("input"); ok && (has(CompatDropNullReasoningContent) || has(CompatMessageBeforeCalls) || has(CompatOutputAfterCall) || has(CompatCustomToolAsFunction)) {
 		var entries []json.RawMessage
 		if json.Unmarshal(raw, &entries) == nil {
 			items := make([]item, len(entries))
@@ -273,6 +308,11 @@ func Rewrite(body []byte, compat []string) ([]byte, Applied, error) {
 					applied[CompatOutputAfterCall], changed = count, true
 				}
 			}
+			if has(CompatCustomToolAsFunction) {
+				if count := customItemsAsFunctions(items); count > 0 {
+					applied[CompatCustomToolAsFunction], changed = count, true
+				}
+			}
 			if changed {
 				request = request.set("input", encodeItems(items))
 			}
@@ -290,10 +330,17 @@ func Rewrite(body []byte, compat []string) ([]byte, Applied, error) {
 			applied[CompatDropNamespaceTools] = count
 		}
 	}
-	if len(applied) == 0 {
-		return body, applied, nil
+	var custom []string
+	if has(CompatCustomToolAsFunction) {
+		var count int
+		if request, custom, count = customToolsAsFunctions(request); count > 0 {
+			applied[CompatCustomToolAsFunction] += count
+		}
 	}
-	return request.encode(), applied, nil
+	if len(applied) == 0 {
+		return body, applied, custom, nil
+	}
+	return request.encode(), applied, custom, nil
 }
 
 func encodeItems(items []item) json.RawMessage {
@@ -438,4 +485,114 @@ func dropNamespaceTools(request object) (object, int) {
 		return request, 0
 	}
 	return request.set("tools", encodeItems(kept)), len(tools) - len(kept)
+}
+
+// applyPatchDescription is what the provider is told of apply_patch offered
+// as a function: the words of the stand-in relay with which gpt-oss-120b on
+// Together answered apply_patch {"input": "*** Begin Patch…"} every time a
+// call completed (the 2026-11-07 diagnosis, probes4-customfn).
+const (
+	applyPatchDescription      = "Edit files with a patch. Pass the whole patch, from *** Begin Patch to *** End Patch, as the `input` string."
+	applyPatchInputDescription = "The entire patch in the apply_patch format."
+)
+
+// customToolsAsFunctions offers each custom tool as a function taking one
+// string, input (unless a function tool of that name is offered too), and a
+// tool_choice naming one as that function. It answers the request, the
+// names it offered so and how many things it changed.
+func customToolsAsFunctions(request object) (object, []string, int) {
+	raw, ok := request.get("tools")
+	if !ok {
+		return request, nil, 0
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(raw, &tools) != nil {
+		return request, nil, 0
+	}
+	parsed := make([]object, len(tools))
+	functions := map[string]bool{}
+	for index, tool := range tools {
+		if fields, err := parseObject(tool); err == nil {
+			parsed[index] = fields
+			if fields.text("type") == "function" {
+				functions[fields.text("name")] = true
+			}
+		}
+	}
+	names := []string{}
+	out := make([]item, len(tools))
+	for index, tool := range tools {
+		out[index] = item{raw: tool}
+		name := parsed[index].text("name")
+		if parsed[index].text("type") != "custom" || name == "" || functions[name] || slices.Contains(names, name) {
+			continue
+		}
+		out[index] = item{raw: customAsFunction(name, parsed[index].text("description"))}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return request, nil, 0
+	}
+	request = request.set("tools", encodeItems(out))
+	count := len(names)
+	if raw, ok := request.get("tool_choice"); ok {
+		if choice, err := parseObject(raw); err == nil && choice.text("type") == "custom" && slices.Contains(names, choice.text("name")) {
+			request = request.set("tool_choice", choice.set("type", mustJSON("function")).encode())
+			count++
+		}
+	}
+	return request, names, count
+}
+
+// customAsFunction is a custom tool as a function taking one string, input.
+func customAsFunction(name, description string) json.RawMessage {
+	described, input := strings.TrimSpace(description+" Pass the whole input as the `input` string."), "The tool's whole input."
+	if name == "apply_patch" {
+		described, input = applyPatchDescription, applyPatchInputDescription
+	}
+	parameters := object{
+		{key: "type", value: mustJSON("object")},
+		{key: "properties", value: object{{key: "input", value: object{{key: "type", value: mustJSON("string")}, {key: "description", value: mustJSON(input)}}.encode()}}.encode()},
+		{key: "required", value: mustJSON([]string{"input"})},
+		{key: "additionalProperties", value: mustJSON(false)},
+	}
+	return object{
+		{key: "type", value: mustJSON("function")}, {key: "name", value: mustJSON(name)}, {key: "description", value: mustJSON(described)},
+		{key: "strict", value: mustJSON(false)}, {key: "parameters", value: parameters.encode()},
+	}.encode()
+}
+
+// customItemsAsFunctions replays each custom_tool_call as a function_call
+// whose arguments are {"input": <its input>}, and each
+// custom_tool_call_output as a function_call_output with the same output.
+// Their other keys (id, status) are left out, as the stand-in relay sent
+// them.
+func customItemsAsFunctions(items []item) int {
+	count := 0
+	keep := func(fields object, keys ...string) object {
+		out := object{}
+		for _, key := range keys {
+			if value, ok := fields.get(key); ok {
+				out = append(out, member{key: key, value: value})
+			}
+		}
+		return out
+	}
+	for index, entry := range items {
+		var replayed object
+		switch entry.fields.text("type") {
+		case "custom_tool_call":
+			arguments := mustJSON(map[string]string{"input": entry.fields.text("input")})
+			replayed = append(object{{key: "type", value: mustJSON("function_call")}}, keep(entry.fields, "call_id", "name")...)
+			replayed = append(replayed, member{key: "arguments", value: mustJSON(string(arguments))})
+		case "custom_tool_call_output":
+			replayed = append(object{{key: "type", value: mustJSON("function_call_output")}}, keep(entry.fields, "call_id", "output")...)
+		default:
+			continue
+		}
+		entry.fields, entry.raw = replayed, replayed.encode()
+		items[index] = entry
+		count++
+	}
+	return count
 }
