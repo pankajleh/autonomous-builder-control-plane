@@ -80,6 +80,11 @@ type ProfileV1 struct {
 	// 4b). A profile without it admits no request that names one; omitted, so
 	// every existing profile keeps its binding digest.
 	ExecutorChoices *ExecutorChoicesV1 `json:"executor_choices,omitempty"`
+	// QueueAdmissions (R7, docs/plans/build-recovery.md §6.3) answers an admission whose launch meets a passing cause
+	// (the wall's probe failing, the workflow database unreachable, the run exiting before it registers, its start
+	// failing) with 202 and queues it, for abcp serve to launch once the cause clears, instead of refusing it with 503.
+	// Not part of the profile's binding digest. Omitted, admissions are refused as before.
+	QueueAdmissions bool `json:"queue_admissions,omitempty"`
 }
 
 // ExecutorChoicesV1 is a profile's allowlist. Either list may be empty, never
@@ -167,6 +172,8 @@ type Controller struct {
 	profiles     map[string]loadedProfile
 	admissionsFD int
 	launchesFD   int
+	// queuedFD is admissions/queued, R7's queue of admissions waiting for a passing cause to clear (queue_linux.go).
+	queuedFD     int
 	start        func(string, []string, *os.File) error
 	parallelRuns int
 	// R6 (docs/plans/build-recovery.md §6.2): workflowProbe reaches the profile's workflow database before a run is
@@ -240,6 +247,10 @@ func (c *Controller) Close() error {
 	if c.launchesFD >= 0 {
 		result = errors.Join(result, closeFD(c.launchesFD))
 		c.launchesFD = -1
+	}
+	if c.queuedFD > 0 {
+		result = errors.Join(result, closeFD(c.queuedFD))
+		c.queuedFD = -1
 	}
 	if c.admissionsFD >= 0 {
 		result = errors.Join(result, closeFD(c.admissionsFD))
