@@ -178,8 +178,12 @@ func (s *eventScanner) Err() error    { return nil }
 // keeps the historical names.
 func (r *Runner) ralphexArtifactName(base string) string {
 	if r.resume && r.resumeOrdinal > 1 {
-		return fmt.Sprintf("%s-attempt-%d%s",
+		base = fmt.Sprintf("%s-attempt-%d%s",
 			strings.TrimSuffix(base, pathExt(base)), r.resumeOrdinal, pathExt(base))
+	}
+	// A fresh attempt (R3) writes its own Ralphex evidence beside the first attempt's.
+	if r.attempt > 1 {
+		base = fmt.Sprintf("%s-fresh-%d%s", strings.TrimSuffix(base, pathExt(base)), r.attempt, pathExt(base))
 	}
 	return base
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -195,7 +196,7 @@ func recordedFailureEvidence(t *testing.T, event ledger.Event) runfailure.Eviden
 		if ref.Kind != runfailure.EvidenceKind {
 			continue
 		}
-		if filepath.Base(ref.URI) != runfailure.EvidenceName {
+		if name := filepath.Base(ref.URI); name != runfailure.EvidenceName && !regexp.MustCompile(`^failure-detail-[0-9]+\.json$`).MatchString(name) {
 			t.Fatalf("evidence name = %s", ref.URI)
 		}
 		data, err := os.ReadFile(ref.URI)

@@ -311,6 +311,8 @@ type Runner struct {
 	finalization  FinalizationHook
 	snapshots     SnapshotCoordinator
 	parallelRuns  int
+	// attempt is the Ralphex attempt the run is on: 1, then 2 for a fresh attempt (R3).
+	attempt int
 	// openModelOptions are the open-model start's seams; zero is live.
 	openModelOptions openmodel.StartOptions
 	// wall walls every Ralphex run (SetBuildWall, or loaded from wallFile by
@@ -652,304 +654,367 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		}
 	}
 
-	configDir, err := os.MkdirTemp("", "abcp-ralphex-config-")
-	if err != nil {
-		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("create isolated Ralphex config directory: %w", err), nil)
-	}
-	defer os.RemoveAll(configDir)
-	validationSpecPath, err := r.prepareValidationSpec(configDir)
-	if err != nil {
-		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
-	}
-	// R2: the profile's task_retry_count goes to Ralphex through its isolated configuration; without one, Ralphex keeps
-	// its own default and the configuration folder is as before.
-	if retries := r.governed.Ralphex().TaskRetryCount; retries > 0 {
-		if err := appendRalphexConfig(configDir, fmt.Sprintf("task_retry_count = %d", retries)); err != nil {
-			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("write the Ralphex task retry count: %w", err), nil)
-		}
-	}
-	if agents := r.governed.Ralphex().ReviewAgents; len(agents) > 0 {
-		if err := ralphex.WriteReviewPrompt(configDir, agents); err != nil {
-			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
-		}
-	}
-	var executionPlanPath string
-	var cleanupExecutionPlan func() error
+	// R3 (docs/plans/build-recovery.md §5): a run makes one Ralphex attempt, and one fresh attempt more when its profile
+	// allows one and the first ended without its builder finishing.
+	var first *firstAttempt
+	var engineMounts []WallMount
+	var engineEnv map[string]string
 	if walled != nil {
-		executionPlanPath, err = walled.executionPlan(ctx, r.governed.Plan())
-		cleanupExecutionPlan = walled.removePlanCopy
-	} else {
-		executionPlanPath, cleanupExecutionPlan, err = r.prepareExecutionPlan(ctx, repositoryLease)
+		engineMounts, engineEnv = append([]WallMount{}, walled.mounts...), copyStrings(walled.env)
 	}
-	if err != nil {
-		if cleanupExecutionPlan != nil {
-			err = errors.Join(err, cleanupExecutionPlan())
+	for attempt := 1; ; attempt++ {
+		r.attempt = attempt
+		startFrom := domain.StateAuthorityValidated
+		planHandoff := false
+		if attempt > 1 {
+			startFrom = domain.StateRetrying
+			// The run slot, the open-model engine's build slot and (for an unwalled run) the repository execution lease
+			// are taken again, as for the first attempt; a walled run needs no lease past its setup.
+			if err := acquireLease(); err != nil {
+				return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
+			}
+			if walled != nil && repositoryLease != nil {
+				if err := repositoryLease.Close(); err != nil {
+					return r.fail(ctx, result, startFrom, "build-wall", err, nil)
+				}
+				repositoryLease = nil
+			}
 		}
-		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
-	}
-	defer func() {
-		if cleanupExecutionPlan != nil {
-			runErr = errors.Join(runErr, cleanupExecutionPlan())
-		}
-	}()
-	invocation, err := r.invocation(configDir, executionPlanPath)
-	if err == nil {
-		invocation.ValidationSpecPath = validationSpecPath
-	}
-	if err != nil {
-		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
-	}
-	// An engine lane (Repo C design note A6) replaces the inherited settings of
-	// its engine for this build only. It is read now, so a changed or removed
-	// file stops the build before the engine starts; only its name, SHA-256 and
-	// setting names are recorded, never a value.
-	var lane *enginelane.Lane
-	if policy := r.governed.Executor(); policy.Lane != "" {
-		loaded, err := enginelane.Load(policy.Lane, policy.LaneFile, policy.Executor)
+		configDir, err := os.MkdirTemp("", "abcp-ralphex-config-")
 		if err != nil {
-			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
+			return r.fail(ctx, result, startFrom, "ralphex-adapter", fmt.Errorf("create isolated Ralphex config directory: %w", err), nil)
 		}
-		lane = &loaded
-		// Ralphex removes ANTHROPIC_API_KEY from Claude Code's environment unless asked to keep it.
-		_, invocation.PreserveAnthropicAPIKey = loaded.Settings["ANTHROPIC_API_KEY"]
-	}
-	// A walled run's engine gets a home in the run's folder (an open-model engine's configuration is written there)
-	// before its start is recorded, so the evidence names the home it runs with.
-	if walled != nil {
-		engine := r.governed.Executor().Executor
-		if openModel == nil && openModelUnavailable != nil {
-			engine = "codex"
-		}
-		if err := walled.prepareEngine(engine, lane, openModel); err != nil {
-			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", err, nil)
-		}
-	}
-	openModelEvidence, err := r.applyOpenModel(configDir, &invocation, openModel, openModelUnavailable)
-	if err != nil {
-		return r.fail(ctx, result, domain.StateAuthorityValidated, "open-model-engine", err, nil)
-	}
-	argv, err := invocation.Argv()
-	if err != nil {
-		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
-	}
-	ralphexTimeout, err := time.ParseDuration(r.governed.Ralphex().Timeout)
-	if err != nil {
-		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("parse governed Ralphex timeout: %w", err), nil)
-	}
-	environment := ralphexEnvironment(r.governed.Executor().Executor, r.capsule)
-	startEvidence := map[string]any{"argv": argv, "timeout": r.governed.Ralphex().Timeout, "environment_policy": ralphexEnvironmentPolicy}
-	if retries := r.governed.Ralphex().TaskRetryCount; retries > 0 {
-		startEvidence["task_retry_count"] = retries
-	}
-	if openModelEvidence != nil {
-		startEvidence["open_model"] = openModelEvidence
-	}
-	if openModel != nil {
-		environment = openModel.Environment(environment)
-	}
-	if lane != nil {
-		environment = lane.Environment(environment)
-		startEvidence["engine_lane"], startEvidence["engine_lane_sha256"], startEvidence["engine_lane_keys"] = lane.Name, lane.SHA256, lane.Keys()
-	}
-	commandArgv, commandCwd := argv, r.governed.Repository().Path
-	if walled != nil {
-		environment = walled.environment(environment)
-		wallArgs, err := walled.args(r.governed, configDir)
+		defer os.RemoveAll(configDir)
+		validationSpecPath, err := r.prepareValidationSpec(configDir)
 		if err != nil {
-			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", err, nil)
+			return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
 		}
-		if err := r.wall.Check(ctx, wallArgs); err != nil {
-			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", err, nil)
+		// R2: the profile's task_retry_count goes to Ralphex through its isolated configuration; without one, Ralphex keeps
+		// its own default and the configuration folder is as before.
+		if retries := r.governed.Ralphex().TaskRetryCount; retries > 0 {
+			if err := appendRalphexConfig(configDir, fmt.Sprintf("task_retry_count = %d", retries)); err != nil {
+				return r.fail(ctx, result, startFrom, "ralphex-adapter", fmt.Errorf("write the Ralphex task retry count: %w", err), nil)
+			}
 		}
-		// Its wall starts, so the run's branch starts in the product repository, for every fetch back to fast-forward.
-		if err := walled.startBranch(ctx); err != nil {
-			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", err, nil)
+		if agents := r.governed.Ralphex().ReviewAgents; len(agents) > 0 {
+			if err := ralphex.WriteReviewPrompt(configDir, agents); err != nil {
+				return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
+			}
 		}
-		isolation := r.wall.Evidence(wallArgs)
-		for key, value := range walled.evidence {
-			isolation[key] = value
+		// R3: a fresh attempt's task prompt is Ralphex's own with what the first attempt ended with after it.
+		if first != nil {
+			if err := ralphex.WriteFreshAttemptPrompt(configDir, freshAttemptSummary(first.detail, first.body)); err != nil {
+				return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
+			}
 		}
-		startEvidence["isolation"] = isolation
-		commandArgv, commandCwd = append(append([]string{}, wallArgs...), argv...), walled.repository
-	}
-	if err := r.transition(ctx, domain.StateAuthorityValidated, domain.StateExecutionStarting, "governed-runner", startEvidence, nil); err != nil {
-		return result, err
-	}
-	result.State = domain.StateExecutionStarting
-	if err := r.transition(ctx, domain.StateExecutionStarting, domain.StateImplementing, "ralphex-adapter", map[string]any{"argv": argv}, nil); err != nil {
-		return result, err
-	}
-	result.State = domain.StateImplementing
-
-	command := supervisor.Command{
-		Argv:    commandArgv,
-		Cwd:     commandCwd,
-		Env:     environment,
-		Timeout: ralphexTimeout,
-		Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: r.ralphexArtifactName("ralphex-stdout.log"), Kind: "ralphex-stdout"},
-		Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: r.ralphexArtifactName("ralphex-stderr.log"), Kind: "ralphex-stderr"},
-	}
-	var reservation governancev3.InvocationReservationV1
-	if invocation.Bounds != nil {
-		admission, _ := r.governed.Governance()
-		reservation, err = r.controller.ReserveRalphexInvocationV1(r.parsedCapsule, admission.Operation, admission.Mutation, admission.LeaseSHA256)
+		var executionPlanPath string
+		var cleanupExecutionPlan func() error
+		if walled != nil {
+			executionPlanPath, err = walled.executionPlanFor(ctx, r.governed.Plan(), attempt)
+			cleanupExecutionPlan = walled.removePlanCopy
+			planHandoff = walled.planCopy != ""
+		} else {
+			executionPlanPath, cleanupExecutionPlan, err = r.prepareExecutionPlan(ctx, repositoryLease)
+			planHandoff = cleanupExecutionPlan != nil
+		}
 		if err != nil {
-			return r.fail(ctx, result, domain.StateImplementing, "governance-controller", err, nil)
+			if cleanupExecutionPlan != nil {
+				err = errors.Join(err, cleanupExecutionPlan())
+			}
+			return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
 		}
-	}
-	var process supervisor.Result
-	var processErr error
-	var containment *ContainmentEvidenceV1
-	stopSetupWatch := func() {}
-	if repositoryLease != nil && r.governed.Worktree().Enabled {
-		stopSetupWatch = r.releaseLeaseAfterWorktreeSetup(ctx, repositoryLease)
-		defer stopSetupWatch()
-	}
-	stopBringBack := func() {}
-	if walled != nil {
-		stopBringBack = walled.bringBackWhileRunning(ctx)
-		defer stopBringBack()
-	}
-	if invocation.Bounds != nil {
-		contained, ok := r.processes.(ContainedCommandRunner)
-		if !ok {
-			return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", errors.New("EXECUTION_BOUNDS_INVALID: Linux containment handoff is unavailable"), nil)
+		defer func() {
+			if cleanupExecutionPlan != nil {
+				runErr = errors.Join(runErr, cleanupExecutionPlan())
+			}
+		}()
+		invocation, err := r.invocation(configDir, executionPlanPath)
+		if err == nil {
+			invocation.ValidationSpecPath = validationSpecPath
 		}
-		evidence, containedErr := ContainmentEvidenceV1{}, error(nil)
-		process, evidence, containedErr = contained.RunContained(ctx, command, ContainmentRequestV1{
-			Identity: r.governed.RunID(), WallClockTimeout: invocation.Bounds.WallClockTimeout,
-		})
-		processErr = containedErr
-		containment = &evidence
-		if processErr == nil && (evidence.Kind != "ContainmentEvidenceV1" || evidence.ScopeIdentity == "" || evidence.Primitive != "cgroup-v2" || !evidence.MembershipVerified || !evidence.EmptyScopeVerified) {
-			processErr = errors.New("EXECUTION_BOUNDS_INVALID: containment membership or empty-scope proof is invalid")
+		if err != nil {
+			return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
 		}
-	} else {
-		process, processErr = r.processes.Run(ctx, command)
-	}
-	stopSetupWatch()
-	stopBringBack()
-	if cleanupExecutionPlan != nil {
-		processErr = errors.Join(processErr, cleanupExecutionPlan())
-		cleanupExecutionPlan = nil
-	}
-	// The branch is brought back once more after Ralphex exits, before acceptance reads it in the product repository.
-	if walled != nil {
-		processErr = errors.Join(processErr, walled.bringBackFinally(context.WithoutCancel(ctx)))
-	}
-	if repositoryLease != nil {
-		processErr = errors.Join(processErr, repositoryLease.Close())
-		repositoryLease = nil
-	}
-	if slots != nil {
-		processErr = errors.Join(processErr, slots.Close())
-		slots = nil
-	}
-	if openModel != nil {
-		processErr = errors.Join(processErr, openModel.Release())
-		openModel = nil
-	}
-	if invocation.Bounds != nil {
-		if finishErr := r.controller.FinishRalphexInvocationV1(reservation); finishErr != nil {
-			processErr = errors.Join(processErr, finishErr)
+		// An engine lane (Repo C design note A6) replaces the inherited settings of
+		// its engine for this build only. It is read now, so a changed or removed
+		// file stops the build before the engine starts; only its name, SHA-256 and
+		// setting names are recorded, never a value.
+		var lane *enginelane.Lane
+		if policy := r.governed.Executor(); policy.Lane != "" {
+			loaded, err := enginelane.Load(policy.Lane, policy.LaneFile, policy.Executor)
+			if err != nil {
+				return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
+			}
+			lane = &loaded
+			// Ralphex removes ANTHROPIC_API_KEY from Claude Code's environment unless asked to keep it.
+			_, invocation.PreserveAnthropicAPIKey = loaded.Settings["ANTHROPIC_API_KEY"]
 		}
-	}
-	if invocation.Mode == ralphex.ModeReview {
-		if reviewErr := validateReadOnlyReviewRepositoryV1(ctx, r.governed.Repository().Path, r.governed.Repository().StartSHA); reviewErr != nil {
-			processErr = errors.Join(processErr, reviewErr)
+		// A walled run's engine gets a home in the run's folder (an open-model engine's configuration is written there)
+		// before its start is recorded, so the evidence names the home it runs with.
+		if walled != nil {
+			engine := r.governed.Executor().Executor
+			if openModel == nil && openModelUnavailable != nil {
+				engine = "codex"
+			}
+			walled.mounts, walled.env = append([]WallMount{}, engineMounts...), copyStrings(engineEnv)
+			if err := walled.prepareEngine(engine, lane, openModel); err != nil {
+				return r.fail(ctx, result, startFrom, "build-wall", err, nil)
+			}
 		}
-	}
-	result.Ralphex = process
-	if processErr != nil {
-		if _, api := APICancelProvenance(ctx); api {
-			return r.cancel(ctx, result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
+		openModelEvidence, err := r.applyOpenModel(configDir, &invocation, openModel, openModelUnavailable)
+		if err != nil {
+			return r.fail(ctx, result, startFrom, "open-model-engine", err, nil)
 		}
-		if isHumanDecisionFailure(process, processErr) {
-			return r.blockHumanDecision(ctx, result, process, processErr, processRefs(process))
+		argv, err := invocation.Argv()
+		if err != nil {
+			return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
 		}
-		return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
-	}
-	metadataRef, err := r.writeJSON(r.ralphexArtifactName("ralphex-process.json"), "ralphex-process-metadata", struct {
-		Process           supervisor.Result      `json:"process"`
-		EnvironmentPolicy string                 `json:"environment_policy"`
-		EvidenceRefs      []ledger.EvidenceRef   `json:"evidence_refs"`
-		Containment       *ContainmentEvidenceV1 `json:"containment,omitempty"`
-	}{Process: process, EnvironmentPolicy: ralphexEnvironmentPolicy, EvidenceRefs: processRefs(process), Containment: containment})
-	if err != nil {
-		return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", err, processRefs(process))
-	}
-	result.RalphexMetadataRef = metadataRef
-	implementationRefs := append(processRefs(process), metadataRef)
-
-	_, apiCancelActive := APICancelProvenance(ctx)
-	if process.Outcome != supervisor.OutcomeSucceeded || apiCancelActive {
-		terminal := domain.StateFailed
-		if process.Outcome == supervisor.OutcomeCanceled || apiCancelActive {
-			terminal = domain.StateCancelled
+		ralphexTimeout, err := time.ParseDuration(r.governed.Ralphex().Timeout)
+		if err != nil {
+			return r.fail(ctx, result, startFrom, "ralphex-adapter", fmt.Errorf("parse governed Ralphex timeout: %w", err), nil)
 		}
-		if !apiCancelActive && process.Outcome != supervisor.OutcomeCanceled &&
-			isHumanDecisionFailure(process, nil) {
-			return r.blockHumanDecision(ctx, result, process, nil, implementationRefs)
+		environment := ralphexEnvironment(r.governed.Executor().Executor, r.capsule)
+		startEvidence := map[string]any{"argv": argv, "timeout": r.governed.Ralphex().Timeout, "environment_policy": ralphexEnvironmentPolicy}
+		if retries := r.governed.Ralphex().TaskRetryCount; retries > 0 {
+			startEvidence["task_retry_count"] = retries
 		}
-		reason := fmt.Sprintf("Ralphex ended with outcome %s", process.Outcome)
-		result.State = terminal
-		result.FailureReason = reason
-		payload := map[string]any{
-			"outcome": process.Outcome, "exit_code": process.ExitCode, "signal": process.TerminatingSignal,
+		if first != nil {
+			startEvidence["attempt"] = attempt
+			startEvidence["fresh_attempt_after"] = string(first.detail.Cause)
 		}
-		classification := classificationOfRalphexFailure(process, nil)
-		if terminal == domain.StateFailed {
-			// Why it failed, from the implementer's own output (the classifier's
-			// fixed class, never the matched text), so a reader can tell a stop
-			// that running again would get past from one it would not.
-			payload["failure_class"] = string(classification.Class)
-			payload["retryability"] = string(classification.Retryability)
+		if openModelEvidence != nil {
+			startEvidence["open_model"] = openModelEvidence
 		}
-		// R1: how Ralphex ended, by its own lines: the cause, the failing check, the repair turns and retries it used,
-		// and the check's own output as evidence.
-		detail, body := r.ralphexEnding(ctx, process, classification, terminal == domain.StateCancelled)
-		payload, implementationRefs = r.withFailureDetail(payload, detail, body, implementationRefs)
-		if err := r.transition(ctx, domain.StateImplementing, terminal, "ralphex-adapter", payload, implementationRefs); err != nil {
+		if openModel != nil {
+			environment = openModel.Environment(environment)
+		}
+		if lane != nil {
+			environment = lane.Environment(environment)
+			startEvidence["engine_lane"], startEvidence["engine_lane_sha256"], startEvidence["engine_lane_keys"] = lane.Name, lane.SHA256, lane.Keys()
+		}
+		commandArgv, commandCwd := argv, r.governed.Repository().Path
+		if walled != nil {
+			environment = walled.environment(environment)
+			wallArgs, err := walled.args(r.governed, configDir)
+			if err != nil {
+				return r.fail(ctx, result, startFrom, "build-wall", err, nil)
+			}
+			if err := r.wall.Check(ctx, wallArgs); err != nil {
+				return r.fail(ctx, result, startFrom, "build-wall", err, nil)
+			}
+			// Its wall starts, so the run's branch starts in the product repository, for every fetch back to fast-forward.
+			if err := walled.startBranch(ctx); err != nil {
+				return r.fail(ctx, result, startFrom, "build-wall", err, nil)
+			}
+			isolation := r.wall.Evidence(wallArgs)
+			for key, value := range walled.evidence {
+				isolation[key] = value
+			}
+			startEvidence["isolation"] = isolation
+			commandArgv, commandCwd = append(append([]string{}, wallArgs...), argv...), walled.repository
+			if first != nil {
+				if err := r.removeRetainedWorktree(ctx, walled.repository, wallArgs, walled.environment(gitexec.Environment())); err != nil {
+					return r.fail(ctx, result, startFrom, "build-wall", err, nil)
+				}
+			}
+		} else if first != nil {
+			if err := r.removeRetainedWorktree(ctx, r.governed.Repository().Path, nil, nil); err != nil {
+				return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
+			}
+		}
+		if first != nil {
+			startEvidence["retained_worktree_removed"] = true
+		}
+		if err := r.transition(ctx, startFrom, domain.StateExecutionStarting, "governed-runner", startEvidence, nil); err != nil {
 			return result, err
 		}
-		return result, nil
-	}
-	if invocation.Bounds != nil {
-		admission, _ := r.governed.Governance()
-		if admission.Operation == contextcapsule.OperationImplementationReview && admission.Mutation {
-			candidateSHA, headErr := gitOutput(ctx, r.governed.Repository().Path, "rev-parse", "--verify", "HEAD^{commit}")
-			if headErr != nil {
-				return r.fail(ctx, result, domain.StateImplementing, "governance-controller", fmt.Errorf("resolve mutation result HEAD: %w", headErr), implementationRefs)
-			}
-			receipt, receiptErr := r.controller.CompleteMutationReceiptV1(r.governed.Repository().Path, r.parsedCapsule, admission.LeaseSHA256, candidateSHA)
-			if receiptErr != nil {
-				return r.fail(ctx, result, domain.StateImplementing, "governance-controller", receiptErr, implementationRefs)
-			}
-			receiptRef, writeErr := r.writeJSON("mutation-receipt.json", "mutation-receipt", receipt)
-			if writeErr != nil {
-				return r.fail(ctx, result, domain.StateImplementing, "governance-controller", writeErr, implementationRefs)
-			}
-			result.MutationReceiptRef = receiptRef
-			implementationRefs = append(implementationRefs, receiptRef)
+		result.State = domain.StateExecutionStarting
+		if err := r.transition(ctx, domain.StateExecutionStarting, domain.StateImplementing, "ralphex-adapter", map[string]any{"argv": argv}, nil); err != nil {
+			return result, err
 		}
-	}
+		result.State = domain.StateImplementing
 
-	transition := r.transition
-	if invocation.Bounds != nil {
-		transition = r.finalTransition
+		command := supervisor.Command{
+			Argv:    commandArgv,
+			Cwd:     commandCwd,
+			Env:     environment,
+			Timeout: ralphexTimeout,
+			Stdout:  supervisor.EvidenceSink{Writer: r.artifacts, Name: r.ralphexArtifactName("ralphex-stdout.log"), Kind: "ralphex-stdout"},
+			Stderr:  supervisor.EvidenceSink{Writer: r.artifacts, Name: r.ralphexArtifactName("ralphex-stderr.log"), Kind: "ralphex-stderr"},
+		}
+		var reservation governancev3.InvocationReservationV1
+		if invocation.Bounds != nil {
+			admission, _ := r.governed.Governance()
+			reservation, err = r.controller.ReserveRalphexInvocationV1(r.parsedCapsule, admission.Operation, admission.Mutation, admission.LeaseSHA256)
+			if err != nil {
+				return r.fail(ctx, result, domain.StateImplementing, "governance-controller", err, nil)
+			}
+		}
+		var process supervisor.Result
+		var processErr error
+		var containment *ContainmentEvidenceV1
+		stopSetupWatch := func() {}
+		if repositoryLease != nil && r.governed.Worktree().Enabled && first == nil {
+			stopSetupWatch = r.releaseLeaseAfterWorktreeSetup(ctx, repositoryLease)
+			defer stopSetupWatch()
+		}
+		stopBringBack := func() {}
+		if walled != nil {
+			stopBringBack = walled.bringBackWhileRunning(ctx)
+			defer stopBringBack()
+		}
+		if invocation.Bounds != nil {
+			contained, ok := r.processes.(ContainedCommandRunner)
+			if !ok {
+				return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", errors.New("EXECUTION_BOUNDS_INVALID: Linux containment handoff is unavailable"), nil)
+			}
+			evidence, containedErr := ContainmentEvidenceV1{}, error(nil)
+			process, evidence, containedErr = contained.RunContained(ctx, command, ContainmentRequestV1{
+				Identity: r.governed.RunID(), WallClockTimeout: invocation.Bounds.WallClockTimeout,
+			})
+			processErr = containedErr
+			containment = &evidence
+			if processErr == nil && (evidence.Kind != "ContainmentEvidenceV1" || evidence.ScopeIdentity == "" || evidence.Primitive != "cgroup-v2" || !evidence.MembershipVerified || !evidence.EmptyScopeVerified) {
+				processErr = errors.New("EXECUTION_BOUNDS_INVALID: containment membership or empty-scope proof is invalid")
+			}
+		} else {
+			process, processErr = r.processes.Run(ctx, command)
+		}
+		stopSetupWatch()
+		stopBringBack()
+		if cleanupExecutionPlan != nil {
+			processErr = errors.Join(processErr, cleanupExecutionPlan())
+			cleanupExecutionPlan = nil
+		}
+		// The branch is brought back once more after Ralphex exits, before acceptance reads it in the product repository.
+		if walled != nil {
+			processErr = errors.Join(processErr, walled.bringBackFinally(context.WithoutCancel(ctx)))
+		}
+		if repositoryLease != nil {
+			processErr = errors.Join(processErr, repositoryLease.Close())
+			repositoryLease = nil
+		}
+		if slots != nil {
+			processErr = errors.Join(processErr, slots.Close())
+			slots = nil
+		}
+		if openModel != nil {
+			processErr = errors.Join(processErr, openModel.Release())
+			openModel = nil
+		}
+		if invocation.Bounds != nil {
+			if finishErr := r.controller.FinishRalphexInvocationV1(reservation); finishErr != nil {
+				processErr = errors.Join(processErr, finishErr)
+			}
+		}
+		if invocation.Mode == ralphex.ModeReview {
+			if reviewErr := validateReadOnlyReviewRepositoryV1(ctx, r.governed.Repository().Path, r.governed.Repository().StartSHA); reviewErr != nil {
+				processErr = errors.Join(processErr, reviewErr)
+			}
+		}
+		result.Ralphex = process
+		if processErr != nil {
+			if _, api := APICancelProvenance(ctx); api {
+				return r.cancel(ctx, result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
+			}
+			if isHumanDecisionFailure(process, processErr) {
+				return r.blockHumanDecision(ctx, result, process, processErr, processRefs(process))
+			}
+			return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", processErr, processRefs(process))
+		}
+		metadataRef, err := r.writeJSON(r.ralphexArtifactName("ralphex-process.json"), "ralphex-process-metadata", struct {
+			Process           supervisor.Result      `json:"process"`
+			EnvironmentPolicy string                 `json:"environment_policy"`
+			EvidenceRefs      []ledger.EvidenceRef   `json:"evidence_refs"`
+			Containment       *ContainmentEvidenceV1 `json:"containment,omitempty"`
+		}{Process: process, EnvironmentPolicy: ralphexEnvironmentPolicy, EvidenceRefs: processRefs(process), Containment: containment})
+		if err != nil {
+			return r.fail(ctx, result, domain.StateImplementing, "ralphex-adapter", err, processRefs(process))
+		}
+		result.RalphexMetadataRef = metadataRef
+		implementationRefs := append(processRefs(process), metadataRef)
+
+		_, apiCancelActive := APICancelProvenance(ctx)
+		if process.Outcome != supervisor.OutcomeSucceeded || apiCancelActive {
+			terminal := domain.StateFailed
+			if process.Outcome == supervisor.OutcomeCanceled || apiCancelActive {
+				terminal = domain.StateCancelled
+			}
+			if !apiCancelActive && process.Outcome != supervisor.OutcomeCanceled &&
+				isHumanDecisionFailure(process, nil) {
+				return r.blockHumanDecision(ctx, result, process, nil, implementationRefs)
+			}
+			reason := fmt.Sprintf("Ralphex ended with outcome %s", process.Outcome)
+			result.State = terminal
+			result.FailureReason = reason
+			payload := map[string]any{
+				"outcome": process.Outcome, "exit_code": process.ExitCode, "signal": process.TerminatingSignal,
+			}
+			classification := classificationOfRalphexFailure(process, nil)
+			if terminal == domain.StateFailed {
+				// Why it failed, from the implementer's own output (the classifier's
+				// fixed class, never the matched text), so a reader can tell a stop
+				// that running again would get past from one it would not.
+				payload["failure_class"] = string(classification.Class)
+				payload["retryability"] = string(classification.Retryability)
+			}
+			// R1: how Ralphex ended, by its own lines: the cause, the failing check, the repair turns and retries it used,
+			// and the check's own output as evidence.
+			detail, body := r.ralphexEnding(ctx, process, classification, terminal == domain.StateCancelled)
+			payload, implementationRefs = r.withFailureDetail(payload, detail, body, implementationRefs)
+			// R3: the first attempt's builder ended without finishing; one fresh attempt starts on the branch before the
+			// run fails, recorded as IMPLEMENTING -> RETRYING with how the first attempt ended.
+			if terminal == domain.StateFailed && first == nil && r.freshAttemptEligible(invocation, walled != nil, planHandoff, detail) {
+				payload["recovery"], payload["next_attempt"] = "FRESH_ATTEMPT", attempt+1
+				if err := r.transition(ctx, domain.StateImplementing, domain.StateRetrying, "ralphex-adapter", payload, implementationRefs); err != nil {
+					return result, err
+				}
+				result.State, result.FailureReason = domain.StateRetrying, ""
+				first = &firstAttempt{detail: detail, body: body}
+				continue
+			}
+			if err := r.transition(ctx, domain.StateImplementing, terminal, "ralphex-adapter", payload, implementationRefs); err != nil {
+				return result, err
+			}
+			return result, nil
+		}
+		if invocation.Bounds != nil {
+			admission, _ := r.governed.Governance()
+			if admission.Operation == contextcapsule.OperationImplementationReview && admission.Mutation {
+				candidateSHA, headErr := gitOutput(ctx, r.governed.Repository().Path, "rev-parse", "--verify", "HEAD^{commit}")
+				if headErr != nil {
+					return r.fail(ctx, result, domain.StateImplementing, "governance-controller", fmt.Errorf("resolve mutation result HEAD: %w", headErr), implementationRefs)
+				}
+				receipt, receiptErr := r.controller.CompleteMutationReceiptV1(r.governed.Repository().Path, r.parsedCapsule, admission.LeaseSHA256, candidateSHA)
+				if receiptErr != nil {
+					return r.fail(ctx, result, domain.StateImplementing, "governance-controller", receiptErr, implementationRefs)
+				}
+				receiptRef, writeErr := r.writeJSON("mutation-receipt.json", "mutation-receipt", receipt)
+				if writeErr != nil {
+					return r.fail(ctx, result, domain.StateImplementing, "governance-controller", writeErr, implementationRefs)
+				}
+				result.MutationReceiptRef = receiptRef
+				implementationRefs = append(implementationRefs, receiptRef)
+			}
+		}
+
+		transition := r.transition
+		if invocation.Bounds != nil {
+			transition = r.finalTransition
+		}
+		if err := transition(ctx, domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter", map[string]any{
+			"outcome": process.Outcome, "exit_code": process.ExitCode,
+		}, implementationRefs); err != nil {
+			return result, err
+		}
+		result.State = domain.StateImplementationCompleted
+		if invocation.Bounds != nil {
+			// B can produce implementation/review evidence only. Acceptance and
+			// BRANCH_ACCEPTED-equivalent authority require a derived exact-head C.
+			return result, nil
+		}
+		return r.acceptBranch(ctx, result, implementationRefs)
 	}
-	if err := transition(ctx, domain.StateImplementing, domain.StateImplementationCompleted, "ralphex-adapter", map[string]any{
-		"outcome": process.Outcome, "exit_code": process.ExitCode,
-	}, implementationRefs); err != nil {
-		return result, err
-	}
-	result.State = domain.StateImplementationCompleted
-	if invocation.Bounds != nil {
-		// B can produce implementation/review evidence only. Acceptance and
-		// BRANCH_ACCEPTED-equivalent authority require a derived exact-head C.
-		return result, nil
-	}
-	return r.acceptBranch(ctx, result, implementationRefs)
 }
 
 // acceptBranch runs the branch acceptance of a run whose implementation has
@@ -1907,7 +1972,7 @@ func (r *Runner) writeJSON(name, kind string, value any) (ledger.EvidenceRef, er
 
 func ep002State(state domain.State) bool {
 	switch state {
-	case domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateImplementing,
+	case domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateImplementing, domain.StateRetrying,
 		domain.StateImplementationCompleted, domain.StateBranchAcceptancePending, domain.StateBranchAccepted,
 		domain.StateValidationUnavailable, domain.StateHumanDecisionRequired, domain.StateFailed, domain.StateCancelled:
 		return true

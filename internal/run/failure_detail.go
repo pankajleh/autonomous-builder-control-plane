@@ -33,7 +33,7 @@ const (
 // failureDetail is the run's own part of every detail: its engine and the budgets it ran with.
 func (r *Runner) failureDetail(cause runfailure.Cause, phase runfailure.Phase) runfailure.Detail {
 	policy := r.governed.Executor()
-	detail := runfailure.Detail{Cause: cause, Phase: phase, Engine: policy.Executor, Attempts: 1, TaskRetryLimit: r.taskRetryLimit()}
+	detail := runfailure.Detail{Cause: cause, Phase: phase, Engine: policy.Executor, Attempts: max(r.attempt, 1), TaskRetryLimit: r.taskRetryLimit()}
 	if policy.Provider != nil {
 		detail.Provider = policy.Provider.ID
 	}
