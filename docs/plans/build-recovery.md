@@ -227,10 +227,19 @@ pin in every manifest template and a quiet restart.
 2. **Build** on the host from the merge: `$R/a-abcp-build-r3.sh <merge sha>`, as `a-abcp-build-b193.sh` built `1d69c32`. It
    runs the walled test of a fresh attempt (`TestAWalledRunGetsAFreshAttemptAfterItsWorktreeIsRemovedInsideItsWall`) with
    the other wall tests, none skipped, and stages `a-abcp-start-<sha7>.sh`.
-3. **Templates:** each product template in `profiles.json` (and the two Groq ones beside it) staged as `<name>.r3-new`
-   with `"fresh_attempts": 1` (`a-r3-stage.py`); the binary before this PR refuses the field, so they go in only while
-   ABCP is down. `a-r3-validate.sh` reads them as both binaries read a template at start.
-4. **One quiet restart:** `$R/a-abcp-restart-r3.sh <merge sha> <repo-c sha>` stops `1d69c32`, keeps each template as
-   `.pre-r3-<time>`, moves the copies in, starts the new binary, checks the engines and `/failure`, and moves the boot
-   entry; on any failure it puts everything back and starts `1d69c32` again. Its `DRY=` mode runs every step on copies.
+3. **Templates:** each product template in `profiles.json` (49) staged as `<name>.r3-new` with `"fresh_attempts": 1`
+   (`a-r3-stage.py`); the binary before this PR refuses the field, so they go in only while ABCP is down.
+   `a-r3-validate.sh` reads them as both binaries read a template at start. Two more changes ride on the same restart:
+   - **the store kit's check** (Repo C `BUILD_RELIABILITY.md` §5.1 left it for the kit's next install): `store-kit-1`
+     still held the check of 2026-09-29, which refuses a variant's own picture (`variants[].image`, what a catalogue of
+     several colours gives each colour). `a-store-install.sh <repo-c sha>` installs main's `check_store.py` and
+     `STORE_FORMAT.md` (still format `autobuild-store/1`: it takes every store it took before), and the four Shopify
+     `.r3-new` copies carry its pin in their validation and acceptance, so the kit and its pin move together;
+   - **the two Groq templates** (not in `profiles.json` until Repo B #192 goes live): made again from their Together twins,
+     so they carry the node kit's new check pin, `task_retry_count` and `fresh_attempts`, and `a-groq-stage.py check`
+     holds again.
+4. **One quiet restart:** `$R/a-abcp-restart-r3.sh <merge sha> <repo-c sha>` stops `1d69c32`, swaps the store kit, keeps
+   each template as `.pre-r3-<time>`, moves the copies in, starts the new binary, checks the engines and `/failure`, and
+   moves the boot entry; on any failure it puts everything back and starts `1d69c32` again. Its `DRY=` mode runs every
+   step on copies.
 5. **Check it live:** the next build's `EXECUTION_STARTING` evidence; a failing build's `RETRYING` and second attempt.
