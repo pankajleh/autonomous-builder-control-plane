@@ -251,6 +251,9 @@ func validateExactEdit(edit ExactEditManifest) error {
 // owner's spend for R2, 2026-11-07).
 const MaxTaskRetryCount = 3
 
+// MaxFreshAttempts bounds ralphex.fresh_attempts: one more attempt, once (the owner's spend for R3, 2026-11-07).
+const MaxFreshAttempts = 1
+
 // RalphexManifest pins the executable, its source metadata, and invocation mode.
 type RalphexValidationCommand struct {
 	ID               string   `json:"id"`
@@ -285,6 +288,11 @@ type RalphexManifest struct {
 	// signals FAILED is sent back, in a fresh session with the last failed check's evidence, before the task attempt
 	// fails. 1 to MaxTaskRetryCount; omitted, Ralphex's own default (1) and the manifest's digest as before.
 	TaskRetryCount int `json:"task_retry_count,omitempty"`
+	// FreshAttempts (R3, docs/plans/build-recovery.md §5): 1 lets a run whose builder ended without finishing (R1's
+	// VALIDATION_FAILED or MODEL_SIGNALLED_FAILED, Ralphex's own retries used) start once more in a fresh session on its
+	// branch, with a summary of the first attempt in the task prompt, before it fails. Omitted, the run fails there as
+	// before and the manifest keeps its digest.
+	FreshAttempts int `json:"fresh_attempts,omitempty"`
 }
 
 // GovernanceManifest selects one V3 operation and binds activation evidence
@@ -873,6 +881,17 @@ func validateRequired(manifest Manifest) error {
 	}
 	if manifest.Ralphex.TaskRetryCount < 0 || manifest.Ralphex.TaskRetryCount > MaxTaskRetryCount {
 		return fmt.Errorf("ralphex.task_retry_count must be between 1 and %d, or omitted for Ralphex's own 1", MaxTaskRetryCount)
+	}
+	if manifest.Ralphex.FreshAttempts < 0 || manifest.Ralphex.FreshAttempts > MaxFreshAttempts {
+		return fmt.Errorf("ralphex.fresh_attempts must be %d, or omitted for none", MaxFreshAttempts)
+	}
+	if manifest.Ralphex.FreshAttempts > 0 {
+		if !manifest.Worktree.Enabled || manifest.Ralphex.Mode == ralphex.ModeReview {
+			return errors.New("ralphex.fresh_attempts needs a worktree run that implements (not review mode)")
+		}
+		if manifest.Ralphex.SourceSHA != ralphex.TaskPromptSourceSHA {
+			return fmt.Errorf("ralphex.fresh_attempts needs Ralphex source %s, the one its fresh attempt's task prompt is written for", ralphex.TaskPromptSourceSHA)
+		}
 	}
 	if tool := manifest.Ralphex.ExternalReviewTool; tool != "" {
 		if !slices.Contains(ralphex.ExternalReviewTools, tool) {

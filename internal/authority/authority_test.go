@@ -481,6 +481,43 @@ func TestNewValidatesTheTaskRetryCount(t *testing.T) {
 	}
 }
 
+// R3: ralphex.fresh_attempts is 1 or omitted, for a worktree run that implements, on the Ralphex source whose task
+// prompt the fresh attempt's prompt is written for; omitted, the canonical form is as before.
+func TestNewValidatesTheFreshAttempts(t *testing.T) {
+	plain, err := New(fixtureManifest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain.CanonicalJSON()), "fresh_attempts") {
+		t.Fatal("a manifest without the field changed its canonical form")
+	}
+	allowed := func() Manifest {
+		manifest := fixtureManifest(t)
+		manifest.Ralphex.FreshAttempts, manifest.Ralphex.SourceSHA = 1, ralphex.TaskPromptSourceSHA
+		manifest.Worktree = WorktreePolicy{Enabled: true, Branch: "abcp/fresh"}
+		return manifest
+	}
+	governed, err := New(allowed())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if governed.Ralphex().FreshAttempts != 1 || !strings.Contains(string(governed.CanonicalJSON()), `"fresh_attempts":1`) {
+		t.Fatalf("canonical form: %s", governed.CanonicalJSON())
+	}
+	for name, edit := range map[string]func(*Manifest){
+		"two":            func(m *Manifest) { m.Ralphex.FreshAttempts = 2 },
+		"negative":       func(m *Manifest) { m.Ralphex.FreshAttempts = -1 },
+		"no worktree":    func(m *Manifest) { m.Worktree = WorktreePolicy{} },
+		"another source": func(m *Manifest) { m.Ralphex.SourceSHA = "abcdef0123456789" },
+	} {
+		manifest := allowed()
+		edit(&manifest)
+		if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "ralphex.fresh_attempts") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestNewValidatesTheTemplateCopy(t *testing.T) {
 	plain, err := New(fixtureManifest(t))
 	if err != nil {

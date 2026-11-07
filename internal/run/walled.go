@@ -223,6 +223,13 @@ func userGitConfig(ctx context.Context, repository, home, key string) (string, e
 // commit tracks it, else an untracked copy Ralphex copies into its worktree and commits on the run's branch. The copy
 // is removed after Ralphex exits.
 func (w *walledRun) executionPlan(ctx context.Context, plan authority.PlanManifest) (string, error) {
+	return w.executionPlanFor(ctx, plan, 1)
+}
+
+// executionPlanFor is executionPlan for one attempt of the run. A fresh attempt's copy (R3) has a folder of its own,
+// abcp-ralphex-plan-<run digest>-fresh-<attempt>: the first attempt's copy is committed on the run's branch already, and
+// Ralphex, finding the same file there again, would have nothing to commit and refuse to start.
+func (w *walledRun) executionPlanFor(ctx context.Context, plan authority.PlanManifest, attempt int) (string, error) {
 	relative, err := filepath.Rel(w.product, plan.Path)
 	if err != nil || relative == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 		return "", errors.New("prepare Ralphex execution plan: governed plan is outside the repository")
@@ -246,7 +253,11 @@ func (w *walledRun) executionPlan(ctx context.Context, plan authority.PlanManife
 		return "", errors.New("governed plan differs from its authority")
 	}
 	runSum := sha256.Sum256([]byte(w.runID))
-	dir := filepath.Join(w.repository, ralphex.ExecutionPlanHandoffPrefixV1+hex.EncodeToString(runSum[:]))
+	name := ralphex.ExecutionPlanHandoffPrefixV1 + hex.EncodeToString(runSum[:])
+	if attempt > 1 {
+		name = fmt.Sprintf("%s-fresh-%d", name, attempt)
+	}
+	dir := filepath.Join(w.repository, name)
 	if err := w.removePlanCopyAt(dir); err != nil {
 		return "", err
 	}

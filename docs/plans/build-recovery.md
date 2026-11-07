@@ -4,7 +4,8 @@ Date: 2026-11-07
 
 Exact base: `add6f4e` (PR #191)
 
-Status: **R1 and R2 built in PR #193; R3 to R7 designed below for the next PRs.** Repo C design note
+Status: **R1 and R2 built in PR #193 (`1d69c32`, live since 2026-11-07 15:24 UTC); R3 built in PR #194; R2b and R4 to
+R7 designed below for the next PRs.** Repo C design note
 `BUILD_RELIABILITY.md` §5.6 is the proposal (Repo C P1122, PR #1137). The owner, 2026-11-07, on "Recovery in ABCP":
 "Yes, build it (Recommended)": each Repo B merge and each quiet ABCP restart for R1 to R7 is covered, at about US$30 a
 month of extra model spend on builds that fail.
@@ -60,7 +61,7 @@ Every transition that ends a run without an accepted branch (`FAILED`, `CANCELLE
 | `phase` | `ADMISSION`, `SETUP`, `IMPLEMENTATION`, `REVIEW`, `ACCEPTANCE` |
 | `check`, `check_state`, `check_exit_code` | the failing validation command's id (or acceptance command's name, `acceptance-<n>` when its name is not an identifier); `EXITED`, `TIMED_OUT`, `STALLED`; the exit code when `EXITED` |
 | `repair_turns`, `task_retries` | Ralphex's "deterministic validation failed" turns and "task failed, retrying..." retries in the run |
-| `task_retry_limit`, `attempts` | the profile's `task_retry_count` (else 1); builder attempts (1 until R3) |
+| `task_retry_limit`, `attempts` | the profile's `task_retry_count` (else 1); builder attempts (2 once a fresh attempt ran, R3); `repair_turns` and `task_retries` are the last attempt's |
 | `engine`, `provider` | the executor (`codex`, `claude`); the open-model provider's id |
 
 Causes: `VALIDATION_FAILED` (a check still failed when the attempt ended, the builder having given up on it or its review
@@ -132,48 +133,47 @@ as before. Each retry is one more session on a failing build only (the owner's s
 the check again (verbose when its output has no reason) before a FAILED retry, so the retry gets new evidence and a test
 that fails only with the others is caught as flaky (Repo C slice 2 makes the node kit say so itself).
 
-## 5. R3: a fresh second attempt (next PR)
+## 5. R3: a fresh second attempt (built, PR #194)
 
-Not built here. Building it showed what it needs, and that the part every build takes would change:
+`ralphex.fresh_attempts: 1` (`authority.MaxFreshAttempts`; omitted, none, and every manifest keeps its digest). It needs a
+worktree run that implements and the Ralphex source `ralphex.TaskPromptSourceSHA` (`c66debc`, the live pin). When the
+first attempt's builder ends without finishing, R1's cause `VALIDATION_FAILED` or `MODEL_SIGNALLED_FAILED` (Ralphex's own
+repair turns and retries used), the run starts Ralphex once more on its branch before it fails:
 
-1. **The retained worktree.** Product builds keep their worktree (`worktree.retain`), and Ralphex refuses a second
-   `--worktree --branch <run's branch>` start while it is there ("worktree already exists … another instance may be
-   running"). The walled run's repository is the build's to write, so ABCP removes it only inside the wall (`git worktree
-   remove --force`, as Ralphex's own Git runs). Running the second attempt in place instead would not do: Ralphex would
-   write a second progress file inside the worktree, the sidecar (which watches the repository recursively) would list it
-   as a second session of the run, the collector's correlation would fail with an integrity error and record the
-   provider-integrity marker, and the preview resolver would refuse every checkpoint of the run: accepted, and never
-   opened with Try it.
-2. **One pass through the runner.** `Run` executes Ralphex once. A second attempt takes its run slot, its open-model build
-   slot, its engine home, the wall's check, the branch's bring-back and its evidence names again: a change to the path
-   every build takes, which wants a forced failure proved on the host (the real wall, Ralphex and sidecar) before it
-   reaches people.
+- **Ledger:** `IMPLEMENTING → RETRYING` with the first attempt's ending (`outcome`, `failure_class`, its `failure_detail`
+  with `attempts: 1`, `recovery: FRESH_ATTEMPT`, `next_attempt: 2`), then `RETRYING → EXECUTION_STARTING` (its start
+  evidence names `attempt: 2`, `fresh_attempt_after` and `retained_worktree_removed`) `→ IMPLEMENTING`, all edges the
+  state machine already allows. A second failure ends `FAILED` with R1's `attempts: 2`; a fresh attempt that cannot start
+  fails from `RETRYING`. The fresh attempt's Ralphex evidence is named `-fresh-2`. Any other ending (max iterations, the
+  review, a provider, a timeout, a cancel) ends the run as before, and so does an accepted first attempt: one attempt.
+- **The retained worktree** (Ralphex refuses to start while it is there) is removed first with Git's own `worktree remove
+  --force` and `worktree prune`: inside the wall for a walled run (the run's repository is the build's to write), with
+  Git's controller environment (no hooks, no fsmonitor). Ralphex then adds the worktree again from the existing branch,
+  at the same path, so every commit of the first attempt is kept and the activity binding resolves as before.
+- **One progress session:** Ralphex appends the new start to the same progress file (the failed attempt's `Failed:`
+  footer is never archived, its `progressCompletedAt`), so the sidecar keeps one session and the collector's append-only
+  proof holds. A start in place, without a worktree, is not used: its second progress file would be refused.
+- **Activity:** from `RETRYING` until the attempt implements again the missing worktree is "not there yet", as before a
+  first attempt, however long the attempt waits for its run slot (`executionStarted`); then the usual bounded window.
+  Checkpoints of both attempts resolve for preview.
+- **The plan:** a walled run's untracked plan copy has a folder of its own for the attempt,
+  `abcp-ralphex-plan-<run digest>-fresh-2/` (the kits skip every `abcp-ralphex-plan-*` folder): the first attempt's copy
+  is committed on the branch, and Ralphex, finding the same file again, would have nothing to commit and refuse to start.
+  An unwalled run with an untracked plan copy gets no fresh attempt (only tests run unwalled).
+- **The prompt:** Ralphex's own task prompt (`internal/ralphex/task_prompt.txt`, the pinned source's file byte for byte)
+  with a "FRESH ATTEMPT" section after it, written to the isolated settings folder's `prompts/task.txt` for the second
+  attempt only: how the first ended, in fixed words, the check and its exit, the repair turns and retries used, and at
+  most 2 KiB of the check's own output, with Ralphex's variable and signal markers broken up.
+- **The runner:** one loop over at most two attempts. Each takes its run slot, its open-model build slot and (unwalled)
+  the repository lease again, a fresh settings folder, its engine home written again from the same base, the wall's
+  check, the bring-back of the branch; a walled run needs no lease past its setup. An attempt that is not the first holds
+  an unwalled run's lease until Ralphex exits.
 
-What makes it safe once those are done: a failed attempt's progress file ends with Ralphex's `Failed:` footer, which
-Ralphex does not archive (`progressCompletedAt`, its issue #288). A new start on the branch appends a "restarted at"
-section to the same file under the same header, so the sidecar keeps one session with the same start time and the
-collector's append-only proof holds.
+Each fresh attempt is one more session on a failing build only (the owner's spend).
 
-**Design.** After a task attempt ends `TASK_NOT_COMPLETED` with R1's cause `VALIDATION_FAILED` or
-`MODEL_SIGNALLED_FAILED` (Ralphex's own retries used), once per run and only when the profile says
-`ralphex.fresh_attempts: 1`:
-
-- **Ledger:** `IMPLEMENTING → RETRYING` (payload `recovery: FRESH_ATTEMPT`, `attempt: 2`, the first attempt's
-  `failure_detail`) `→ EXECUTION_STARTING → IMPLEMENTING`, all edges the state machine already allows; R1's `attempts`
-  becomes 2. The second attempt's evidence is named `-attempt-2`, as a resumed run's is.
-- **The run:** the retained worktree removed inside the wall; Ralphex started again with `--worktree --branch` on the
-  existing branch (Ralphex then adds the worktree from it, keeping every commit of the first attempt); a short summary of
-  the first attempt (cause, check, at most 2 KB of the check's output, the repair turns and retries used) in the task
-  prompt through the isolated configuration's `prompts/`, as the review agents' prompt is written today, pinned to the
-  Ralphex source it was written for.
-- **Repo C:** `RETRYING` is a new state for it to word ("starting again in a fresh session"); it lasts seconds.
-- **Tests:** a stand-in that signals FAILED, then passes on the fresh attempt (accepted, two attempts); one that fails
-  both (R1's detail with `attempts: 2`); the activity collector across a `Failed:` footer and a "restarted at" section
-  (one session, no marker), and across a second progress file (the marker, as today).
-
-The smaller alternative is a governance patch in which Ralphex itself starts one more task round with the summary in its
-prompt, in the same process, worktree and progress file. It cannot change the engine, so R4 would still need the
-ABCP-level attempt.
+**R2b, the review's repair turns and a fresh check before a retry, is its own PR next:** both are Ralphex's code
+(`validateWithOneRepair`, the task loop's FAILED retry), so a governance patch in `pankajleh/ralphex-governance`, a new
+pin in every manifest template and a quiet restart.
 
 ## 6. R4 to R7 (next PRs)
 
@@ -220,3 +220,26 @@ ABCP-level attempt.
 6. **Back:** the `.pre-build-recovery` templates, and the previous binary (`add6f4e`), with no build running. A run
    admitted with `task_retry_count` names it in its authority, which the previous binary's preview reads strictly, so
    such runs cannot be previewed by it: go back only before the first such run is wanted in Try it.
+
+## 8. Going live (R3)
+
+1. **Merge.** Covered by the owner's answer of 2026-11-07.
+2. **Build** on the host from the merge: `$R/a-abcp-build-r3.sh <merge sha>`, as `a-abcp-build-b193.sh` built `1d69c32`. It
+   runs the walled test of a fresh attempt (`TestAWalledRunGetsAFreshAttemptAfterItsWorktreeIsRemovedInsideItsWall`) with
+   the other wall tests, none skipped, and stages `a-abcp-start-<sha7>.sh`.
+3. **Templates:** each product template in `profiles.json` (49) staged as `<name>.r3-new` with `"fresh_attempts": 1`
+   (`a-r3-stage.py`); the binary before this PR refuses the field, so they go in only while ABCP is down.
+   `a-r3-validate.sh` reads them as both binaries read a template at start. Two more changes ride on the same restart:
+   - **the store kit's check** (Repo C `BUILD_RELIABILITY.md` §5.1 left it for the kit's next install): `store-kit-1`
+     still held the check of 2026-09-29, which refuses a variant's own picture (`variants[].image`, what a catalogue of
+     several colours gives each colour). `a-store-install.sh <repo-c sha>` installs main's `check_store.py` and
+     `STORE_FORMAT.md` (still format `autobuild-store/1`: it takes every store it took before), and the four Shopify
+     `.r3-new` copies carry its pin in their validation and acceptance, so the kit and its pin move together;
+   - **the two Groq templates** (not in `profiles.json` until Repo B #192 goes live): made again from their Together twins,
+     so they carry the node kit's new check pin, `task_retry_count` and `fresh_attempts`, and `a-groq-stage.py check`
+     holds again.
+4. **One quiet restart:** `$R/a-abcp-restart-r3.sh <merge sha> <repo-c sha>` stops `1d69c32`, swaps the store kit, keeps
+   each template as `.pre-r3-<time>`, moves the copies in, starts the new binary, checks the engines and `/failure`, and
+   moves the boot entry; on any failure it puts everything back and starts `1d69c32` again. Its `DRY=` mode runs every
+   step on copies.
+5. **Check it live:** the next build's `EXECUTION_STARTING` evidence; a failing build's `RETRYING` and second attempt.

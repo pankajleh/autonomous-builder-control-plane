@@ -454,17 +454,25 @@ func (s *Service) worktreeReturned(ctx context.Context, run, registration string
 	return true, nil
 }
 
-// executionStarted reports whether the run has reached implementation, the
-// first state in which its provider has created the governed worktree.
+// executionStarted reports whether the run's current attempt has reached
+// implementation, the first state in which its provider has created the
+// governed worktree. A fresh attempt (RETRYING, docs/plans/build-recovery.md
+// §5) has its worktree removed and added again by the provider at the same
+// path, so from RETRYING until it implements again the worktree is not there
+// yet, as before a run's first attempt.
 func executionStarted(snapshot readmodel.Snapshot) bool {
+	started := false
 	for _, fact := range snapshot.Events {
 		switch fact.StateTo {
 		case "", domain.StateRunCreated, domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateCapacityWait:
 			continue
+		case domain.StateRetrying:
+			started = false
+			continue
 		}
-		return true
+		started = true
 	}
-	return false
+	return started
 }
 
 func implementationFinished(snapshot readmodel.Snapshot) bool {

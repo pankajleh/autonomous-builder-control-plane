@@ -530,3 +530,28 @@ func TestReviewedProviderIntegrityMarkerIsEligibleOnlyAsReviewed(t *testing.T) {
 		})
 	}
 }
+
+// After a fresh attempt (Repo B docs/plans/build-recovery.md §5) the run's activity holds the first attempt's
+// checkpoint, the provider's own "workflow failed" for its first attempt and the run's lifecycle, then the fresh
+// attempt's checkpoint on the same branch, and no marker: both checkpoints resolve, so the accepted version opens with
+// Try it, and so does the first attempt's.
+func TestAFreshAttemptsCheckpointsBothResolve(t *testing.T) {
+	f := newBindingFixture(t)
+	first := f.events.page.Events[0]
+	os.WriteFile(filepath.Join(f.worktree, "fresh"), []byte("the fresh attempt\n"), 0600)
+	command(t, f.worktree, "add", "fresh")
+	command(t, f.worktree, "commit", "-m", "fresh attempt")
+	sha := command(t, f.worktree, "rev-parse", "HEAD")
+	failed := activity.Event{SchemaVersion: "ActivityEventV1", RunID: f.run, Ordinal: 2, ActivityID: strings.Repeat("f", 64), AuthorityLevel: "PROVIDER_DETAIL",
+		Category: "ERROR", Status: "FAILED", Title: "Implementation workflow failed", SourceKind: "RALPHEX_PROGRESS",
+		SourceSessionID: "sha256-" + strings.Repeat("a", 64), SourceEventID: "sha256-" + strings.Repeat("b", 64)}
+	second := activity.Event{SchemaVersion: "ActivityEventV1", Ordinal: 3, ActivityID: jsonDigest([]string{f.run, "checkpoint", sha}), RunID: f.run, AuthorityLevel: "ABCP_STATE",
+		Category: "CHECKPOINT", Status: "AVAILABLE", SourceKind: "ABCP_CHECKPOINT_OBSERVER", SourceDigest: jsonDigest([]string{f.run, sha}), CheckpointSHA: sha, CheckpointClean: true}
+	f.events.page.Events = []activity.Event{first, failed, second}
+	for _, checkpoint := range []activity.Event{second, first} {
+		source, err := f.resolver().Resolve(context.Background(), f.run, checkpoint.ActivityID)
+		if err != nil || source.SHA != checkpoint.CheckpointSHA {
+			t.Fatalf("checkpoint %s: %+v, %v", checkpoint.CheckpointSHA, source, err)
+		}
+	}
+}
