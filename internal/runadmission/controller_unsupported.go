@@ -19,3 +19,11 @@ func (c *Controller) admitDevelopmentRun(context.Context, serviceapi.Principal, 
 }
 
 func closeFD(int) error { return nil }
+
+func (c *Controller) QueuedRun(string) (serviceapi.QueuedRunV1, bool) {
+	return serviceapi.QueuedRunV1{}, false
+}
+
+func (c *Controller) RunQueue(context.Context) {}
+
+func (c *Controller) QueuePass(context.Context) int { return 0 }
