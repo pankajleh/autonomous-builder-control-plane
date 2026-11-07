@@ -8,7 +8,8 @@
         "run.forget",
         "hosting.control",
         "accounts.control",
-        "targets.control"
+        "targets.control",
+        "lanes.control"
       ],
       "may_assert_delegated_actor": true
     }
