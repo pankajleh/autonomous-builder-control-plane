@@ -113,6 +113,12 @@ type EvidenceReader interface {
 	ReadEvidence(context.Context, string, string) ([]byte, error)
 }
 
+// RunFailureReader answers GET /v1/runs/{run}/failure (RunFailureV1): why a run ended without an accepted branch, from
+// its ledger and its verified failure-detail evidence, writing nothing (docs/plans/build-recovery.md, R1).
+type RunFailureReader interface {
+	ReadRunFailure(context.Context, string) (json.RawMessage, error)
+}
+
 type ActionKind string
 
 const (
@@ -204,6 +210,8 @@ type ServerConfig struct {
 	RequestLog io.Writer
 	// BuildIsolation, when set, says in GET /v1/capabilities whether builds are walled.
 	BuildIsolation BuildIsolationReporter
+	// Failures, when set, answers GET /v1/runs/{run}/failure (docs/plans/build-recovery.md, R1).
+	Failures RunFailureReader
 }
 
 type Server struct {
@@ -519,6 +527,8 @@ func (s *Server) runRoute(writer http.ResponseWriter, request *http.Request, pri
 		s.runEvents(writer, request, requestID, runID)
 	case len(parts) == 2 && parts[1] == "timeline":
 		s.runTimeline(writer, request, requestID, runID)
+	case len(parts) == 2 && parts[1] == "failure":
+		s.runFailure(writer, request, requestID, runID)
 	case len(parts) == 2 && parts[1] == "evidence":
 		s.runEvidence(writer, request, requestID, runID)
 	case len(parts) == 3 && parts[1] == "evidence":
@@ -595,6 +605,28 @@ func (s *Server) runTimeline(writer http.ResponseWriter, request *http.Request, 
 		return
 	}
 	response, err := s.reserved.Timeline.ReadTimeline(request.Context(), runID, page)
+	if err != nil {
+		s.writeDependencyError(writer, requestID, err)
+		return
+	}
+	s.writeDependencyJSON(writer, requestID, response)
+}
+
+// runFailure answers why the run ended without an accepted branch (RunFailureV1); its check output is evidence, so a
+// forgotten run's is refused as its evidence is.
+func (s *Server) runFailure(writer http.ResponseWriter, request *http.Request, requestID, runID string) {
+	if err := validEmptyReadRequest(request); err != nil {
+		s.writeError(writer, http.StatusBadRequest, ErrorV1{Code: "invalid_request", Message: "invalid run-failure request", RequestID: requestID})
+		return
+	}
+	if s.reserved.Failures == nil {
+		s.writeDependencyError(writer, requestID, ErrUnsupportedCapability)
+		return
+	}
+	if !s.requireRegisteredRun(writer, requestID, runID) || !s.refuseForgotten(writer, requestID, runID) {
+		return
+	}
+	response, err := s.reserved.Failures.ReadRunFailure(request.Context(), runID)
 	if err != nil {
 		s.writeDependencyError(writer, requestID, err)
 		return

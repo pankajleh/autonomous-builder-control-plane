@@ -34,6 +34,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/openmodel"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ralphex"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/runfailure"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/runtimecatalog"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/supervisor"
 )
@@ -577,7 +578,9 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 			}
 			result.State = domain.StateFailed
 			result.FailureReason = validationErr.Error()
-			if appendErr := r.transition(ctx, domain.StateRunCreated, domain.StateFailed, "authority-validator", map[string]any{"reason": ledgerReason("authority-validator", validationErr, false)}, r.withFailureText(validationErr, []ledger.EvidenceRef{authorityRef})); appendErr != nil {
+			payload, refs := r.withFailureDetail(map[string]any{"reason": ledgerReason("authority-validator", validationErr, false)},
+				r.stopDetail(ctx, domain.StateRunCreated, "authority-validator", validationErr, false), nil, []ledger.EvidenceRef{authorityRef})
+			if appendErr := r.transition(ctx, domain.StateRunCreated, domain.StateFailed, "authority-validator", payload, r.withFailureText(validationErr, refs)); appendErr != nil {
 				return result, errors.Join(validationErr, appendErr)
 			}
 			return result, fmt.Errorf("validate pinned authority: %w", validationErr)
@@ -658,6 +661,13 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
+	// R2: the profile's task_retry_count goes to Ralphex through its isolated configuration; without one, Ralphex keeps
+	// its own default and the configuration folder is as before.
+	if retries := r.governed.Ralphex().TaskRetryCount; retries > 0 {
+		if err := appendRalphexConfig(configDir, fmt.Sprintf("task_retry_count = %d", retries)); err != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("write the Ralphex task retry count: %w", err), nil)
+		}
+	}
 	if agents := r.governed.Ralphex().ReviewAgents; len(agents) > 0 {
 		if err := ralphex.WriteReviewPrompt(configDir, agents); err != nil {
 			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
@@ -728,6 +738,9 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	}
 	environment := ralphexEnvironment(r.governed.Executor().Executor, r.capsule)
 	startEvidence := map[string]any{"argv": argv, "timeout": r.governed.Ralphex().Timeout, "environment_policy": ralphexEnvironmentPolicy}
+	if retries := r.governed.Ralphex().TaskRetryCount; retries > 0 {
+		startEvidence["task_retry_count"] = retries
+	}
 	if openModelEvidence != nil {
 		startEvidence["open_model"] = openModelEvidence
 	}
@@ -884,14 +897,18 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		payload := map[string]any{
 			"outcome": process.Outcome, "exit_code": process.ExitCode, "signal": process.TerminatingSignal,
 		}
+		classification := classificationOfRalphexFailure(process, nil)
 		if terminal == domain.StateFailed {
 			// Why it failed, from the implementer's own output (the classifier's
 			// fixed class, never the matched text), so a reader can tell a stop
 			// that running again would get past from one it would not.
-			classification := classificationOfRalphexFailure(process, nil)
 			payload["failure_class"] = string(classification.Class)
 			payload["retryability"] = string(classification.Retryability)
 		}
+		// R1: how Ralphex ended, by its own lines: the cause, the failing check, the repair turns and retries it used,
+		// and the check's own output as evidence.
+		detail, body := r.ralphexEnding(ctx, process, classification, terminal == domain.StateCancelled)
+		payload, implementationRefs = r.withFailureDetail(payload, detail, body, implementationRefs)
 		if err := r.transition(ctx, domain.StateImplementing, terminal, "ralphex-adapter", payload, implementationRefs); err != nil {
 			return result, err
 		}
@@ -970,10 +987,10 @@ func (r *Runner) acceptBranch(ctx context.Context, result Result, implementation
 	if ctx.Err() != nil {
 		result.State = domain.StateCancelled
 		result.FailureReason = ctx.Err().Error()
-		payload := map[string]any{
+		payload, refs := r.withFailureDetail(map[string]any{
 			"status": accepted.Status(), "reason": ledgerReason("acceptance-controller", ctx.Err(), true),
-		}
-		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateCancelled, "acceptance-controller", payload, r.withFailureWords(result.FailureReason, acceptanceRefs)); err != nil {
+		}, r.stopDetail(ctx, domain.StateBranchAcceptancePending, "acceptance-controller", ctx.Err(), true), nil, acceptanceRefs)
+		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateCancelled, "acceptance-controller", payload, r.withFailureWords(result.FailureReason, refs)); err != nil {
 			return result, errors.Join(acceptanceErr, err)
 		}
 		return result, cleanupErr
@@ -986,9 +1003,10 @@ func (r *Runner) acceptBranch(ctx context.Context, result Result, implementation
 		}
 		// The reason's words can carry Git's or a process's error, with paths: the ledger keeps a code, the evidence the
 		// words.
-		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateValidationUnavailable, "acceptance-controller", map[string]any{
+		payload, refs := r.withFailureDetail(map[string]any{
 			"status": accepted.Status(), "reason": "ACCEPTANCE_UNAVAILABLE",
-		}, r.withFailureWords(result.FailureReason, acceptanceRefs)); err != nil {
+		}, r.failureDetail(runfailure.CauseAcceptanceUnavailable, runfailure.PhaseAcceptance), nil, acceptanceRefs)
+		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateValidationUnavailable, "acceptance-controller", payload, r.withFailureWords(result.FailureReason, refs)); err != nil {
 			return result, errors.Join(acceptanceErr, err)
 		}
 		return result, fmt.Errorf("run branch acceptance: %w", acceptanceErr)
@@ -998,10 +1016,12 @@ func (r *Runner) acceptBranch(ctx context.Context, result Result, implementation
 		result.FailureReason = accepted.FailureReason()
 		// The built branch did not pass its acceptance checks: the request was
 		// built and checked, and building it again the same way ends the same.
-		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateFailed, "acceptance-controller", map[string]any{
+		detail, body := r.acceptanceEnding(accepted)
+		payload, refs := r.withFailureDetail(map[string]any{
 			"status": accepted.Status(), "reason": "ACCEPTANCE_FAILED",
 			"failure_class": string(blocker.ClassTaskNotCompleted), "retryability": string(blocker.RetryableAfterChange),
-		}, r.withFailureWords(result.FailureReason, acceptanceRefs)); err != nil {
+		}, detail, body, acceptanceRefs)
+		if err := r.transition(ctx, domain.StateBranchAcceptancePending, domain.StateFailed, "acceptance-controller", payload, r.withFailureWords(result.FailureReason, refs)); err != nil {
 			return result, err
 		}
 		return result, nil
@@ -1129,11 +1149,22 @@ func (r *Runner) applyOpenModel(configDir string, invocation *ralphex.Invocation
 	if invocation.TaskEffort == "" || invocation.ReviewEffort == "" {
 		// Ralphex's own default level (high) would otherwise reach Codex for a
 		// part that names none; an empty one sends none.
-		if err := os.WriteFile(filepath.Join(configDir, "config"), []byte("codex_reasoning_effort =\n"), 0o600); err != nil {
+		if err := appendRalphexConfig(configDir, "codex_reasoning_effort ="); err != nil {
 			return nil, fmt.Errorf("write the Ralphex configuration for %s: %w", start.Model.Name, err)
 		}
 	}
 	return start.Evidence(), nil
+}
+
+// appendRalphexConfig adds one "key = value" line to the isolated Ralphex configuration file (<config-dir>/config),
+// which Ralphex merges over its embedded defaults key by key.
+func appendRalphexConfig(configDir, line string) error {
+	file, err := os.OpenFile(filepath.Join(configDir, "config"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.WriteString(line + "\n")
+	return errors.Join(writeErr, file.Close())
 }
 
 func (r *Runner) prepareValidationSpec(configDir string) (string, error) {
@@ -1791,7 +1822,8 @@ func validateTransitionProvenance(value TransitionProvenance) error {
 func (r *Runner) fail(ctx context.Context, result Result, from domain.State, source string, cause error, refs []ledger.EvidenceRef) (Result, error) {
 	result.State = domain.StateFailed
 	result.FailureReason = cause.Error()
-	if err := r.transition(ctx, from, domain.StateFailed, source, map[string]any{"reason": ledgerReason(source, cause, false)}, r.withFailureText(cause, refs)); err != nil {
+	payload, refs := r.withFailureDetail(map[string]any{"reason": ledgerReason(source, cause, false)}, r.stopDetail(ctx, from, source, cause, false), nil, refs)
+	if err := r.transition(ctx, from, domain.StateFailed, source, payload, r.withFailureText(cause, refs)); err != nil {
 		return result, errors.Join(cause, err)
 	}
 	return result, cause
@@ -1800,7 +1832,8 @@ func (r *Runner) fail(ctx context.Context, result Result, from domain.State, sou
 func (r *Runner) cancel(ctx context.Context, result Result, from domain.State, source string, cause error, refs []ledger.EvidenceRef) (Result, error) {
 	result.State = domain.StateCancelled
 	result.FailureReason = cause.Error()
-	if err := r.transition(ctx, from, domain.StateCancelled, source, map[string]any{"reason": ledgerReason(source, cause, true)}, r.withFailureText(cause, refs)); err != nil {
+	payload, refs := r.withFailureDetail(map[string]any{"reason": ledgerReason(source, cause, true)}, r.stopDetail(ctx, from, source, cause, true), nil, refs)
+	if err := r.transition(ctx, from, domain.StateCancelled, source, payload, r.withFailureText(cause, refs)); err != nil {
 		return result, errors.Join(cause, err)
 	}
 	return result, nil

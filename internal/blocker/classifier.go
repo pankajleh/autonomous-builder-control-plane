@@ -349,6 +349,13 @@ func containsAny(diagnostic string, phrases []string) bool {
 	return false
 }
 
+// Redact removes the credentials the classifier knows how to recognise (private
+// keys, URL credentials, authorization headers, secret assignments and token
+// shapes) from text that is kept as evidence, such as a failed check's output.
+func Redact(text string) string {
+	return redactDiagnostics(text)
+}
+
 func redactDiagnostics(diagnostic string) string {
 	diagnostic = strings.ToValidUTF8(diagnostic, "�")
 	diagnostic = privateKeyPattern.ReplaceAllString(diagnostic, "[REDACTED PRIVATE KEY]")

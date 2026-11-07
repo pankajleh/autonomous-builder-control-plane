@@ -1188,7 +1188,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Forget:        eviction.API{Sweeper: sweeper},
 		Hosting:       hosting,
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
-		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Actions: actions,
+		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Failures: timelineService, Actions: actions,
 		RunAdmission: admissions, DevelopmentRunAdmission: admissions, Engines: engines, AccountLanes: accountLanes, Targets: targets,
 		Deployments: deployments, AppHealth: appHealth, StackJobs: stackJobs, ChangeJobs: changeJobs,
 		BuildIsolation: buildIsolation,
