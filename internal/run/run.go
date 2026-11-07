@@ -661,6 +661,13 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if err != nil {
 		return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
 	}
+	// R2: the profile's task_retry_count goes to Ralphex through its isolated configuration; without one, Ralphex keeps
+	// its own default and the configuration folder is as before.
+	if retries := r.governed.Ralphex().TaskRetryCount; retries > 0 {
+		if err := appendRalphexConfig(configDir, fmt.Sprintf("task_retry_count = %d", retries)); err != nil {
+			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", fmt.Errorf("write the Ralphex task retry count: %w", err), nil)
+		}
+	}
 	if agents := r.governed.Ralphex().ReviewAgents; len(agents) > 0 {
 		if err := ralphex.WriteReviewPrompt(configDir, agents); err != nil {
 			return r.fail(ctx, result, domain.StateAuthorityValidated, "ralphex-adapter", err, nil)
@@ -731,6 +738,9 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	}
 	environment := ralphexEnvironment(r.governed.Executor().Executor, r.capsule)
 	startEvidence := map[string]any{"argv": argv, "timeout": r.governed.Ralphex().Timeout, "environment_policy": ralphexEnvironmentPolicy}
+	if retries := r.governed.Ralphex().TaskRetryCount; retries > 0 {
+		startEvidence["task_retry_count"] = retries
+	}
 	if openModelEvidence != nil {
 		startEvidence["open_model"] = openModelEvidence
 	}
@@ -1139,11 +1149,22 @@ func (r *Runner) applyOpenModel(configDir string, invocation *ralphex.Invocation
 	if invocation.TaskEffort == "" || invocation.ReviewEffort == "" {
 		// Ralphex's own default level (high) would otherwise reach Codex for a
 		// part that names none; an empty one sends none.
-		if err := os.WriteFile(filepath.Join(configDir, "config"), []byte("codex_reasoning_effort =\n"), 0o600); err != nil {
+		if err := appendRalphexConfig(configDir, "codex_reasoning_effort ="); err != nil {
 			return nil, fmt.Errorf("write the Ralphex configuration for %s: %w", start.Model.Name, err)
 		}
 	}
 	return start.Evidence(), nil
+}
+
+// appendRalphexConfig adds one "key = value" line to the isolated Ralphex configuration file (<config-dir>/config),
+// which Ralphex merges over its embedded defaults key by key.
+func appendRalphexConfig(configDir, line string) error {
+	file, err := os.OpenFile(filepath.Join(configDir, "config"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.WriteString(line + "\n")
+	return errors.Join(writeErr, file.Close())
 }
 
 func (r *Runner) prepareValidationSpec(configDir string) (string, error) {

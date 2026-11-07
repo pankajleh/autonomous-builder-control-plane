@@ -40,8 +40,12 @@ func (r *Runner) failureDetail(cause runfailure.Cause, phase runfailure.Phase) r
 	return detail
 }
 
-// taskRetryLimit is how often Ralphex retries a task after the builder signals FAILED: Ralphex's own default, 1.
+// taskRetryLimit is how often Ralphex retries a task after the builder signals FAILED: the profile's
+// ralphex.task_retry_count (R2), else Ralphex's own default, 1.
 func (r *Runner) taskRetryLimit() int {
+	if retries := r.governed.Ralphex().TaskRetryCount; retries > 0 {
+		return retries
+	}
 	return 1
 }
 

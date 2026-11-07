@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -443,6 +444,39 @@ func TestNewValidatesTheReviewSettings(t *testing.T) {
 		edit(&invalid.Ralphex)
 		if _, err := New(invalid); err == nil || !strings.Contains(err.Error(), "ralphex.") {
 			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// R2: ralphex.task_retry_count is 1 to MaxTaskRetryCount, or omitted; omitted, the canonical form (and so every existing
+// manifest's digest) is as before.
+func TestNewValidatesTheTaskRetryCount(t *testing.T) {
+	plain, err := New(fixtureManifest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain.CanonicalJSON()), "task_retry_count") || plain.Ralphex().TaskRetryCount != 0 {
+		t.Fatal("a manifest without the field changed its canonical form")
+	}
+	for _, count := range []int{1, MaxTaskRetryCount} {
+		manifest := fixtureManifest(t)
+		manifest.Ralphex.TaskRetryCount = count
+		governed, err := New(manifest)
+		if err != nil {
+			t.Fatalf("%d: %v", count, err)
+		}
+		if governed.Ralphex().TaskRetryCount != count || !strings.Contains(string(governed.CanonicalJSON()), fmt.Sprintf(`"task_retry_count":%d`, count)) {
+			t.Fatalf("%d: %s", count, governed.CanonicalJSON())
+		}
+		if governed.SHA256() == plain.SHA256() {
+			t.Fatalf("%d: the digest did not change", count)
+		}
+	}
+	for _, count := range []int{-1, MaxTaskRetryCount + 1} {
+		manifest := fixtureManifest(t)
+		manifest.Ralphex.TaskRetryCount = count
+		if _, err := New(manifest); err == nil || !strings.Contains(err.Error(), "ralphex.task_retry_count") {
+			t.Fatalf("%d: %v", count, err)
 		}
 	}
 }

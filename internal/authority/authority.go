@@ -247,6 +247,10 @@ func validateExactEdit(edit ExactEditManifest) error {
 	return nil
 }
 
+// MaxTaskRetryCount bounds ralphex.task_retry_count: each retry is one more builder session on a failing build (the
+// owner's spend for R2, 2026-11-07).
+const MaxTaskRetryCount = 3
+
 // RalphexManifest pins the executable, its source metadata, and invocation mode.
 type RalphexValidationCommand struct {
 	ID               string   `json:"id"`
@@ -277,6 +281,10 @@ type RalphexManifest struct {
 	Validation                []RalphexValidationCommand `json:"validation,omitempty"`
 	Capability                *ralphex.CapabilityV1      `json:"capability,omitempty"`
 	ExecutionState            *ralphex.ExecutionStateV1  `json:"execution_state,omitempty"`
+	// TaskRetryCount is Ralphex's task_retry_count (R2, docs/plans/build-recovery.md): how often the builder that
+	// signals FAILED is sent back, in a fresh session with the last failed check's evidence, before the task attempt
+	// fails. 1 to MaxTaskRetryCount; omitted, Ralphex's own default (1) and the manifest's digest as before.
+	TaskRetryCount int `json:"task_retry_count,omitempty"`
 }
 
 // GovernanceManifest selects one V3 operation and binds activation evidence
@@ -862,6 +870,9 @@ func validateRequired(manifest Manifest) error {
 	}
 	if manifest.Ralphex.MaxIterations < 0 || manifest.Ralphex.MaxInternalReviewPasses < 0 || manifest.Ralphex.MaxInternalReviewPasses > 2 {
 		return errors.New("invalid Ralphex iteration/review budget")
+	}
+	if manifest.Ralphex.TaskRetryCount < 0 || manifest.Ralphex.TaskRetryCount > MaxTaskRetryCount {
+		return fmt.Errorf("ralphex.task_retry_count must be between 1 and %d, or omitted for Ralphex's own 1", MaxTaskRetryCount)
 	}
 	if tool := manifest.Ralphex.ExternalReviewTool; tool != "" {
 		if !slices.Contains(ralphex.ExternalReviewTools, tool) {

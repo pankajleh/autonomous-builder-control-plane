@@ -29,7 +29,8 @@
         "expected_duration": "1m",
         "stall_timeout": "5m"
       }
-    ]
+    ],
+    "task_retry_count": 3
   },
   "executor": {
     "executor": "codex",
