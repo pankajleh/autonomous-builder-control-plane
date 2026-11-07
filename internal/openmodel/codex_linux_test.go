@@ -290,3 +290,197 @@ func TestCodexBuildsThroughTheChatBridge(t *testing.T) {
 		t.Errorf("the relay's log = %s", logged)
 	}
 }
+
+// TestCodexBuildsThroughTheRelayWithGptOssOnTogethersFixes runs the real
+// Codex CLI (as above) through a build's relay with gpt-oss-120b's compat
+// list, stop_at_first_call and custom_tool_as_function included, to a fake
+// provider that streams as Together does (the 2026-11-07 diagnosis): the
+// first answer's call is followed by Together's parse error, the second's
+// function apply_patch {"command": ["apply_patch", …]} by an invented "done"
+// and Together's shifted .done items. Codex runs the first call, applies the
+// second as its own apply_patch (the file is written), and its replay
+// reaches the provider with apply_patch as a function call; no custom tool
+// or item ever reaches the provider.
+func TestCodexBuildsThroughTheRelayWithGptOssOnTogethersFixes(t *testing.T) {
+	binary := os.Getenv("ABCP_TEST_CODEX")
+	if binary == "" {
+		t.Skip("ABCP_TEST_CODEX names no Codex binary")
+	}
+	var mu sync.Mutex
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			fmt.Fprint(w, `{"object":"list","data":[{"id":"openai/gpt-oss-120b","object":"model"}]}`)
+			return
+		}
+		body := readAll(t, r)
+		mu.Lock()
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+		outputs := strings.Count(string(body), `"type":"function_call_output"`)
+		answer := newTogetherAnswer().reasoning(0)
+		switch outputs {
+		case 0:
+			answer.call(1, "exec_command", "call_e", `{"cmd":"echo hi-from-exec"}`).parseError()
+		case 1:
+			answer.call(1, "apply_patch", "call_p", `{"command":["apply_patch",`+mustText("*** Begin Patch\n*** Add File: hello.txt\n+hi\n*** End Patch")+`]}`).
+				message(2, "done").
+				add("response.output_item.done", map[string]any{"output_index": 1, "item": map[string]any{"type": "function_call", "name": "exec_command", "call_id": "call_x", "arguments": `{"cmd":"ls"}`}}).
+				completed([]any{}, map[string]any{"input_tokens": 6000, "output_tokens": 5900, "total_tokens": 11900})
+		default:
+			answer.message(1, "all done").
+				add("response.output_item.done", map[string]any{"output_index": 1, "item": map[string]any{"id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+					"content": []any{map[string]any{"type": "output_text", "text": "all done", "annotations": []any{}}}}}).
+				completed([]any{}, map[string]any{"input_tokens": 6100, "output_tokens": 3, "total_tokens": 6103})
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, answer.String())
+	}))
+	defer server.Close()
+
+	provider := testProvider(t)
+	provider.ID, provider.BaseURL, provider.Relay = "together", server.URL+"/v1", true
+	provider.Models[0].Compat = []string{CompatDropNullReasoningContent, CompatMessageBeforeCalls, CompatOutputAfterCall, CompatStopAtFirstCall, CompatCustomToolAsFunction}
+	provider.Models[0].CodexCatalog = &CodexCatalog{ApplyPatch: true}
+	if err := provider.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	start, err := Begin(context.Background(), provider, "gpt-oss-120b", StartOptions{Run: "codex-gpt-oss"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer start.Release()
+	work := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, binary, "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox",
+		"-c", "features.multi_agent=true", "-c", "model_reasoning_effort=high", "Run echo, then write hello.txt.")
+	command.Dir = work
+	command.Env = start.Environment([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir()})
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("codex: %v\n%s", err, output)
+	}
+	if written, err := os.ReadFile(filepath.Join(work, "hello.txt")); err != nil || string(written) != "hi\n" {
+		t.Fatalf("apply_patch did not write the file: %q, %v\n%s", written, err, output)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 3 {
+		t.Fatalf("the provider saw %d requests\n%s", len(bodies), output)
+	}
+	for index, body := range bodies {
+		if strings.Contains(body, `"type":"custom`) || !strings.Contains(body, `"type":"function","name":"apply_patch","description":"Edit files with a patch.`) {
+			t.Errorf("request %d reached the provider with a custom tool or item, or without apply_patch as a function", index+1)
+		}
+	}
+	if !strings.Contains(bodies[2], `"type":"function_call","call_id":"call_p","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch`) ||
+		!strings.Contains(bodies[1], "hi-from-exec") {
+		t.Errorf("Codex's replay reached the provider as:\n%s", bodies[2])
+	}
+	logged, err := relayLogLines(filepath.Join(start.Home, RelayLogFile), 3)
+	if err != nil || !strings.Contains(string(logged), "stop_at_first_call:1 duration=") || !strings.Contains(string(logged), " cut=error usage=lost ") ||
+		!strings.Contains(string(logged), " cut=next_item usage=lost ") || !strings.Contains(string(logged), "custom_tool_as_function:") || strings.Contains(string(logged), testKey) {
+		t.Errorf("the relay's log = %s, %v", logged, err)
+	}
+	t.Logf("codex through the relay:\n%s\nrelay log:\n%s", output, logged)
+}
+
+// TestLiveCodexWritesOneFileThroughTheRelay is the go-live check of a relay
+// model on its real provider (about US$0.01 for gpt-oss-120b on Together).
+// With ABCP_TEST_CODEX naming Codex and ABCP_TEST_LIVE_TEMPLATE a manifest
+// template whose executor.provider asks for the relay (ABCP_TEST_LIVE_MODEL
+// names the model, the template's task_model by default), real Codex is
+// asked through ABCP's relay to create hello.txt containing hi, in a scratch
+// folder with a scratch Codex home (the provider's lanes are not touched, so
+// the usage collector does not count it). The key is read from the
+// template's key_file and never shown; the relay may send the provider at
+// most liveCheckRequests requests. Skipped otherwise.
+func TestLiveCodexWritesOneFileThroughTheRelay(t *testing.T) {
+	binary, templatePath := os.Getenv("ABCP_TEST_CODEX"), os.Getenv("ABCP_TEST_LIVE_TEMPLATE")
+	if binary == "" || templatePath == "" {
+		t.Skip("ABCP_TEST_CODEX and ABCP_TEST_LIVE_TEMPLATE name no Codex binary and template")
+	}
+	data, err := os.ReadFile(templatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var template struct {
+		Executor struct {
+			TaskModel string   `json:"task_model"`
+			Provider  Provider `json:"provider"`
+		} `json:"executor"`
+	}
+	if err := json.Unmarshal(data, &template); err != nil {
+		t.Fatal(err)
+	}
+	provider, name := template.Executor.Provider, os.Getenv("ABCP_TEST_LIVE_MODEL")
+	if name == "" {
+		name = template.Executor.TaskModel
+	}
+	provider.CodexHome = filepath.Join(t.TempDir(), "lane")
+	if err := provider.Validate(); err != nil || !provider.Relay {
+		t.Fatalf("the template's provider: relay %v, %v", provider.Relay, err)
+	}
+	model, ok := provider.Model(name)
+	if !ok {
+		t.Fatalf("the template offers no model %q", name)
+	}
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.DisableCompression = true
+	budget := &requestBudget{next: base, left: liveCheckRequests}
+	start, err := Begin(context.Background(), provider, name, StartOptions{Run: "live-check", RelayTransport: budget})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer start.Release()
+	work := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	arguments := []string{"exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"}
+	if model.DefaultEffort != "" {
+		arguments = append(arguments, "-c", "model_reasoning_effort="+model.DefaultEffort)
+	}
+	command := exec.CommandContext(ctx, binary, append(arguments, "Create the file hello.txt containing exactly the word hi, then stop.")...)
+	command.Dir = work
+	command.Env = start.Environment([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir()})
+	output, runErr := command.CombinedOutput()
+	logged, _ := os.ReadFile(filepath.Join(start.Home, RelayLogFile))
+	if key, err := ReadKey(provider.KeyFile); err == nil && key.Value() != "" && (strings.Contains(string(output), key.Value()) || strings.Contains(string(logged), key.Value())) {
+		t.Fatal("the key showed in Codex's output or the relay's log")
+	}
+	t.Logf("codex (%v):\n%s\nrelay log (%d of %d requests sent):\n%s", runErr, output, liveCheckRequests-budget.remaining(), liveCheckRequests, logged)
+	written, err := os.ReadFile(filepath.Join(work, "hello.txt"))
+	if runErr != nil || err != nil || strings.TrimSpace(string(written)) != "hi" {
+		t.Fatalf("hello.txt = %q, %v; codex: %v", written, err, runErr)
+	}
+}
+
+// liveCheckRequests bounds what the live check sends the provider.
+const liveCheckRequests = 12
+
+// requestBudget refuses requests once it has sent so many.
+type requestBudget struct {
+	next http.RoundTripper
+	mu   sync.Mutex
+	left int
+}
+
+func (b *requestBudget) RoundTrip(request *http.Request) (*http.Response, error) {
+	b.mu.Lock()
+	ok := b.left > 0
+	if ok {
+		b.left--
+	}
+	b.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("the live check sent its %d requests", liveCheckRequests)
+	}
+	return b.next.RoundTrip(request)
+}
+
+func (b *requestBudget) remaining() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.left
+}

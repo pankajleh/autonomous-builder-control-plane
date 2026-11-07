@@ -3,8 +3,9 @@
 Status: **built; on the host for the trial since 2026-11-01** (`local-p02-together`, round 1, through a Python relay on
 127.0.0.1:18996). **#183 (2026-11-02) moves the relay into ABCP** with per-model `compat` lists and gives each model a
 Codex catalog entry (gpt-oss-120b gets `apply_patch`); not on until the switch-over below (one announced restart with
-no build running). A manifest without `relay`, `compat` or `codex_catalog` runs exactly as before. Repo C design note
-`OPEN_MODEL_ENGINES.md` (§9.1).
+no build running). **2026-11-07 adds `stop_at_first_call` and `custom_tool_as_function`** for gpt-oss-120b on
+Together (below); not live until its profile names them. A manifest without `relay`, `compat` or `codex_catalog` runs
+exactly as before. Repo C design note `OPEN_MODEL_ENGINES.md` (§9.1).
 
 ## Why
 
@@ -197,14 +198,17 @@ tests rebuild those requests and a stand-in that refuses what Together refused, 
 | `drop_namespace_tools` | leaves out `namespace` tools (Codex's multi_agent_v1) | Bonsai: "tools[4].type: unknown variant `namespace`" (probe-bonsai.log) |
 | `chat_completions_bridge` | sends the request to `/chat/completions` (not streamed) with each turn's reasoning as `reasoning_content`, and answers Codex with the Responses events it reads (created, in progress, each item added and done, the message's text as one delta, completed with the usage and its cached tokens); a refusal goes back as the provider gave it | Beam: "The assistant turn at messages[5] is missing its reasoning" on /responses; Chat Completions with `reasoning_content` 200 (probe-beam*.log); the accepted Beam build ran on this bridge |
 | `drop_medium_effort` | leaves out an empty `reasoning: {}` or a `"medium"` effort | DeepSeek: `reasoning_effort must be low, high, xhigh, max …; got "medium"` for `{}` (Together fills in medium) and for medium (probe-deepseek*.log) |
+| `custom_tool_as_function` | offers each `custom` tool (`apply_patch`) as a function taking one string `input`, replays earlier custom items as function items; on the streamed answer, the model's call of that function goes back to Codex as a `custom_tool_call` | (2026-11-07, below) Together drops custom tools from what gpt-oss sees and answers 200; the model called a function `apply_patch` with arguments of its own making |
+| `stop_at_first_call` | on the streamed answer: ends it at its first call (at the next item, an error or the stream's end), with a `response.completed` of the relay's, and closes the provider's stream | (2026-11-07, below) Together does not stop gpt-oss at `<\|call\|>`: "Parse error: Failed to process token …", or invented calls and answers |
 
 Codex's freeform `apply_patch` replays as `custom_tool_call` items; the two reordering fixes treat them as calls.
 A fix rewrites only what it names: the other keys, their order and every number go on byte for byte, and a request no
 fix changes is sent exactly as it came. They apply in the order of the table above (the bridge last).
 
-`deploy/open-models/make-open-model-profiles.py` writes the round-1 lists: gpt-oss-120b, nemotron-3.5-super,
-muse-spark-open and glm-5.3 the first three; bonsai-27b those and `drop_namespace_tools`; beam-1.0 the bridge alone;
-deepseek-v4.1-flash the first three and `drop_medium_effort`.
+`deploy/open-models/make-open-model-profiles.py` writes the round-1 lists: nemotron-3.5-super, muse-spark-open and
+glm-5.3 the first three; gpt-oss-120b those and `stop_at_first_call`, `custom_tool_as_function` (2026-11-07); bonsai-27b
+the first three and `drop_namespace_tools`; beam-1.0 the bridge alone; deepseek-v4.1-flash the first three and
+`drop_medium_effort`.
 
 ### Codex's model catalog (`codex_catalog`)
 
@@ -244,10 +248,8 @@ binary (skipped otherwise; run them on the host after any Codex upgrade).
 **`apply_patch` only where it is known to work.** Together took Codex's `custom` tool type for gpt-oss-120b
 (probe-custom-tool.log: 200 with and without the grammar), so the script sets it for gpt-oss-120b alone; Bonsai's
 endpoint lists no custom type and the chat bridge carries function tools only. Every round-1 model gets an entry for
-the tool-output limit and the sub-agent list. **Still open:** the probe showed Together accepting the tool, not what it
-answers when gpt-oss calls it. Codex applies only a `custom_tool_call`; a `function_call` named `apply_patch` comes back
-"aborted". The first round-2 gpt-oss build (or a one-cent probe) shows which; a function-call answer would need one
-more relay fix.
+the tool-output limit and the sub-agent list. **Answered 2026-11-07 (below):** Together takes the tool but leaves it out
+of what gpt-oss sees, so the model calls a function `apply_patch`; `custom_tool_as_function` is that relay fix.
 
 ### Evidence
 
@@ -272,6 +274,118 @@ more relay fix.
 - `internal/run`: a build through its own relay (Ralphex's `config.toml` names it and the catalog; a request through it
   reaches the provider fixed with the key; the start records the relay; the relay is gone after the run).
 - `go build`, `go vet`; `go test ./...` 43 packages pass, the known M02/M03 in `mergelifecycle` as on `main`.
+
+## 2026-11-07: gpt-oss-120b on Together (`stop_at_first_call`, `custom_tool_as_function`)
+
+Rounds 1 and 2 of the trial: gpt-oss-120b on Together wrote no file (Repo C `OPEN_MODEL_ENGINES.md` §7.5, §7.6). The
+Stream A diagnosis of 2026-11-07 (scratch probes under `/tmp/gptoss-diag/` on the host) found two causes, both
+Together's, not Codex's or the relay's:
+
+- **Together does not stop gpt-oss at harmony's `<|call|>`.** The model keeps generating after its call with nothing to
+  read. Either Together's own parser breaks on the next token (`Parse error: Failed to process token N: Unexpected
+  token N while expecting start token 200006`, an `error` event after HTTP 200 with no `response.completed`; HTTP 500
+  `harmony_parsing_failed` without streaming and on Chat Completions), or the answer "completes" with what the model
+  wrote without the tool's result: more calls (up to 5 in one answer, `parallel_tool_calls: false` ignored), an early
+  "done", `<<<RALPHEX:TASK_FAILED>>>`, "Could you paste the contents of plan.md?" (one answer 11,925 output tokens).
+  Round 2: 11 of 12 sessions made no call at all.
+- **Together drops non-function tools** from the prompt gpt-oss sees (the `custom` `apply_patch`, the `namespace`
+  `multi_agent_v1`) and answers 200. The model, told by Codex's base prompt to use `apply_patch`, calls a *function*
+  `apply_patch` with `{"patch": …}`, `{"command": …}` or `{"command": ["apply_patch", …]}`; Codex applies only a
+  `custom_tool_call`.
+
+How Together streams such an answer: an `output_item.added` for each item as the model starts it, a call's arguments
+as `function_call_arguments.delta` events, and every later `.done` held to the very end, where the items no longer
+match the deltas (names, arguments and call ids shifted between calls). A stand-in relay that ended each answer at its
+first call and offered `apply_patch` as a function made Codex write `hello.txt`, then make two real `apply_patch`
+edits (exit 0 both times; 2 of 3 answers had hit the parse error and were saved).
+
+### `stop_at_first_call` (the streamed answer of `POST …/responses`)
+
+- Every event passes to Codex byte for byte as it comes until an item of type `function_call` (or `custom_tool_call`)
+  has started. Its `output_item.added` and argument deltas pass too.
+- Then the next `output_item.added`, an `error` (or `response.failed`, `response.incomplete`) or the stream's end
+  ends the answer at that call. Codex gets the call's `function_call_arguments.done` and `output_item.done`, built
+  from the added item and its deltas (complete JSON by then), never from Together's `.done`; an item before the call
+  that Together had not ended (a preamble message: its streamed text); then a `response.completed` of the relay's own
+  whose output is those items, with the response's id, `created_at` and model, and its usage only when the provider
+  gave one. The relay then closes the provider's stream. Nothing after the call reaches Codex.
+- An error before a call is complete (no call, or arguments not yet one JSON value) goes to Codex as it came, and so
+  does the rest of that stream, so Codex's own retries apply (`stream_max_retries`).
+- A provider that does stop at the call is not cut: its `.done` is taken as the call's end (built the same way) and
+  its own `response.completed`, with its usage, goes on with the items as Codex got them as its output.
+- Relay events are numbered after the provider's last `sequence_number`. Only a `200` `text/event-stream` answer is
+  read; any other passes as before.
+
+### `custom_tool_as_function`
+
+- **The request:** each `custom` tool is offered as a `function` with one string parameter `input` (apply_patch: "Edit
+  files with a patch. Pass the whole patch, from *** Begin Patch to *** End Patch, as the `input` string.", the words
+  with which the stand-in got `{"input": "*** Begin Patch…"}` every time), unless a function of that name is offered
+  too; a `tool_choice` naming it names the function. Codex's earlier `custom_tool_call` is replayed as a
+  `function_call` with `arguments` `{"input": <its input>}`, and its `custom_tool_call_output` as a
+  `function_call_output` (their `id` and `status` left out, as the stand-in sent them). The reorder fixes count them
+  as calls as before.
+- **The answer:** a `function_call` of such a tool is held (none of its events reach Codex) until it ends, then goes to
+  Codex as `output_item.added` and `output_item.done` of a `custom_tool_call` (the call's `id` and `call_id`, its
+  name) whose `input` is the arguments' `input`. For the shapes gpt-oss improvised: a `patch` or `command` string, or
+  the item of a `command` list that holds the patch (else its last string); for `apply_patch`, the text from `*** Begin
+  Patch` to `*** End Patch`. Arguments of no such shape go as the input as they came, so `apply_patch` answers the model
+  with its own error. With `stop_at_first_call` the call ends at the cut; alone, at the provider's own `.done`.
+- **Codex's catalog entry is unchanged:** `apply_patch_tool_type` stays `freeform` (Codex must offer the tool and
+  accept the `custom_tool_call`; `freeform` is the only value Codex takes), and the base prompt stays Codex's own.
+
+The chat bridge makes its own answer from function tools, so it is refused with either fix.
+
+### The log
+
+When a fixed stream's answer was cut, the line says `cut=next_item|error|end`; when it ended without the provider's
+usage (Together sends usage only in its last `response.completed`, which a cut or a broken stream never reaches), it
+says `usage=lost` with an estimate (about four bytes a token) of the request sent and of the text, arguments and input
+the model streamed. Together does not stream gpt-oss's reasoning, so the output estimate is a floor; whether Together
+stops billing when the stream closes is not known. For example:
+
+```text
+2026-11-07T09:00:00Z abcp open-model relay run=<run> together/gpt-oss-120b POST /v1/responses model=openai/gpt-oss-120b status=200 fixes=drop_null_reasoning_content:1,custom_tool_as_function:4,stop_at_first_call:1 duration=6.412s cut=error usage=lost est_input_tokens=7150 est_output_tokens=38
+```
+
+`custom_tool_as_function` counts the tools, tool choice and items it changed in the request and the calls it turned
+back in the answer.
+
+### What stays open
+
+- **Usage is lost** on every cut answer: metering undercounts unless it adds the `usage=lost` lines' estimates.
+- **The model never gets its reasoning back**: Together streams none, so between calls gpt-oss sees an empty analysis;
+  expect weaker multi-step coherence.
+- **`spawn_agent` and the other multi-agent tools stay invisible** to gpt-oss (Together drops namespace tools). If
+  Ralphex's review needs sub-agents it may fail as Bonsai's did; flattening the namespace would be a third fix.
+- Not yet tried: a real Ralphex build. Groq's own serving of gpt-oss-120b may stop at `<|call|>`; no Groq key is on the
+  host yet (`runtime/secrets/groq-api-key`), so it is unprobed.
+
+### Checks (2026-11-07)
+
+- `internal/openmodel` (`stream_test.go`, on streams shaped as the diagnosis recorded them): a parse error after a
+  complete call ends the answer at the call (events before it byte for byte, the call's end from its deltas, a
+  completed without usage, no error); the runaway answer (five calls, a "done", shifted `.done` items, a completed with
+  usage) reaches Codex as its first call alone; a preamble message ends with its text; an error before a call is
+  complete, and all after it, goes as it came; a provider that stops keeps its usage; a function `apply_patch` in each
+  shape (`input`, `patch`, `command`, `command` list, pretty-printed) reaches Codex as its `custom_tool_call`, another
+  function as it came; the input from each shape; the custom fix alone ends at the provider's `.done`; answers with
+  nothing to fix pass byte for byte (events split over reads, CRLF, a last event without its blank line).
+  `compat_test.go`: the request (the tool in its place, the replay, `tool_choice`, a clashing function, Together's
+  stand-in takes it); other models' fixes leave custom tools and items exactly as they came; validation.
+  `relay_test.go`: end to end, the relay closes the provider's stream at the invented item, the provider gets
+  `apply_patch` as a function and the replay, the log line; nemotron's identical answer passes byte for byte.
+- `TestCodexBuildsThroughTheRelayWithGptOssOnTogethersFixes` (real Codex, `ABCP_TEST_CODEX`): Codex runs a call cut
+  at Together's parse error, applies a function `apply_patch {"command": ["apply_patch", …]}` cut at an invented
+  "done" (the file is written), and its replay reaches the provider with no custom tool or item.
+
+### Going live
+
+1. Merge; build the binary on the host; the real-Codex checks there (§4b step 1's command now runs three tests).
+2. Stage the live gpt-oss template with the two names (`make-open-model-profiles.py … --providers together`, or edit
+   the template's gpt-oss `compat` list), as `.new` beside the live file, with the live one kept.
+3. One announced ABCP restart with no build running, the `.new` in place.
+4. A one-file check through ABCP's real relay (about US$0.01), then one real build.
 
 ## Rollout
 

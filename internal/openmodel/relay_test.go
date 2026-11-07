@@ -367,3 +367,98 @@ func TestTheRelayLogsNoHeaderKeyOrBody(t *testing.T) {
 		}
 	}
 }
+
+// gptOss is gpt-oss-120b on Together with its compat list (the profile
+// script's) and apply_patch in Codex's catalog.
+func gptOss(baseURL string) Provider {
+	provider := together(baseURL)
+	provider.Models = append(provider.Models, Model{Name: "gpt-oss-120b", ID: "openai/gpt-oss-120b", Origin: "US", ContextWindow: 131072,
+		Compat:       []string{CompatDropNullReasoningContent, CompatMessageBeforeCalls, CompatOutputAfterCall, CompatStopAtFirstCall, CompatCustomToolAsFunction},
+		CodexCatalog: &CodexCatalog{ApplyPatch: true}})
+	return provider
+}
+
+// TestTheRelayEndsGptOssAnswersAtTheirCallAndClosesTheProvidersStream: end
+// to end against a stand-in for Together that, as Together does, runs on
+// past the model's call. The provider gets apply_patch as a function and
+// Codex's earlier custom call replayed as a function call; Codex gets the
+// model's function apply_patch {"command": ["apply_patch", …]} as the custom
+// call it applies, and a response.completed; the relay closes the
+// provider's stream at the next item, and logs the cut and an estimate of
+// the usage it never got.
+func TestTheRelayEndsGptOssAnswersAtTheirCallAndClosesTheProvidersStream(t *testing.T) {
+	answer := newTogetherAnswer().reasoning(0).call(1, "apply_patch", "call_p", `{"command":["apply_patch",`+mustText(helloPatch)+`]}`)
+	runaway := newTogetherAnswer()
+	runaway.seq = answer.seq
+	runaway.events = nil
+	runaway.call(2, "exec_command", "call_2", `{"cmd":"cat hello.txt"}`).message(3, "Implemented the whole app.").completed([]any{}, map[string]any{"input_tokens": 9000, "output_tokens": 11925})
+	closed := make(chan bool, 1)
+	fake := &fakeTogether{answer: func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, answer.String()+runaway.events[0])
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+			closed <- true
+		case <-time.After(5 * time.Second):
+			closed <- false
+		}
+		io.WriteString(w, strings.Join(runaway.events[1:], ""))
+		return true
+	}}
+	server := httptest.NewServer(fake)
+	defer server.Close()
+	log := &lockedBuffer{}
+	relay := startRelay(t, gptOss(server.URL+"/v1"), 2, log)
+	earlier := map[string]any{"type": "custom_tool_call", "call_id": "call_0", "name": "apply_patch", "input": "*** Begin Patch\n*** Add File: plan.txt\n+x\n*** End Patch\n"}
+	request := codexRequest("openai/gpt-oss-120b", withInput(codexOpening(), reasoningItem("rs_0"), earlier,
+		map[string]any{"type": "custom_tool_call_output", "call_id": "call_0", "output": "Success."}), func(r map[string]any) {
+		r["tools"] = append(codexTools(), map[string]any{"type": "custom", "name": "apply_patch", "description": "FREEFORM", "format": map[string]any{"type": "grammar"}})
+	})
+	response, data := post(t, relay.URL()+"/responses", request, nil)
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("%d %v", response.StatusCode, response.Header)
+	}
+	if !<-closed {
+		t.Error("the relay did not close the provider's stream at the next item")
+	}
+	events := codexEvents(t, string(data))
+	_, kinds := completedOutput(t, events)
+	if strings.Join(kinds, " ") != "reasoning custom_tool_call:apply_patch" || strings.Contains(string(data), "cat hello.txt") || strings.Contains(string(data), "Implemented") {
+		t.Fatalf("Codex got %v:\n%s", kinds, data)
+	}
+	patched := events[len(events)-2]["item"].(map[string]any)
+	if patched["type"] != "custom_tool_call" || patched["input"] != helloPatch || patched["call_id"] != "call_p" {
+		t.Errorf("Codex's call = %v", patched)
+	}
+	sent := string(fake.requests[0].body)
+	if refusal := togetherRefusal(fake.requests[0].body); refusal != "" || strings.Contains(sent, `"custom`) || !strings.Contains(sent, `"name":"apply_patch","description":"Edit files with a patch.`) ||
+		!strings.Contains(sent, `{"type":"function_call","call_id":"call_0","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** Add File: plan.txt\\n+x\\n*** End Patch\\n\"}"}`) {
+		t.Errorf("the provider got %s (%s)", sent, refusal)
+	}
+	logged := log.lines(1)
+	want := "together/gpt-oss-120b POST /v1/responses model=openai/gpt-oss-120b status=200 fixes=drop_null_reasoning_content:1,custom_tool_as_function:4,stop_at_first_call:1 duration="
+	estimate := fmt.Sprintf(" cut=next_item usage=lost est_input_tokens=%d est_output_tokens=%d\n", (len(fake.requests[0].body)+3)/4, (len(`{"command":["apply_patch",`+mustText(helloPatch)+`]}`)+3)/4)
+	if !strings.Contains(logged, want) || !strings.HasSuffix(logged, estimate) {
+		t.Errorf("the relay logged %q, want %q … %q", logged, want, estimate)
+	}
+
+	// The same answer for a model without the fixes reaches Codex as it
+	// came, runaway and all.
+	fake.answer = func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, answer.String()+runaway.String())
+		return true
+	}
+	plain := startRelay(t, together(server.URL+"/v1"), 0, nil)
+	_, data = post(t, plain.URL()+"/responses", codexRequest("nvidia/NVIDIA-Nemotron-3.5-Super-VL", codexOpening(), nil), nil)
+	if string(data) != answer.String()+runaway.String() {
+		t.Errorf("nemotron's answer changed:\n%s", data)
+	}
+}
+
+func mustText(text string) string {
+	data, _ := json.Marshal(text)
+	return string(data)
+}
