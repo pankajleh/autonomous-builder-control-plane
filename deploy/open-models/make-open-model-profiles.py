@@ -12,7 +12,8 @@ binary, budgets, validation and acceptance stay exactly the host's):
 Each Together model also gets, from round 1 of the trial (Repo C OPEN_MODEL_ENGINES §9.1, the server's
 runtime/open-models/round1-results.md and probe-*.log), its "compat" list (the fixes ABCP's relay applies to its
 requests; the provider then says "relay": true) and a "codex_catalog" entry (Codex's model catalog: apply_patch where
-the provider takes Codex's freeform tool, tool output cut at 10,000 tokens instead of 10,000 bytes). A models file may
+the provider takes Codex's freeform tool, tool output cut at 10,000 tokens instead of 10,000 bytes); Groq's gpt-oss-120b
+gets its own, from the Groq probes of 2026-11-07. A models file may
 give a model's own "compat" or "codex_catalog", which then wins. A provider with no compat list and no catalog entry is
 written exactly as before.
 
@@ -45,7 +46,12 @@ SLOTS = {"together": 1, "groq": 1}
 # harmony's <|call|>, so its parser fails after the call ("Parse error: Failed to process token …") or the model writes
 # on without the tool's result; and it leaves Codex's custom apply_patch out of what the model sees, so the model calls
 # a function apply_patch Codex cannot apply. The relay ends each answer at its first call and offers apply_patch as a
-# function, turning the call back into Codex's own.
+# function, turning the call back into Codex's own. Groq's gpt-oss-120b (the Groq probes of 2026-11-07, /tmp/groq-stage
+# on the host: Codex's own requests through ABCP's relay, cut to fit the free plan): Groq stops at the call and streams
+# the reasoning's text, and takes Codex's replay (the reasoning with its text, calls, outputs) as it comes, so none of
+# Together's turn or stream fixes; but a custom or namespace tool makes the body "invalid JSON body",
+# client_metadata is an "unknown field" and include is "not supported", so it gets drop_namespace_tools,
+# drop_client_metadata, drop_include and custom_tool_as_function (apply_patch offered as a function).
 TURNS = ["drop_null_reasoning_content", "message_before_calls", "output_after_call"]
 COMPAT = {
     "together": {
@@ -56,6 +62,9 @@ COMPAT = {
         "bonsai-27b": TURNS + ["drop_namespace_tools"],
         "beam-1.0": ["chat_completions_bridge"],
         "deepseek-v4.1-flash": TURNS + ["drop_medium_effort"],
+    },
+    "groq": {
+        "gpt-oss-120b": ["drop_namespace_tools", "drop_client_metadata", "drop_include", "custom_tool_as_function"],
     },
 }
 # Codex's model catalog per model: every round-1 model gets an entry (tool output at 10,000 tokens, spawn_agent naming
@@ -72,6 +81,9 @@ CATALOG = {
         "bonsai-27b": {},
         "beam-1.0": {},
         "deepseek-v4.1-flash": {},
+    },
+    "groq": {
+        "gpt-oss-120b": {"apply_patch": True},
     },
 }
 

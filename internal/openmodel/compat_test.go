@@ -364,3 +364,93 @@ func TestTheStreamFixesGoWithTheRelayButNotTheBridge(t *testing.T) {
 		}
 	}
 }
+
+// TestGroqsRefusalsTurnIntoAnAnswerWithItsFixes walks Codex 0.163.0's request
+// for gpt-oss-120b through what Groq answered on 2026-11-07 (groqRefusal):
+// as sent, the custom apply_patch and the namespace make the body invalid;
+// with those offered as Groq takes them, client_metadata is unknown; without
+// it, include is not supported; without that too, Groq answers. The replay of
+// a later turn (Groq's reasoning item with its text, a call, its output) goes
+// through with the same list, and nothing else in the request changes.
+func TestGroqsRefusalsTurnIntoAnAnswerWithItsFixes(t *testing.T) {
+	codex := func(input []any) []byte {
+		return codexRequest("openai/gpt-oss-120b", input, func(r map[string]any) {
+			r["tools"] = append(codexTools(), customPatchTool())
+			r["reasoning"] = map[string]any{"effort": "high"}
+			r["client_metadata"] = codexClientMetadata()
+		})
+	}
+	request := codex(codexOpening())
+	steps := []struct {
+		compat  []string
+		refused string
+	}{
+		{nil, "invalid JSON body"},
+		{[]string{CompatDropNamespaceTools}, "invalid JSON body"},
+		{[]string{CompatDropNamespaceTools, CompatCustomToolAsFunction}, "unknown field `client_metadata` in request body"},
+		{[]string{CompatDropNamespaceTools, CompatCustomToolAsFunction, CompatDropClientMetadata}, "Field 'include' is not supported"},
+		{groqCompat, ""},
+	}
+	for _, step := range steps {
+		fixed, _, err := Rewrite(request, step.compat)
+		if err != nil || groqRefusal(fixed) != step.refused {
+			t.Fatalf("with %v Groq's stand-in answered %q, Groq %q (%v)", step.compat, groqRefusal(fixed), step.refused, err)
+		}
+	}
+	fixed, applied, err := Rewrite(request, groqCompat)
+	if err != nil || applied.String() != "drop_namespace_tools:1,drop_client_metadata:1,drop_include:1,custom_tool_as_function:1" {
+		t.Fatalf("applied %s, %v", applied, err)
+	}
+	var got map[string]json.RawMessage
+	json.Unmarshal(fixed, &got)
+	for _, key := range []string{"model", "input", "tool_choice", "parallel_tool_calls", "reasoning", "store", "stream", "prompt_cache_key"} {
+		var before map[string]json.RawMessage
+		json.Unmarshal(request, &before)
+		if !bytes.Equal(got[key], before[key]) {
+			t.Errorf("%s changed: %s, was %s", key, got[key], before[key])
+		}
+	}
+	reasoning := map[string]any{"type": "reasoning", "id": "resp_01m6t3a7raef1v2cacgz92sf8h", "summary": []any{},
+		"content": []any{map[string]any{"type": "reasoning_text", "text": "We need to call function."}}, "encrypted_content": nil}
+	replay := codex(withInput(codexOpening(), reasoning, call("fc_1"), output("fc_1")))
+	if again, applied, err := Rewrite(replay, groqCompat); err != nil || groqRefusal(again) != "" || applied[CompatDropNullReasoningContent] != 0 ||
+		!bytes.Contains(again, []byte(`"content":[{"text":"We need to call function.","type":"reasoning_text"}]`)) {
+		t.Errorf("Groq's stand-in refused the replay (%q) or its reasoning changed: %s, %v", groqRefusal(again), applied, err)
+	}
+}
+
+// TestTheFieldFixesLeaveOutTheirKeyAndNothingElse: drop_client_metadata and
+// drop_include each leave out one top-level key; the other keys, their order
+// and every number go on byte for byte; a request without the key is sent
+// exactly as it came.
+func TestTheFieldFixesLeaveOutTheirKeyAndNothingElse(t *testing.T) {
+	body := []byte(`{"model":"m","include":["reasoning.encrypted_content"],"max_output_tokens":12345678901234567890,` +
+		`"client_metadata":{"turn_id":"t","x-codex-turn-metadata":"{\"a\":1e-7}"},"input":[{"type":"message","role":"user","content":"a \u00e9"}],"stream":true}`)
+	for fix, want := range map[string]string{
+		CompatDropClientMetadata: `{"model":"m","include":["reasoning.encrypted_content"],"max_output_tokens":12345678901234567890,` +
+			`"input":[{"type":"message","role":"user","content":"a \u00e9"}],"stream":true}`,
+		CompatDropInclude: `{"model":"m","max_output_tokens":12345678901234567890,` +
+			`"client_metadata":{"turn_id":"t","x-codex-turn-metadata":"{\"a\":1e-7}"},"input":[{"type":"message","role":"user","content":"a \u00e9"}],"stream":true}`,
+	} {
+		got, applied, err := Rewrite(body, []string{fix})
+		if err != nil || string(got) != want || applied.String() != fix+":1" {
+			t.Errorf("%s:\n got %s\nwant %s (%s, %v)", fix, got, want, applied, err)
+		}
+	}
+	both, applied, _ := Rewrite(body, []string{CompatDropClientMetadata, CompatDropInclude})
+	if string(both) != `{"model":"m","max_output_tokens":12345678901234567890,"input":[{"type":"message","role":"user","content":"a \u00e9"}],"stream":true}` ||
+		applied.String() != "drop_client_metadata:1,drop_include:1" {
+		t.Errorf("both: %s (%s)", both, applied)
+	}
+	plain := []byte(`{"model":"m","stream":true,"n":1e-7}`)
+	if same, applied, err := Rewrite(plain, []string{CompatDropClientMetadata, CompatDropInclude}); err != nil || !bytes.Equal(same, plain) || applied.String() != "none" {
+		t.Errorf("a request without the keys changed: %s %s %v", same, applied, err)
+	}
+	relayed := groq()
+	provider := relayed.Clone()
+	provider.Relay, provider.Models[0].Compat = true, append([]string{}, groqCompat...)
+	provider.Models[0].CodexCatalog = &CodexCatalog{ApplyPatch: true}
+	if err := provider.Validate(); err != nil {
+		t.Errorf("gpt-oss-120b's list on Groq was refused: %v", err)
+	}
+}
