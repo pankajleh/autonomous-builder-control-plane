@@ -6,7 +6,7 @@ Exact base: `add6f4e` (PR #191)
 
 Status: **R1 and R2 built in PR #193 (`1d69c32`, live since 2026-11-07 15:24 UTC); R3 built in PR #194 (`c0aeb06`,
 live since 2026-11-07 16:38 UTC); R5 built in PR #195; R6's 503 built in PR #196; R2b, R4, R6's resume and R7
-designed below for the next PRs.** Repo C
+(Repo C first) designed below for the next PRs.** Repo C
 design note
 `BUILD_RELIABILITY.md` §5.6 is the proposal (Repo C P1122, PR #1137). The owner, 2026-11-07, on "Recovery in ABCP":
 "Yes, build it (Recommended)": each Repo B merge and each quiet ABCP restart for R1 to R7 is covered, at about US$30 a
@@ -185,8 +185,7 @@ pin in every manifest template and a quiet restart.
   Repo C's A2 build rules.
 - **R5, acceptance once more: built, PR #195** (§6.1).
 - **R6, restarts:** admission's `503` built, PR #196; the resume designed, its own PR (§6.2).
-- **R7, a queue at admission.** A passing refusal (unavailable, busy) is accepted and queued, not refused, and starts
-  when the cause clears; Repo C words the wait.
+- **R7, a queue at admission:** designed (§6.3); it goes live only after Repo C reads a queued run.
 
 ### 6.1 R5: the final acceptance once more (built, PR #195)
 
@@ -259,6 +258,52 @@ every run:
    that ended `Failed:` or with no footer, so one session); a run interrupted in acceptance runs its acceptance again;
 3. bounds: one resume per run, a limit on resumes after a boot, none for a run its owner stopped;
 4. Repo C to read `RECOVERY_REQUIRED` as still preparing while ABCP resumes it (`journey.ts` counts it `PAUSED` today).
+
+### 6.3 R7: a queue at admission (designed; Repo C first)
+
+**What is passing today.** After R6, ABCP refuses an approved build for a passing reason with `503`: `admission_unavailable`
+(the workflow database unreachable, the run exiting before it registers, a launch lock or start failing),
+`build_wall_unavailable` (the wall's probe failing), and, before the controller, `service_busy` and
+`authoritative_read_busy` (the HTTP layer's own guards). Repo C maps all four to `ADMISSION_UNAVAILABLE`. A *restarting*
+ABCP answers nothing (connection refused, or Repo C's 30-second timeout): Repo C's `TRANSPORT_AMBIGUOUS`. A *capacity
+wait* (an open-model engine full) is already inside the run (`on_unavailable: wait`, `CAPACITY_WAIT`), not a refusal.
+
+**ABCP's side.** An admission whose request is valid and whose binding is frozen (profile, base, template, executor,
+exact edit and read paths all accepted) but whose launch meets a passing cause (the wall, the database, an exit before
+registering, the launch lock) is answered `202` with the same body as today, and queued instead of refused:
+
+- a durable entry, `<service-root>/admissions/queued/<run>.json` (`AdmissionQueueEntryV1`: the run, its binding's name,
+  the cause code, first queued at, attempts, next try at), written before the `202`;
+- `abcp serve` retries the queue every 30 s, oldest first, a few per pass: the wall and the database checked again, then
+  the launch exactly as admission's (launch intent, `abcp run`, R6's wait for registration). Registered: the entry goes.
+  The same cause: it stays, with a back-off. Queued 30 minutes: it ends `expired` and is kept for 7 days;
+- while queued, `GET /v1/runs/{run}` (and its `/activity`, `/timeline`, `/failure`, `/evidence`) answers
+  `404 run_queued` (`retryable: true`, with `queued_since` and the cause code); once expired, `404 admission_expired`;
+  a replay of the request while queued answers `202`, after expiry it is queued again;
+- `service_busy` and `authoritative_read_busy` stay refusals (they are seconds long and come before admission reads the
+  request); a down ABCP cannot queue what it never received.
+
+**Why not built yet:** without Repo C reading `run_queued`, a queued build looks to today's Repo C exactly like
+`58cbcfac` (a `202`, then `404` for ever), the very failure R6 removes. So Repo C goes first.
+
+**What Repo C must change (exact):**
+
+1. `HttpAbcpRuntimeClient`: `404 run_queued` maps to a new kind `RUN_QUEUED` (not an error; its `queued_since` and cause
+   kept), `404 admission_expired` to `ADMISSION_EXPIRED` (an ending: the build could not start, nothing charged); today an
+   unknown code is `REMOTE_ERROR`.
+2. The build's state (`lib/journey.ts` `buildPhase`, `BuildNotices.BEFORE_WORK`): a queued run is *preparing*, worded
+   as waiting for the builder ("It starts by itself; nothing to press"); an expired one ends with the existing
+   `ADMISSION_UNAVAILABLE` words and **Start the build again** (the same request id, so never two builds).
+3. Polling (`NOTIFICATION_POLLING_BUDGET.md`): a queued run is read every 60 s and no longer than the queue's 30 minutes
+   plus one read.
+4. A down ABCP (`TRANSPORT_AMBIGUOUS` from a refused connection, and `ADMISSION_UNAVAILABLE` from `service_busy` /
+   `authoritative_read_busy`): Repo C itself sends the same request again (the same `X-Request-ID` and body; ABCP's
+   admission is idempotent) every 30 s for up to 10 minutes before it shows the refusal, since nothing on ABCP's side can
+   hold a request it never received.
+5. The admission response is unchanged (`202`, `run_id`, `run_url`): no change to `parseAccepted`.
+
+Then ABCP's R7 PR, and one restart; the queue is off (refusals as today) until a profile setting turns it on, so the order
+of the two releases cannot strand a build.
 
 ## 7. Going live (R1, R2)
 
