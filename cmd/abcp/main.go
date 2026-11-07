@@ -541,6 +541,7 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	serviceRoot := flags.String("service-root", "", "optional EP-006 service root for runtime registration")
 	workflowAuthorityConfigFile := flags.String("workflow-authority-config-file", "", "optional protected PostgreSQL workflow-authority config file")
 	resume := flags.Bool("resume", false, "re-enter a run paused at HUMAN_DECISION_REQUIRED from its recorded human decision")
+	resumeInterrupted := flags.Bool("resume-interrupted", false, "go on with a registered run whose builder was interrupted and whose owner is gone, once (abcp serve launches it; docs/plans/build-recovery.md §6.2); needs --service-root")
 	parallelRuns := flags.Int("parallel-runs", 1, "how many runs of the repository may execute at once (1 to 8)")
 	buildWallFile := flags.String("build-wall-file", "", "protected build wall file every Ralphex run starts in (Repo C design note BUILD_ISOLATION.md); required")
 	buildWallSHA256 := flags.String("build-wall-sha256", "", "the SHA-256 of the wall file abcp serve probed; a run whose wall file is another is refused; required")
@@ -551,8 +552,12 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "parallel runs must be between 1 and %d\n", runctl.MaxParallelRuns)
 		return 2
 	}
-	if flags.NArg() != 0 || *manifestPath == "" || *ledgerPath == "" || *evidenceRoot == "" {
-		fmt.Fprintln(stderr, "usage: abcp run --manifest <path> --ledger <path> --evidence-root <path> --build-wall-file <protected-file> --build-wall-sha256 <hex> [--workflow-authority-config-file <protected-file>]")
+	if flags.NArg() != 0 || *manifestPath == "" || *ledgerPath == "" || *evidenceRoot == "" || (*resume && *resumeInterrupted) {
+		fmt.Fprintln(stderr, "usage: abcp run --manifest <path> --ledger <path> --evidence-root <path> --build-wall-file <protected-file> --build-wall-sha256 <hex> [--workflow-authority-config-file <protected-file>] [--resume | --resume-interrupted]")
+		return 2
+	}
+	if *resumeInterrupted && *serviceRoot == "" {
+		fmt.Fprintln(stderr, "abcp run --resume-interrupted takes the run's catalog ownership over: --service-root is required")
 		return 2
 	}
 
@@ -626,7 +631,8 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// R6: SIGTERM ends the run with a cause of its own, so a run that may be resumed stops at RECOVERY_REQUIRED.
+	signalCtx, stopSignals := runSignals(context.Background())
 	defer stopSignals()
 	ctx, cancelAPI := context.WithCancelCause(signalCtx)
 	defer cancelAPI(nil)
@@ -636,6 +642,13 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 	var actionJournal *actioncontrol.Journal
 	var runnerSnapshots *actioncontrol.RunnerSnapshotCoordinator
 	if *serviceRoot != "" {
+		// R6: a resume after an interruption first retires the owner its last abcp run left.
+		if *resumeInterrupted {
+			if err := takeOverInterruptedOwner(ctx, *serviceRoot, governed.RunID()); err != nil {
+				fmt.Fprintln(stderr, err)
+				return 1
+			}
+		}
 		catalog, owner, err = registerRuntimeOwner(*serviceRoot, governed, events, artifacts.RunDir())
 		if err != nil {
 			fmt.Fprintln(stderr, err)
@@ -693,9 +706,12 @@ func runCommand(args []string, stdout, stderr io.Writer) int {
 		watcher.Start()
 	}
 	var runResult runctl.Result
-	if *resume {
+	switch {
+	case *resume:
 		runResult, err = runner.RunResume(ctx)
-	} else {
+	case *resumeInterrupted:
+		runResult, err = runner.RunResumeInterrupted(ctx)
+	default:
 		runResult, err = runner.Run(ctx)
 	}
 	result := runResult
@@ -1062,6 +1078,11 @@ func serveCommand(args []string, stderr io.Writer) int {
 	}
 	if *evictionInterval > 0 {
 		go sweeper.Run(ctx, *evictionInterval)
+	}
+	// R6's resume (docs/plans/build-recovery.md §6.2): at start and every 5 minutes, a registered run whose builder was
+	// interrupted and whose owner is gone is launched once more, as abcp run --resume-interrupted.
+	if admissions != nil {
+		go admissions.Resumer(interruptedRuns{catalog: catalog, states: readService}, stderr).Run(ctx)
 	}
 	nightly.Finished = sweeper.RunFinished
 	// The nightly clean-up (Repo C APP_DELETION.md §4, decision 11): git gc of the product repositories named, and engine

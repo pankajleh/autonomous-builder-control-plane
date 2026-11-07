@@ -43,6 +43,17 @@ Start from that record: find the cause of the failure it names and fix it, then 
 `, nil
 }
 
+// ResumedAttemptPrompt is Ralphex's own task prompt with one section after it, for an attempt that goes on after the
+// one before it was interrupted (R6's resume, docs/plans/build-recovery.md §6.2): the builder's session was stopped from
+// outside, not by anything it did, and only its commits are kept.
+func ResumedAttemptPrompt() string {
+	return taskPromptTemplate + `
+RESUMED ATTEMPT
+
+An earlier session at this task was stopped from outside before it finished (the machine it ran on restarted, or its process was stopped); nothing it did caused that. Its commits are on this branch; anything it had not committed is gone. Read the plan and the branch as they are before you change anything, then go on with the task from where the branch stands: do again only what is not committed.
+`
+}
+
 // WriteFreshAttemptPrompt writes the fresh attempt's task prompt into Ralphex's isolated settings folder, where Ralphex
 // reads it in place of its built-in one (as WriteReviewPrompt's first-review prompt).
 func WriteFreshAttemptPrompt(configDir, summary string) error {
@@ -50,12 +61,21 @@ func WriteFreshAttemptPrompt(configDir, summary string) error {
 	if err != nil {
 		return err
 	}
+	return writeTaskPrompt(configDir, prompt)
+}
+
+// WriteResumedAttemptPrompt writes a resumed attempt's task prompt (ResumedAttemptPrompt) as WriteFreshAttemptPrompt does.
+func WriteResumedAttemptPrompt(configDir string) error {
+	return writeTaskPrompt(configDir, ResumedAttemptPrompt())
+}
+
+func writeTaskPrompt(configDir, prompt string) error {
 	dir := filepath.Join(configDir, "prompts")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create Ralphex prompts directory: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "task.txt"), []byte(prompt), 0o600); err != nil {
-		return fmt.Errorf("write Ralphex fresh attempt task prompt: %w", err)
+		return fmt.Errorf("write Ralphex task prompt: %w", err)
 	}
 	return nil
 }

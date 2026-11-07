@@ -459,14 +459,16 @@ func (s *Service) worktreeReturned(ctx context.Context, run, registration string
 // governed worktree. A fresh attempt (RETRYING, docs/plans/build-recovery.md
 // §5) has its worktree removed and added again by the provider at the same
 // path, so from RETRYING until it implements again the worktree is not there
-// yet, as before a run's first attempt.
+// yet, as before a run's first attempt. A run resumed after an interruption
+// (RECOVERY_REQUIRED, §6.2) is the same: its attempt's worktree is removed and
+// added again once it implements.
 func executionStarted(snapshot readmodel.Snapshot) bool {
 	started := false
 	for _, fact := range snapshot.Events {
 		switch fact.StateTo {
 		case "", domain.StateRunCreated, domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateCapacityWait:
 			continue
-		case domain.StateRetrying:
+		case domain.StateRetrying, domain.StateRecoveryRequired:
 			started = false
 			continue
 		}

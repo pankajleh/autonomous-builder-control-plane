@@ -45,10 +45,18 @@ const freshAttemptWorktreeRemoval = 2 * time.Minute
 // bounds, the first attempt's builder ended without finishing, and its plan can be handed to Ralphex again (a walled
 // run's copy gets a folder of its own; an unwalled run's untracked copy would be the same file again).
 func (r *Runner) freshAttemptEligible(invocation ralphex.Invocation, walled, planHandoff bool, detail runfailure.Detail) bool {
-	if r.governed.Ralphex().FreshAttempts < 1 || !r.governed.Worktree().Enabled || invocation.Bounds != nil || invocation.Mode == ralphex.ModeReview {
+	if detail.Cause != runfailure.CauseValidationFailed && detail.Cause != runfailure.CauseModelSignalledFailed {
 		return false
 	}
-	if detail.Cause != runfailure.CauseValidationFailed && detail.Cause != runfailure.CauseModelSignalledFailed {
+	return r.attemptCanStartAgain(invocation, walled, planHandoff)
+}
+
+// attemptCanStartAgain: Ralphex can be started once more on the run's branch (R3's fresh attempt, R6's resume). The
+// profile allows a fresh attempt, the run is a worktree run that implements outside V3 bounds, and its plan can be
+// handed to Ralphex again (a walled run's copy gets a folder of its own; an unwalled run's untracked copy would be the
+// same file again).
+func (r *Runner) attemptCanStartAgain(invocation ralphex.Invocation, walled, planHandoff bool) bool {
+	if r.governed.Ralphex().FreshAttempts < 1 || !r.governed.Worktree().Enabled || invocation.Bounds != nil || invocation.Mode == ralphex.ModeReview {
 		return false
 	}
 	return walled || !planHandoff

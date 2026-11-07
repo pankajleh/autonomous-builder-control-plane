@@ -104,7 +104,8 @@ func (r *Runner) SetBuildWallFile(path, sha256 string) error {
 	return nil
 }
 
-// prepareWalledRun makes (or, for a resumed run, finds) the run's folder and repository. It runs under the setup lease.
+// prepareWalledRun makes (or, for a run resumed after a human decision or an interruption, finds) the run's folder and
+// repository. It runs under the setup lease.
 func (r *Runner) prepareWalledRun(ctx context.Context) (*walledRun, error) {
 	isolation, ok := r.governed.Isolation()
 	if !ok {
@@ -130,7 +131,7 @@ func (r *Runner) prepareWalledRun(ctx context.Context) (*walledRun, error) {
 		readPaths: isolation.ReadPaths, env: map[string]string{},
 	}
 	if _, err := os.Lstat(folder); errors.Is(err, os.ErrNotExist) {
-		if r.resume {
+		if r.resume || r.interrupted {
 			return nil, fmt.Errorf("%w: the resumed run's folder %s is not there", ErrBuildWallUnavailable, folder)
 		}
 		if err := os.Mkdir(folder, 0o700); err != nil {
@@ -141,7 +142,7 @@ func (r *Runner) prepareWalledRun(ctx context.Context) (*walledRun, error) {
 		}
 	} else if err != nil {
 		return nil, fmt.Errorf("%w: inspect the run's folder: %v", ErrBuildWallUnavailable, err)
-	} else if !r.resume {
+	} else if !r.resume && !r.interrupted {
 		return nil, fmt.Errorf("%w: the run's folder %s is there already; a run starts in a folder of its own", ErrBuildWallUnavailable, folder)
 	}
 	if err := privateWallDirectory(folder); err != nil {
