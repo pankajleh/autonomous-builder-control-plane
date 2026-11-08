@@ -1170,12 +1170,45 @@ func (d *dockerRuntime) prove(ctx context.Context, p PreviewProfileV1) (proved b
 	}
 	return true
 }
+
+// probeConcurrency is how many startup probes run at once. Each probe is its own group (its own ID, source and page
+// folders, network, containers, volume and gateway listener) and records its result under d.mu, so probes do not
+// share anything but the Docker daemon. One at a time, the 15 live profiles took 97.6 s (2026-11-08, about 5 to 7.6 s
+// each, mostly the 2 s wget timeouts that prove a service cannot reach out), and abcp serve answers nothing until they
+// end. Four at a time keeps the daemon's load small and well inside each probe's own 30 s limit.
+const probeConcurrency = 4
+
 func (d *dockerRuntime) proveProfiles(ctx context.Context, profiles map[string]PreviewProfileV1) {
+	list := make([]PreviewProfileV1, 0, len(profiles))
 	for _, p := range profiles {
-		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		d.prove(probeCtx, p)
-		cancel()
+		list = append(list, p)
 	}
+	eachBounded(len(list), probeConcurrency, func(i int) {
+		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		d.prove(probeCtx, list[i])
+	})
+}
+
+// eachBounded calls do(i) for each i below n, at most limit at once, and returns when every call has returned.
+func eachBounded(n, limit int, do func(int)) {
+	if limit < 1 {
+		limit = 1
+	}
+	slots := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(i int) {
+			defer func() {
+				<-slots
+				wg.Done()
+			}()
+			do(i)
+		}(i)
+	}
+	wg.Wait()
 }
 
 // String never includes private Docker IDs, endpoints or filesystem paths.
