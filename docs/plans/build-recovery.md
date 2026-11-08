@@ -5,8 +5,9 @@ Date: 2026-11-07
 Exact base: `add6f4e` (PR #191)
 
 Status: **R1 and R2 built in PR #193 (`1d69c32`, live since 2026-11-07 15:24 UTC); R3 built in PR #194 (`c0aeb06`,
-live since 2026-11-07 16:38 UTC); R5 built in PR #195; R6's 503 built in PR #196; R6's resume built in its own PR
-(§6.2); R2b, R4 and R7 (Repo C first) designed below for the next PRs.** Repo C
+live since 2026-11-07 16:38 UTC); R5 and R6's 503 built in PRs #195 and #196 (`3010d56`, live since 2026-11-07
+17:46 UTC); R7 built in PR #197 (`1305e35`), to go live after Repo C reads a queued run; R6's resume built in PR #199
+(§6.2); R2b and R4 designed below for the next PRs.** Repo C
 design note
 `BUILD_RELIABILITY.md` §5.6 is the proposal (Repo C P1122, PR #1137). The owner, 2026-11-07, on "Recovery in ABCP":
 "Yes, build it (Recommended)": each Repo B merge and each quiet ABCP restart for R1 to R7 is covered, at about US$30 a
@@ -184,8 +185,8 @@ pin in every manifest template and a quiet restart.
   start; a fallback for a running build is R3's attempt on another invocation). Which engine customers fall back to is
   Repo C's A2 build rules.
 - **R5, acceptance once more: built, PR #195** (§6.1).
-- **R6, restarts:** admission's `503` built, PR #196; the resume built, its own PR (§6.2).
-- **R7, a queue at admission:** designed (§6.3); it goes live only after Repo C reads a queued run.
+- **R6, restarts:** admission's `503` built, PR #196; the resume built, PR #199 (§6.2).
+- **R7, a queue at admission:** built, PR #197 (§6.3); it goes live only after Repo C reads a queued run.
 
 ### 6.1 R5: the final acceptance once more (built, PR #195)
 
@@ -301,7 +302,7 @@ each under the run's launch lock.
 **Repo C** reads `RECOVERY_REQUIRED` as still preparing ("picking up where it stopped") while ABCP resumes it
 (`journey.ts` counted it `PAUSED`).
 
-### 6.3 R7: a queue at admission (designed; Repo C first)
+### 6.3 R7: a queue at admission (built, PR #197; live after Repo C)
 
 **What is passing today.** After R6, ABCP refuses an approved build for a passing reason with `503`: `admission_unavailable`
 (the workflow database unreachable, the run exiting before it registers, a launch lock or start failing),
@@ -310,23 +311,30 @@ each under the run's launch lock.
 ABCP answers nothing (connection refused, or Repo C's 30-second timeout): Repo C's `TRANSPORT_AMBIGUOUS`. A *capacity
 wait* (an open-model engine full) is already inside the run (`on_unavailable: wait`, `CAPACITY_WAIT`), not a refusal.
 
-**ABCP's side.** An admission whose request is valid and whose binding is frozen (profile, base, template, executor,
-exact edit and read paths all accepted) but whose launch meets a passing cause (the wall, the database, an exit before
-registering, the launch lock) is answered `202` with the same body as today, and queued instead of refused:
+**ABCP's side, as built.** A profile with `queue_admissions: true` (profiles.json; not part of the profile's binding
+digest; omitted, refusals as before) answers an admission whose request is valid and whose binding is frozen (profile,
+base, template, executor, exact edit and read paths all accepted) but whose launch meets a passing cause with `202` and
+the same body as today, and queues it instead of refusing it. The causes (`internal/runadmission/queue_linux.go`):
+`build_wall_unavailable` (a wall is configured but its probe fails), `workflow_database_unavailable` (R6's probe),
+`run_exited_before_registering` (R6's wait) and `launch_failed` (`abcp run` could not be started).
 
-- a durable entry, `<service-root>/admissions/queued/<run>.json` (`AdmissionQueueEntryV1`: the run, its binding's name,
-  the cause code, first queued at, attempts, next try at), written before the `202`;
-- `abcp serve` retries the queue every 30 s, oldest first, a few per pass: the wall and the database checked again, then
-  the launch exactly as admission's (launch intent, `abcp run`, R6's wait for registration). Registered: the entry goes.
-  The same cause: it stays, with a back-off. Queued 30 minutes: it ends `expired` and is kept for 7 days;
-- while queued, `GET /v1/runs/{run}` (and its `/activity`, `/timeline`, `/failure`, `/evidence`) answers
-  `404 run_queued` (`retryable: true`, with `queued_since` and the cause code); once expired, `404 admission_expired`;
-  a replay of the request while queued answers `202`, after expiry it is queued again;
+- A durable entry, `<service-root>/admissions/queued/<run>.json` (`AdmissionQueueEntryV1`: the run, its receipt's name,
+  the cause, `queued_since`, attempts, `next_try_at`, state `QUEUED` or `EXPIRED`), written before the `202`.
+- `abcp serve` passes over the queue every 30 s, oldest first, at most 4 launches a pass, a due entry only: the run's
+  launch lock free (else a launch of it is starting), the wall and the database checked again, then the launch exactly
+  as admission's (launch intent, `abcp run`, R6's wait). Registered: the entry goes. The same cause: it stays, its next
+  try 30 s later, doubling to at most 5 minutes. Queued 30 minutes: `EXPIRED`, kept 7 days, then removed.
+- While queued, every route that checks a run's registration (`GET /v1/runs/{run}`, `/activity`, `/events`, `/timeline`,
+  `/failure`, `/evidence` and the rest) answers `404` with `{"error": {"code": "run_queued", "retryable": true,
+  "details": {"queued_since": "<RFC 3339>", "cause": "<cause>"}, ...}}`; once expired, `404` with code
+  `admission_expired`, `retryable: true` and the same details. Any other unknown run answers `404 not_found` as before.
+- A replay of the request while queued answers `202` and launches nothing; after expiry it is admitted again (queued again
+  while the cause holds).
 - `service_busy` and `authoritative_read_busy` stay refusals (they are seconds long and come before admission reads the
   request); a down ABCP cannot queue what it never received.
 
-**Why not built yet:** without Repo C reading `run_queued`, a queued build looks to today's Repo C exactly like
-`58cbcfac` (a `202`, then `404` for ever), the very failure R6 removes. So Repo C goes first.
+**Why it goes live after Repo C:** without Repo C reading `run_queued`, a queued build looks to today's Repo C exactly like
+`58cbcfac` (a `202`, then `404` for ever), the very failure R6 removes.
 
 **What Repo C must change (exact):**
 
@@ -344,8 +352,8 @@ registering, the launch lock) is answered `202` with the same body as today, and
    hold a request it never received.
 5. The admission response is unchanged (`202`, `run_id`, `run_url`): no change to `parseAccepted`.
 
-Then ABCP's R7 PR, and one restart; the queue is off (refusals as today) until a profile setting turns it on, so the order
-of the two releases cannot strand a build.
+The restart that takes R7 live turns `queue_admissions` on in the product profiles; until then the queue is off and
+refusals are as today, so the order of the two releases cannot strand a build.
 
 ## 7. Going live (R1, R2)
 
