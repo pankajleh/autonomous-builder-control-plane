@@ -33,6 +33,7 @@ type store struct {
 	owners    map[string]ownerIdentity
 	receipts  map[string]receipt
 	revisions map[string]uint64
+	live      int // records not yet FAILED, EXPIRED or STOPPED
 	sequence  uint64
 	head      string
 	size      int64
@@ -113,6 +114,13 @@ func (s *store) load() error {
 	s.broken = false
 	return nil
 }
+
+// maxLivePreviews bounds the previews that are not yet FAILED, EXPIRED or STOPPED. Ended previews stay in the journal
+// as ids, states and times and no longer count: the journal's own size and sequence limits bound them. Counting them
+// made every new preview fail once 1,000 had ever been made (live Repo C, 2026-11-07 18:27 UTC: every Try it answered
+// "Couldn't open this app"). A variable so tests can lower it.
+var maxLivePreviews = 1000
+
 func terminal(status string) bool {
 	return status == "FAILED" || status == "EXPIRED" || status == "STOPPED"
 }
@@ -131,7 +139,7 @@ func (s *store) validate(f frame) error {
 	}
 	old, ok := s.records[v.PreviewID]
 	if !ok {
-		if len(s.records) >= 1000 || v.Revision != s.revisions[v.RunID]+1 || v.Status != "REQUESTED" || f.Receipt == nil {
+		if s.live >= maxLivePreviews || v.Revision != s.revisions[v.RunID]+1 || v.Status != "REQUESTED" || f.Receipt == nil {
 			return ErrIntegrity
 		}
 	} else {
@@ -156,6 +164,12 @@ func (s *store) validate(f frame) error {
 }
 func (s *store) apply(f frame) {
 	v := f.Preview
+	if old, ok := s.records[v.PreviewID]; ok && !terminal(old.Status) {
+		s.live--
+	}
+	if !terminal(v.Status) {
+		s.live++
+	}
 	s.records[v.PreviewID] = v
 	s.owners[v.PreviewID] = f.Owner
 	if v.Revision > s.revisions[v.RunID] {

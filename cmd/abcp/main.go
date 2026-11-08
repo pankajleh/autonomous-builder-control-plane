@@ -29,6 +29,7 @@ import (
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/evidence"
 	governancev3 "github.com/pankajleh/autonomous-builder-control-plane/internal/governance"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/housekeeping"
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/lanekey"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/ledger"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/preview"
 	"github.com/pankajleh/autonomous-builder-control-plane/internal/readmodel"
@@ -95,6 +96,8 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		return serveCommand(args[1:], stderr)
 	case "build-wall-probe":
 		return buildWallProbeCommand(args[1:], stdout, stderr)
+	case "lane-keys":
+		return laneKeysCommand(args[1:], stdout, stderr)
 	case "stack-tool":
 		// The change jobs' run tool (docs/plans/change-jobs.md): an MCP server over stdio for the agent.
 		if len(args) != 3 || args[1] != "--socket" || !filepath.IsAbs(args[2]) {
@@ -1180,6 +1183,24 @@ func serveCommand(args []string, stderr io.Writer) int {
 			}
 		}
 	}
+	// Lane keys (docs/plans/lane-keys.md; Repo C BUILD_ENGINE_RULES.md §9, slice 5): the key lanes the admission profiles
+	// name take a key from Repo C, written to the key file their builds read when they start. Without the profile file,
+	// or with lanes that do not check, the routes say they are unsupported and the rest of the service runs.
+	var laneKeys serviceapi.LaneKeyController
+	if admissions != nil {
+		if lanes, err := lanekey.Load(*admissionProfileFile); err != nil {
+			fmt.Fprintf(stderr, "abcp lane keys ready=false reason=%q\n", err.Error())
+		} else if manager, err := lanekey.New(lanes, stderr, time.Now); err != nil {
+			fmt.Fprintf(stderr, "abcp lane keys ready=false reason=%q\n", err.Error())
+		} else {
+			names := strings.Join(manager.Names(), ",")
+			if names == "" {
+				names = "none"
+			}
+			fmt.Fprintf(stderr, "abcp lane keys ready=true lanes=%s other-lanes=%d\n", names, len(lanes.Other))
+			laneKeys = manager
+		}
+	}
 	// Only a controller with its profiles answers GET /v1/engines; without one the route says it is unsupported.
 	var engines serviceapi.EngineCatalog
 	var buildIsolation serviceapi.BuildIsolationReporter
@@ -1195,7 +1216,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Hosting:       hosting,
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Failures: timelineService, Actions: actions,
-		RunAdmission: admissions, DevelopmentRunAdmission: admissions, AdmissionQueue: admissionQueue, Engines: engines, AccountLanes: accountLanes, Targets: targets,
+		RunAdmission: admissions, DevelopmentRunAdmission: admissions, AdmissionQueue: admissionQueue, Engines: engines, AccountLanes: accountLanes, LaneKeys: laneKeys, Targets: targets,
 		Deployments: deployments, AppHealth: appHealth, StackJobs: stackJobs, ChangeJobs: changeJobs,
 		BuildIsolation: buildIsolation,
 	})
@@ -1299,7 +1320,7 @@ func loadManifest(path string) (authority.Manifest, error) {
 }
 
 func usage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|governance-*-validate|governance-lease-issue|run|serve|build-wall-probe|recovery-inspect|recovery-resume>")
+	fmt.Fprintln(writer, "usage: abcp <version|validate-transition|context-build|context-verify|governance-*-validate|governance-lease-issue|run|serve|build-wall-probe|lane-keys|recovery-inspect|recovery-resume>")
 }
 
 // stringList is a repeatable flag: --canary, --git-gc-repository, --session-logs-dir, --lane-session-logs-dir.
@@ -1333,5 +1354,37 @@ func buildWallProbeCommand(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "build wall ready kind=%s bwrap=%q wall_file_sha256=%s\n", runctl.BuildIsolationKindV1, wall.Version(), wall.SHA256())
+	return 0
+}
+
+// laneKeysCommand reads the key lanes an admission profile file names, as abcp serve does at start, and each lane's key
+// state as GET /v1/lanes answers it, so a profile file can be checked on the host before a restart
+// (docs/plans/lane-keys.md). It prints no key and no fingerprint, and writes nothing.
+func laneKeysCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("lane-keys", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	profileFile := flags.String("admission-profile-file", "", "protected run admission profile file")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || *profileFile == "" {
+		fmt.Fprintln(stderr, "usage: abcp lane-keys --admission-profile-file <protected-file>")
+		return 2
+	}
+	lanes, err := lanekey.Load(*profileFile)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	manager, err := lanekey.New(lanes, io.Discard, time.Now)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	answer, _ := manager.Lanes(context.Background())
+	for _, lane := range answer.Lanes {
+		fmt.Fprintf(stdout, "lane %s kind=%s state=%s profiles=%s\n", lane.Lane, lane.Kind, lane.State, strings.Join(lane.Profiles, ","))
+	}
+	fmt.Fprintf(stdout, "lane keys ready lanes=%d other-lanes=%s\n", len(answer.Lanes), strings.Join(lanes.Other, ","))
 	return 0
 }
