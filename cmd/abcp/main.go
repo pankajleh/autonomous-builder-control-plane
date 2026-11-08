@@ -936,6 +936,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		activity.UseObserverWall(wall)
 	}
 	var admissions *runadmission.Controller
+	var admissionQueue serviceapi.AdmissionQueue
 	if *admissionProfileFile != "" {
 		admissions, err = runadmission.NewController(runadmission.Config{
 			ProfileFile: *admissionProfileFile, ServiceRoot: *serviceRoot, Catalog: catalog, ParallelRuns: *parallelRuns, Wall: wall,
@@ -945,6 +946,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 			return 1
 		}
 		defer admissions.Close()
+		admissionQueue = admissions
 		if wall != nil {
 			if wallErr := admissions.BuildWallStatus(context.Background()); wallErr != nil {
 				fmt.Fprintf(stderr, "abcp build wall ready=false reason=%q\n", wallErr.Error())
@@ -992,6 +994,10 @@ func serveCommand(args []string, stderr io.Writer) int {
 	}
 	defer actions.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// R7: admissions a profile queued are launched once their passing cause clears (docs/plans/build-recovery.md §6.3).
+	if admissions != nil {
+		go admissions.RunQueue(ctx)
+	}
 	defer stop()
 	activityService, err := activity.New(ctx, *serviceRoot, catalog, readService, cursors)
 	if err != nil {
@@ -1210,7 +1216,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		Hosting:       hosting,
 		Authenticator: authenticator, Authority: authorityMatcher, Catalog: catalog, CursorSigner: cursors,
 		RunProjections: readService, Events: readService, Timeline: timelineService, Evidence: timelineService, Failures: timelineService, Actions: actions,
-		RunAdmission: admissions, DevelopmentRunAdmission: admissions, Engines: engines, AccountLanes: accountLanes, LaneKeys: laneKeys, Targets: targets,
+		RunAdmission: admissions, DevelopmentRunAdmission: admissions, AdmissionQueue: admissionQueue, Engines: engines, AccountLanes: accountLanes, LaneKeys: laneKeys, Targets: targets,
 		Deployments: deployments, AppHealth: appHealth, StackJobs: stackJobs, ChangeJobs: changeJobs,
 		BuildIsolation: buildIsolation,
 	})

@@ -164,14 +164,26 @@ func NewController(config Config) (*Controller, error) {
 		syscall.Close(admissionsFD)
 		return nil, serviceapi.ErrAdmissionUnavailable
 	}
+	queuedFD, err := openChildDirectory(admissionsFD, "queued", true)
+	if err == nil {
+		if err = validatePrivateDirectoryFD(queuedFD); err != nil {
+			syscall.Close(queuedFD)
+		}
+	}
+	if err != nil {
+		syscall.Close(launchesFD)
+		syscall.Close(admissionsFD)
+		return nil, serviceapi.ErrAdmissionUnavailable
+	}
 	if err := ensureLockFile(admissionsFD, ".lock"); err != nil || syscall.Fsync(admissionsFD) != nil {
+		syscall.Close(queuedFD)
 		syscall.Close(launchesFD)
 		syscall.Close(admissionsFD)
 		return nil, serviceapi.ErrAdmissionUnavailable
 	}
 	controller := &Controller{
 		serviceRoot: config.ServiceRoot, executable: executable, catalog: config.Catalog,
-		clock: config.Clock, profiles: profiles, admissionsFD: admissionsFD, launchesFD: launchesFD,
+		clock: config.Clock, profiles: profiles, admissionsFD: admissionsFD, launchesFD: launchesFD, queuedFD: queuedFD,
 		parallelRuns: config.ParallelRuns,
 	}
 	controller.start = startProcess
@@ -360,12 +372,15 @@ func loadProfile(configuration ProfileV1) (loadedProfile, error) {
 	manifest.Plan = authority.PlanManifest{}
 	manifest.ContextCapsule = nil
 	manifest.Worktree.Branch = ""
+	// The queue setting is how ABCP answers, not what a run is bound to: the binding digest is as without it.
+	bound := configuration
+	bound.QueueAdmissions = false
 	profileBindingData, err := json.Marshal(struct {
 		Configuration                 ProfileV1 `json:"configuration"`
 		ManifestTemplateSHA256        string    `json:"manifest_template_sha256"`
 		WorkflowAuthorityConfigSHA256 string    `json:"workflow_authority_config_sha256"`
 	}{
-		Configuration: configuration, ManifestTemplateSHA256: digest(templateData),
+		Configuration: bound, ManifestTemplateSHA256: digest(templateData),
 		WorkflowAuthorityConfigSHA256: digest(workflowConfiguration),
 	})
 	if err != nil {
@@ -430,13 +445,26 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 	} else if registered {
 		return response, nil
 	}
+	// R7: a replay of a queued admission is answered as the first was; one whose wait expired is admitted again.
+	if queued, found, err := c.readQueueEntry(runID); err != nil {
+		return serviceapi.RunAdmissionResponseV1{}, err
+	} else if found && queued.State == QueueStateQueued {
+		return response, nil
+	} else if found {
+		if err := c.removeQueueEntry(runID); err != nil {
+			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
+		}
+	}
 	binding, bindingFound, err := c.readAdmissionBinding(receipt)
 	if err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
 	}
-	// No build starts while its wall cannot (Repo C design note BUILD_ISOLATION.md §7, decision 3A).
-	if err := c.requireWall(ctx); err != nil {
-		return serviceapi.RunAdmissionResponseV1{}, err
+	// No build starts while its wall cannot (Repo C design note BUILD_ISOLATION.md §7, decision 3A). A profile that
+	// queues (R7) still freezes the admission, and queues it below instead of launching it.
+	queues := c.queues(receipt.ProfileID)
+	wallErr := c.requireWall(ctx)
+	if wallErr != nil && !(queues && c.wall != nil) {
+		return serviceapi.RunAdmissionResponseV1{}, wallErr
 	}
 	if !bindingFound && len(admission.readPaths) > 0 {
 		if err := c.wall.ValidateReadPaths(admission.readPaths, admission.productTaskID); err != nil {
@@ -538,15 +566,37 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 	if launchAttempted {
 		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrReconciliationRequired
 	}
+	if wallErr != nil {
+		return c.queueAdmission(response, receipt, binding, QueueCauseBuildWall)
+	}
 	// R6: a run that cannot reach its workflow database cannot start; it is refused as passing (503) before anything
-	// says it was launched, so the same request admits it once the database is back.
+	// says it was launched, so the same request admits it once the database is back (R7: or it is queued).
 	if c.workflowProbe != nil {
 		if err := c.workflowProbe(ctx, binding.WorkflowAuthorityConfigPath); err != nil {
+			if queues {
+				return c.queueAdmission(response, receipt, binding, QueueCauseWorkflowDatabase)
+			}
 			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
 		}
 	}
-	if err := c.createAdmissionLaunchIntent(binding); err != nil {
+	started = true
+	cause, err := c.launch(ctx, binding, lock)
+	if errors.Is(err, serviceapi.ErrAdmissionUnavailable) && cause != "" && queues {
+		return c.queueAdmission(response, receipt, binding, cause)
+	}
+	if err != nil {
 		return serviceapi.RunAdmissionResponseV1{}, err
+	}
+	return response, nil
+}
+
+// launch starts the bound run under its launch lock (closed here in every case) and waits for it as R6 does. A
+// passing failure (its start failing, the run exiting before it registers) answers ErrAdmissionUnavailable with its
+// queue cause, the launch intent cleared.
+func (c *Controller) launch(ctx context.Context, binding AdmissionBindingV1, lock *os.File) (string, error) {
+	if err := c.createAdmissionLaunchIntent(binding); err != nil {
+		lock.Close()
+		return "", err
 	}
 	args := c.runArgs([]string{
 		"run", "--manifest", binding.ManifestPath, "--ledger", binding.CanonicalLedgerPath,
@@ -555,19 +605,22 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 		"--workflow-authority-config-file", binding.WorkflowAuthorityConfigPath,
 	})
 	if err := c.start(c.executable, args, lock); err != nil {
+		lock.Close()
 		if clearErr := c.clearAdmissionLaunchIntent(binding); clearErr != nil {
-			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrReconciliationRequired
+			return "", serviceapi.ErrReconciliationRequired
 		}
-		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
+		return QueueCauseLaunchFailed, serviceapi.ErrAdmissionUnavailable
 	}
-	started = true
 	if err := lock.Close(); err != nil {
-		return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrAdmissionUnavailable
+		return "", serviceapi.ErrAdmissionUnavailable
 	}
-	if err := c.awaitLaunch(ctx, runID, binding); err != nil {
-		return serviceapi.RunAdmissionResponseV1{}, err
+	if err := c.awaitLaunch(ctx, binding.RunID, binding); err != nil {
+		if errors.Is(err, serviceapi.ErrAdmissionUnavailable) {
+			return QueueCauseExitedBeforeRegistering, err
+		}
+		return "", err
 	}
-	return response, nil
+	return "", nil
 }
 
 // defaultLaunchWait bounds admission's wait for a launched run to register: well inside Repo C's 30-second request

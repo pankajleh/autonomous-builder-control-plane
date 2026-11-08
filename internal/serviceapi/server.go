@@ -131,6 +131,20 @@ type ActionController interface {
 	ReadAction(context.Context, Principal, string, string) (ActionStatusV1, error)
 }
 
+// QueuedRunV1 is what admission's queue (R7, docs/plans/build-recovery.md §6.3) knows of a run the catalog does not:
+// queued since when and on which passing cause, or expired.
+type QueuedRunV1 struct {
+	Expired     bool
+	QueuedSince string
+	Cause       string
+}
+
+// AdmissionQueue answers for a run admitted and queued but not yet registered: its routes answer 404 run_queued while it
+// waits and 404 admission_expired once its wait ended, instead of 404 not_found.
+type AdmissionQueue interface {
+	QueuedRun(runID string) (QueuedRunV1, bool)
+}
+
 type RunAdmissionController interface {
 	AdmitRun(context.Context, Principal, RunAdmissionRequestV1) (RunAdmissionResponseV1, error)
 }
@@ -188,6 +202,8 @@ type ServerConfig struct {
 	Actions                 ActionController
 	RunAdmission            RunAdmissionController
 	DevelopmentRunAdmission DevelopmentRunAdmissionController
+	// AdmissionQueue, when set, answers a queued run's routes (R7).
+	AdmissionQueue AdmissionQueue
 	// Engines, when set, answers GET /v1/engines (Repo C design note AI_KEYS_AND_MODELS §9.5).
 	Engines EngineCatalog
 	// AccountLanes, when set, answers /v1/account-lanes (step 4c) for a service
@@ -925,10 +941,27 @@ func (s *Server) requireRegisteredRun(writer http.ResponseWriter, requestID, run
 		return true
 	}
 	if errors.Is(err, os.ErrNotExist) {
+		if s.reserved.AdmissionQueue != nil {
+			if queued, ok := s.reserved.AdmissionQueue.QueuedRun(runID); ok {
+				s.writeQueuedRun(writer, requestID, queued)
+				return false
+			}
+		}
 		err = ErrDependencyNotFound
 	}
 	s.writeDependencyError(writer, requestID, err)
 	return false
+}
+
+// writeQueuedRun answers a queued run's route: 404 run_queued while it waits, 404 admission_expired once its wait
+// ended (a replay of its request queues it again); both retryable, with queued_since and the cause in details.
+func (s *Server) writeQueuedRun(writer http.ResponseWriter, requestID string, queued QueuedRunV1) {
+	apiError := ErrorV1{Code: "run_queued", Message: "the run is admitted and waits to start", RequestID: requestID, Retryable: true,
+		Details: map[string]any{"queued_since": queued.QueuedSince, "cause": queued.Cause}}
+	if queued.Expired {
+		apiError.Code, apiError.Message = "admission_expired", "the run waited to start and expired; admit its request again"
+	}
+	s.writeError(writer, http.StatusNotFound, apiError)
 }
 
 func parsePageQuery(query url.Values, defaultSize, maximumSize int) (PageRequestV1, error) {
