@@ -878,3 +878,69 @@ func TestKeptDataUnusedForNinetyDaysIsRemovedButNeverWhileATryItRuns(t *testing.
 		t.Fatal("removed twice", removed, err)
 	}
 }
+
+func TestEndedPreviewsNoLongerCountTowardTheLimitOfLiveOnes(t *testing.T) {
+	defer func(n int) { maxLivePreviews = n }(maxLivePreviews)
+	maxLivePreviews = 2
+	rt := &memoryRuntime{available: true, healthy: true}
+	s, _ := fixtureService(t, rt)
+	root := s.store.root
+	first, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("limit-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitPreview(t, s, first.PreviewID, "READY", "")
+	second, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("limit-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitPreview(t, s, second.PreviewID, "READY", "")
+	if _, err = s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("limit-3")); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
+		t.Fatal("a third live preview was admitted past the limit", err)
+	}
+	stop := serviceapi.PreviewStopRequestV1{SchemaVersion: 1, RequestID: "limit-stop", ExpectedRunID: "run-1", ExpectedPreviewID: first.PreviewID, DelegatedActor: createCommand("").DelegatedActor}
+	if v, err := s.StopPreview(context.Background(), principal(), testAuthorityDigest, "run-1", first.PreviewID, stop); err != nil || v.Status != "STOPPED" {
+		t.Fatal(v, err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		s.mu.Lock()
+		_, running := s.workers[first.PreviewID]
+		s.mu.Unlock()
+		if !running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the stopped preview's worker did not end")
+		}
+	}
+	third, err := s.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("limit-3"))
+	if err != nil || third.Revision != second.Revision+1 {
+		t.Fatal("a stopped preview still counted toward the limit", third, err)
+	}
+	awaitPreview(t, s, third.PreviewID, "READY", "")
+	if len(s.store.records) != 3 || s.store.live != 2 {
+		t.Fatal("records", len(s.store.records), "live", s.store.live)
+	}
+	s.Close()
+	// After a restart every preview has ended: three records stay, none counts, and revisions go on from the journal.
+	again, _ := serviceAt(t, root, rt, time.Now)
+	if len(again.store.records) != 3 || again.store.live != 0 {
+		t.Fatal("after restart: records", len(again.store.records), "live", again.store.live)
+	}
+	for i, id := range []string{"limit-4", "limit-5"} {
+		v, err := again.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand(id))
+		if err != nil || v.Revision != third.Revision+uint64(i)+1 {
+			t.Fatal("after restart, past the ended previews", v, err)
+		}
+		awaitPreview(t, again, v.PreviewID, "READY", "")
+	}
+	if _, err = again.CreatePreview(context.Background(), principal(), testAuthorityDigest, "run-1", createCommand("limit-6")); !errors.Is(err, serviceapi.ErrPreviewUnavailable) {
+		t.Fatal("the limit no longer holds live previews after a restart", err)
+	}
+	again.Close()
+	if reopened, err := openLoadedStore(root); err != nil || len(reopened.records) != 5 || reopened.live != 0 {
+		t.Fatal("the journal no longer loads past the limit", err)
+	} else {
+		reopened.close()
+	}
+}
