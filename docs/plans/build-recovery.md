@@ -6,8 +6,8 @@ Exact base: `add6f4e` (PR #191)
 
 Status: **R1 and R2 built in PR #193 (`1d69c32`, live since 2026-11-07 15:24 UTC); R3 built in PR #194 (`c0aeb06`,
 live since 2026-11-07 16:38 UTC); R5 and R6's 503 built in PRs #195 and #196 (`3010d56`, live since 2026-11-07
-17:46 UTC); R7 built in PR #197, to go live after Repo C reads a queued run; R2b, R4 and R6's resume designed below.**
-Repo C
+17:46 UTC); R7 built in PR #197 (`1305e35`), to go live after Repo C reads a queued run; R6's resume built in PR #199
+(§6.2); R2b and R4 designed below for the next PRs.** Repo C
 design note
 `BUILD_RELIABILITY.md` §5.6 is the proposal (Repo C P1122, PR #1137). The owner, 2026-11-07, on "Recovery in ABCP":
 "Yes, build it (Recommended)": each Repo B merge and each quiet ABCP restart for R1 to R7 is covered, at about US$30 a
@@ -185,7 +185,7 @@ pin in every manifest template and a quiet restart.
   start; a fallback for a running build is R3's attempt on another invocation). Which engine customers fall back to is
   Repo C's A2 build rules.
 - **R5, acceptance once more: built, PR #195** (§6.1).
-- **R6, restarts:** admission's `503` built, PR #196; the resume designed, its own PR (§6.2).
+- **R6, restarts:** admission's `503` built, PR #196; the resume built, PR #199 (§6.2).
 - **R7, a queue at admission:** built, PR #197 (§6.3); it goes live only after Repo C reads a queued run.
 
 ### 6.1 R5: the final acceptance once more (built, PR #195)
@@ -223,7 +223,7 @@ accept a truncation whose archive holds the proven prefix byte for byte. Until t
 
 **Spend:** one more acceptance run (minutes, no model) on a failing build only.
 
-### 6.2 R6: never 202 and nothing (built, PR #196); the resume (designed)
+### 6.2 R6: never 202 and nothing (built, PR #196); the resume (built)
 
 **The case** (Repo C `BUILD_RELIABILITY.md` §3.3 row 11, `admission-58cbcfac…`, 2026-10-17 02:27 UTC): admission launched
 `abcp run` and answered `202`; `abcp run` could not open its workflow database and exited before it registered, so the
@@ -244,21 +244,63 @@ run never appeared (`GET /v1/runs/<run>` still answers `404`) and a replay of th
 Repo C already words `ADMISSION_UNAVAILABLE` ("the builder is restarting or busy: start the build again in a minute");
 R7 is for that press to need no one.
 
-**The resume (not built here, its own PR).** An ABCP restart does not interrupt a build: each `abcp run` is its own
-process, and `abcp serve` can stop and start beside it. What interrupts one is the host's restart (`4a40c064`,
-2026-10-16), an out-of-memory kill or a `kill`. On SIGTERM `abcp run` records `CANCELLED` with R1's `INTERRUPTED`, a state
-with no way out; on SIGKILL it records nothing and its catalog owner lease goes stale. A resume needs, each touching
-every run:
+**The resume (built).** An ABCP restart does not interrupt a build: each `abcp run` is its own process, and `abcp
+serve` can stop and start beside it (the quiet restarts wait for no build running anyway). What interrupts one is the
+host's restart (`4a40c064`, 2026-10-16), an out-of-memory kill or a `kill`. Until now, on SIGTERM `abcp run` recorded
+`CANCELLED` with R1's `INTERRUPTED`, a state with no way out; on SIGKILL it recorded nothing and its catalog owner lease
+went stale, the run left `IMPLEMENTING` for ever. Now a run whose profile allows a fresh attempt (`ralphex.fresh_attempts:
+1`, R3; no template changes, every product template has it since R3 went live) goes on, once
+(`internal/run/resume_interrupted.go`, `internal/runadmission/interrupted*.go`, `cmd/abcp/resume_interrupted.go`):
 
-1. a SIGTERM that is not an API cancel to record `RECOVERY_REQUIRED` (cause `INTERRUPTED`) instead of `CANCELLED`, so
-   the run can go on (`RECOVERY_REQUIRED → EXECUTION_STARTING` is allowed);
-2. `abcp serve`, at start and on a timer, to find registered runs that are not terminal and whose owner process is gone,
-   and relaunch each once (`abcp run --resume-interrupted`), which takes the catalog's ownership over (a new owner lease,
-   the cancel watcher, the action journal), records `RECOVERY_REQUIRED` first when the run stopped without it, and goes on
-   as R3's fresh attempt (the worktree removed inside the wall, `-fresh-N` evidence; Ralphex appends to a progress file
-   that ended `Failed:` or with no footer, so one session); a run interrupted in acceptance runs its acceptance again;
-3. bounds: one resume per run, a limit on resumes after a boot, none for a run its owner stopped;
-4. Repo C to read `RECOVERY_REQUIRED` as still preparing while ABCP resumes it (`journey.ts` counts it `PAUSED` today).
+1. **SIGTERM records `RECOVERY_REQUIRED`.** `abcp run` cancels its run with a cause of its own for each signal
+   (`runctl.NewSignalCause`). When the builder's run ends and the cause is SIGTERM (not an API cancellation, which has its
+   own), the run is a worktree run that implements outside V3 bounds whose plan can be handed to Ralphex again (R3's
+   `attemptCanStartAgain`), its ledger shows no resume yet and no `API_CANCEL_REQUESTED`, the attempt records `IMPLEMENTING
+   → RECOVERY_REQUIRED` in place of `CANCELLED`: `outcome`, `exit_code`, `signal`, R1's `failure_detail` (cause
+   `INTERRUPTED`, `attempts` the attempt's), `interruption: SIGTERM`, `recovery: RESUME`, `next_attempt`. Ralphex ending
+   by itself on the same SIGTERM (it reaches the whole host at a shutdown) counts too. SIGINT (a person at the terminal)
+   and every other case end as before. `/failure` answers no `failure` for it (it is not a stop state) and activity resets
+   on it as on `RETRYING` (the worktree "not there yet" until the resumed attempt implements).
+2. **`abcp serve` relaunches the run once.** At start and every 5 minutes (`ResumeEvery`), the resume pass reads each
+   registered run not yet settled: its ledger (`runctl.InterruptionOf`) and its owner lease. A run is launched when its
+   ledger stops at that `RECOVERY_REQUIRED` (recovery `RESUME`) or in `EXECUTION_STARTING`/`IMPLEMENTING`, never resumed
+   before and never asked to stop, its owner's process is gone (the lease retired or its process identity dead), its last
+   ledger event is at most 24 hours old (`ResumeWithin`: one interrupted while ABCP itself was down longer is left), its
+   own frozen manifest allows it (`runctl.ResumesAfterInterruption`: `fresh_attempts`, a worktree run, not a review or an
+   exact edit), and its launch lock is free (a live owner or a launch of it holds it). Then, as admission's launch: the
+   wall and the workflow database checked (either down: the pass stops, writes nothing, the next tries again), a durable
+   record written (`<service-root>/admissions/resumes/<run>.json`, `InterruptedResumeV1`, never removed but when `abcp
+   run` could not even start), and `abcp run --resume-interrupted` launched from the run's admission binding with the
+   launch lock as file 3. At most 4 a pass (`ResumesPerPass`). Ended, resumed, refused or unadmitted runs are settled and
+   not read again by that `abcp serve`. One line each: `abcp interrupted runs resume ready=true …` at start, `abcp resume
+   launched run=… state=… attempt=…`, `abcp resume waits run=… cause=…`, `abcp resume skipped run=… reason=…`.
+3. **`abcp run --resume-interrupted` takes the run over and goes on as R3's fresh attempt.** It needs `--service-root`.
+   It retires the owner lease the last `abcp run` left (only once that process is gone; refused while a cancel still waits
+   for that owner in the action journal: a run its owner stopped is not resumed), under the journal's lock then the
+   catalog's, as its watcher would have; then registers as every `abcp run` does (the next owner generation, its cancel
+   watcher, the action journal; the same attempt id, so Repo C's Stop build reaches it). The runner reads the ledger again:
+   not resumable, it records nothing and exits (`RESUME_NOT_ALLOWED`); from `EXECUTION_STARTING`/`IMPLEMENTING` (a SIGKILL)
+   it first records `→ RECOVERY_REQUIRED` (`resume-controller`, `interruption: OWNER_GONE`, R1's `INTERRUPTED`). Then,
+   under its run slot and (until a walled run's setup is done) the repository lease again, `RECOVERY_REQUIRED →
+   EXECUTION_STARTING` (start evidence `attempt`, `resume_after: INTERRUPTED`, `retained_worktree_removed`) `→
+   IMPLEMENTING`: the attempt numbered from the ledger (its `EXECUTION_STARTING` edges plus one), the retained worktree
+   removed first with Git's own commands, inside the wall for a walled run (its uncommitted work goes with it; its commits
+   stay on the branch), a walled plan copy and Ralphex evidence named `-fresh-<attempt>`, Ralphex's own task prompt with a
+   "RESUMED ATTEMPT" section (the session before was stopped from outside; only its commits are kept). Ralphex appends to
+   the progress file, which ended `Failed:` (SIGTERM) or with no footer (SIGKILL), so one session. R3's fresh attempt stays
+   available after a resume when the run had not used it (its ledger's `RETRYING`): at most three builder sessions.
+4. **Bounds.** One resume per run, ever: a run whose ledger shows a resume ends `CANCELLED` (`INTERRUPTED`, R1's
+   attempts) at its next SIGTERM, and serve's record keeps it from a second launch whatever happens; none for a run asked
+   to stop; at most 4 a pass and none older than a day.
+
+**Not resumed (as before):** a run interrupted before its builder started (`RUN_CREATED`, `AUTHORITY_VALIDATED`, waiting
+for its run slot), between attempts (`RETRYING`), or in acceptance (`IMPLEMENTATION_COMPLETED`, `BRANCH_ACCEPTANCE_PENDING`:
+a Ralphex that succeeded leaves a `Completed:` footer, §6.1); a resumed run killed again by SIGKILL stays as it was. And
+R7's queue never collides with it: the queue launches only runs that never registered, the resume only registered ones,
+each under the run's launch lock.
+
+**Repo C** reads `RECOVERY_REQUIRED` as still preparing ("picking up where it stopped") while ABCP resumes it
+(`journey.ts` counted it `PAUSED`).
 
 ### 6.3 R7: a queue at admission (built, PR #197; live after Repo C)
 
@@ -380,3 +422,15 @@ refusals are as today, so the order of the two releases cannot strand a build.
    whichever Repo B PRs of this batch are merged by then. R6 (PR #196) changes no template: its binary refuses a launch
    while the database is down and waits for the run to register.
 4. **Check it live:** the next accepted build's `BRANCH_ACCEPTED` payload; a flaky acceptance's `acceptance_flaky`.
+
+## 10. Going live (R6's resume, with R7 and lane keys)
+
+One build and one quiet restart take whichever of R7 (#197), R6's resume (this PR) and lane keys (Repo B #198) `main`
+holds, each by its own files: `$R/a-abcp-build-resume-batch.sh <main sha>` builds the binary (each one's tests, the wall
+tests with R3's and `TestAResumedWalledRun…`, none skipped, the Codex end-to-end tests, `abcp lane-keys` on the live
+profiles when lane keys are in) and stages `a-abcp-start-<sha7>.sh`; `$R/a-abcp-restart-resume-batch.sh <main sha>`
+waits as every quiet restart does, stops the live ABCP, moves in R7's `profiles.json.r7-new` (kept as
+`profiles.json.pre-r7-<time>`) and lane keys' `lanes.control` in `grants.json` (kept as `grants.json.pre-lane-keys-<time>`)
+for what the commit holds, starts the new binary and checks the engines, `/failure`, the resume pass's ready line and
+`GET /v1/lanes` as each is in; on any failure everything goes back and the binary before starts again. Its `DRY=` mode
+does every step on copies. R6's resume changes no file: its pass starts with the binary.

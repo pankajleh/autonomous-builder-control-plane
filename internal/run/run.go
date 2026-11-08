@@ -311,8 +311,13 @@ type Runner struct {
 	finalization  FinalizationHook
 	snapshots     SnapshotCoordinator
 	parallelRuns  int
-	// attempt is the Ralphex attempt the run is on: 1, then 2 for a fresh attempt (R3).
+	// attempt is the Ralphex attempt the run is on: 1, then 2 for a fresh attempt (R3); a resumed run's is one more
+	// than the attempts its ledger shows started (R6).
 	attempt int
+	// interrupted: the run is resumed after an interruption (RunResumeInterrupted, R6); freshAttemptUsed: R3's fresh
+	// attempt has run (its ledger says so, for a resumed run), so it gets none more.
+	interrupted      bool
+	freshAttemptUsed bool
 	// openModelOptions are the open-model start's seams; zero is live.
 	openModelOptions openmodel.StartOptions
 	// wall walls every Ralphex run (SetBuildWall, or loaded from wallFile by
@@ -550,6 +555,11 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		}
 	}()
 
+	// resumeAttempt is the attempt a run resumed after an interruption makes (R6), from RECOVERY_REQUIRED.
+	resumeAttempt := 0
+	if r.resume && r.interrupted {
+		return result, errors.New("a run is resumed after a human decision or after an interruption, not both")
+	}
 	if r.resume {
 		// Re-entry: the attempt already passed authority validation in its first
 		// lifecycle. Perform the HUMAN_DECISION_REQUIRED -> next transition from
@@ -563,6 +573,20 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		}
 		if err := acquireLease(); err != nil {
 			return r.fail(ctx, result, domain.StateAuthorityValidated, "resume-controller", err, nil)
+		}
+	} else if r.interrupted {
+		// R6: the run passed authority validation in its first lifecycle; it goes on from RECOVERY_REQUIRED as a fresh
+		// attempt, under its run slot and (until a walled run's setup is done) the repository lease again.
+		var err error
+		if resumeAttempt, err = r.beginResumeAfterInterruption(ctx); err != nil {
+			return result, err
+		}
+		result.State = domain.StateRecoveryRequired
+		if err := acquireLease(); err != nil {
+			if ctx.Err() != nil {
+				return r.cancel(ctx, result, domain.StateRecoveryRequired, "ralphex-adapter", err, nil)
+			}
+			return r.fail(ctx, result, domain.StateRecoveryRequired, "ralphex-adapter", err, nil)
 		}
 	} else {
 		authorityRef, err := r.artifacts.WriteBytes("authority.json", "validated-authority", r.governed.CanonicalJSON())
@@ -630,6 +654,10 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	// A walled run (Repo C design note BUILD_ISOLATION.md, phase 1) gets its own folder and repository while the setup
 	// lease is held; the product repository is then needed only to bring its branch back, so the lease is let go.
 	var walled *walledRun
+	setupFrom := domain.StateAuthorityValidated
+	if r.interrupted {
+		setupFrom = domain.StateRecoveryRequired
+	}
 	if r.wall == nil && r.wallFile != "" {
 		loaded, wallErr := LoadBuildWall(r.wallFile)
 		if wallErr == nil && loaded.SHA256() != r.wallSHA256 {
@@ -637,18 +665,18 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 			wallErr = fmt.Errorf("%w: the wall file is not the one abcp serve probed (sha256 %s, probed %s)", ErrBuildWallUnavailable, loaded.SHA256(), r.wallSHA256)
 		}
 		if wallErr != nil {
-			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", wallErr, nil)
+			return r.fail(ctx, result, setupFrom, "build-wall", wallErr, nil)
 		}
 		r.wall = loaded
 	}
 	if r.wall != nil {
 		var wallErr error
 		if walled, wallErr = r.prepareWalledRun(ctx); wallErr != nil {
-			return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", wallErr, nil)
+			return r.fail(ctx, result, setupFrom, "build-wall", wallErr, nil)
 		}
 		if repositoryLease != nil {
 			if err := repositoryLease.Close(); err != nil {
-				return r.fail(ctx, result, domain.StateAuthorityValidated, "build-wall", err, nil)
+				return r.fail(ctx, result, setupFrom, "build-wall", err, nil)
 			}
 			repositoryLease = nil
 		}
@@ -662,11 +690,21 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 	if walled != nil {
 		engineMounts, engineEnv = append([]WallMount{}, walled.mounts...), copyStrings(walled.env)
 	}
-	for attempt := 1; ; attempt++ {
+	// R6: a run resumed after an interruption starts at the attempt after the ones its ledger shows, from
+	// RECOVERY_REQUIRED, under the run slot taken above; R3's fresh attempt may still follow it.
+	firstOfRun := 1
+	if r.interrupted {
+		firstOfRun = resumeAttempt
+	}
+	for attempt := firstOfRun; ; attempt++ {
 		r.attempt = attempt
 		startFrom := domain.StateAuthorityValidated
 		planHandoff := false
-		if attempt > 1 {
+		resuming := r.interrupted && attempt == firstOfRun
+		if resuming {
+			startFrom = domain.StateRecoveryRequired
+		}
+		if attempt > firstOfRun {
 			startFrom = domain.StateRetrying
 			// The run slot, the open-model engine's build slot and (for an unwalled run) the repository execution lease
 			// are taken again, as for the first attempt; a walled run needs no lease past its setup.
@@ -701,9 +739,14 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 				return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
 			}
 		}
-		// R3: a fresh attempt's task prompt is Ralphex's own with what the first attempt ended with after it.
+		// R3: a fresh attempt's task prompt is Ralphex's own with what the first attempt ended with after it; R6: a resumed
+		// one's says the attempt before it was interrupted.
 		if first != nil {
 			if err := ralphex.WriteFreshAttemptPrompt(configDir, freshAttemptSummary(first.detail, first.body)); err != nil {
+				return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
+			}
+		} else if resuming {
+			if err := ralphex.WriteResumedAttemptPrompt(configDir); err != nil {
 				return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
 			}
 		}
@@ -716,6 +759,10 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		} else {
 			executionPlanPath, cleanupExecutionPlan, err = r.prepareExecutionPlan(ctx, repositoryLease)
 			planHandoff = cleanupExecutionPlan != nil
+		}
+		if err == nil && resuming && walled == nil && planHandoff {
+			// An unwalled run's untracked plan copy would be the same file again (only tests run unwalled).
+			err = fmt.Errorf("%w: an unwalled run's untracked plan cannot be handed to Ralphex again", ErrNotResumable)
 		}
 		if err != nil {
 			if cleanupExecutionPlan != nil {
@@ -781,6 +828,9 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		if first != nil {
 			startEvidence["attempt"] = attempt
 			startEvidence["fresh_attempt_after"] = string(first.detail.Cause)
+		} else if resuming {
+			startEvidence["attempt"] = attempt
+			startEvidence["resume_after"] = string(runfailure.CauseInterrupted)
 		}
 		if openModelEvidence != nil {
 			startEvidence["open_model"] = openModelEvidence
@@ -812,17 +862,17 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 			}
 			startEvidence["isolation"] = isolation
 			commandArgv, commandCwd = append(append([]string{}, wallArgs...), argv...), walled.repository
-			if first != nil {
+			if attempt > 1 {
 				if err := r.removeRetainedWorktree(ctx, walled.repository, wallArgs, walled.environment(gitexec.Environment())); err != nil {
 					return r.fail(ctx, result, startFrom, "build-wall", err, nil)
 				}
 			}
-		} else if first != nil {
+		} else if attempt > 1 {
 			if err := r.removeRetainedWorktree(ctx, r.governed.Repository().Path, nil, nil); err != nil {
 				return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
 			}
 		}
-		if first != nil {
+		if attempt > 1 {
 			startEvidence["retained_worktree_removed"] = true
 		}
 		if err := r.transition(ctx, startFrom, domain.StateExecutionStarting, "governed-runner", startEvidence, nil); err != nil {
@@ -854,7 +904,7 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		var processErr error
 		var containment *ContainmentEvidenceV1
 		stopSetupWatch := func() {}
-		if repositoryLease != nil && r.governed.Worktree().Enabled && first == nil {
+		if repositoryLease != nil && r.governed.Worktree().Enabled && attempt == 1 {
 			stopSetupWatch = r.releaseLeaseAfterWorktreeSetup(ctx, repositoryLease)
 			defer stopSetupWatch()
 		}
@@ -940,7 +990,14 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 			if process.Outcome == supervisor.OutcomeCanceled || apiCancelActive {
 				terminal = domain.StateCancelled
 			}
-			if !apiCancelActive && process.Outcome != supervisor.OutcomeCanceled &&
+			// R6: abcp run received SIGTERM (not an API cancellation) while the builder ran, and the run may be resumed:
+			// the attempt stops at RECOVERY_REQUIRED, for abcp serve to start it again, instead of CANCELLED. However
+			// Ralphex itself ended (the same SIGTERM may have reached it first), the run was interrupted.
+			interrupted := !apiCancelActive && r.resumableInterruption(ctx, invocation, walled != nil, planHandoff)
+			if interrupted {
+				terminal = domain.StateCancelled
+			}
+			if !interrupted && !apiCancelActive && process.Outcome != supervisor.OutcomeCanceled &&
 				isHumanDecisionFailure(process, nil) {
 				return r.blockHumanDecision(ctx, result, process, nil, implementationRefs)
 			}
@@ -962,15 +1019,25 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 			// and the check's own output as evidence.
 			detail, body := r.ralphexEnding(ctx, process, classification, terminal == domain.StateCancelled)
 			payload, implementationRefs = r.withFailureDetail(payload, detail, body, implementationRefs)
+			if interrupted {
+				payload["interruption"], payload["recovery"], payload["next_attempt"] = InterruptionSIGTERM, RecoveryResume, attempt+1
+				if err := r.transition(ctx, domain.StateImplementing, domain.StateRecoveryRequired, "ralphex-adapter", payload, implementationRefs); err != nil {
+					return result, err
+				}
+				result.State, result.FailureReason = domain.StateRecoveryRequired, "interrupted by SIGTERM: abcp serve resumes the run"
+				return result, nil
+			}
 			// R3: the first attempt's builder ended without finishing; one fresh attempt starts on the branch before the
-			// run fails, recorded as IMPLEMENTING -> RETRYING with how the first attempt ended.
-			if terminal == domain.StateFailed && first == nil && r.freshAttemptEligible(invocation, walled != nil, planHandoff, detail) {
+			// run fails, recorded as IMPLEMENTING -> RETRYING with how the first attempt ended. A resumed run (R6) that had
+			// not used its fresh attempt still has it.
+			if terminal == domain.StateFailed && !r.freshAttemptUsed && r.freshAttemptEligible(invocation, walled != nil, planHandoff, detail) {
 				payload["recovery"], payload["next_attempt"] = "FRESH_ATTEMPT", attempt+1
 				if err := r.transition(ctx, domain.StateImplementing, domain.StateRetrying, "ralphex-adapter", payload, implementationRefs); err != nil {
 					return result, err
 				}
 				result.State, result.FailureReason = domain.StateRetrying, ""
 				first = &firstAttempt{detail: detail, body: body}
+				r.freshAttemptUsed = true
 				continue
 			}
 			if err := r.transition(ctx, domain.StateImplementing, terminal, "ralphex-adapter", payload, implementationRefs); err != nil {
@@ -1997,7 +2064,7 @@ func ep002State(state domain.State) bool {
 	switch state {
 	case domain.StateAuthorityValidated, domain.StateExecutionStarting, domain.StateImplementing, domain.StateRetrying,
 		domain.StateImplementationCompleted, domain.StateBranchAcceptancePending, domain.StateBranchAccepted,
-		domain.StateValidationUnavailable, domain.StateHumanDecisionRequired, domain.StateFailed, domain.StateCancelled:
+		domain.StateValidationUnavailable, domain.StateHumanDecisionRequired, domain.StateRecoveryRequired, domain.StateFailed, domain.StateCancelled:
 		return true
 	default:
 		return false
