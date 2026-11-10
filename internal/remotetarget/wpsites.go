@@ -35,13 +35,14 @@ import (
 
 // The kit's server images, by digest (Repo C tools/wp-site-kit, built and run
 // by wp-site-kit.yml's server job exactly as these scripts run them, and
-// published from main). The server is Repo C fd1f035's (#1024, P1010: the kit's
-// plugin 1.5.0, whose `page set` the pages operation runs, taking Site details'
-// files beside the pages and drawing Powered by Deployflix from their footer,
-// and 1.3.0's footer links); the database is still Repo C 168dbff's (#918,
-// W5a), unchanged since.
+// published from main). The server is Repo C 1d900b1's (#1181, P1163: the kit's
+// plugin 1.5.1, which WordPress lists as "Deployflix site" and whose words say
+// Deployflix, otherwise 1.5.0 of fd1f035, #1024, P1010: `page set`, which the
+// pages operation runs, taking Site details' files beside the pages and drawing
+// Powered by Deployflix from their footer, and 1.3.0's footer links); the
+// database is still Repo C 168dbff's (#918, W5a), unchanged since.
 const (
-	WordPressServerImage  = "ghcr.io/pankajleh/autobuild-wp-server@sha256:74c56ec36bc2888e3745ce6ccbe00a6692372ae01787fdd4c60566b2cedff094"
+	WordPressServerImage  = "ghcr.io/pankajleh/autobuild-wp-server@sha256:70874da2256622d4220222a073d6d86c61f172f58719e1a7b3c3079dbfbeb7f9"
 	WordPressMariaDBImage = "ghcr.io/pankajleh/autobuild-wp-mariadb@sha256:ad91266b3362c723d2bc7386a052e41ef0bb5e60231e977b2f540da89901e99e"
 )
 
