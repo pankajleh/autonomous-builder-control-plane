@@ -53,6 +53,9 @@ type ExactEditResultV1 struct {
 	Branch    string                  `json:"branch"`
 	Worktree  string                  `json:"worktree,omitempty"`
 	Files     []ExactEditFileResultV1 `json:"files"`
+	// Regenerated: a site-kit website's pages the export wrote or removed after the edit, one commit after it
+	// (siteexport.go); HeadSHA is then that commit.
+	Regenerated []string `json:"regenerated,omitempty"`
 }
 
 // ExactEditFileResultV1 names one file the edit changed, by its blobs.
@@ -116,6 +119,14 @@ func readExactEdit(ctx context.Context, repository string, edit authority.ExactE
 		content, err := gitBytes(ctx, repository, nil, nil, "cat-file", "blob", replacement.BaseBlob)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", replacement.Path, err)
+		}
+		if replacement.JSON() {
+			updated, err := replaceJSONValue(content, replacement.Pointer, []byte(replacement.From), []byte(replacement.To))
+			if err != nil {
+				return nil, fmt.Errorf("%w: %s: %v", ErrExactEditDoesNotApply, replacement.Path, err)
+			}
+			files = append(files, exactEditFile{path: replacement.Path, mode: fields[0], blob: fields[2], updated: updated})
+			continue
 		}
 		find := []byte(replacement.Find)
 		at := bytes.Index(content, find)
@@ -349,6 +360,10 @@ func (r *Runner) applyExactEdit(ctx context.Context, edit authority.ExactEditMan
 	if err != nil {
 		return ExactEditResultV1{}, err
 	}
+	regenerated, headSHA, err := exportSitePages(ctx, r.wall, repository.Path, branch, headSHA)
+	if err != nil {
+		return ExactEditResultV1{}, err
+	}
 	worktree, err := checkoutExactEdit(ctx, repository.Path, branch)
 	if err != nil {
 		return ExactEditResultV1{}, err
@@ -361,6 +376,6 @@ func (r *Runner) applyExactEdit(ctx context.Context, edit authority.ExactEditMan
 	}
 	return ExactEditResultV1{
 		Kind: "ExactEditResultV1", SourceSHA: edit.SourceSHA, CopySHA: copySHA, HeadSHA: headSHA,
-		Branch: branch, Worktree: worktree, Files: changed,
+		Branch: branch, Worktree: worktree, Files: changed, Regenerated: regenerated,
 	}, nil
 }

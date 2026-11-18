@@ -266,3 +266,38 @@ func TestRunAdmissionExactEditIsOptionalAndBounded(t *testing.T) {
 		t.Error("an exact edit with an executor choice is accepted")
 	}
 }
+
+func TestRunAdmissionExactEditTakesAJSONReplacement(t *testing.T) {
+	valid := RunAdmissionRequestV1{
+		SchemaVersion: 1, RequestID: "request-1", ProfileID: "default",
+		ProductAuthorizationID: "authorization-1", ProductTaskID: "task-1", ProductVersionID: "version-1",
+		ProductManifestSHA256: strings.Repeat("a", 64), RepositoryBaseSHA: strings.Repeat("b", 40),
+		TaskMarkdown: "# Picture changed\n", DelegatedActor: DelegatedActorV1{SubjectID: "user-1", SubjectType: PrincipalUser},
+	}
+	pointer := RunReplacementV1{Path: "content.json", BaseBlob: strings.Repeat("c", 40),
+		Pointer: "/pages/gallery/sections/0/items/0/image", From: `"public/assets/section-1.png"`, To: `"public/assets/picked-7.png"`}
+	valid.ExactEdit = &RunExactEditV1{SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{pointer}}
+	if err := ValidateRunAdmissionRequestV1(valid); err != nil {
+		t.Fatalf("a JSON replacement is accepted: %v", err)
+	}
+	for name, change := range map[string]func(*RunReplacementV1){
+		"and text too":         func(r *RunReplacementV1) { r.Find = "a"; r.Replace = "b" },
+		"from without pointer": func(r *RunReplacementV1) { r.Pointer = "" },
+		"not a JSON file":      func(r *RunReplacementV1) { r.Path = "index.html" },
+		"no leading slash":     func(r *RunReplacementV1) { r.Pointer = "pages/home" },
+		"a bad escape":         func(r *RunReplacementV1) { r.Pointer = "/a~2" },
+		"from not JSON":        func(r *RunReplacementV1) { r.From = "section-1.png" },
+		"to empty":             func(r *RunReplacementV1) { r.To = "" },
+		"to too long":          func(r *RunReplacementV1) { r.To = `"` + strings.Repeat("x", MaxExactEditTextBytes) + `"` },
+		"the same value":       func(r *RunReplacementV1) { r.To = r.From },
+		"a control character":  func(r *RunReplacementV1) { r.Pointer = "/a\nb" },
+	} {
+		replacement := pointer
+		change(&replacement)
+		invalid := valid
+		invalid.ExactEdit = &RunExactEditV1{SourceSHA: strings.Repeat("d", 40), Replacements: []RunReplacementV1{replacement}}
+		if ValidateRunAdmissionRequestV1(invalid) == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

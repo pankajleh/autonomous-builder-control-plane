@@ -1374,6 +1374,7 @@ func exactEditManifest(edit serviceapi.RunExactEditV1) authority.ExactEditManife
 	for _, replacement := range edit.Replacements {
 		manifest.Replacements = append(manifest.Replacements, authority.ExactEditReplacement{
 			Path: replacement.Path, BaseBlob: replacement.BaseBlob, Find: replacement.Find, Replace: replacement.Replace,
+			Pointer: replacement.Pointer, From: replacement.From, To: replacement.To,
 		})
 	}
 	return manifest
