@@ -53,6 +53,9 @@ type ExactEditResultV1 struct {
 	Branch    string                  `json:"branch"`
 	Worktree  string                  `json:"worktree,omitempty"`
 	Files     []ExactEditFileResultV1 `json:"files"`
+	// Regenerated: a site-kit website's pages the export wrote or removed after the edit, one commit after it
+	// (siteexport.go); HeadSHA is then that commit.
+	Regenerated []string `json:"regenerated,omitempty"`
 }
 
 // ExactEditFileResultV1 names one file the edit changed, by its blobs.
@@ -357,6 +360,10 @@ func (r *Runner) applyExactEdit(ctx context.Context, edit authority.ExactEditMan
 	if err != nil {
 		return ExactEditResultV1{}, err
 	}
+	regenerated, headSHA, err := exportSitePages(ctx, r.wall, repository.Path, branch, headSHA)
+	if err != nil {
+		return ExactEditResultV1{}, err
+	}
 	worktree, err := checkoutExactEdit(ctx, repository.Path, branch)
 	if err != nil {
 		return ExactEditResultV1{}, err
@@ -369,6 +376,6 @@ func (r *Runner) applyExactEdit(ctx context.Context, edit authority.ExactEditMan
 	}
 	return ExactEditResultV1{
 		Kind: "ExactEditResultV1", SourceSHA: edit.SourceSHA, CopySHA: copySHA, HeadSHA: headSHA,
-		Branch: branch, Worktree: worktree, Files: changed,
+		Branch: branch, Worktree: worktree, Files: changed, Regenerated: regenerated,
 	}, nil
 }
