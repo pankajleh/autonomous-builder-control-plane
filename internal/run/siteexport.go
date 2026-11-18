@@ -235,6 +235,25 @@ func (w *Wall) nodeBinary() (string, error) {
 	return found[0], nil
 }
 
+// exportWall answers the wall a site-kit website's export runs in after the exact edit on commit. An exact edit runs no
+// build, so it starts before Run loads a build's wall from wallFile (2026-11-18: the first live try found no wall, and
+// the edit was refused); the wall is loaded here as Run loads it, and only the one abcp serve probed. Nothing is loaded
+// for a commit that is not a site-kit website, or when the runner was given its wall or no wall file.
+func (r *Runner) exportWall(ctx context.Context, repository, commit string) (*Wall, error) {
+	if r.wall != nil || r.wallFile == "" || !siteKitSite(ctx, repository, commit) {
+		return r.wall, nil
+	}
+	wall, err := LoadBuildWall(r.wallFile)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the pages: %v", ErrBuildWallUnavailable, err)
+	}
+	if wall.SHA256() != r.wallSHA256 {
+		return nil, fmt.Errorf("%w: the pages: the wall file is not the one abcp serve probed (sha256 %s, probed %s)",
+			ErrBuildWallUnavailable, wall.SHA256(), r.wallSHA256)
+	}
+	return wall, nil
+}
+
 // exportSitePages runs the export after a site-kit website's edit and commits what it wrote on the branch, one commit
 // after headSHA. It answers the files regenerated and the branch's new head; nothing (and headSHA) when the commit is
 // not a site-kit website or the pages already follow.

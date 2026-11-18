@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 )
 
 // A site-kit website as a build leaves it: content.json, the pages the export wrote from it, and a page it no longer makes.
@@ -137,6 +139,75 @@ func TestAFailedExportRefusesTheEdit(t *testing.T) {
 	// With no wall, the real export refuses to run at all.
 	if err := walledSiteExport(context.Background(), nil, t.TempDir()); err == nil {
 		t.Fatal("the export ran without a wall")
+	}
+}
+
+// The first live try (2026-11-18): an exact edit runs before Run loads a build's wall, so the export found none and the
+// edit was refused. A whole run given only the wall file abcp serve probed, as abcp serve gives it, hands the export that wall.
+func TestAnExactEditRunHandsTheExportTheProbedWall(t *testing.T) {
+	wall, dirs, err := writeTestWall(t, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var given *Wall
+	saved := siteExportCommand
+	siteExportCommand = func(_ context.Context, w *Wall, dir string) error {
+		given = w
+		write(t, dir, "gallery.html", "<img src=\"public/assets/picked-7.png\">\n<!-- made by the export -->\n")
+		return nil
+	}
+	t.Cleanup(func() { siteExportCommand = saved })
+	fixture, _ := exactEditFixture(t, siteKitVersion, func(repository string, edit *authority.ExactEditManifest) {
+		edit.Replacements = []authority.ExactEditReplacement{{Path: "content.json", BaseBlob: blobAt(t, repository, edit.SourceSHA, "content.json"),
+			Pointer: "/pages/gallery/sections/0/items/0/image", From: `"public/assets/section-1.png"`, To: `"public/assets/picked-7.png"`}}
+	}, commandPath(t, "true"))
+	runner := fixture.runner(t)
+	if err := runner.SetBuildWallFile(dirs.file, wall.SHA256()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Accepted() {
+		t.Fatalf("the edit was not accepted: %#v", result)
+	}
+	if given == nil || given.SHA256() != wall.SHA256() {
+		t.Fatalf("the export ran with wall %v, want the probed one", given)
+	}
+	repository := fixture.authority.Repository().Path
+	if got := runGit(t, repository, "show", "abcp/run-fixture:gallery.html"); !strings.Contains(got, "picked-7.png") {
+		t.Fatalf("the branch's gallery.html = %q, want the export's", got)
+	}
+}
+
+// The export's wall is loaded only for a site-kit website, only from the wall file, and only the one abcp serve probed.
+func TestTheExportsWallIsTheOneProbedAndOnlyForASiteKitWebsite(t *testing.T) {
+	ctx := context.Background()
+	wall, dirs, err := writeTestWall(t, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, _, _ := buildRepository(t)
+	site := addVersion(t, repository, "abcp/site", siteKitVersion)
+	plain := addVersion(t, repository, "abcp/plain", versionFiles)
+	if w, err := (&Runner{}).exportWall(ctx, repository, site); w != nil || err != nil {
+		t.Fatalf("no wall file: %v, %v", w, err)
+	}
+	missing := &Runner{wallFile: filepath.Join(t.TempDir(), "missing.json"), wallSHA256: wall.SHA256()}
+	if w, err := missing.exportWall(ctx, repository, plain); w != nil || err != nil {
+		t.Fatalf("not a site-kit website, so nothing is loaded: %v, %v", w, err)
+	}
+	if _, err := missing.exportWall(ctx, repository, site); !errors.Is(err, ErrBuildWallUnavailable) {
+		t.Fatalf("a wall file that does not load: %v", err)
+	}
+	other := &Runner{wallFile: dirs.file, wallSHA256: strings.Repeat("0", 64)}
+	if _, err := other.exportWall(ctx, repository, site); !errors.Is(err, ErrBuildWallUnavailable) {
+		t.Fatalf("a wall file abcp serve did not probe: %v", err)
+	}
+	probed := &Runner{wallFile: dirs.file, wallSHA256: wall.SHA256()}
+	if w, err := probed.exportWall(ctx, repository, site); err != nil || w == nil || w.SHA256() != wall.SHA256() {
+		t.Fatalf("the probed wall: %v, %v", w, err)
 	}
 }
 

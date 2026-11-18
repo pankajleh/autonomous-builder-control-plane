@@ -360,7 +360,11 @@ func (r *Runner) applyExactEdit(ctx context.Context, edit authority.ExactEditMan
 	if err != nil {
 		return ExactEditResultV1{}, err
 	}
-	regenerated, headSHA, err := exportSitePages(ctx, r.wall, repository.Path, branch, headSHA)
+	wall, err := r.exportWall(ctx, repository.Path, headSHA)
+	if err != nil {
+		return ExactEditResultV1{}, err
+	}
+	regenerated, headSHA, err := exportSitePages(ctx, wall, repository.Path, branch, headSHA)
 	if err != nil {
 		return ExactEditResultV1{}, err
 	}
