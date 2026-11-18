@@ -1245,3 +1245,38 @@ func TestIsolationReadPathsNameTheirAppByItsCanonicalUUID(t *testing.T) {
 		}
 	}
 }
+
+func TestNewValidatesAnExactEditsJSONReplacement(t *testing.T) {
+	jsonEdit := func() *ExactEditManifest {
+		return &ExactEditManifest{SourceSHA: strings.Repeat("a", 40), Replacements: []ExactEditReplacement{{
+			Path: "content.json", BaseBlob: strings.Repeat("b", 40),
+			Pointer: "/pages/gallery/sections/0/items/0/image", From: `"public/assets/section-1.png"`, To: `"public/assets/picked-7.png"`,
+		}}}
+	}
+	manifest := fixtureManifest(t)
+	manifest.Worktree = WorktreePolicy{Enabled: true, Branch: "abcp/exact-edit"}
+	manifest.ExactEdit = jsonEdit()
+	governed, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := governed.ExactEdit(); !ok || !got.Replacements[0].JSON() || got.Replacements[0].To != `"public/assets/picked-7.png"` {
+		t.Fatalf("exact edit %+v", got)
+	}
+	for name, change := range map[string]func(*ExactEditReplacement){
+		"and text too":       func(r *ExactEditReplacement) { r.Find = "a" },
+		"to without pointer": func(r *ExactEditReplacement) { r.Pointer = "" },
+		"not a JSON file":    func(r *ExactEditReplacement) { r.Path = "public/index.html" },
+		"no leading slash":   func(r *ExactEditReplacement) { r.Pointer = "pages/gallery" },
+		"from not JSON":      func(r *ExactEditReplacement) { r.From = "{" },
+		"the same value":     func(r *ExactEditReplacement) { r.To = r.From },
+	} {
+		invalid := fixtureManifest(t)
+		invalid.Worktree = WorktreePolicy{Enabled: true, Branch: "abcp/exact-edit"}
+		invalid.ExactEdit = jsonEdit()
+		change(&invalid.ExactEdit.Replacements[0])
+		if _, err := New(invalid); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

@@ -123,12 +123,19 @@ type RunExactEditV1 struct {
 }
 
 // RunReplacementV1 replaces Find, which must occur exactly once in the file at
-// Path as the source commit holds it (blob BaseBlob), with Replace.
+// Path as the source commit holds it (blob BaseBlob), with Replace. Or, for a
+// JSON file, it changes the one value at Pointer (RFC 6901) from From to To,
+// each one JSON value as text: the same item word for word in two places of a
+// site-kit website's content.json can't be told apart by text (Repo C
+// PREVIEW_EDITOR.md §12.2). One form or the other, never both.
 type RunReplacementV1 struct {
 	Path     string `json:"path"`
 	BaseBlob string `json:"base_blob"`
 	Find     string `json:"find"`
 	Replace  string `json:"replace"`
+	Pointer  string `json:"pointer,omitempty"`
+	From     string `json:"from,omitempty"`
+	To       string `json:"to,omitempty"`
 }
 
 const (
@@ -170,6 +177,18 @@ func ValidateRunExactEditV1(edit RunExactEditV1) error {
 	}
 	seen := map[string]bool{}
 	for _, replacement := range edit.Replacements {
+		if replacement.Pointer != "" {
+			if !ValidExactEditPath(replacement.Path) || seen[replacement.Path] || !isLowerGitObjectID(replacement.BaseBlob) ||
+				replacement.Find != "" || replacement.Replace != "" ||
+				!ValidExactEditJSON(replacement.Path, replacement.Pointer, replacement.From, replacement.To) {
+				return errors.New("invalid exact edit")
+			}
+			seen[replacement.Path] = true
+			continue
+		}
+		if replacement.From != "" || replacement.To != "" {
+			return errors.New("invalid exact edit")
+		}
 		if !ValidExactEditPath(replacement.Path) || seen[replacement.Path] || !isLowerGitObjectID(replacement.BaseBlob) ||
 			replacement.Find == "" || len(replacement.Find) > MaxExactEditTextBytes || len(replacement.Replace) > MaxExactEditTextBytes ||
 			!utf8.ValidString(replacement.Find) || !utf8.ValidString(replacement.Replace) ||
@@ -570,4 +589,32 @@ func ValidatePreviewV1(v PreviewV1) error {
 		return errors.New("invalid preview state")
 	}
 	return nil
+}
+
+// ValidExactEditJSON accepts a JSON replacement's shape, as the run authority
+// checks it again: a file whose name ends in .json; an RFC 6901 pointer below
+// the root ("/…", every "~" followed by 0 or 1) of at most
+// MaxExactEditPathBytes bytes, UTF-8 without a control character; and from and
+// to each one JSON value of 1 to MaxExactEditTextBytes bytes, different.
+func ValidExactEditJSON(path, pointer, from, to string) bool {
+	if !strings.HasSuffix(strings.ToLower(path), ".json") {
+		return false
+	}
+	if pointer == "" || pointer[0] != '/' || len(pointer) > MaxExactEditPathBytes || !utf8.ValidString(pointer) {
+		return false
+	}
+	for i, r := range pointer {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+		if r == '~' && (i+1 >= len(pointer) || (pointer[i+1] != '0' && pointer[i+1] != '1')) {
+			return false
+		}
+	}
+	for _, value := range []string{from, to} {
+		if value == "" || len(value) > MaxExactEditTextBytes || !json.Valid([]byte(value)) {
+			return false
+		}
+	}
+	return from != to
 }

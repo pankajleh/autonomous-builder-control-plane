@@ -117,6 +117,14 @@ func readExactEdit(ctx context.Context, repository string, edit authority.ExactE
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", replacement.Path, err)
 		}
+		if replacement.JSON() {
+			updated, err := replaceJSONValue(content, replacement.Pointer, []byte(replacement.From), []byte(replacement.To))
+			if err != nil {
+				return nil, fmt.Errorf("%w: %s: %v", ErrExactEditDoesNotApply, replacement.Path, err)
+			}
+			files = append(files, exactEditFile{path: replacement.Path, mode: fields[0], blob: fields[2], updated: updated})
+			continue
+		}
 		find := []byte(replacement.Find)
 		at := bytes.Index(content, find)
 		if at < 0 {
