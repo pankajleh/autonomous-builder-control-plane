@@ -14,26 +14,38 @@ import (
 const testLaneKey = "tgp_v1_Zk9uZWtleWZvcnRoZXRlc3Rpbmdvbmx5LTAxMjM0NTY3"
 
 type testLaneKeys struct {
-	sets    []string
-	removes []string
-	err     error
+	sets     []string
+	removes  []string
+	expected []string
+	err      error
+}
+
+// expect records what If-Match the route passed on: the fingerprint, or "-" for none.
+func (t *testLaneKeys) expect(ctx context.Context) {
+	fingerprint, named := ExpectedLaneKey(ctx)
+	if !named {
+		fingerprint = "-"
+	}
+	t.expected = append(t.expected, fingerprint)
 }
 
 func (t *testLaneKeys) Lanes(context.Context) (LanesV1, error) {
 	return LanesV1{SchemaVersion: LanesSchemaV1, Lanes: []LaneV1{
-		{Lane: "groq", Kind: LaneKindKey, State: LaneKeyMissing, Profiles: []string{"local-p02-groq"}},
-		{Lane: "together", Kind: LaneKindKey, State: LaneKeySet, Fingerprint: "1a2b3c4d", Profiles: []string{"local-p02-together"}},
+		{Lane: "groq", Kind: LaneKindKey, Provider: "groq", State: LaneKeyMissing, Profiles: []string{"local-p02-groq"}},
+		{Lane: "together", Kind: LaneKindKey, Provider: "together", State: LaneKeySet, Fingerprint: "1a2b3c4d", Profiles: []string{"local-p02-together"}},
 	}}, t.err
 }
 
-func (t *testLaneKeys) SetKey(_ context.Context, lane string, request LaneKeyRequestV1) (LaneV1, error) {
+func (t *testLaneKeys) SetKey(ctx context.Context, lane string, request LaneKeyRequestV1) (LaneV1, error) {
+	t.expect(ctx)
 	t.sets = append(t.sets, lane+":"+request.Key)
-	return LaneV1{Lane: lane, Kind: LaneKindKey, State: LaneKeySet, Fingerprint: "1a2b3c4d", Profiles: []string{"local-p02-together"}}, t.err
+	return LaneV1{Lane: lane, Kind: LaneKindKey, Provider: lane, State: LaneKeySet, Fingerprint: "1a2b3c4d", Profiles: []string{"local-p02-together"}}, t.err
 }
 
-func (t *testLaneKeys) RemoveKey(_ context.Context, lane string) (LaneV1, error) {
+func (t *testLaneKeys) RemoveKey(ctx context.Context, lane string) (LaneV1, error) {
+	t.expect(ctx)
 	t.removes = append(t.removes, lane)
-	return LaneV1{Lane: lane, Kind: LaneKindKey, State: LaneKeyMissing, Profiles: []string{"local-p02-together"}}, t.err
+	return LaneV1{Lane: lane, Kind: LaneKindKey, Provider: lane, State: LaneKeyMissing, Profiles: []string{"local-p02-together"}}, t.err
 }
 
 func laneServer(t *testing.T, grant bool) (*Server, *testLaneKeys, *bytes.Buffer) {
@@ -57,12 +69,12 @@ func TestLaneKeysAreListedSetAndRemovedWithTheirGrant(t *testing.T) {
 	s, backend, log := laneServer(t, true)
 	list := call(s, http.MethodGet, "/v1/lanes", "")
 	if list.Code != http.StatusOK || list.Body.String() != `{"schema_version":"LanesV1","lanes":[`+
-		`{"lane":"groq","kind":"key","state":"missing","profiles":["local-p02-groq"]},`+
-		`{"lane":"together","kind":"key","state":"set","fingerprint":"1a2b3c4d","profiles":["local-p02-together"]}]}`+"\n" {
+		`{"lane":"groq","kind":"key","provider":"groq","state":"missing","profiles":["local-p02-groq"]},`+
+		`{"lane":"together","kind":"key","provider":"together","state":"set","fingerprint":"1a2b3c4d","profiles":["local-p02-together"]}]}`+"\n" {
 		t.Fatalf("list = %d %s", list.Code, list.Body.String())
 	}
 	set := call(s, http.MethodPut, "/v1/lanes/together/key", `{"key":"`+testLaneKey+`"}`)
-	if set.Code != http.StatusOK || set.Body.String() != `{"lane":"together","kind":"key","state":"set","fingerprint":"1a2b3c4d","profiles":["local-p02-together"]}`+"\n" ||
+	if set.Code != http.StatusOK || set.Body.String() != `{"lane":"together","kind":"key","provider":"together","state":"set","fingerprint":"1a2b3c4d","profiles":["local-p02-together"]}`+"\n" ||
 		len(backend.sets) != 1 || backend.sets[0] != "together:"+testLaneKey {
 		t.Fatalf("set = %d %s %v", set.Code, set.Body.String(), backend.sets)
 	}
@@ -147,8 +159,10 @@ func TestLaneKeyErrorsAnswerStableCodesWithoutTheKey(t *testing.T) {
 		status int
 		code   string
 	}{
-		ErrLaneUnknown: {http.StatusNotFound, "lane_unknown"},
-		ErrLaneNotKey:  {http.StatusConflict, "lane_not_key"},
+		ErrLaneUnknown:     {http.StatusNotFound, "lane_unknown"},
+		ErrLaneNotKey:      {http.StatusConflict, "lane_not_key"},
+		ErrLaneKeyRequired: {http.StatusConflict, "lane_key_required"},
+		ErrLaneKeyChanged:  {http.StatusPreconditionFailed, "lane_key_changed"},
 		fmt.Errorf("%w: a groq key is …", ErrLaneKeyInvalid):  {http.StatusBadRequest, "lane_key_invalid"},
 		fmt.Errorf("%w: "+testLaneKey, ErrLaneKeyUnavailable): {http.StatusServiceUnavailable, "lane_key_unavailable"},
 		context.DeadlineExceeded:                              {http.StatusServiceUnavailable, "lane_key_unavailable"},
@@ -204,5 +218,55 @@ func TestLaneKeysNeedTheirGrantAndTheirLanes(t *testing.T) {
 	s.reserved.LaneKeys = nil
 	if response := call(s, http.MethodGet, "/v1/lanes", ""); response.Code != http.StatusNotImplemented || !strings.Contains(response.Body.String(), `"code":"unsupported_capability"`) {
 		t.Errorf("without lanes = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestIfMatchNamesTheKeyALaneMustHoldAndIsPassedToTheLanes(t *testing.T) {
+	s, backend, _ := laneServer(t, true)
+	send := func(method, path, body string, ifMatch ...string) *httptest.ResponseRecorder {
+		request := authenticatedRequest(method, path, bytes.NewReader([]byte(body)))
+		for _, value := range ifMatch {
+			request.Header.Add("If-Match", value)
+		}
+		response := httptest.NewRecorder()
+		s.Handler().ServeHTTP(response, request)
+		return response
+	}
+	good := `{"key":"` + testLaneKey + `"}`
+	for _, request := range []struct{ method, body, ifMatch string }{
+		{http.MethodPut, good, `"1a2b3c4d"`},
+		{http.MethodDelete, "", `"1a2b3c4d"`},
+		{http.MethodPut, good, ""},
+		{http.MethodDelete, "", ""},
+	} {
+		var values []string
+		if request.ifMatch != "" {
+			values = append(values, request.ifMatch)
+		}
+		if response := send(request.method, "/v1/lanes/together/key", request.body, values...); response.Code != http.StatusOK {
+			t.Fatalf("%s If-Match %s = %d %s", request.method, request.ifMatch, response.Code, response.Body.String())
+		}
+	}
+	if strings.Join(backend.expected, ",") != "1a2b3c4d,1a2b3c4d,-,-" {
+		t.Fatalf("the lanes were told %v", backend.expected)
+	}
+	for _, values := range [][]string{{"1a2b3c4d"}, {`W/"1a2b3c4d"`}, {`"1A2B3C4D"`}, {`"1a2b3c4"`}, {`"1a2b3c4d5"`}, {`*`}, {`"1a2b3c4d", "5e6f7a8b"`},
+		{`"1a2b3c4d"`, `"1a2b3c4d"`}, {`""`}} {
+		for _, method := range []string{http.MethodPut, http.MethodDelete} {
+			body := ""
+			if method == http.MethodPut {
+				body = good
+			}
+			if response := send(method, "/v1/lanes/together/key", body, values...); response.Code != http.StatusBadRequest ||
+				!strings.Contains(response.Body.String(), `"code":"invalid_request"`) {
+				t.Errorf("%s If-Match %q = %d %s", method, values, response.Code, response.Body.String())
+			}
+		}
+	}
+	if response := send(http.MethodGet, "/v1/lanes", "", `"1a2b3c4d"`); response.Code != http.StatusBadRequest {
+		t.Errorf("GET with If-Match = %d", response.Code)
+	}
+	if len(backend.sets) != 2 || len(backend.removes) != 2 {
+		t.Fatalf("a refused If-Match reached the lanes: %v %v", backend.sets, backend.removes)
 	}
 }

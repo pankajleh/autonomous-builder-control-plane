@@ -633,11 +633,11 @@ func TestTheLaneRoutesWriteTheKeyFileAndNoAnswerOrLogHoldsTheKey(t *testing.T) {
 		answers = append(answers, fmt.Sprint(response.Code, response.Header(), response.Body.String()))
 		return response
 	}
-	if r := send(http.MethodGet, "/v1/lanes", token, ""); r.Code != 200 || r.Body.String() != `{"schema_version":"LanesV1","lanes":[{"lane":"together","kind":"key","state":"missing","profiles":["local-p02-node-together","local-p02-together"]}]}`+"\n" {
+	if r := send(http.MethodGet, "/v1/lanes", token, ""); r.Code != 200 || r.Body.String() != `{"schema_version":"LanesV1","lanes":[{"lane":"together","kind":"key","provider":"together","state":"missing","profiles":["local-p02-node-together","local-p02-together"]}]}`+"\n" {
 		t.Fatalf("lanes = %d %s", r.Code, r.Body.String())
 	}
 	if r := send(http.MethodPut, "/v1/lanes/together/key", token, `{"key":"`+firstKey+`"}`); r.Code != 200 ||
-		r.Body.String() != `{"lane":"together","kind":"key","state":"set","fingerprint":"`+Fingerprint(firstKey)+`","profiles":["local-p02-node-together","local-p02-together"]}`+"\n" {
+		r.Body.String() != `{"lane":"together","kind":"key","provider":"together","state":"set","fingerprint":"`+Fingerprint(firstKey)+`","profiles":["local-p02-node-together","local-p02-together"]}`+"\n" {
 		t.Fatalf("set = %d %s", r.Code, r.Body.String())
 	}
 	if key, err := openmodel.ReadKey(f.together.KeyFile); err != nil || key.Value() != firstKey {

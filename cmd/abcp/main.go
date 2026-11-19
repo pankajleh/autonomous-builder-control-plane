@@ -845,6 +845,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	previewProfileFile := flags.String("preview-profile-file", "", "optional protected preview profile file")
 	admissionProfileFile := flags.String("admission-profile-file", "", "optional protected run admission profile file")
 	accountLanesFile := flags.String("account-lanes-file", "", "optional protected account lanes file (administrators' own Codex and Claude accounts)")
+	laneKeyEngineLanes := flags.String("lane-key-engine-lanes", "", "optional comma-separated API-key engine lanes (claude-api,codex-api) whose key setting PUT /v1/lanes/{lane}/key writes (docs/plans/lane-keys.md); never an account lane")
 	accountLaneAskModel := flags.String("account-lane-ask-model", accountlane.DefaultAskModel, "model a signed-in Claude account lane answers an administrator's own app with (docs/plans/account-lane-ask.md)")
 	accountLaneAskTimeout := flags.Duration("account-lane-ask-timeout", accountlane.DefaultAskTimeout, "time one question to an account lane may take, its wait for the lane included (at most 1m)")
 	targetsDir := flags.String("targets-dir", "", "optional private folder (mode 0700) for remote targets: their SSH keys and preflights")
@@ -1103,11 +1104,15 @@ func serveCommand(args []string, stderr io.Writer) int {
 	// Account lanes (docs/plans/account-lanes.md): without the file the routes say they are unsupported. A signed-in Claude
 	// lane answers an administrator's own app one question at a time (docs/plans/account-lane-ask.md).
 	var accountLanes serviceapi.AccountLaneController
+	var accountLaneNames []string
 	if *accountLanesFile != "" {
 		file, err := accountlane.ReadFile(*accountLanesFile)
 		if err != nil {
 			fmt.Fprintln(stderr, "load account lanes configuration:", err)
 			return 1
+		}
+		for _, lane := range file.Lanes {
+			accountLaneNames = append(accountLaneNames, lane.Lane)
 		}
 		manager, err := accountlane.New(file, accountlane.CodexDeviceLogin, time.Now,
 			accountlane.WithAsk(accountlane.AskConfig{Model: *accountLaneAskModel, Timeout: *accountLaneAskTimeout}))
@@ -1207,9 +1212,13 @@ func serveCommand(args []string, stderr io.Writer) int {
 	// Lane keys (docs/plans/lane-keys.md; Repo C BUILD_ENGINE_RULES.md §9, slice 5): the key lanes the admission profiles
 	// name take a key from Repo C, written to the key file their builds read when they start. Without the profile file,
 	// or with lanes that do not check, the routes say they are unsupported and the rest of the service runs.
+	// The engine lanes named by --lane-key-engine-lanes take a key too (their API-key setting); an account lane never does.
 	var laneKeys serviceapi.LaneKeyController
 	if admissions != nil {
-		if lanes, err := lanekey.Load(*admissionProfileFile); err != nil {
+		engineLanes, err := lanekey.EngineLaneNames(*laneKeyEngineLanes, accountLaneNames)
+		if err != nil {
+			fmt.Fprintf(stderr, "abcp lane keys ready=false reason=%q\n", err.Error())
+		} else if lanes, err := lanekey.Load(*admissionProfileFile, engineLanes...); err != nil {
 			fmt.Fprintf(stderr, "abcp lane keys ready=false reason=%q\n", err.Error())
 		} else if manager, err := lanekey.New(lanes, stderr, time.Now); err != nil {
 			fmt.Fprintf(stderr, "abcp lane keys ready=false reason=%q\n", err.Error())
@@ -1218,7 +1227,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 			if names == "" {
 				names = "none"
 			}
-			fmt.Fprintf(stderr, "abcp lane keys ready=true lanes=%s other-lanes=%d\n", names, len(lanes.Other))
+			fmt.Fprintf(stderr, "abcp lane keys ready=true lanes=%s engine-lanes=%d other-lanes=%d\n", names, len(lanes.Engine), len(lanes.Other))
 			laneKeys = manager
 		}
 	}
@@ -1385,14 +1394,32 @@ func laneKeysCommand(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("lane-keys", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	profileFile := flags.String("admission-profile-file", "", "protected run admission profile file")
+	engineLaneList := flags.String("lane-key-engine-lanes", "", "comma-separated API-key engine lanes, as abcp serve takes them")
+	accountLanesFile := flags.String("account-lanes-file", "", "protected account lanes file, as abcp serve takes it")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 	if flags.NArg() != 0 || *profileFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp lane-keys --admission-profile-file <protected-file>")
+		fmt.Fprintln(stderr, "usage: abcp lane-keys --admission-profile-file <protected-file> [--lane-key-engine-lanes <lanes> --account-lanes-file <protected-file>]")
 		return 2
 	}
-	lanes, err := lanekey.Load(*profileFile)
+	var accountLaneNames []string
+	if *accountLanesFile != "" {
+		file, err := accountlane.ReadFile(*accountLanesFile)
+		if err != nil {
+			fmt.Fprintln(stderr, "load account lanes configuration:", err)
+			return 1
+		}
+		for _, lane := range file.Lanes {
+			accountLaneNames = append(accountLaneNames, lane.Lane)
+		}
+	}
+	engineLanes, err := lanekey.EngineLaneNames(*engineLaneList, accountLaneNames)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	lanes, err := lanekey.Load(*profileFile, engineLanes...)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -1404,7 +1431,7 @@ func laneKeysCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	answer, _ := manager.Lanes(context.Background())
 	for _, lane := range answer.Lanes {
-		fmt.Fprintf(stdout, "lane %s kind=%s state=%s profiles=%s\n", lane.Lane, lane.Kind, lane.State, strings.Join(lane.Profiles, ","))
+		fmt.Fprintf(stdout, "lane %s kind=%s provider=%s state=%s profiles=%s\n", lane.Lane, lane.Kind, lane.Provider, lane.State, strings.Join(lane.Profiles, ","))
 	}
 	fmt.Fprintf(stdout, "lane keys ready lanes=%d other-lanes=%s\n", len(answer.Lanes), strings.Join(lanes.Other, ","))
 	return 0

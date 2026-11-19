@@ -14,6 +14,11 @@
 //
 // The key is never logged, answered, or put in a ledger event or an evidence item: answers and audit lines carry the
 // lane and the first 8 hex of the key's SHA-256. ABCP never calls the provider here; it checks the key's shape only.
+//
+// An API-key engine lane (claude-api, codex-api) takes a key too, once the operator names it (abcp serve
+// --lane-key-engine-lanes): its lane file's one key setting (ANTHROPIC_API_KEY, OPENAI_API_KEY) is replaced in a new
+// file written and renamed the same way, every other line kept byte for byte (engine.go). A request may name the key a
+// lane must hold now (If-Match, serviceapi.ExpectedLaneKey), so a removal never takes away a key it did not mean.
 package lanekey
 
 import (
@@ -45,18 +50,32 @@ type Lane struct {
 	Profiles []string
 }
 
-// Lanes are the lanes the admission profile file names: the key lanes, and the names of the engine lanes (files and
-// accounts), which never take a key.
+// EngineLane is an API-key engine lane the operator named: the lane file its profiles' builds read, their executor, the
+// setting of that file that holds the key, the vendor whose key it is, and those profiles.
+type EngineLane struct {
+	Name     string
+	LaneFile string
+	Executor string
+	Setting  string
+	Provider string
+	Profiles []string
+}
+
+// Lanes are the lanes the admission profile file names: the key lanes, the engine lanes the operator named, and the
+// names of the other engine lanes (files and accounts), which never take a key.
 type Lanes struct {
-	Key   []Lane
-	Other []string
+	Key    []Lane
+	Engine []EngineLane
+	Other  []string
 }
 
 // Load reads the admission profile file and each profile's manifest template, as abcp serve's run admission reads
 // them (private files of the controller's user, no link in their paths, strict JSON), and answers the lanes they name.
 // It reads no key file. Two profiles that name one provider must name the same key file, a key file belongs to one
-// lane, and no name is both a key lane and an engine lane.
-func Load(profileFile string) (Lanes, error) {
+// lane, and no name is both a key lane and an engine lane. Each engine lane named in engineLanes must be one a profile
+// names, on an executor whose key a lane file holds (engineKeys), with one lane file and executor across its profiles,
+// a file of its own, and a lane file that is not paid another way; it is read once to tell (as run admission reads it).
+func Load(profileFile string, engineLanes ...string) (Lanes, error) {
 	data, err := enginelane.ReadPrivate(profileFile, runadmission.MaxProfileFileBytes)
 	if err != nil {
 		return Lanes{}, fmt.Errorf("the admission profile file cannot be read: %w", err)
@@ -68,6 +87,8 @@ func Load(profileFile string) (Lanes, error) {
 	keys := map[string]*Lane{}
 	others := map[string]bool{}
 	files := map[string]string{}
+	engines := map[string]*EngineLane{}
+	mixed := map[string]bool{}
 	for _, profile := range file.Profiles {
 		if !filepath.IsAbs(profile.ManifestTemplatePath) || filepath.Clean(profile.ManifestTemplatePath) != profile.ManifestTemplatePath {
 			return Lanes{}, fmt.Errorf("profile %q: its manifest template path is not absolute and clean", profile.ProfileID)
@@ -102,6 +123,15 @@ func Load(profileFile string) (Lanes, error) {
 			lane.Profiles = append(lane.Profiles, profile.ProfileID)
 		case executor.Lane != "":
 			others[executor.Lane] = true
+			engine := engines[executor.Lane]
+			if engine == nil {
+				engine = &EngineLane{Name: executor.Lane, LaneFile: executor.LaneFile, Executor: executor.Executor}
+				engines[executor.Lane] = engine
+			}
+			if engine.LaneFile != executor.LaneFile || engine.Executor != executor.Executor {
+				mixed[executor.Lane] = true
+			}
+			engine.Profiles = append(engine.Profiles, profile.ProfileID)
 		}
 	}
 	out := Lanes{}
@@ -113,20 +143,56 @@ func Load(profileFile string) (Lanes, error) {
 		out.Key = append(out.Key, *lane)
 	}
 	sort.Slice(out.Key, func(i, j int) bool { return out.Key[i].Name < out.Key[j].Name })
+	named := map[string]bool{}
+	for _, name := range engineLanes {
+		engine := engines[name]
+		switch {
+		case named[name]:
+			return Lanes{}, fmt.Errorf("engine lane %q is named twice", name)
+		case engine == nil:
+			return Lanes{}, fmt.Errorf("engine lane %q: no profile names it", name)
+		case mixed[name]:
+			return Lanes{}, fmt.Errorf("engine lane %q: its profiles name two lane files or executors", name)
+		}
+		named[name] = true
+		key, known := engineKeys[engine.Executor]
+		if !known {
+			return Lanes{}, fmt.Errorf("engine lane %q: executor %q takes no API key in a lane file", name, engine.Executor)
+		}
+		if owner, taken := files[engine.LaneFile]; taken {
+			return Lanes{}, fmt.Errorf("engine lane %q: its file is lane %q's too", name, owner)
+		}
+		files[engine.LaneFile] = name
+		loaded, err := enginelane.Load(engine.Name, engine.LaneFile, engine.Executor)
+		if err != nil {
+			return Lanes{}, fmt.Errorf("engine lane %q: its lane file cannot be read as a build reads it", name)
+		}
+		if why := paidOtherwise(engine.Executor, loaded.Settings); why != "" {
+			return Lanes{}, fmt.Errorf("engine lane %q is paid another way (%s), not with an API key", name, why)
+		}
+		engine.Setting, engine.Provider = key.setting, key.provider
+		sort.Strings(engine.Profiles)
+		out.Engine = append(out.Engine, *engine)
+	}
+	sort.Slice(out.Engine, func(i, j int) bool { return out.Engine[i].Name < out.Engine[j].Name })
 	for name := range others {
-		out.Other = append(out.Other, name)
+		if !named[name] {
+			out.Other = append(out.Other, name)
+		}
 	}
 	sort.Strings(out.Other)
 	return out, nil
 }
 
-// Manager keeps the key lanes' key files and answers the lane routes (serviceapi.LaneKeyController).
+// Manager keeps the key lanes' key files and the named engine lanes' key settings, and answers the lane routes
+// (serviceapi.LaneKeyController).
 type Manager struct {
-	lanes map[string]Lane
-	names []string
-	other map[string]bool
-	log   io.Writer
-	now   func() time.Time
+	lanes   map[string]Lane
+	engines map[string]EngineLane
+	names   []string
+	other   map[string]bool
+	log     io.Writer
+	now     func() time.Time
 	// mu serializes writes and removals, so two requests for one lane never race on its file.
 	mu sync.Mutex
 }
@@ -139,7 +205,7 @@ func New(lanes Lanes, log io.Writer, now func() time.Time) (*Manager, error) {
 	if log == nil {
 		log = io.Discard
 	}
-	m := &Manager{lanes: map[string]Lane{}, other: map[string]bool{}, log: log, now: now}
+	m := &Manager{lanes: map[string]Lane{}, engines: map[string]EngineLane{}, other: map[string]bool{}, log: log, now: now}
 	for _, lane := range lanes.Key {
 		if _, twice := m.lanes[lane.Name]; twice || !filepath.IsAbs(lane.KeyFile) || filepath.Clean(lane.KeyFile) != lane.KeyFile {
 			return nil, fmt.Errorf("lane %q is given twice or its key file is not an absolute, clean path", lane.Name)
@@ -148,9 +214,23 @@ func New(lanes Lanes, log io.Writer, now func() time.Time) (*Manager, error) {
 		m.lanes[lane.Name] = lane
 		m.names = append(m.names, lane.Name)
 	}
+	for _, engine := range lanes.Engine {
+		key, known := engineKeys[engine.Executor]
+		_, twice := m.lanes[engine.Name]
+		_, twiceEngine := m.engines[engine.Name]
+		if twice || twiceEngine || !known || key.setting != engine.Setting || key.provider != engine.Provider || !enginelane.ValidName(engine.Name) ||
+			!enginelane.ValidPath(engine.LaneFile) {
+			return nil, fmt.Errorf("engine lane %q is given twice, or its executor, setting or lane file is not one a key is written to", engine.Name)
+		}
+		engine.Profiles = slices.Clone(engine.Profiles)
+		m.engines[engine.Name] = engine
+		m.names = append(m.names, engine.Name)
+	}
 	sort.Strings(m.names)
 	for _, name := range lanes.Other {
-		if _, key := m.lanes[name]; key {
+		_, key := m.lanes[name]
+		_, engine := m.engines[name]
+		if key || engine {
 			return nil, fmt.Errorf("lane %q is both a provider and an engine lane", name)
 		}
 		m.other[name] = true
@@ -158,13 +238,20 @@ func New(lanes Lanes, log io.Writer, now func() time.Time) (*Manager, error) {
 	return m, nil
 }
 
-// Names answers the key lanes' names, sorted.
+// Names answers the names of the lanes that take a key, sorted.
 func (m *Manager) Names() []string { return slices.Clone(m.names) }
 
-// Lanes answers each key lane's state and key fingerprint, reading each key file under the builds' own rules.
+// Lanes answers each lane's state and key fingerprint, reading each key file under the builds' own rules. An engine
+// lane whose file is now paid another way is left out: it takes no key.
 func (m *Manager) Lanes(context.Context) (serviceapi.LanesV1, error) {
 	out := serviceapi.LanesV1{SchemaVersion: serviceapi.LanesSchemaV1, Lanes: make([]serviceapi.LaneV1, 0, len(m.names))}
 	for _, name := range m.names {
+		if engine, ok := m.engines[name]; ok {
+			if answer, listed := engineState(engine); listed {
+				out.Lanes = append(out.Lanes, answer)
+			}
+			continue
+		}
 		out.Lanes = append(out.Lanes, m.state(m.lanes[name]))
 	}
 	return out, nil
@@ -172,7 +259,7 @@ func (m *Manager) Lanes(context.Context) (serviceapi.LanesV1, error) {
 
 // state reads a lane's key file as a build would (openmodel.ReadKey).
 func (m *Manager) state(lane Lane) serviceapi.LaneV1 {
-	answer := serviceapi.LaneV1{Lane: lane.Name, Kind: serviceapi.LaneKindKey, Profiles: slices.Clone(lane.Profiles)}
+	answer := serviceapi.LaneV1{Lane: lane.Name, Kind: serviceapi.LaneKindKey, Provider: lane.Name, Profiles: slices.Clone(lane.Profiles)}
 	key, err := openmodel.ReadKey(lane.KeyFile)
 	switch {
 	case errors.Is(err, openmodel.ErrKeyMissing):
@@ -195,9 +282,22 @@ func (m *Manager) lane(name string) (Lane, error) {
 	return Lane{}, serviceapi.ErrLaneUnknown
 }
 
+// expect checks a request's If-Match against what the lane holds now: a key lane holding exactly that key, or none
+// named.
+func expect(ctx context.Context, now serviceapi.LaneV1) error {
+	fingerprint, named := serviceapi.ExpectedLaneKey(ctx)
+	if named && (now.State != serviceapi.LaneKeySet || now.Fingerprint != fingerprint) {
+		return serviceapi.ErrLaneKeyChanged
+	}
+	return nil
+}
+
 // SetKey writes the lane's key file with the key, after checking its shape for the provider, and reads it back as the
 // next build will. The answer and the audit line carry the key's fingerprint, never the key.
-func (m *Manager) SetKey(_ context.Context, name string, request serviceapi.LaneKeyRequestV1) (serviceapi.LaneV1, error) {
+func (m *Manager) SetKey(ctx context.Context, name string, request serviceapi.LaneKeyRequestV1) (serviceapi.LaneV1, error) {
+	if engine, ok := m.engines[name]; ok {
+		return m.setEngineKey(ctx, engine, request)
+	}
 	lane, err := m.lane(name)
 	if err != nil {
 		return serviceapi.LaneV1{}, err
@@ -208,6 +308,10 @@ func (m *Manager) SetKey(_ context.Context, name string, request serviceapi.Lane
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := expect(ctx, m.state(lane)); err != nil {
+		m.audit("refused", lane.Name, "reason=changed")
+		return serviceapi.LaneV1{}, err
+	}
 	if err := writeKeyFile(lane.KeyFile, []byte(request.Key+"\n")); err != nil {
 		m.audit("not set", lane.Name, "reason=write")
 		return serviceapi.LaneV1{}, fmt.Errorf("%w: %s", serviceapi.ErrLaneKeyUnavailable, err.Error())
@@ -222,7 +326,10 @@ func (m *Manager) SetKey(_ context.Context, name string, request serviceapi.Lane
 }
 
 // RemoveKey removes the lane's key file; a lane without one answers missing as well.
-func (m *Manager) RemoveKey(_ context.Context, name string) (serviceapi.LaneV1, error) {
+func (m *Manager) RemoveKey(ctx context.Context, name string) (serviceapi.LaneV1, error) {
+	if engine, ok := m.engines[name]; ok {
+		return m.removeEngineKey(ctx, engine)
+	}
 	lane, err := m.lane(name)
 	if err != nil {
 		return serviceapi.LaneV1{}, err
@@ -230,6 +337,10 @@ func (m *Manager) RemoveKey(_ context.Context, name string) (serviceapi.LaneV1, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	before := m.state(lane)
+	if err := expect(ctx, before); err != nil {
+		m.audit("refused", lane.Name, "reason=changed")
+		return serviceapi.LaneV1{}, err
+	}
 	removed, err := removeKeyFile(lane.KeyFile)
 	if err != nil {
 		m.audit("not removed", lane.Name, "reason=remove")
@@ -285,6 +396,9 @@ func printable(c byte) bool { return c >= 0x21 && c <= 0x7e }
 var shapes = map[string]shape{
 	"together": {min: 32, max: 128, allowed: keyCharacter, words: "32 to 128 letters, digits, '_' or '-'"},
 	"groq":     {min: 40, max: 128, allowed: keyCharacter, words: "40 to 128 letters, digits, '_' or '-'"},
+	// The engine lanes' vendors (sk-ant-api03-…, sk-proj-…): one .env line's value, so nothing that could end it.
+	"anthropic": {min: 20, max: 512, allowed: keyCharacter, words: "20 to 512 letters, digits, '_' or '-', and not a setup token"},
+	"openai":    {min: 20, max: 512, allowed: keyCharacter, words: "20 to 512 letters, digits, '_' or '-'"},
 }
 
 var defaultShape = shape{min: 16, max: 512, allowed: printable, words: "16 to 512 printable characters without spaces"}
@@ -295,7 +409,8 @@ func CheckShape(provider, key string) error {
 	if !known {
 		rule = defaultShape
 	}
-	bad := len(key) < rule.min || len(key) > rule.max || !known && envName(key)
+	// An Anthropic setup token signs an account lane in (CLAUDE_CODE_OAUTH_TOKEN); it is never an API key.
+	bad := len(key) < rule.min || len(key) > rule.max || !known && envName(key) || provider == "anthropic" && strings.HasPrefix(key, "sk-ant-oat")
 	for index := 0; !bad && index < len(key); index++ {
 		bad = !rule.allowed(key[index])
 	}
