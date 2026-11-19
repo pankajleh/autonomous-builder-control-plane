@@ -1,6 +1,6 @@
 # Lane keys: a key entered on the page reaches builds
 
-Status: **built, not live** (#198). One quiet restart takes it live, with `lanes.control` added to `grants.json`; no template
+Status: **#198 live since 2026-11-08 02:16 UTC** (provider key lanes); **engine lanes built, not live** (below). One quiet restart takes it live, with `lanes.control` added to `grants.json`; no template
 changes. Repo C design note `BUILD_ENGINE_RULES.md` §9, slice 5 (Repo B's half). Repo C wires the page's "Add key" to it
 afterwards.
 
@@ -118,8 +118,54 @@ provider here. `GET /v1/capabilities` is unchanged: Repo C learns the routes exi
    state and fingerprint from `GET /v1/lanes`, and "Remove" sends `DELETE`. Then one build on a key entered on the page
    (design note §9's check).
 
+## Engine lanes (the slice's second half, branch `feature/lane-key-from-product-api`; built, not live)
+
+Repo C's page keeps an Anthropic and an OpenAI key, and the builds that pay with those keys run on the API-key engine
+lanes `claude-api` (22 profiles) and `codex-api` (2), whose `.env` lane file holds the key in one line
+(`ANTHROPIC_API_KEY=`, `OPENAI_API_KEY=`). #198 refused them (`lane_not_key`); this takes them, once the operator names them.
+
+- **`abcp serve --lane-key-engine-lanes claude-api,codex-api`** (and the same flag on `abcp lane-keys`). Empty, the
+  default, is #198 exactly. Each lane named must be one a profile names in `executor.lane`, on `codex` (`OPENAI_API_KEY`,
+  vendor `openai`) or `claude` (`ANTHROPIC_API_KEY`, `anthropic`); every profile naming it names the same lane file and
+  executor; its file is no other lane's; it is not in the account lanes file; and its file, read at start as run
+  admission reads it, is not paid another way (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_OAUTH_TOKEN`, or an
+  `OPENAI_BASE_URL` other than OpenAI's). Otherwise `abcp lane keys ready=false reason=…` and the routes answer `501`.
+  Start line: `abcp lane keys ready=true lanes=claude-api,codex-api,together engine-lanes=2 other-lanes=2`.
+- **`GET /v1/lanes`**: every lane gains `provider`, the vendor whose key it takes (`together`, `groq`, `anthropic`,
+  `openai`); an engine lane is `"kind":"engine"`, its state and fingerprint those of its key setting. An engine lane whose
+  file is now paid another way is left out.
+- **`PUT`** on an engine lane reads its file as a build does, replaces the key setting's line (or adds it at the end),
+  keeps every other line byte for byte (comments, other settings, line endings), checks the result as a build reads it,
+  and writes it whole exactly as a key file is written (`.claude-api.env.abcp-<16 hex>.tmp`, 0600, fsync, rename, folder
+  fsync), then reads it back with `enginelane.Load`. A file no build reads is not rewritten (`503`). Shapes: 20 to 512
+  letters, digits, `_` or `-` for both; an Anthropic setup token (`sk-ant-oat…`) is refused. Neither vendor is called.
+- **`DELETE`** on an engine lane removes the key setting's line. When nothing else would be left it answers **`409
+  lane_key_required`** and changes nothing: a lane file that gives no setting fails profile load, and with it every
+  admission, at the next start. `codex-api`'s file may be that file.
+- **`If-Match: "<fingerprint>"`** (new, on `PUT` and `DELETE` of every lane): the lane must hold exactly that key now,
+  checked under the write lock, or **`412 lane_key_changed`** and nothing changes. One quoted 8-hex tag only; anything
+  else is `400 invalid_request` (and on `GET`). Repo C removes a key with the fingerprint of the key it entered, so it
+  never removes a key the operator or a newer entry put there.
+- **A build running** keeps the settings it started with (`run.go` reads the lane file once at the run's start); the
+  next start, a run resumed after a restart, and `GET /v1/engines` read the new file.
+- **Audit lines** as before, plus `abcp lane key kept at=… lane=codex-api reason=required` and `abcp lane key refused
+  at=… lane=… reason=changed|bedrock|setup-token|another-address`.
+- **Not here:** the change jobs' lane (`change-engine.json`, `change-api`, Anthropic) still reads its own file; whether a
+  page key should reach quick edits too is the owner's call.
+
+Checks: `internal/lanekey` (`engine_linux_test.go`: the flag and every refused configuration; a key line replaced with
+every other byte kept under umask 0, 0600, read back, the next build's `enginelane.Load` and environment on the new key
+while a loaded lane keeps its own; `If-Match` met and unmet on set and removal; the line removed, `lane_key_required`;
+shapes; Bedrock after start; an unreadable file not rewritten; a failed sync or rename keeping the file; every file but the
+lane files, every answer, error and log line scanned for six test keys; the routes end to end with `If-Match`),
+`internal/serviceapi` (`If-Match` passed on or refused, the two new codes), `cmd/abcp` (`abcp lane-keys` with an engine lane
+and an account lane refused).
+
+**Rollout:** merge; build the binary as before; one quiet restart (the owner's word) with `--lane-key-engine-lanes
+claude-api,codex-api` added to the start script. Without the flag the new binary behaves as #198 (`provider` aside).
+Check with `abcp lane-keys --admission-profile-file … --lane-key-engine-lanes claude-api,codex-api --account-lanes-file …`
+before the restart: both lanes `state=set`. No grant or template change.
+
 ## Not here
 
-The API-key lane files (`codex-api`, `claude-api`) take their key in a `.env` line; writing those from the page is a
-later slice if the owner wants it. A Groq lane appears in `GET /v1/lanes` once its profiles are live (#192) and ABCP
-restarts on them.
+A Groq lane appears in `GET /v1/lanes` once its profiles are live (#192) and ABCP restarts on them.

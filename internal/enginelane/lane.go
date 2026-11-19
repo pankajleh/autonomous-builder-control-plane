@@ -96,6 +96,19 @@ func Load(name, path, executor string) (Lane, error) {
 	return Lane{Name: name, Settings: settings, SHA256: hex.EncodeToString(sum[:])}, nil
 }
 
+// Parse reads a lane file's data for executor exactly as Load reads the file, without a file: what a lane key write
+// (internal/lanekey) checks before it replaces a lane file. Errors name a line or a setting, never a value.
+func Parse(data []byte, executor string) (map[string]string, error) {
+	keys, ok := allowed[executor]
+	if !ok {
+		return nil, fmt.Errorf("executor %q has no engine lanes", executor)
+	}
+	if len(data) > MaxBytes {
+		return nil, errors.New("file is too large")
+	}
+	return parse(data, keys)
+}
+
 // parse reads KEY=VALUE lines; blank lines and lines starting with # are
 // skipped. A key must be on the executor's list and given once; a value is one
 // line without NUL. Errors name the line, never its value.

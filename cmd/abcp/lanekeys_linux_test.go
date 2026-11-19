@@ -39,7 +39,7 @@ func TestLaneKeysReadsTheProfilesLanesAndPrintsNoKey(t *testing.T) {
 	profileFile := write(filepath.Join(root, "profiles.json"), profiles)
 	var stdout, stderr bytes.Buffer
 	if code := runCLI([]string{"lane-keys", "--admission-profile-file", profileFile}, &stdout, &stderr); code != 0 ||
-		stdout.String() != "lane together kind=key state=set profiles=local-p02-together\nlane keys ready lanes=1 other-lanes=codex-account\n" {
+		stdout.String() != "lane together kind=key provider=together state=set profiles=local-p02-together\nlane keys ready lanes=1 other-lanes=codex-account\n" {
 		t.Fatalf("lane-keys = %d %q %q", code, stdout.String(), stderr.String())
 	}
 	if strings.Contains(stdout.String()+stderr.String(), key) {
@@ -53,5 +53,36 @@ func TestLaneKeysReadsTheProfilesLanesAndPrintsNoKey(t *testing.T) {
 	}
 	if code := runCLI([]string{"lane-keys"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("no profile file = %d", code)
+	}
+	if err := os.Chmod(profileFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// An API-key engine lane the operator names is listed by its vendor; an account lane can't be named.
+	anthropic := "sk-ant-api03-" + strings.Repeat("Z", 40)
+	claudeFile := write(filepath.Join(root, "claude-api.env"), []byte("ANTHROPIC_API_KEY="+anthropic+"\nANTHROPIC_MODEL=claude-sonnet-5-5\n"))
+	claude, _ := json.Marshal(map[string]any{"executor": map[string]any{"executor": "claude", "lane": "claude-api", "lane_file": claudeFile}})
+	profiles, _ = json.Marshal(map[string]any{"schema_version": 1, "profiles": []map[string]string{
+		{"profile_id": "local-p02-together", "manifest_template_path": filepath.Join(root, "together.json")},
+		{"profile_id": "local-p02-claude-api", "manifest_template_path": write(filepath.Join(root, "claude.json"), claude)},
+		{"profile_id": "local-p02-codex-account", "manifest_template_path": filepath.Join(root, "account.json")},
+	}})
+	write(profileFile, profiles)
+	accounts, _ := json.Marshal(map[string]any{"schema_version": 1, "lanes": []map[string]string{
+		{"lane": "codex-account", "executor": "codex", "lane_file": filepath.Join(root, "codex-account.env"), "home": filepath.Join(root, "codex-account-home")},
+	}})
+	accountsFile := write(filepath.Join(root, "account-lanes.json"), accounts)
+	stdout.Reset()
+	stderr.Reset()
+	if code := runCLI([]string{"lane-keys", "--admission-profile-file", profileFile, "--lane-key-engine-lanes", "claude-api", "--account-lanes-file", accountsFile}, &stdout, &stderr); code != 0 ||
+		stdout.String() != "lane claude-api kind=engine provider=anthropic state=set profiles=local-p02-claude-api\n"+
+			"lane together kind=key provider=together state=set profiles=local-p02-together\nlane keys ready lanes=2 other-lanes=codex-account\n" {
+		t.Fatalf("lane-keys with an engine lane = %d %q %q", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String()+stderr.String(), anthropic) {
+		t.Fatal("lane-keys printed the key")
+	}
+	if code := runCLI([]string{"lane-keys", "--admission-profile-file", profileFile, "--lane-key-engine-lanes", "claude-api,codex-account", "--account-lanes-file", accountsFile}, &stdout, &stderr); code != 1 {
+		t.Fatalf("an account lane named = %d", code)
 	}
 }
