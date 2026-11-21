@@ -845,7 +845,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 	previewProfileFile := flags.String("preview-profile-file", "", "optional protected preview profile file")
 	admissionProfileFile := flags.String("admission-profile-file", "", "optional protected run admission profile file")
 	accountLanesFile := flags.String("account-lanes-file", "", "optional protected account lanes file (administrators' own Codex and Claude accounts)")
-	laneKeyEngineLanes := flags.String("lane-key-engine-lanes", "", "optional comma-separated API-key engine lanes (claude-api,codex-api) whose key setting PUT /v1/lanes/{lane}/key writes (docs/plans/lane-keys.md); never an account lane")
+	laneKeyEngineLanes := flags.String("lane-key-engine-lanes", "", "optional comma-separated API-key engine lanes (claude-api,codex-api, and the change engine's lane: change-api) whose key setting PUT /v1/lanes/{lane}/key writes (docs/plans/lane-keys.md); never an account lane")
 	accountLaneAskModel := flags.String("account-lane-ask-model", accountlane.DefaultAskModel, "model a signed-in Claude account lane answers an administrator's own app with (docs/plans/account-lane-ask.md)")
 	accountLaneAskTimeout := flags.Duration("account-lane-ask-timeout", accountlane.DefaultAskTimeout, "time one question to an account lane may take, its wait for the lane included (at most 1m)")
 	targetsDir := flags.String("targets-dir", "", "optional private folder (mode 0700) for remote targets: their SSH keys and preflights")
@@ -1188,10 +1188,15 @@ func serveCommand(args []string, stderr io.Writer) int {
 	// Change jobs (docs/plans/change-jobs.md) need the stack profiles too; without all their settings, or with one that does
 	// not check, the route says they are not configured and the rest of the service runs.
 	var changeJobs serviceapi.ChangeJobController
+	// The change engine's lane, which takes a key once --lane-key-engine-lanes names it (docs/plans/lane-keys.md).
+	var changeLane lanekey.ChangeLane
 	if *changeRoot != "" || *changeSourceRoot != "" || *changeEngineFile != "" {
 		profiles, profilesErr := stackjob.LoadProfiles(*stackProfilesFile)
 		engine, engineErr := stackjob.LoadEngine(*changeEngineFile)
 		self, selfErr := os.Executable()
+		if engineErr == nil {
+			changeLane = lanekey.ChangeLane{Name: engine.LaneName, LaneFile: engine.LaneFile}
+		}
 		switch {
 		case profilesErr != nil:
 			fmt.Fprintln(stderr, "change jobs unavailable: the stack profiles do not check")
@@ -1212,13 +1217,14 @@ func serveCommand(args []string, stderr io.Writer) int {
 	// Lane keys (docs/plans/lane-keys.md; Repo C BUILD_ENGINE_RULES.md §9, slice 5): the key lanes the admission profiles
 	// name take a key from Repo C, written to the key file their builds read when they start. Without the profile file,
 	// or with lanes that do not check, the routes say they are unsupported and the rest of the service runs.
-	// The engine lanes named by --lane-key-engine-lanes take a key too (their API-key setting); an account lane never does.
+	// The engine lanes named by --lane-key-engine-lanes take a key too (their API-key setting), the change engine's lane
+	// among them once named; an account lane never does.
 	var laneKeys serviceapi.LaneKeyController
 	if admissions != nil {
 		engineLanes, err := lanekey.EngineLaneNames(*laneKeyEngineLanes, accountLaneNames)
 		if err != nil {
 			fmt.Fprintf(stderr, "abcp lane keys ready=false reason=%q\n", err.Error())
-		} else if lanes, err := lanekey.Load(*admissionProfileFile, engineLanes...); err != nil {
+		} else if lanes, err := lanekey.LoadWithChange(*admissionProfileFile, changeLane, engineLanes...); err != nil {
 			fmt.Fprintf(stderr, "abcp lane keys ready=false reason=%q\n", err.Error())
 		} else if manager, err := lanekey.New(lanes, stderr, time.Now); err != nil {
 			fmt.Fprintf(stderr, "abcp lane keys ready=false reason=%q\n", err.Error())
@@ -1396,11 +1402,12 @@ func laneKeysCommand(args []string, stdout, stderr io.Writer) int {
 	profileFile := flags.String("admission-profile-file", "", "protected run admission profile file")
 	engineLaneList := flags.String("lane-key-engine-lanes", "", "comma-separated API-key engine lanes, as abcp serve takes them")
 	accountLanesFile := flags.String("account-lanes-file", "", "protected account lanes file, as abcp serve takes it")
+	changeEngineFile := flags.String("change-engine-file", "", "protected change engine file, as abcp serve takes it, for its lane")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 	if flags.NArg() != 0 || *profileFile == "" {
-		fmt.Fprintln(stderr, "usage: abcp lane-keys --admission-profile-file <protected-file> [--lane-key-engine-lanes <lanes> --account-lanes-file <protected-file>]")
+		fmt.Fprintln(stderr, "usage: abcp lane-keys --admission-profile-file <protected-file> [--lane-key-engine-lanes <lanes> --account-lanes-file <protected-file> [--change-engine-file <protected-file>]]")
 		return 2
 	}
 	var accountLaneNames []string
@@ -1414,12 +1421,21 @@ func laneKeysCommand(args []string, stdout, stderr io.Writer) int {
 			accountLaneNames = append(accountLaneNames, lane.Lane)
 		}
 	}
+	var changeLane lanekey.ChangeLane
+	if *changeEngineFile != "" {
+		engine, err := stackjob.LoadEngine(*changeEngineFile)
+		if err != nil {
+			fmt.Fprintln(stderr, "load change engine:", err)
+			return 1
+		}
+		changeLane = lanekey.ChangeLane{Name: engine.LaneName, LaneFile: engine.LaneFile}
+	}
 	engineLanes, err := lanekey.EngineLaneNames(*engineLaneList, accountLaneNames)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	lanes, err := lanekey.Load(*profileFile, engineLanes...)
+	lanes, err := lanekey.LoadWithChange(*profileFile, changeLane, engineLanes...)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -1431,7 +1447,11 @@ func laneKeysCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	answer, _ := manager.Lanes(context.Background())
 	for _, lane := range answer.Lanes {
-		fmt.Fprintf(stdout, "lane %s kind=%s provider=%s state=%s profiles=%s\n", lane.Lane, lane.Kind, lane.Provider, lane.State, strings.Join(lane.Profiles, ","))
+		uses := ""
+		if len(lane.Uses) > 0 {
+			uses = " uses=" + strings.Join(lane.Uses, ",")
+		}
+		fmt.Fprintf(stdout, "lane %s kind=%s provider=%s state=%s profiles=%s%s\n", lane.Lane, lane.Kind, lane.Provider, lane.State, strings.Join(lane.Profiles, ","), uses)
 	}
 	fmt.Fprintf(stdout, "lane keys ready lanes=%d other-lanes=%s\n", len(answer.Lanes), strings.Join(lanes.Other, ","))
 	return 0

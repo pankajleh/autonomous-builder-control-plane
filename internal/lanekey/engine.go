@@ -69,7 +69,7 @@ func paidOtherwise(executor string, settings map[string]string) string {
 // engineState reads an engine lane's file as a build reads it and answers its key's state; listed is false when the
 // file is now paid another way, so the lane takes no key.
 func engineState(lane EngineLane) (answer serviceapi.LaneV1, listed bool) {
-	answer = serviceapi.LaneV1{Lane: lane.Name, Kind: serviceapi.LaneKindEngine, Provider: lane.Provider, Profiles: slices.Clone(lane.Profiles)}
+	answer = serviceapi.LaneV1{Lane: lane.Name, Kind: serviceapi.LaneKindEngine, Provider: lane.Provider, Profiles: names(lane.Profiles), Uses: names(lane.Uses)}
 	loaded, err := enginelane.Load(lane.Name, lane.LaneFile, lane.Executor)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -105,8 +105,8 @@ func laneFile(lane EngineLane) ([]byte, map[string]string, error) {
 
 // heldState is a lane's state from its settings, as engineState answers it.
 func heldState(lane EngineLane, settings map[string]string) serviceapi.LaneV1 {
-	answer := serviceapi.LaneV1{Lane: lane.Name, Kind: serviceapi.LaneKindEngine, Provider: lane.Provider, Profiles: slices.Clone(lane.Profiles),
-		State: serviceapi.LaneKeyMissing}
+	answer := serviceapi.LaneV1{Lane: lane.Name, Kind: serviceapi.LaneKindEngine, Provider: lane.Provider, Profiles: names(lane.Profiles),
+		Uses: names(lane.Uses), State: serviceapi.LaneKeyMissing}
 	if value := settings[lane.Setting]; value != "" {
 		answer.State, answer.Fingerprint = serviceapi.LaneKeySet, Fingerprint(value)
 	}

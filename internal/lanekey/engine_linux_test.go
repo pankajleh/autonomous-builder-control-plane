@@ -30,9 +30,11 @@ const (
 	anthropicFirst       = "sk-ant-api03-TestOnlyKeyEnteredOnThePageForClaudeApi-01"
 	anthropicSecond      = "sk-ant-api03-TestOnlyKeyEnteredOnThePageForClaudeApi-02"
 	openAIKey            = "sk-proj-TestOnlyKeyEnteredOnThePageForCodexApi_000001"
+	// The change engine's lane's own key, before the page's reaches it.
+	operatorChangeKey = "sk-ant-api03-OperatorsOwnTestKeyInTheChangeEnginesLane-00"
 )
 
-var engineTestKeys = []string{operatorAnthropicKey, operatorOpenAIKey, anthropicFirst, anthropicSecond, openAIKey, firstKey, secondKey}
+var engineTestKeys = []string{operatorAnthropicKey, operatorOpenAIKey, anthropicFirst, anthropicSecond, openAIKey, firstKey, secondKey, operatorChangeKey}
 
 // The claude-api lane file as the operator wrote it: a comment, its home, the key, its model; CRLF on one line.
 var claudeLaneFile = "# Claude Code on Anthropic's API\nCLAUDE_CONFIG_DIR=/srv/claude-api-home\nANTHROPIC_API_KEY=" + operatorAnthropicKey +
@@ -471,4 +473,269 @@ func TestTheLaneRoutesTakeAnEngineLanesKeyAndIfMatch(t *testing.T) {
 		t.Fatal("the key line is still there")
 	}
 	scanFiles(t, f.root, []string{f.claudeFile, f.codexFile}, append(answers, log.String())...)
+}
+
+// changeLaneText is the change engine's lane file as the host has it (change-engine.json's change-api): the key and the
+// models, no configuration folder.
+var changeLaneText = "ANTHROPIC_API_KEY=" + operatorChangeKey + "\nANTHROPIC_MODEL=claude-sonnet-5-5\nANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5\n"
+
+// changeLane writes the change engine's lane file beside the others and answers the lane as the change engine file
+// names it.
+func (f *engineFixture) changeLane(t *testing.T) ChangeLane {
+	t.Helper()
+	lane := ChangeLane{Name: "change-api", LaneFile: filepath.Join(f.lanes, "change-api.env")}
+	privateFile(t, lane.LaneFile, []byte(changeLaneText))
+	return lane
+}
+
+func TestTheChangeEnginesLaneTakesTheAnthropicKeyOnlyWhenTheOperatorNamesIt(t *testing.T) {
+	f := newEngineFixture(t)
+	change := f.changeLane(t)
+	// Not named, it is left out entirely, as before: neither a lane that takes a key nor another lane.
+	lanes, err := LoadWithChange(f.profiles, change, "claude-api", "codex-api")
+	if err != nil || len(lanes.Engine) != 2 || strings.Join(lanes.Other, ",") != "codex-account" {
+		t.Fatalf("not named = %+v, %v", lanes, err)
+	}
+	// Named without a change engine (change jobs not configured, or their engine file not checking), no lane is it.
+	if _, err := Load(f.profiles, "claude-api", "change-api"); err == nil || !strings.Contains(err.Error(), "nor the change engine") {
+		t.Fatalf("named without the change engine = %v", err)
+	}
+	if names, err := EngineLaneNames("claude-api,codex-api,change-api", []string{"codex-account"}); err != nil || len(names) != 3 {
+		t.Fatalf("the flag = %v, %v", names, err)
+	}
+	lanes, err = LoadWithChange(f.profiles, change, "claude-api", "codex-api", "change-api")
+	if err != nil || len(lanes.Engine) != 3 || strings.Join(lanes.Other, ",") != "codex-account" {
+		t.Fatalf("named = %+v, %v", lanes, err)
+	}
+	lane := lanes.Engine[0]
+	if lane.Name != "change-api" || lane.LaneFile != change.LaneFile || lane.Executor != "claude" || lane.Setting != "ANTHROPIC_API_KEY" ||
+		lane.Provider != "anthropic" || lane.Profiles == nil || len(lane.Profiles) != 0 || strings.Join(lane.Uses, ",") != "change-jobs" ||
+		lanes.Engine[1].Name != "claude-api" || lanes.Engine[1].Uses != nil {
+		t.Fatalf("change-api = %+v", lanes.Engine)
+	}
+	// A profile may name the same lane on the same file and executor: its builds and the change jobs then read it.
+	g := newEngineFixture(t)
+	shared := g.changeLane(t)
+	g.profiles = g.writeEngineProfiles(t, map[string][]byte{
+		"local-p02-claude-api": template(t, map[string]any{"executor": "claude", "lane": "claude-api", "lane_file": g.claudeFile}),
+		"local-p02-other":      template(t, map[string]any{"executor": "claude", "lane": "change-api", "lane_file": shared.LaneFile}),
+	})
+	if both, err := LoadWithChange(g.profiles, shared, "change-api"); err != nil || len(both.Engine) != 1 ||
+		strings.Join(both.Engine[0].Profiles, ",") != "local-p02-other" || strings.Join(both.Engine[0].Uses, ",") != "change-jobs" {
+		t.Fatalf("a profile on the change lane = %+v, %v", both, err)
+	}
+
+	// Each of these refuses the whole configuration, so the routes say they are unsupported, as for a profile's lane.
+	for name, setup := range map[string]func(g *engineFixture, lane ChangeLane) ChangeLane{
+		"on Bedrock": func(g *engineFixture, lane ChangeLane) ChangeLane {
+			g.appendTo(t, lane.LaneFile, "CLAUDE_CODE_USE_BEDROCK=1\nAWS_REGION=us-east-1\n")
+			return lane
+		},
+		"on a setup token": func(g *engineFixture, lane ChangeLane) ChangeLane {
+			g.appendTo(t, lane.LaneFile, "CLAUDE_CODE_OAUTH_TOKEN=x\n")
+			return lane
+		},
+		"a lane file open to others": func(g *engineFixture, lane ChangeLane) ChangeLane { _ = os.Chmod(lane.LaneFile, 0o644); return lane },
+		"a lane file Claude Code does not read": func(g *engineFixture, lane ChangeLane) ChangeLane {
+			g.appendTo(t, lane.LaneFile, "OPENAI_API_KEY="+operatorOpenAIKey+"\n")
+			return lane
+		},
+		"no lane file": func(g *engineFixture, lane ChangeLane) ChangeLane {
+			return ChangeLane{Name: lane.Name, LaneFile: lane.LaneFile + ".gone.env"}
+		},
+		"a lane path": func(g *engineFixture, lane ChangeLane) ChangeLane {
+			return ChangeLane{Name: lane.Name, LaneFile: "change-api.env"}
+		},
+		"claude-api's file, though claude-api is not named": func(g *engineFixture, lane ChangeLane) ChangeLane {
+			return ChangeLane{Name: lane.Name, LaneFile: g.claudeFile}
+		},
+		"an account lane's file": func(g *engineFixture, lane ChangeLane) ChangeLane {
+			return ChangeLane{Name: lane.Name, LaneFile: filepath.Join(g.lanes, "codex-account.env")}
+		},
+		"a provider's name": func(g *engineFixture, lane ChangeLane) ChangeLane {
+			return ChangeLane{Name: "together", LaneFile: lane.LaneFile}
+		},
+		"a profile naming it on another file": func(g *engineFixture, lane ChangeLane) ChangeLane {
+			other := filepath.Join(g.lanes, "change-api-2.env")
+			privateFile(t, other, []byte(changeLaneText))
+			g.profiles = g.writeEngineProfiles(t, map[string][]byte{
+				"local-p02-claude-api": template(t, map[string]any{"executor": "claude", "lane": "claude-api", "lane_file": g.claudeFile}),
+				"local-p02-other":      template(t, map[string]any{"executor": "claude", "lane": "change-api", "lane_file": other}),
+			})
+			return lane
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := newEngineFixture(t)
+			lane := setup(g, g.changeLane(t))
+			if lanes, err := LoadWithChange(g.profiles, lane, lane.Name); err == nil {
+				t.Fatalf("loaded %+v", lanes)
+			} else if strings.Contains(err.Error(), operatorChangeKey) || strings.Contains(err.Error(), operatorAnthropicKey) {
+				t.Fatal("the error holds a key")
+			}
+		})
+	}
+}
+
+func TestTheChangeEnginesLaneKeyLineIsReplacedAndTheNextChangeJobReadsIt(t *testing.T) {
+	old := syscall.Umask(0)
+	defer syscall.Umask(old)
+	f := newEngineFixture(t)
+	change := f.changeLane(t)
+	lanes, err := LoadWithChange(f.profiles, change, "claude-api", "change-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := &bytes.Buffer{}
+	m, err := New(lanes, log, func() time.Time { return testTime })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	var answers []string
+	record := func(value any, err error) string {
+		data, _ := json.Marshal(value)
+		answers = append(answers, string(data), fmt.Sprint(err))
+		return string(data)
+	}
+	listed, _ := m.Lanes(ctx)
+	record(listed, nil)
+	if len(listed.Lanes) != 3 || record(listed.Lanes[0], nil) != `{"lane":"change-api","kind":"engine","provider":"anthropic","state":"set","fingerprint":"`+
+		Fingerprint(operatorChangeKey)+`","profiles":[],"uses":["change-jobs"]}` || strings.Contains(record(listed.Lanes[1], nil), "uses") {
+		t.Fatalf("lanes = %+v", listed)
+	}
+
+	// A change job already running holds the settings it started with (stackjob.ClaudeEngine.Pin reads the lane so).
+	running, err := enginelane.Load("change-api", change.LaneFile, "claude")
+	if err != nil || running.Settings["ANTHROPIC_API_KEY"] != operatorChangeKey {
+		t.Fatal(err)
+	}
+	set, err := m.SetKey(ctx, "change-api", serviceapi.LaneKeyRequestV1{Key: anthropicFirst})
+	if record(set, err) != `{"lane":"change-api","kind":"engine","provider":"anthropic","state":"set","fingerprint":"`+Fingerprint(anthropicFirst)+
+		`","profiles":[],"uses":["change-jobs"]}` || err != nil {
+		t.Fatalf("set = %+v, %v", set, err)
+	}
+	want := strings.Replace(changeLaneText, operatorChangeKey, anthropicFirst, 1)
+	if read(t, change.LaneFile) != want || read(t, f.claudeFile) != claudeLaneFile {
+		t.Fatal("the change lane's file is not the operator's with the key line alone changed, or another lane's file changed")
+	}
+	info, err := os.Lstat(change.LaneFile)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || int(info.Sys().(*syscall.Stat_t).Uid) != os.Getuid() {
+		t.Fatalf("the lane file is %v, %v", info.Mode(), err)
+	}
+	if entries, _ := os.ReadDir(f.lanes); len(entries) != 4 {
+		t.Fatalf("the folder holds more than the lane files: %v", entries)
+	}
+	// The next change job's start reads the new key with the models as they were; the running one keeps its own.
+	next, err := enginelane.Load("change-api", change.LaneFile, "claude")
+	if err != nil || next.Settings["ANTHROPIC_API_KEY"] != anthropicFirst || next.Settings["ANTHROPIC_MODEL"] != "claude-sonnet-5-5" ||
+		running.Settings["ANTHROPIC_API_KEY"] != operatorChangeKey {
+		t.Fatalf("the next change job's lane = %v", err)
+	}
+
+	// If-Match, as on every lane: a key the lane does not hold refuses, and changes nothing.
+	stale := serviceapi.WithExpectedLaneKey(ctx, Fingerprint(operatorChangeKey))
+	if _, err := m.SetKey(stale, "change-api", serviceapi.LaneKeyRequestV1{Key: anthropicSecond}); !errors.Is(err, serviceapi.ErrLaneKeyChanged) {
+		t.Fatalf("a stale set = %v", err)
+	}
+	if _, err := m.RemoveKey(stale, "change-api"); !errors.Is(err, serviceapi.ErrLaneKeyChanged) || read(t, change.LaneFile) != want {
+		t.Fatalf("a stale removal = %v", err)
+	}
+	// Removal takes the key's line alone away; the file still loads, so the next change job starts and has no key.
+	removed, err := m.RemoveKey(serviceapi.WithExpectedLaneKey(ctx, Fingerprint(anthropicFirst)), "change-api")
+	record(removed, err)
+	without := "ANTHROPIC_MODEL=claude-sonnet-5-5\nANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5\n"
+	if err != nil || removed.State != "missing" || removed.Fingerprint != "" || strings.Join(removed.Uses, ",") != "change-jobs" || read(t, change.LaneFile) != without {
+		t.Fatalf("remove = %+v, %v", removed, err)
+	}
+	if lane, err := enginelane.Load("change-api", change.LaneFile, "claude"); err != nil || lane.Settings["ANTHROPIC_API_KEY"] != "" {
+		t.Fatalf("the lane after removal = %v", err)
+	}
+	// A lane file holding the key alone keeps it: an empty one would stop change jobs from loading at the next start.
+	privateFile(t, change.LaneFile, []byte("ANTHROPIC_API_KEY="+anthropicSecond+"\n"))
+	if _, err := m.RemoveKey(ctx, "change-api"); !errors.Is(err, serviceapi.ErrLaneKeyRequired) || read(t, change.LaneFile) != "ANTHROPIC_API_KEY="+anthropicSecond+"\n" {
+		t.Fatalf("removing the only setting = %v", err)
+	}
+	// A setup token is never an API key.
+	if _, err := m.SetKey(ctx, "change-api", serviceapi.LaneKeyRequestV1{Key: "sk-ant-oat01-" + strings.Repeat("a", 40)}); !errors.Is(err, serviceapi.ErrLaneKeyInvalid) {
+		t.Fatalf("a setup token = %v", err)
+	}
+	// A change lane the operator moved to Bedrock takes no key and is no longer listed.
+	f.appendTo(t, change.LaneFile, "CLAUDE_CODE_USE_BEDROCK=1\n")
+	if _, err := m.SetKey(ctx, "change-api", serviceapi.LaneKeyRequestV1{Key: anthropicFirst}); !errors.Is(err, serviceapi.ErrLaneNotKey) {
+		t.Fatalf("set on Bedrock = %v", err)
+	}
+	if listed, _ := m.Lanes(ctx); len(listed.Lanes) != 2 || listed.Lanes[0].Lane != "claude-api" {
+		t.Fatalf("lanes with change-api on Bedrock = %+v", listed)
+	}
+
+	wantLog := []string{
+		"abcp lane key set at=2026-11-07T18:00:00Z lane=change-api fingerprint=" + Fingerprint(anthropicFirst),
+		"abcp lane key refused at=2026-11-07T18:00:00Z lane=change-api reason=changed",
+		"abcp lane key refused at=2026-11-07T18:00:00Z lane=change-api reason=changed",
+		"abcp lane key removed at=2026-11-07T18:00:00Z lane=change-api fingerprint=" + Fingerprint(anthropicFirst),
+		"abcp lane key kept at=2026-11-07T18:00:00Z lane=change-api reason=required",
+		"abcp lane key refused at=2026-11-07T18:00:00Z lane=change-api reason=shape",
+		"abcp lane key refused at=2026-11-07T18:00:00Z lane=change-api reason=bedrock",
+	}
+	if log.String() != strings.Join(wantLog, "\n")+"\n" {
+		t.Fatalf("audit lines:\n%s", log.String())
+	}
+	scanFiles(t, f.root, []string{f.claudeFile, f.codexFile, change.LaneFile}, append(answers, log.String())...)
+}
+
+func TestTheLaneRoutesListAndTakeTheChangeEnginesLane(t *testing.T) {
+	f := newEngineFixture(t)
+	change := f.changeLane(t)
+	lanes, err := LoadWithChange(f.profiles, change, "claude-api", "change-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := &bytes.Buffer{}
+	manager, err := New(lanes, log, func() time.Time { return testTime })
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, token := liveServer(t, f.fixture, []string{"lanes.control"}, manager, log)
+	var answers []string
+	send := func(method, path, ifMatch, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+token)
+		if ifMatch != "" {
+			request.Header.Set("If-Match", ifMatch)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		answers = append(answers, fmt.Sprint(response.Code, response.Header(), response.Body.String()))
+		return response
+	}
+	operator := Fingerprint(operatorChangeKey)
+	if r := send(http.MethodGet, "/v1/lanes", "", ""); r.Code != 200 || r.Body.String() != `{"schema_version":"LanesV1","lanes":[`+
+		`{"lane":"change-api","kind":"engine","provider":"anthropic","state":"set","fingerprint":"`+operator+`","profiles":[],"uses":["change-jobs"]},`+
+		`{"lane":"claude-api","kind":"engine","provider":"anthropic","state":"set","fingerprint":"`+Fingerprint(operatorAnthropicKey)+`","profiles":["local-p02-claude-api","local-p02-node-claude-api"]},`+
+		`{"lane":"together","kind":"key","provider":"together","state":"missing","profiles":["local-p02-node-together","local-p02-together"]}]}`+"\n" {
+		t.Fatalf("lanes = %d %s", r.Code, r.Body.String())
+	}
+	body := `{"key":"` + anthropicFirst + `"}`
+	if r := send(http.MethodPut, "/v1/lanes/change-api/key", `"00000000"`, body); r.Code != 412 || !strings.Contains(r.Body.String(), `"code":"lane_key_changed"`) {
+		t.Fatalf("a stale set = %d %s", r.Code, r.Body.String())
+	}
+	if r := send(http.MethodPut, "/v1/lanes/change-api/key", `"`+operator+`"`, body); r.Code != 200 || r.Body.String() != `{"lane":"change-api","kind":"engine",`+
+		`"provider":"anthropic","state":"set","fingerprint":"`+Fingerprint(anthropicFirst)+`","profiles":[],"uses":["change-jobs"]}`+"\n" {
+		t.Fatalf("set = %d %s", r.Code, r.Body.String())
+	}
+	if read(t, change.LaneFile) != strings.Replace(changeLaneText, operatorChangeKey, anthropicFirst, 1) || read(t, f.claudeFile) != claudeLaneFile {
+		t.Fatal("the set did not replace the change lane's key line alone")
+	}
+	if r := send(http.MethodDelete, "/v1/lanes/change-api/key", `"`+operator+`"`, ""); r.Code != 412 {
+		t.Fatalf("a stale removal = %d %s", r.Code, r.Body.String())
+	}
+	if r := send(http.MethodDelete, "/v1/lanes/change-api/key", `"`+Fingerprint(anthropicFirst)+`"`, ""); r.Code != 200 || !strings.Contains(r.Body.String(), `"state":"missing"`) {
+		t.Fatalf("remove = %d %s", r.Code, r.Body.String())
+	}
+	privateFile(t, change.LaneFile, []byte("ANTHROPIC_API_KEY="+anthropicSecond+"\n"))
+	if r := send(http.MethodDelete, "/v1/lanes/change-api/key", "", ""); r.Code != 409 || !strings.Contains(r.Body.String(), `"code":"lane_key_required"`) {
+		t.Fatalf("removing the only setting = %d %s", r.Code, r.Body.String())
+	}
+	scanFiles(t, f.root, []string{f.claudeFile, f.codexFile, change.LaneFile}, append(answers, log.String())...)
 }

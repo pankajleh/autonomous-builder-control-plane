@@ -270,3 +270,25 @@ func TestIfMatchNamesTheKeyALaneMustHoldAndIsPassedToTheLanes(t *testing.T) {
 		t.Fatalf("a refused If-Match reached the lanes: %v %v", backend.sets, backend.removes)
 	}
 }
+
+// changeLaneKeys lists the change engine's lane, which no profile reads, beside a build lane.
+type changeLaneKeys struct{ testLaneKeys }
+
+func (*changeLaneKeys) Lanes(context.Context) (LanesV1, error) {
+	return LanesV1{SchemaVersion: LanesSchemaV1, Lanes: []LaneV1{
+		{Lane: "change-api", Kind: LaneKindEngine, Provider: "anthropic", State: LaneKeySet, Fingerprint: "5e6f7a8b", Profiles: []string{}, Uses: []string{LaneUseChangeJobs}},
+		{Lane: "claude-api", Kind: LaneKindEngine, Provider: "anthropic", State: LaneKeyMissing, Profiles: []string{"local-p02-claude-api"}},
+	}}, nil
+}
+
+func TestTheChangeEnginesLaneIsListedWithNoProfilesAndItsUse(t *testing.T) {
+	s, _, _ := laneServer(t, true)
+	s.reserved.LaneKeys = &changeLaneKeys{}
+	list := call(s, http.MethodGet, "/v1/lanes", "")
+	// A lane only builds read has no uses, as before; the change engine's lists none of its profiles, never null.
+	if list.Code != http.StatusOK || list.Body.String() != `{"schema_version":"LanesV1","lanes":[`+
+		`{"lane":"change-api","kind":"engine","provider":"anthropic","state":"set","fingerprint":"5e6f7a8b","profiles":[],"uses":["change-jobs"]},`+
+		`{"lane":"claude-api","kind":"engine","provider":"anthropic","state":"missing","profiles":["local-p02-claude-api"]}]}`+"\n" {
+		t.Fatalf("list = %d %s", list.Code, list.Body.String())
+	}
+}

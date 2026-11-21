@@ -85,4 +85,30 @@ func TestLaneKeysReadsTheProfilesLanesAndPrintsNoKey(t *testing.T) {
 	if code := runCLI([]string{"lane-keys", "--admission-profile-file", profileFile, "--lane-key-engine-lanes", "claude-api,codex-account", "--account-lanes-file", accountsFile}, &stdout, &stderr); code != 1 {
 		t.Fatalf("an account lane named = %d", code)
 	}
+
+	// The change engine's lane, named with its engine file as abcp serve takes it: listed by its vendor, no profiles, the
+	// change jobs as its use. Named without the engine file, no lane is it.
+	changeKey := "sk-ant-api03-" + strings.Repeat("C", 40)
+	changeFile := write(filepath.Join(root, "change-api.env"), []byte("ANTHROPIC_API_KEY="+changeKey+"\nANTHROPIC_MODEL=claude-sonnet-5-5\n"))
+	claudeBinary := filepath.Join(root, "claude")
+	if err := os.WriteFile(claudeBinary, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	engine, _ := json.Marshal(map[string]any{"schema_version": 1, "binary": claudeBinary, "lane_name": "change-api", "lane_file": changeFile})
+	engineFile := write(filepath.Join(root, "change-engine.json"), engine)
+	stdout.Reset()
+	stderr.Reset()
+	if code := runCLI([]string{"lane-keys", "--admission-profile-file", profileFile, "--lane-key-engine-lanes", "claude-api,change-api", "--account-lanes-file", accountsFile,
+		"--change-engine-file", engineFile}, &stdout, &stderr); code != 0 ||
+		stdout.String() != "lane change-api kind=engine provider=anthropic state=set profiles= uses=change-jobs\n"+
+			"lane claude-api kind=engine provider=anthropic state=set profiles=local-p02-claude-api\n"+
+			"lane together kind=key provider=together state=set profiles=local-p02-together\nlane keys ready lanes=3 other-lanes=codex-account\n" {
+		t.Fatalf("lane-keys with the change engine's lane = %d %q %q", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String()+stderr.String(), changeKey) {
+		t.Fatal("lane-keys printed the key")
+	}
+	if code := runCLI([]string{"lane-keys", "--admission-profile-file", profileFile, "--lane-key-engine-lanes", "claude-api,change-api", "--account-lanes-file", accountsFile}, &stdout, &stderr); code != 1 {
+		t.Fatalf("the change engine's lane without its engine file = %d", code)
+	}
 }

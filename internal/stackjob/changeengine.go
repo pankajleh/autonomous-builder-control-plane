@@ -61,6 +61,30 @@ func LoadEngine(path string) (*ClaudeEngine, error) {
 // older Claude Code refuses the flag and the job ends ENGINE_UNAVAILABLE.
 type ClaudeEngine struct {
 	Binary, LaneName, LaneFile, Model string
+	// lane is the lane's settings as a job read them when it started (Pin); nil, each session reads the lane file.
+	lane *enginelane.Lane
+}
+
+// Pin reads the engine's lane file now, as a build's run reads its lane when it starts, and answers the engine on those
+// settings: every session of one change job and its secret checks use them and never read the file again. So a key
+// written to the lane meanwhile (PUT /v1/lanes/{lane}/key, docs/plans/lane-keys.md) reaches the next job without a
+// restart, and a job already running keeps the key it started with.
+func (e *ClaudeEngine) Pin() (Engine, error) {
+	lane, err := enginelane.Load(e.LaneName, e.LaneFile, "claude")
+	if err != nil {
+		return nil, err
+	}
+	pinned := *e
+	pinned.lane = &lane
+	return &pinned, nil
+}
+
+// settings answers the settings the engine was pinned to, or the lane file's now.
+func (e *ClaudeEngine) settings() (enginelane.Lane, error) {
+	if e.lane != nil {
+		return *e.lane, nil
+	}
+	return enginelane.Load(e.LaneName, e.LaneFile, "claude")
 }
 
 // The built-in tools the agent has; the edits and the run tool it may use without asking; and those it never has,
@@ -98,7 +122,7 @@ func environment(home string, lane enginelane.Lane) []string {
 // SecretValues answers the lane's setting values long enough to be secrets, so a change or a summary that carries one is
 // never handed back.
 func (e *ClaudeEngine) SecretValues() []string {
-	lane, err := enginelane.Load(e.LaneName, e.LaneFile, "claude")
+	lane, err := e.settings()
 	if err != nil {
 		return nil
 	}
@@ -131,7 +155,7 @@ type claudeResult struct {
 
 // Run runs one session in its own process group, ended with the context.
 func (e *ClaudeEngine) Run(ctx context.Context, run EngineRun) (EngineResult, error) {
-	lane, err := enginelane.Load(e.LaneName, e.LaneFile, "claude")
+	lane, err := e.settings()
 	if err != nil {
 		return EngineResult{}, err
 	}

@@ -17,13 +17,19 @@ import (
 //
 // An API-key engine lane takes a key too once the operator names it (abcp serve --lane-key-engine-lanes; the slice's
 // second half): claude-api's ANTHROPIC_API_KEY line, codex-api's OPENAI_API_KEY line. Its lane file is rewritten whole
-// with that one line changed, every other line kept.
+// with that one line changed, every other line kept. The change jobs' engine lane (change-engine.json's change-api, on
+// Claude Code) is one too once the operator names it: no build profile reads it, so it lists none, and its uses say the
+// change jobs do.
 
 // LaneKindKey is an open-model provider's key lane: its key file holds the key alone.
 const LaneKindKey = "key"
 
 // LaneKindEngine is an API-key engine lane the operator named: one line of its lane file holds the key.
 const LaneKindEngine = "engine"
+
+// LaneUseChangeJobs is a lane's use besides its profiles' builds: the change jobs' engine reads it when each job starts
+// (docs/plans/change-jobs.md).
+const LaneUseChangeJobs = "change-jobs"
 
 // Lane key states.
 const (
@@ -47,8 +53,12 @@ type LaneV1 struct {
 	State string `json:"state"`
 	// Fingerprint is the first 8 hex of the SHA-256 of the key, so Repo C can show which key is set; only when set.
 	Fingerprint string `json:"fingerprint,omitempty"`
-	// Profiles are the build profiles whose builds read this lane's key, sorted.
+	// Profiles are the build profiles whose builds read this lane's key, sorted; none (an empty list, never null) for a
+	// lane only the change jobs read.
 	Profiles []string `json:"profiles"`
+	// Uses are what else reads this lane's key when it starts: LaneUseChangeJobs for the change jobs' engine lane. Absent
+	// for a lane only builds read, as before.
+	Uses []string `json:"uses,omitempty"`
 }
 
 // LanesV1 lists every key lane the build profiles name, by lane name.
@@ -79,7 +89,7 @@ type LaneKeyController interface {
 }
 
 var (
-	// ErrLaneUnknown: no build profile names the lane.
+	// ErrLaneUnknown: no build profile names the lane, and it is not a change engine lane the operator named.
 	ErrLaneUnknown = errors.New("lane unknown")
 	// ErrLaneNotKey: a profile names the lane, but it is an account lane, an engine lane the operator did not name, or
 	// one paid another way (Bedrock, a setup token, another provider's address), never a key lane.

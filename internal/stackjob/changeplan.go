@@ -57,7 +57,7 @@ func movedParts(pinned, parts []Part) []Part {
 
 // assess runs an assessment once its baseline ran: the checks on the target versions, on a copy of the source of their
 // own so the agent finds the work folder as the baseline left it; then the agent, whose answer is the plan.
-func (m *ChangeManager) assess(ctx context.Context, r *changeRecord, dir, work, home, cache string, parts, baseline []Part, agentPart int,
+func (m *ChangeManager) assess(ctx context.Context, r *changeRecord, engine Engine, dir, work, home, cache string, parts, baseline []Part, agentPart int,
 	before []serviceapi.StackPartV1, registries []serviceapi.RegistryV1) changeEnd {
 	moved := movedParts(Pin(parts, r.Targets, m.profiles.Available()), baseline)
 	if len(moved) > 0 {
@@ -92,10 +92,10 @@ func (m *ChangeManager) assess(ctx context.Context, r *changeRecord, dir, work, 
 	}
 	started := time.Now()
 	agentCtx, agentCancel := context.WithTimeout(ctx, agentTime)
-	said, err := m.engine.Run(agentCtx, EngineRun{Work: work, Home: home, MCPConfig: mcp, MaxTurns: agentTurns,
+	said, err := engine.Run(agentCtx, EngineRun{Work: work, Home: home, MCPConfig: mcp, MaxTurns: agentTurns,
 		Prompt: assessPrompt(r.Words, baseline, before, moved, after)})
 	agentCancel()
-	values := append(m.secretValues(), registrySecrets(registries)...)
+	values := append(secretValues(engine), registrySecrets(registries)...)
 	leaked := leaks([]byte(said.Summary), values)
 	plan, planErr := parsePlan(said.Summary)
 	if planErr == nil && !leaked {
