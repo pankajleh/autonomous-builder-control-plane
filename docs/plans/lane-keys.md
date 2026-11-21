@@ -1,6 +1,7 @@
 # Lane keys: a key entered on the page reaches builds
 
-Status: **#198 live since 2026-11-08 02:16 UTC** (provider key lanes); **engine lanes built, not live** (below). One quiet restart takes it live, with `lanes.control` added to `grants.json`; no template
+Status: **#198 live since 2026-11-08 02:16 UTC** (provider key lanes); **engine lanes live since 2026-11-19 03:15 UTC**
+(#205, ABCP `04a8f6f`, below); **the change engine's lane built, not live** (below). One quiet restart takes it live, with `lanes.control` added to `grants.json`; no template
 changes. Repo C design note `BUILD_ENGINE_RULES.md` §9, slice 5 (Repo B's half). Repo C wires the page's "Add key" to it
 afterwards.
 
@@ -118,7 +119,7 @@ provider here. `GET /v1/capabilities` is unchanged: Repo C learns the routes exi
    state and fingerprint from `GET /v1/lanes`, and "Remove" sends `DELETE`. Then one build on a key entered on the page
    (design note §9's check).
 
-## Engine lanes (the slice's second half, branch `feature/lane-key-from-product-api`; built, not live)
+## Engine lanes (the slice's second half, #205; live since 2026-11-19)
 
 Repo C's page keeps an Anthropic and an OpenAI key, and the builds that pay with those keys run on the API-key engine
 lanes `claude-api` (22 profiles) and `codex-api` (2), whose `.env` lane file holds the key in one line
@@ -150,8 +151,8 @@ lanes `claude-api` (22 profiles) and `codex-api` (2), whose `.env` lane file hol
   next start, a run resumed after a restart, and `GET /v1/engines` read the new file.
 - **Audit lines** as before, plus `abcp lane key kept at=… lane=codex-api reason=required` and `abcp lane key refused
   at=… lane=… reason=changed|bedrock|setup-token|another-address`.
-- **Not here:** the change jobs' lane (`change-engine.json`, `change-api`, Anthropic) still reads its own file; whether a
-  page key should reach quick edits too is the owner's call.
+- **The change jobs' lane** (`change-engine.json`, `change-api`, Anthropic): the owner said yes (2026-11-19); built in
+  the section below.
 
 Checks: `internal/lanekey` (`engine_linux_test.go`: the flag and every refused configuration; a key line replaced with
 every other byte kept under umask 0, 0600, read back, the next build's `enginelane.Load` and environment on the new key
@@ -165,6 +166,62 @@ and an account lane refused).
 claude-api,codex-api` added to the start script. Without the flag the new binary behaves as #198 (`provider` aside).
 Check with `abcp lane-keys --admission-profile-file … --lane-key-engine-lanes claude-api,codex-api --account-lanes-file …`
 before the restart: both lanes `state=set`. No grant or template change.
+
+## The change engine's lane (branch `feature/change-lane-key`; built, not live)
+
+The owner, 2026-11-19 (Repo C `BUILD_ENGINE_RULES.md` §14, answer 1): the change jobs' lane (`change-engine.json`'s
+`change-api`, Claude Code on Anthropic's API; `docs/plans/change-jobs.md`) takes the page's Anthropic key too, "named like
+the engine lanes, its `ANTHROPIC_API_KEY` line written the same way, listed by `GET /v1/lanes` with no profiles but the
+change jobs".
+
+- **Named in the same flag:** `--lane-key-engine-lanes claude-api,codex-api,change-api`. The lane is the change engine
+  file's `lane_name` and `lane_file` (`abcp serve` takes them from `--change-engine-file` whenever that file checks,
+  whether or not change jobs are otherwise ready); executor `claude`, setting `ANTHROPIC_API_KEY`, vendor `anthropic`.
+  The same checks as a profile's engine lane: not an account lane; its file read at start as a build reads it and not paid
+  another way (Bedrock, a setup token); a file of its own (no profile's lane file, named or not, and no key file); a
+  profile that names the same lane names the same file on `claude`. Named while the change engine file is missing or does
+  not check: `abcp lane keys ready=false reason="engine lane \"change-api\": no profile names it, nor the change engine"`
+  and the routes answer `501`, as for any named lane that does not check. Not named, the lane is left out entirely (not
+  in `other-lanes` either), as before.
+- **`GET /v1/lanes`:** `{"lane":"change-api","kind":"engine","provider":"anthropic","state":"set","fingerprint":"…",
+  "profiles":[],"uses":["change-jobs"]}`. `uses` is new and appears only on that lane, so every other lane answers byte for
+  byte as before; `profiles` is an empty list, never `null`. Repo C's `BuilderLanes` already leaves fields it does not read
+  alone and takes an empty `profiles`, and already sends an Anthropic key to every lane whose `provider` is `anthropic`.
+- **`PUT`, `DELETE`, `If-Match`** exactly as on `claude-api`: the key line replaced with every other line kept, 0600, read
+  back; the line removed, or `409 lane_key_required` when nothing else would be left (the host's file also holds its model
+  settings, so a removal goes through and the next change job has no key: `ENGINE_UNAVAILABLE`); `412 lane_key_changed`;
+  audit lines with `lane=change-api`.
+- **Each change job reads the lane once, when it starts** (`stackjob.ClaudeEngine.Pin`, called by the job's worker before
+  its baseline), as a build's run reads its lane: its agent session, its review session and its secret checks use those
+  settings and never read the file again. Until now each session read the file itself, so a key written mid-job reached
+  its review, and its secret check read the lane after the agent had run. A key written by `PUT` reaches the next job
+  without a restart; a job already running keeps the key it started with. A lane file no build would read when a job
+  starts ends it `FAILED` with `ENGINE_UNAVAILABLE` before its baseline (until now, after it). `abcp serve`'s check of
+  the engine file at start is unchanged.
+- **`abcp lane-keys`** takes `--change-engine-file`, as `abcp serve` does, and prints `lane change-api kind=engine
+  provider=anthropic state=set profiles= uses=change-jobs`.
+
+Checks: `internal/lanekey` (the lane named and not named, and named without the change engine; each refused
+configuration: Bedrock, a setup token, a file open to others, a file Claude Code does not read, no file, a relative path,
+`claude-api`'s file though `claude-api` is not named, an account lane's file, a provider's name, a profile naming it on
+another file; a profile on the same file allowed; the key line replaced with every other byte kept under umask 0, 0600,
+read back, the next change job's `enginelane.Load` on the new key while a loaded one keeps its own; `If-Match`; the line
+removed; `lane_key_required`; a setup token; Bedrock after start; every file but the lane files, every answer and log line
+scanned for the test keys; the routes end to end), `internal/stackjob` (a job's agent and review on the key the lane held
+when the job started though a new key was written meanwhile, the next job on the new key; a change carrying the job's own
+key not handed back though the lane holds another by then; an unreadable lane ending a job before anything runs;
+`ClaudeEngine.Pin` through `LoadEngine` with a fake Claude Code that answers the key its session got), `internal/serviceapi`
+(the listing with `uses`, and without it as before), `cmd/abcp` (`abcp lane-keys` with the change engine file, and the
+lane named without it refused).
+
+**Rollout:** merge; build the binary as before; check on the host with `abcp lane-keys --admission-profile-file …
+--lane-key-engine-lanes claude-api,codex-api,change-api --account-lanes-file … --change-engine-file …` (run with this
+branch against the host's files on 2026-11-21: `change-api` `state=set profiles= uses=change-jobs`, `lanes=4`). Then the
+start script's flag gains the change lane, `--lane-key-engine-lanes claude-api,codex-api,change-api`, and one quiet
+restart, on the owner's word. The start line then reads `abcp lane keys ready=true
+lanes=change-api,claude-api,codex-api,together engine-lanes=3 other-lanes=2`. Without `change-api` in the flag the new
+binary behaves as today, but for each change job reading its lane once at its start. No grant, template or lane file
+change. Repo C then sends the Anthropic key to it as to `claude-api` (Send to builds on Anthropic's card).
 
 ## Not here
 

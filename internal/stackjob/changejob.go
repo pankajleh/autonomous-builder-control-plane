@@ -39,6 +39,10 @@ const (
 // secretKeeper is an engine that can say which values must never leave a job.
 type secretKeeper interface{ SecretValues() []string }
 
+// pinner is an engine whose settings come from a lane file (ClaudeEngine): a job reads them once, when it starts (Pin),
+// and its sessions and secret checks all use them.
+type pinner interface{ Pin() (Engine, error) }
+
 const (
 	changeWorkers    = 2
 	changeQueued     = 10
@@ -452,6 +456,13 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 	if free, ok := m.freeDisk(m.root); !ok || free < freeDiskBytes {
 		return changeEnd{ChangeFailed, FailSandbox}
 	}
+	// The engine's lane is read once, as the job starts (as a build's run reads its lane): a key written to it meanwhile
+	// reaches the next job without a restart, and this one keeps the key it started with for its agent, its review and
+	// its secret checks.
+	engine, err := m.jobEngine()
+	if err != nil {
+		return changeEnd{ChangeFailed, ReasonEngine}
+	}
 	work, gitDir, home := filepath.Join(dir, "files"), filepath.Join(dir, "git"), filepath.Join(dir, "home")
 	if os.MkdirAll(dir, 0o700) != nil || os.Mkdir(home, 0o700) != nil {
 		return changeEnd{ChangeFailed, FailSandbox}
@@ -516,7 +527,7 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 	}
 	before := m.snapshot(r).Before
 	if r.Job.Kind == "assess" {
-		return m.assess(ctx, r, dir, work, home, cache, parts, baseline, agentPart, before, registries)
+		return m.assess(ctx, r, engine, dir, work, home, cache, parts, baseline, agentPart, before, registries)
 	}
 	if !baselineReady(r.Job.Kind, before[agentPart]) {
 		return changeEnd{ChangeNotHandedBack, ReasonBaseline}
@@ -543,10 +554,10 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 	}
 	started := time.Now()
 	agentCtx, agentCancel := context.WithTimeout(ctx, agentTime)
-	said, err := m.engine.Run(agentCtx, EngineRun{Work: work, Home: home, MCPConfig: mcp, MaxTurns: agentTurns,
+	said, err := engine.Run(agentCtx, EngineRun{Work: work, Home: home, MCPConfig: mcp, MaxTurns: agentTurns,
 		Prompt: changePrompt(r.Job.Kind, r.Words, parts[agentPart], before[agentPart])})
 	agentCancel()
-	values := append(m.secretValues(), registrySecrets(registries)...)
+	values := append(secretValues(engine), registrySecrets(registries)...)
 	leaked := m.recordAgent(r, said, false, b.commands(), time.Since(started), values)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -566,7 +577,7 @@ func (m *ChangeManager) runChange(ctx context.Context, r *changeRecord, dir stri
 		return changeEnd{ChangeFailed, FailSandbox}
 	}
 	reviewCtx, reviewCancel := context.WithTimeout(ctx, reviewTime)
-	reviewed, err := m.engine.Run(reviewCtx, EngineRun{Work: work, Home: home, MCPConfig: mcp, MaxTurns: reviewTurns,
+	reviewed, err := engine.Run(reviewCtx, EngineRun{Work: work, Home: home, MCPConfig: mcp, MaxTurns: reviewTurns,
 		Prompt: reviewPrompt(r.Job.Kind, r.Words)})
 	reviewCancel()
 	leaked = m.recordAgent(r, reviewed, true, b.commands(), time.Since(started), values) || leaked
@@ -632,9 +643,18 @@ func (m *ChangeManager) snapshot(r *changeRecord) serviceapi.ChangeJobV1 {
 	return copyChangeJob(r.Job)
 }
 
-// secretValues answers the engine's values that must never leave a job.
-func (m *ChangeManager) secretValues() []string {
-	if k, ok := m.engine.(secretKeeper); ok {
+// jobEngine answers the engine one job runs on: an engine on a lane file pinned to the file's settings now, or the
+// engine itself.
+func (m *ChangeManager) jobEngine() (Engine, error) {
+	if p, ok := m.engine.(pinner); ok {
+		return p.Pin()
+	}
+	return m.engine, nil
+}
+
+// secretValues answers a job's engine's values that must never leave the job.
+func secretValues(engine Engine) []string {
+	if k, ok := engine.(secretKeeper); ok {
 		return k.SecretValues()
 	}
 	return nil

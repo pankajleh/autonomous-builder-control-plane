@@ -19,6 +19,10 @@
 // --lane-key-engine-lanes): its lane file's one key setting (ANTHROPIC_API_KEY, OPENAI_API_KEY) is replaced in a new
 // file written and renamed the same way, every other line kept byte for byte (engine.go). A request may name the key a
 // lane must hold now (If-Match, serviceapi.ExpectedLaneKey), so a removal never takes away a key it did not mean.
+//
+// The change jobs' engine lane (the change engine file's lane_name and lane_file, Claude Code: change-api) takes the
+// Anthropic key the same way once the operator names it in the same flag. No build profile reads it, so it lists none;
+// its uses say the change jobs read it, each job when it starts (stackjob.ClaudeEngine.Pin).
 package lanekey
 
 import (
@@ -51,7 +55,8 @@ type Lane struct {
 }
 
 // EngineLane is an API-key engine lane the operator named: the lane file its profiles' builds read, their executor, the
-// setting of that file that holds the key, the vendor whose key it is, and those profiles.
+// setting of that file that holds the key, the vendor whose key it is, those profiles, and what else reads it
+// (serviceapi.LaneUseChangeJobs for the change jobs' engine lane, which no profile reads).
 type EngineLane struct {
 	Name     string
 	LaneFile string
@@ -59,7 +64,18 @@ type EngineLane struct {
 	Setting  string
 	Provider string
 	Profiles []string
+	Uses     []string
 }
+
+// ChangeLane is the change jobs' engine lane, as the change engine file names it (stackjob.LoadEngine: lane_name and
+// lane_file); the zero value when change jobs have no engine. Its executor is Claude Code's.
+type ChangeLane struct {
+	Name     string
+	LaneFile string
+}
+
+// changeExecutor is the change jobs' engine's executor: Claude Code, always (docs/plans/change-jobs.md).
+const changeExecutor = "claude"
 
 // Lanes are the lanes the admission profile file names: the key lanes, the engine lanes the operator named, and the
 // names of the other engine lanes (files and accounts), which never take a key.
@@ -76,6 +92,15 @@ type Lanes struct {
 // names, on an executor whose key a lane file holds (engineKeys), with one lane file and executor across its profiles,
 // a file of its own, and a lane file that is not paid another way; it is read once to tell (as run admission reads it).
 func Load(profileFile string, engineLanes ...string) (Lanes, error) {
+	return LoadWithChange(profileFile, ChangeLane{}, engineLanes...)
+}
+
+// LoadWithChange is Load with the change jobs' engine lane known as well (the zero ChangeLane when change jobs have no
+// engine). Named in engineLanes, it is an engine lane on Claude Code under the same rules as a profile's (an Anthropic
+// API key line, one file, a file no other lane names, not paid another way), listed with no profiles and the change
+// jobs as its use; a profile naming the same lane must name the same file on Claude Code. Not named, it is left out
+// entirely, as before.
+func LoadWithChange(profileFile string, change ChangeLane, engineLanes ...string) (Lanes, error) {
 	data, err := enginelane.ReadPrivate(profileFile, runadmission.MaxProfileFileBytes)
 	if err != nil {
 		return Lanes{}, fmt.Errorf("the admission profile file cannot be read: %w", err)
@@ -89,6 +114,8 @@ func Load(profileFile string, engineLanes ...string) (Lanes, error) {
 	files := map[string]string{}
 	engines := map[string]*EngineLane{}
 	mixed := map[string]bool{}
+	// laneFiles are the engine lanes each profile lane file is named for.
+	laneFiles := map[string][]string{}
 	for _, profile := range file.Profiles {
 		if !filepath.IsAbs(profile.ManifestTemplatePath) || filepath.Clean(profile.ManifestTemplatePath) != profile.ManifestTemplatePath {
 			return Lanes{}, fmt.Errorf("profile %q: its manifest template path is not absolute and clean", profile.ProfileID)
@@ -123,6 +150,7 @@ func Load(profileFile string, engineLanes ...string) (Lanes, error) {
 			lane.Profiles = append(lane.Profiles, profile.ProfileID)
 		case executor.Lane != "":
 			others[executor.Lane] = true
+			laneFiles[executor.LaneFile] = append(laneFiles[executor.LaneFile], executor.Lane)
 			engine := engines[executor.Lane]
 			if engine == nil {
 				engine = &EngineLane{Name: executor.Lane, LaneFile: executor.LaneFile, Executor: executor.Executor}
@@ -133,6 +161,27 @@ func Load(profileFile string, engineLanes ...string) (Lanes, error) {
 			}
 			engine.Profiles = append(engine.Profiles, profile.ProfileID)
 		}
+	}
+	// The change jobs' engine lane, once the operator names it: an engine lane on Claude Code that no profile need name,
+	// whose file is no other lane's.
+	if change.Name != "" && slices.Contains(engineLanes, change.Name) {
+		if keys[change.Name] != nil {
+			return Lanes{}, fmt.Errorf("lane %q is both a provider and an engine lane", change.Name)
+		}
+		for _, owner := range laneFiles[change.LaneFile] {
+			if owner != change.Name {
+				return Lanes{}, fmt.Errorf("engine lane %q: the change engine's lane file is lane %q's too", change.Name, owner)
+			}
+		}
+		engine := engines[change.Name]
+		if engine == nil {
+			engine = &EngineLane{Name: change.Name, LaneFile: change.LaneFile, Executor: changeExecutor, Profiles: []string{}}
+			engines[change.Name] = engine
+		}
+		if engine.LaneFile != change.LaneFile || engine.Executor != changeExecutor {
+			mixed[change.Name] = true
+		}
+		engine.Uses = []string{serviceapi.LaneUseChangeJobs}
 	}
 	out := Lanes{}
 	for name, lane := range keys {
@@ -150,9 +199,9 @@ func Load(profileFile string, engineLanes ...string) (Lanes, error) {
 		case named[name]:
 			return Lanes{}, fmt.Errorf("engine lane %q is named twice", name)
 		case engine == nil:
-			return Lanes{}, fmt.Errorf("engine lane %q: no profile names it", name)
+			return Lanes{}, fmt.Errorf("engine lane %q: no profile names it, nor the change engine", name)
 		case mixed[name]:
-			return Lanes{}, fmt.Errorf("engine lane %q: its profiles name two lane files or executors", name)
+			return Lanes{}, fmt.Errorf("engine lane %q: its profiles (or the change engine) name two lane files or executors", name)
 		}
 		named[name] = true
 		key, known := engineKeys[engine.Executor]
@@ -218,11 +267,13 @@ func New(lanes Lanes, log io.Writer, now func() time.Time) (*Manager, error) {
 		key, known := engineKeys[engine.Executor]
 		_, twice := m.lanes[engine.Name]
 		_, twiceEngine := m.engines[engine.Name]
+		changeJobs := slices.Equal(engine.Uses, []string{serviceapi.LaneUseChangeJobs})
 		if twice || twiceEngine || !known || key.setting != engine.Setting || key.provider != engine.Provider || !enginelane.ValidName(engine.Name) ||
-			!enginelane.ValidPath(engine.LaneFile) {
-			return nil, fmt.Errorf("engine lane %q is given twice, or its executor, setting or lane file is not one a key is written to", engine.Name)
+			!enginelane.ValidPath(engine.LaneFile) || len(engine.Uses) > 0 && (!changeJobs || engine.Executor != changeExecutor) ||
+			len(engine.Profiles) == 0 && !changeJobs {
+			return nil, fmt.Errorf("engine lane %q is given twice, or its executor, setting, lane file or uses are not one a key is written to", engine.Name)
 		}
-		engine.Profiles = slices.Clone(engine.Profiles)
+		engine.Profiles, engine.Uses = names(engine.Profiles), names(engine.Uses)
 		m.engines[engine.Name] = engine
 		m.names = append(m.names, engine.Name)
 	}
@@ -240,6 +291,9 @@ func New(lanes Lanes, log io.Writer, now func() time.Time) (*Manager, error) {
 
 // Names answers the names of the lanes that take a key, sorted.
 func (m *Manager) Names() []string { return slices.Clone(m.names) }
+
+// names answers a copy of a list of names that is never nil, so a lane no profile names answers "profiles":[].
+func names(list []string) []string { return append([]string{}, list...) }
 
 // Lanes answers each lane's state and key fingerprint, reading each key file under the builds' own rules. An engine
 // lane whose file is now paid another way is left out: it takes no key.

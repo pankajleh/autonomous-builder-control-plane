@@ -131,4 +131,6 @@ Its prompt says it makes this step and nothing more, on the versions it moves to
 `abcp serve --change-root <private folder> --change-source-root <folder> --change-engine-file <protected file>` with the
 stack profiles file. The engine file: `{"schema_version": 1, "binary": "/abs/path/claude", "lane_name": "…",
 "lane_file": "/abs/path/….env", "model": "…"}`. Without all of them, or with one that does not check, the route says
-change jobs are not configured and the rest of the service runs.
+change jobs are not configured and the rest of the service runs. Each job reads the engine's lane file once, when it
+starts, and its sessions and secret checks use those settings; so a key written to the lane (`docs/plans/lane-keys.md`,
+the change engine's lane) reaches the next job without a restart, and a running job keeps its own.
