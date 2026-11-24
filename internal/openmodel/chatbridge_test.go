@@ -165,3 +165,36 @@ func TestTheChatBridgeAnswersInTheResponsesEventsCodexReads(t *testing.T) {
 		t.Errorf("a bare answer = %v, %v", plain, err)
 	}
 }
+
+// Compat chat_reasoning_max (2026-11-24): DeepSeek's own /chat/completions
+// takes low, high and max with high as its default; the bridge sends no
+// effort unless the model's compat asks for the most.
+func TestChatBridgeAsksForTheMostReasoningOnlyWhenTold(t *testing.T) {
+	responses := []byte(`{"model":"deepseek-flash","input":"hi","reasoning":{"effort":"high"}}`)
+	plain, err := ChatRequest(responses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "reasoning_effort") {
+		t.Fatalf("no reasoning_effort unless told: %s", plain)
+	}
+	most, err := chatRequest(responses, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(most), `,"reasoning_effort":"max"}`) {
+		t.Fatalf("reasoning_effort max, last: %s", most)
+	}
+	if strings.TrimSuffix(string(most), `,"reasoning_effort":"max"}`)+"}" != string(plain) {
+		t.Fatalf("nothing else changes:\n%s\n%s", plain, most)
+	}
+}
+
+func TestCompatReasoningMaxGoesOnlyWithTheBridge(t *testing.T) {
+	if err := validCompat([]string{CompatChatReasoningMax}); err == nil {
+		t.Fatal("chat_reasoning_max without the bridge must be refused")
+	}
+	if err := validCompat([]string{CompatChatBridge, CompatChatReasoningMax}); err != nil {
+		t.Fatal(err)
+	}
+}

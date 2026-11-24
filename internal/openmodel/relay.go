@@ -248,6 +248,9 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		line.applied = applied
 		if slices.Contains(r.model.Compat, CompatChatBridge) {
 			applied[CompatChatBridge] = 1
+			if slices.Contains(r.model.Compat, CompatChatReasoningMax) {
+				applied[CompatChatReasoningMax] = 1
+			}
 			r.bridge(w, request, rewritten, fields, &line)
 			return
 		}
@@ -358,7 +361,7 @@ func (r *Relay) forward(w http.ResponseWriter, request *http.Request, body []byt
 // bridge sends a Responses request to the provider's /chat/completions and
 // answers Codex in Responses events (chatbridge.go).
 func (r *Relay) bridge(w http.ResponseWriter, request *http.Request, body []byte, fields object, line *relayLine) {
-	chat, err := ChatRequest(body)
+	chat, err := chatRequest(body, slices.Contains(r.model.Compat, CompatChatReasoningMax))
 	if err != nil {
 		line.status, line.fault = http.StatusBadRequest, "bridge_request"
 		refuse(w, http.StatusBadRequest, "abcp_relay_request", "the ABCP relay could not read the request for the chat bridge")
