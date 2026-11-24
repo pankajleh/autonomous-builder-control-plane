@@ -678,7 +678,8 @@ git add more.txt && git commit -qm 'more on the kept candidate' || exit 43
 func TestAWalledRunsBranchStartsAtItsStartCommitSoAnUnrelatedOneIsNeverTaken(t *testing.T) {
 	bwrap := requireBwrap(t)
 	fixture, wall, _, _ := walledFixture(t, bwrap, func(wallDirs, string) string {
-		// The build's branch holds a history of its own, unrelated to the start commit.
+		// The build's branch holds a history of its own, unrelated to the start commit (made around the rewrite guard,
+		// which refuses it, so bringBack's own check is what is proven here).
 		return `#!/bin/sh
 branch=
 while [ "$#" -gt 0 ]; do
@@ -696,7 +697,7 @@ cd "$worktree" || exit 29
 git checkout -q --orphan "$branch" || exit 30
 git rm -rqf --cached . >/dev/null 2>&1
 printf 'unrelated\n' > candidate.txt
-git add candidate.txt && git commit -qm 'an unrelated history' || exit 34
+git add candidate.txt && git -c core.hooksPath=/dev/null commit -qm 'an unrelated history' || exit 34
 `
 	})
 	product := fixture.authority.Repository().Path
