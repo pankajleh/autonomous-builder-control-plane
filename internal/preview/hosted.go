@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -31,7 +32,9 @@ const (
 	MaxHostedRunning = 5
 	// maxHostedRunningCeiling bounds what SetMaxRunning takes.
 	maxHostedRunningCeiling = 200
-	// hostedRestartLimit automatic restarts in an hour leave the key FAILED until it is started again.
+	// hostedRestartLimit automatic restarts in an hour leave the key FAILED. A FAILED key is then tried again by itself,
+	// with growing pauses, for hostedFailedRetryWindow (a host that stalled for a few minutes, say), and after that
+	// stays FAILED until it is started again.
 	hostedRestartLimit = 3
 	hostedNightly      = 24 * time.Hour
 	hostedBackupKeep   = 7 * 24 * time.Hour
@@ -50,6 +53,13 @@ var (
 	hostedHealthEvery      = 5 * time.Second
 	hostedRestartBackoff   = 2 * time.Second
 	hostedNightlyEvery     = 10 * time.Minute
+	// hostedFailedRetryFirst is the first pause before a FAILED key is started again by itself; each further try waits
+	// twice as long, up to hostedFailedRetryMost, while hostedFailedRetryWindow has not passed since it failed.
+	hostedFailedRetryFirst  = time.Minute
+	hostedFailedRetryMost   = 8 * time.Minute
+	hostedFailedRetryWindow = 30 * time.Minute
+	// hostedHealEvery is how often hosting that went unavailable tries again the step that failed.
+	hostedHealEvery = 30 * time.Second
 )
 
 // HostedRuntime is the part of the governed runtime a hosted instance uses. The Docker runtime provides it.
@@ -100,6 +110,10 @@ type hostedKey struct {
 	done   chan struct{}
 	// output keeps the app's recent errors from its first start since the controller's own (BF-07c2), or is nil.
 	output *appOutput
+	// failedSince is when the key last went FAILED and failedTries how often it has been tried again by itself since;
+	// both kept in memory only, guarded by Hosting.mu, and cleared once it is ready again or started again.
+	failedSince time.Time
+	failedTries int
 }
 
 type Hosting struct {
@@ -116,6 +130,16 @@ type Hosting struct {
 	keys        map[string]*hostedKey
 	closed      bool
 	unavailable bool
+	// inherited is set when the preview service itself was unavailable at the start: that stays until a restart.
+	// Otherwise unavailability names its reason, and heal tries the failed step again (the clean-ups in
+	// pendingCleanup, by instance ID, then a write of every key's state) until it works.
+	inherited         bool
+	unavailableReason string
+	unavailableSince  time.Time
+	pendingCleanup    map[string]string
+	// logMu guards logw, where hosting writes one line for each state change it makes (abcp serve: its standard error).
+	logMu sync.Mutex
+	logw  io.Writer
 	// offsiteFile, when set, is the private settings file that copies each backup off the host (hosted_offsite.go).
 	offsiteFile     string
 	offsiteEndpoint func(bucket, region string) string
@@ -134,6 +158,38 @@ func (h *Hosting) SetMaxRunning(n int) {
 		h.maxRunning = 0
 	}
 	h.mu.Unlock()
+}
+
+// SetLog sets where hosting writes its lines: each key's status changes, restarts and failures, and its own
+// unavailability. Lines name a key by the first 12 characters of its digest, never its data or settings.
+func (h *Hosting) SetLog(w io.Writer) {
+	h.logMu.Lock()
+	h.logw = w
+	h.logMu.Unlock()
+}
+
+func (h *Hosting) logf(format string, args ...any) {
+	h.logMu.Lock()
+	defer h.logMu.Unlock()
+	if h.logw != nil {
+		_, _ = fmt.Fprintf(h.logw, "abcp hosted "+format+"\n", args...)
+	}
+}
+
+func shortKey(digest string) string {
+	if len(digest) > 12 {
+		return digest[:12]
+	}
+	return digest
+}
+
+// setUnavailable refuses new starts until heal finds the failed step works again. Call with h.mu held.
+func (h *Hosting) setUnavailable(reason string) {
+	if !h.unavailable {
+		h.unavailableReason, h.unavailableSince = reason, h.now()
+		h.logf("unavailable=true reason=%s: new starts are refused until the step works again", reason)
+	}
+	h.unavailable = true
 }
 
 // runningLimit is the limit of keys running at once; h.mu must be held.
@@ -156,7 +212,10 @@ func NewHosting(parent context.Context, previews *Service) (*Hosting, error) {
 	}
 	h, err := newHosting(parent, filepath.Join(previews.store.root, "hosted"), previews.profiles, previews.resolver, previews.checkout, runtime, previews.now)
 	if err == nil && previews.unavailable {
-		h.unavailable = true
+		h.mu.Lock()
+		h.unavailable, h.inherited, h.unavailableReason = true, true, "previews_unavailable"
+		h.mu.Unlock()
+		h.logf("unavailable=true reason=previews_unavailable: the preview service itself is unavailable until a restart")
 	}
 	return h, err
 }
@@ -176,7 +235,7 @@ func newHosting(parent context.Context, root string, profiles map[string]Preview
 	}
 	ctx, cancel := context.WithCancel(parent)
 	h := &Hosting{root: root, profiles: profiles, resolver: resolver, checkout: checkout, runtime: runtime, now: now, ctx: ctx, cancel: cancel, keys: map[string]*hostedKey{},
-		offsiteEndpoint: s3Endpoint, offsiteClient: &http.Client{}}
+		offsiteEndpoint: s3Endpoint, offsiteClient: &http.Client{}, pendingCleanup: map[string]string{}, logw: os.Stderr}
 	for _, e := range entries {
 		if !sha256Pattern.MatchString(e.Name()) {
 			cancel()
@@ -211,8 +270,9 @@ func newHosting(parent context.Context, root string, profiles map[string]Preview
 			h.launch(k)
 		}
 	}
-	h.wg.Add(1)
+	h.wg.Add(2)
 	go h.nightly()
+	go h.heal()
 	return h, nil
 }
 
@@ -233,8 +293,18 @@ func (h *Hosting) load(digest string) (hostedState, error) {
 	return st, nil
 }
 
-// save writes the key's state whole: a synced temporary file renamed into place, then the directory synced.
+// save writes the key's state whole (write); a write the disk refused makes hosting unavailable until heal finds
+// writes work again.
 func (h *Hosting) save(k *hostedKey, st hostedState) error {
+	err := h.write(k, st)
+	if err == ErrUnavailable {
+		h.setUnavailable("state_write_failed")
+	}
+	return err
+}
+
+// write writes the key's state whole: a synced temporary file renamed into place, then the directory synced.
+func (h *Hosting) write(k *hostedKey, st hostedState) error {
 	if serviceapi.ValidateHostedV1(view(st), st.Key) != nil {
 		return ErrIntegrity
 	}
@@ -245,21 +315,18 @@ func (h *Hosting) save(k *hostedKey, st hostedState) error {
 	dir := filepath.Join(h.root, k.digest)
 	d, err := privateDirectory(dir, true)
 	if err != nil {
-		h.unavailable = true
 		return ErrUnavailable
 	}
 	defer d.Close()
 	tmp := filepath.Join(dir, "state.next")
 	f, err := openRegular(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, true)
 	if err != nil {
-		h.unavailable = true
 		return ErrUnavailable
 	}
 	_, err = f.Write(data)
 	syncErr := f.Sync()
 	closeErr := f.Close()
 	if err != nil || syncErr != nil || closeErr != nil || os.Rename(tmp, filepath.Join(dir, "state.json")) != nil || d.Sync() != nil {
-		h.unavailable = true
 		return ErrUnavailable
 	}
 	k.state = st
@@ -479,6 +546,7 @@ func (h *Hosting) StartHosted(ctx context.Context, p serviceapi.Principal, autho
 		st = hostedState{SchemaVersion: 1, Key: key, Owner: owner(p), CreatedAt: now}
 	}
 	st.Desired, st.Status, st.Health, st.RouteHandle, st.Restarts = "RUNNING", "STARTING", "UNKNOWN", "", nil
+	k.failedSince, k.failedTries = time.Time{}, 0
 	st.Generation++
 	st.InstanceID = hostedInstance(k.digest, st.Generation)
 	st.Version = hostedVersion{RunID: source.RunID, CheckpointActivityID: source.CheckpointActivityID, SourceSHA: source.SHA, ProfileID: c.ProfileID, ProfileDigest: profile.Digest(),
@@ -536,7 +604,7 @@ func (h *Hosting) writeSettings(keyDigest string, settings map[string]string) er
 	path := h.settingsPath(keyDigest)
 	if len(settings) == 0 {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			h.unavailable = true
+			h.setUnavailable("settings_write_failed")
 			return ErrUnavailable
 		}
 		return nil
@@ -551,7 +619,7 @@ func (h *Hosting) writeSettings(keyDigest string, settings map[string]string) er
 		data.WriteString(name + "=" + settings[name] + "\n")
 	}
 	if h.writePrivate(keyDigest, "settings", data.String()) != nil {
-		h.unavailable = true
+		h.setUnavailable("settings_write_failed")
 		return ErrUnavailable
 	}
 	return nil
@@ -617,7 +685,7 @@ func (h *Hosting) ensureSetup(keyDigest string) (string, error) {
 			return "", ErrUnavailable
 		}
 		if h.writePrivate(keyDigest, "setup", "BOOTSTRAP_TOKEN="+hex.EncodeToString(b)+"\n") != nil {
-			h.unavailable = true
+			h.setUnavailable("setup_write_failed")
 			return "", ErrUnavailable
 		}
 	}
@@ -1099,15 +1167,24 @@ func (h *Hosting) supervise(ctx context.Context, k *hostedKey, done chan struct{
 		st.RouteHandle, st.Health = "", "UNKNOWN"
 		if len(recent) >= hostedRestartLimit {
 			st.Status, st.Restarts, st.UpdatedAt = "FAILED", recent, stamp(now)
-			_ = h.save(k, st)
+			err := h.save(k, st)
+			if k.failedSince.IsZero() {
+				k.failedSince, k.failedTries = now, 0
+			}
+			h.logf("key=%s generation=%d status=FAILED restarts_in_last_hour=%d: tries again by itself until %s", shortKey(k.digest), st.Generation, len(recent),
+				stamp(k.failedSince.Add(hostedFailedRetryWindow)))
 			h.mu.Unlock()
-			return
+			if err != nil || !h.retryFailed(ctx, k) {
+				return
+			}
+			continue
 		}
 		st.Restarts = append(recent, stamp(now))
 		k.output.restarted()
 		st.Status, st.Generation, st.UpdatedAt = "STARTING", st.Generation+1, stamp(now)
 		st.InstanceID = hostedInstance(k.digest, st.Generation)
 		err := h.save(k, st)
+		h.logf("key=%s restart attempt=%d reason=generation_ended generation=%d", shortKey(k.digest), len(st.Restarts), st.Generation)
 		h.mu.Unlock()
 		if err != nil {
 			return
@@ -1115,20 +1192,178 @@ func (h *Hosting) supervise(ctx context.Context, k *hostedKey, done chan struct{
 	}
 }
 
-// runGeneration starts one generation, keeps its health current, and removes its runtime objects when it ends.
-func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedState) {
-	id := st.InstanceID
-	defer func() {
-		cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// retryFailed waits, with pauses growing from hostedFailedRetryFirst to hostedFailedRetryMost, to start a FAILED key
+// again by itself, while hostedFailedRetryWindow has not passed since it failed: a host that stalled for a few minutes
+// (out of memory, say) leaves its apps FAILED, and they come back once it has recovered. It answers true once the
+// key's next generation is saved STARTING, and false when the key was stopped or started by a command, or the window
+// has passed (the key then stays FAILED until it is started again, as it always did). A try is skipped while hosting
+// is unavailable or running keys fill the limit.
+func (h *Hosting) retryFailed(ctx context.Context, k *hostedKey) bool {
+	for {
+		h.mu.Lock()
+		delay := hostedFailedRetryMost
+		if k.failedTries < 16 {
+			if d := hostedFailedRetryFirst << k.failedTries; d > 0 && d < hostedFailedRetryMost {
+				delay = d
+			}
+		}
+		if !h.now().Add(delay).Before(k.failedSince.Add(hostedFailedRetryWindow)) {
+			h.logf("key=%s status=FAILED: stopped trying by itself %s after it failed; start it again to run it", shortKey(k.digest), hostedFailedRetryWindow)
+			h.mu.Unlock()
+			return false
+		}
+		h.mu.Unlock()
+		wait(ctx, delay)
+		if ctx.Err() != nil {
+			return false
+		}
+		h.mu.Lock()
+		if ctx.Err() != nil || k.state.Status != "FAILED" || k.state.Desired != "RUNNING" {
+			h.mu.Unlock()
+			return false
+		}
+		k.failedTries++
+		if h.closed || h.unavailable || h.running(k) >= h.runningLimit() {
+			reason := "running_limit"
+			if h.closed || h.unavailable {
+				reason = "unavailable"
+			}
+			h.logf("key=%s status=FAILED: try %d skipped (%s)", shortKey(k.digest), k.failedTries, reason)
+			h.mu.Unlock()
+			continue
+		}
+		st := k.state
+		now := h.now()
+		k.output.restarted()
+		st.Status, st.Health, st.RouteHandle, st.Generation, st.UpdatedAt = "STARTING", "UNKNOWN", "", st.Generation+1, stamp(now)
+		st.InstanceID = hostedInstance(k.digest, st.Generation)
+		err := h.save(k, st)
+		h.logf("key=%s restart attempt reason=retry_after_failed try=%d generation=%d", shortKey(k.digest), k.failedTries, st.Generation)
+		h.mu.Unlock()
+		return err == nil
+	}
+}
+
+// supervising reports whether the key has a supervisor that has not ended. Call with h.mu held.
+func supervising(k *hostedKey) bool {
+	if k.done == nil {
+		return false
+	}
+	select {
+	case <-k.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// heal tries again, every hostedHealEvery, the step that made hosting unavailable: each generation's clean-up that
+// failed (its runtime objects stopped and its checkout removed, both safe to repeat), then a write of every key's
+// state. Once both work, hosting is available again, and every key that is to run but has no supervisor (its last
+// state write failed, or it stopped trying by itself) is started again. The unavailability of a preview service that
+// was itself unavailable at the start (inherited) stays until a restart, as before.
+func (h *Hosting) heal() {
+	defer h.wg.Done()
+	for h.ctx.Err() == nil {
+		wait(h.ctx, hostedHealEvery)
+		if h.ctx.Err() != nil {
+			return
+		}
+		h.tryHeal(h.ctx)
+	}
+}
+
+func (h *Hosting) tryHeal(ctx context.Context) bool {
+	h.mu.Lock()
+	if !h.unavailable || h.inherited || h.closed {
+		h.mu.Unlock()
+		return false
+	}
+	pending := make([]string, 0, len(h.pendingCleanup))
+	for id := range h.pendingCleanup {
+		pending = append(pending, id)
+	}
+	h.mu.Unlock()
+	sort.Strings(pending)
+	for _, id := range pending {
+		cleanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		err := h.runtime.Stop(cleanCtx, id)
 		cancel()
 		if err == nil {
 			err = h.checkout.Remove(id)
 		}
 		if err != nil {
+			return false
+		}
+		h.mu.Lock()
+		delete(h.pendingCleanup, id)
+		h.mu.Unlock()
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.unavailable || h.inherited || h.closed || len(h.pendingCleanup) > 0 {
+		return false
+	}
+	digests := make([]string, 0, len(h.keys))
+	for d := range h.keys {
+		digests = append(digests, d)
+	}
+	sort.Strings(digests)
+	for _, d := range digests {
+		if k := h.keys[d]; k.state.Key != "" && h.write(k, k.state) != nil {
+			return false
+		}
+	}
+	reason, since := h.unavailableReason, h.unavailableSince
+	h.unavailable, h.unavailableReason = false, ""
+	h.logf("unavailable=false after=%s reason_was=%s", h.now().Sub(since).Round(time.Second), reason)
+	for _, d := range digests {
+		k := h.keys[d]
+		if k.state.Key == "" || k.state.Desired != "RUNNING" || supervising(k) {
+			continue
+		}
+		// A command working on the key starts or stops it itself.
+		if !k.op.TryLock() {
+			continue
+		}
+		if h.running(k) < h.runningLimit() {
+			st := k.state
+			st.Status, st.Health, st.RouteHandle, st.Generation, st.UpdatedAt = "STARTING", "UNKNOWN", "", st.Generation+1, stamp(h.now())
+			st.InstanceID = hostedInstance(k.digest, st.Generation)
+			k.failedSince, k.failedTries = time.Time{}, 0
+			if h.save(k, st) == nil {
+				h.logf("key=%s restart attempt reason=available_again generation=%d", shortKey(k.digest), st.Generation)
+				h.launch(k)
+			}
+		}
+		k.op.Unlock()
+	}
+	return true
+}
+
+// runGeneration starts one generation, keeps its health current, and removes its runtime objects when it ends.
+func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedState) {
+	id := st.InstanceID
+	short := shortKey(k.digest)
+	ended := "stopped"
+	defer func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		step := "stop"
+		err := h.runtime.Stop(cleanCtx, id)
+		cancel()
+		if err == nil {
+			step = "remove"
+			err = h.checkout.Remove(id)
+		}
+		if err != nil {
 			h.mu.Lock()
-			h.unavailable = true
+			h.pendingCleanup[id] = k.digest
+			h.setUnavailable("cleanup_failed")
 			h.mu.Unlock()
+			h.logf("key=%s generation=%d clean-up failed at %s: tried again until it works", short, st.Generation, step)
+		}
+		if ctx.Err() == nil || ended != "stopped" {
+			h.logf("key=%s generation=%d ended reason=%s", short, st.Generation, ended)
 		}
 	}()
 	update := func(status, health, route string) bool {
@@ -1141,19 +1376,34 @@ func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedStat
 		if next.Status == status && next.Health == health && next.RouteHandle == route {
 			return true
 		}
+		changed := next.Status != status || next.Health != health
 		next.Status, next.Health, next.RouteHandle, next.UpdatedAt = status, health, route, stamp(h.now())
-		return h.save(k, next) == nil
+		if h.save(k, next) != nil {
+			ended = "state_write_failed"
+			return false
+		}
+		if changed {
+			h.logf("key=%s generation=%d status=%s health=%s", short, next.Generation, status, health)
+		}
+		if status == "READY" && health == "HEALTHY" && !k.failedSince.IsZero() {
+			h.logf("key=%s recovered %s after it failed", short, h.now().Sub(k.failedSince).Round(time.Second))
+			k.failedSince, k.failedTries = time.Time{}, 0
+		}
+		return true
 	}
 	profile, ok := h.profiles[st.Version.ProfileID]
 	if !ok || !profile.Hosted || profile.Digest() != st.Version.ProfileDigest {
+		ended = "profile_changed"
 		return
 	}
 	source, err := h.resolver.Resolve(ctx, st.Version.RunID, st.Version.CheckpointActivityID)
 	if err != nil || source.SHA != st.Version.SourceSHA || source.RepositoryIdentityDigest != st.Version.RepositoryIdentityDigest || source.ValidationID != st.Version.ValidationID {
+		ended = "source_unresolved"
 		return
 	}
 	path, err := h.checkout.Materialize(ctx, id, source)
 	if err != nil {
+		ended = "checkout_failed"
 		return
 	}
 	settings := ""
@@ -1162,6 +1412,7 @@ func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedStat
 	}
 	setup, err := h.ensureSetup(k.digest)
 	if err != nil {
+		ended = "setup_failed"
 		return
 	}
 	var output HostedOutput
@@ -1170,6 +1421,7 @@ func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedStat
 	}
 	route, err := h.runtime.StartHosted(ctx, id, path, profile, st.Key, k.digest, settings, setup, output)
 	if err != nil || !sha256Pattern.MatchString(route) {
+		ended = "start_failed"
 		return
 	}
 	startCtx, cancel := context.WithTimeout(ctx, hostedStartTimeout)
@@ -1185,7 +1437,11 @@ func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedStat
 		}
 	}
 	cancel()
-	if !healthy || !update("READY", "HEALTHY", route) {
+	if !healthy {
+		ended = "not_healthy_within_start_timeout"
+		return
+	}
+	if !update("READY", "HEALTHY", route) {
 		return
 	}
 	var failingSince time.Time
@@ -1196,6 +1452,9 @@ func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedStat
 		}
 		ok, err := h.runtime.Healthy(ctx, id, profile)
 		if err != nil {
+			if ctx.Err() == nil {
+				ended = "health_read_failed"
+			}
 			return
 		}
 		health := "HEALTHY"
@@ -1205,6 +1464,7 @@ func (h *Hosting) runGeneration(ctx context.Context, k *hostedKey, st hostedStat
 				failingSince = h.now()
 			}
 			if h.now().Sub(failingSince) >= hostedUnhealthyRestart {
+				ended = "unhealthy_too_long"
 				return
 			}
 		} else {
