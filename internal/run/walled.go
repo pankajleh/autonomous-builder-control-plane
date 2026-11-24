@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +40,61 @@ import (
 // ErrBranchRewritten says the run's branch cannot be brought back fast-forward: its history was rewritten in the
 // run's repository. The run fails rather than accept a branch the product repository never saw.
 var ErrBranchRewritten = errors.New("BRANCH_REWRITTEN: the run's branch cannot be brought back into the product repository fast-forward")
+
+// rewriteGuardHook is the run's repository's reference-transaction hook, BRANCH_REWRITTEN stopped at its source: once
+// ABCP has brought the run's branch back, a change to that branch that drops what was brought back (an amend, a rebase,
+// a reset, a forced move) is refused, so the engine makes a new commit on top instead and the run is not failed at
+// hand-back. The mark it reads (abcp-brought-back, in the repository's own folder) is the last commit brought back;
+// with no mark, or a mark the repository does not hold, it refuses nothing and bringBack's own check stays the rule.
+const rewriteGuardHook = `#!/bin/sh
+# Installed by ABCP: refuses rewriting the run's branch past what was already brought back to the product repository.
+[ "$1" = "prepared" ] || exit 0
+common=$(git rev-parse --git-common-dir 2>/dev/null) || exit 0
+mark="$common/abcp-brought-back"
+[ -s "$mark" ] || exit 0
+kept=$(cat "$mark")
+git cat-file -e "$kept^{commit}" 2>/dev/null || exit 0
+while read -r old new ref; do
+	[ "$ref" = %s ] || continue
+	case "$new" in *[!0]*) ;; *) continue ;; esac
+	if ! git merge-base --is-ancestor "$kept" "$new" 2>/dev/null; then
+		echo "abcp: refused: $ref was already handed back at $kept; rewriting it (amend, rebase, reset, a forced move) would lose that work. Make a new commit on top instead." >&2
+		exit 1
+	fi
+done
+exit 0
+`
+
+// guardedBranch is a branch name the rewrite guard can name in its hook.
+var guardedBranch = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+
+// guardRewrites installs the run's repository's rewrite guard (rewriteGuardHook) for the run's branch.
+func (w *walledRun) guardRewrites() error {
+	if !guardedBranch.MatchString(w.branch) {
+		return fmt.Errorf("%w: the run's branch %q cannot be guarded", ErrBuildWallUnavailable, w.branch)
+	}
+	hooks := filepath.Join(w.repository, ".git", "hooks")
+	if err := os.MkdirAll(hooks, 0o700); err != nil {
+		return fmt.Errorf("%w: make the run's hooks folder: %v", ErrBuildWallUnavailable, err)
+	}
+	hook := filepath.Join(hooks, "reference-transaction")
+	if err := writePrivateFile(hook, []byte(fmt.Sprintf(rewriteGuardHook, "'refs/heads/"+w.branch+"'"))); err != nil {
+		return fmt.Errorf("%w: write the run's rewrite guard: %v", ErrBuildWallUnavailable, err)
+	}
+	if err := os.Chmod(hook, 0o700); err != nil {
+		return fmt.Errorf("%w: make the run's rewrite guard runnable: %v", ErrBuildWallUnavailable, err)
+	}
+	return nil
+}
+
+// markBroughtBack records, in the run's repository, the last commit of its branch the product repository holds, so
+// the rewrite guard refuses dropping it. A mark that cannot be written leaves bringBack's own check as the rule.
+func (w *walledRun) markBroughtBack(sha string) {
+	if sha == "" {
+		return
+	}
+	_ = writePrivateFile(filepath.Join(w.repository, ".git", "abcp-brought-back"), []byte(sha+"\n"))
+}
 
 // fetchBackInterval is how often a running build's branch is looked at, to be brought back as it moves.
 var fetchBackInterval = 2 * time.Second
@@ -204,7 +260,7 @@ func (w *walledRun) cloneRepository(ctx context.Context) error {
 			return fmt.Errorf("%w: set the run's %s: %v", ErrBuildWallUnavailable, key, err)
 		}
 	}
-	return nil
+	return w.guardRewrites()
 }
 
 // userGitConfig reads a setting as Git resolves it for the controller's user in repository (its own and the user's
@@ -542,6 +598,7 @@ func (w *walledRun) startBranch(ctx context.Context) error {
 	ref := "refs/heads/" + w.branch
 	if current, err := gitOutput(ctx, w.product, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err == nil && current != "" {
 		w.fetched = current
+		w.markBroughtBack(current)
 		return nil
 	}
 	// An empty old value makes the branch only where there is none.
@@ -549,6 +606,7 @@ func (w *walledRun) startBranch(ctx context.Context) error {
 		return fmt.Errorf("start the run's branch in the product repository: %w", err)
 	}
 	w.fetched = w.startSHA
+	w.markBroughtBack(w.startSHA)
 	return nil
 }
 
@@ -613,6 +671,7 @@ func (w *walledRun) bringBack(ctx context.Context) error {
 		return fmt.Errorf("read the brought-back branch: %w", err)
 	}
 	w.fetched = fetched
+	w.markBroughtBack(fetched)
 	return nil
 }
 
