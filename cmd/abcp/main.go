@@ -1074,6 +1074,7 @@ func serveCommand(args []string, stderr io.Writer) int {
 		// Read afresh at each backup; one that cannot be read copies nothing and never stops a backup.
 		h.SetOffsiteFile(*hostedOffsiteFile)
 		h.SetMaxRunning(*hostedMaxRunning)
+		h.SetLog(stderr)
 		fmt.Fprintf(stderr, "abcp hosted instances limit=%d\n", *hostedMaxRunning)
 		hosting = h
 	}

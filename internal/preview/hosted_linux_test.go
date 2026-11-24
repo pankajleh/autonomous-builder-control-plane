@@ -39,6 +39,7 @@ type hostedMemory struct {
 	data                string // what pg_restore writes for any backup (BF-06b)
 	extracted           []string
 	extractErr          error
+	stopErr             error // what Stop answers: a host that stalled refuses clean-ups for a while
 }
 
 // Extract answers the data the memory was given, as pg_restore writes it, after reading the whole backup (BF-06b).
@@ -94,7 +95,7 @@ func (r *hostedMemory) Stop(_ context.Context, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stopped = append(r.stopped, id)
-	return nil
+	return r.stopErr
 }
 func (r *hostedMemory) Dump(_ context.Context, _ string, _ PreviewProfileV1, w io.Writer) error {
 	r.mu.Lock()
@@ -148,10 +149,15 @@ func (c *hostedClock) Add(d time.Duration) {
 
 func fastHosted(t *testing.T) {
 	t.Helper()
-	saved := []time.Duration{hostedStartTimeout, hostedUnhealthyRestart, hostedHealthEvery, hostedRestartBackoff, hostedNightlyEvery}
+	saved := []time.Duration{hostedStartTimeout, hostedUnhealthyRestart, hostedHealthEvery, hostedRestartBackoff, hostedNightlyEvery,
+		hostedFailedRetryFirst, hostedFailedRetryMost, hostedFailedRetryWindow, hostedHealEvery}
 	hostedStartTimeout, hostedUnhealthyRestart, hostedHealthEvery, hostedRestartBackoff, hostedNightlyEvery = 200*time.Millisecond, 2*time.Minute, 2*time.Millisecond, time.Millisecond, time.Hour
+	// A FAILED key is not tried again by itself here (the first pause is longer than the window), as it never was;
+	// the self-heal tests shorten these.
+	hostedFailedRetryFirst, hostedFailedRetryMost, hostedFailedRetryWindow, hostedHealEvery = time.Hour, time.Hour, 30*time.Minute, 2*time.Millisecond
 	t.Cleanup(func() {
 		hostedStartTimeout, hostedUnhealthyRestart, hostedHealthEvery, hostedRestartBackoff, hostedNightlyEvery = saved[0], saved[1], saved[2], saved[3], saved[4]
+		hostedFailedRetryFirst, hostedFailedRetryMost, hostedFailedRetryWindow, hostedHealEvery = saved[5], saved[6], saved[7], saved[8]
 	})
 }
 
