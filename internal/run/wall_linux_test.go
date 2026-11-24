@@ -485,10 +485,14 @@ func TestTheRunsRepositoryIsAFreshCloneAndItsBranchComesBackFastForwardOnly(t *t
 	if got := runGit(t, product, "rev-parse", "refs/heads/"+w.branch); got != second {
 		t.Fatalf("product branch = %s, want the fast-forward %s", got, second)
 	}
-	// A rewritten branch is never brought back; the product repository keeps what it had.
-	runGit(t, w.repository, "reset", "-q", "--hard", first)
+	// The rewrite guard refuses a reset that drops a commit already brought back.
+	if output, err := exec.Command("git", "-C", w.repository, "reset", "-q", "--soft", first).CombinedOutput(); err == nil {
+		t.Fatalf("the rewrite guard let a reset drop a brought-back commit: %s", output)
+	}
+	// A rewritten branch (a build that got around the guard) is never brought back; the product repository keeps what it had.
+	runGit(t, w.repository, "-c", "core.hooksPath=/dev/null", "reset", "-q", "--hard", first)
 	writeTestFile(t, filepath.Join(w.repository, "app.txt"), []byte("rewritten\n"), 0o600)
-	runGit(t, w.repository, "commit", "-qam", "rewritten")
+	runGit(t, w.repository, "-c", "core.hooksPath=/dev/null", "commit", "-qam", "rewritten")
 	if err := w.bringBack(context.Background()); !errors.Is(err, ErrBranchRewritten) {
 		t.Fatalf("a rewritten branch = %v, want BRANCH_REWRITTEN", err)
 	}
@@ -504,6 +508,81 @@ func TestTheRunsRepositoryIsAFreshCloneAndItsBranchComesBackFastForwardOnly(t *t
 	}
 	if err := w.bringBack(context.Background()); err == nil {
 		t.Fatal("a linked repository was read")
+	}
+}
+
+func TestTheRewriteGuardRefusesDroppingABroughtBackCommitAndLetsANewOneThrough(t *testing.T) {
+	wall, dirs, err := writeTestWall(t, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	product := filepath.Join(dirs.root, "product")
+	runGit(t, "", "init", "-q", "-b", "main", product)
+	runGit(t, product, "config", "user.email", "product@example.test")
+	runGit(t, product, "config", "user.name", "Product")
+	writeTestFile(t, filepath.Join(product, "README.md"), []byte("start\n"), 0o600)
+	runGit(t, product, "add", "README.md")
+	runGit(t, product, "commit", "-qm", "start")
+	w := walledRunFor(t, wall, product, "admission-guard")
+	if err := w.cloneRepository(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, w.repository, "checkout", "-q", "-b", w.branch)
+	writeTestFile(t, filepath.Join(w.repository, "app.txt"), []byte("one\n"), 0o600)
+	runGit(t, w.repository, "add", "app.txt")
+	runGit(t, w.repository, "commit", "-qm", "one")
+	// Nothing brought back yet: the engine may still amend its own commit.
+	runGit(t, w.repository, "commit", "-q", "--amend", "-m", "one, amended before it was brought back")
+	if err := w.bringBack(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	kept := runGit(t, w.repository, "rev-parse", "HEAD")
+	// Once brought back, an amend is refused with ABCP's reason, and the branch keeps the brought-back commit.
+	output, err := exec.Command("git", "-C", w.repository, "commit", "-q", "--amend", "-m", "amended after").CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "abcp: refused") {
+		t.Fatalf("an amend of a brought-back commit = %v %q, want refused", err, output)
+	}
+	if got := runGit(t, w.repository, "rev-parse", "refs/heads/"+w.branch); got != kept {
+		t.Fatalf("the branch moved to %s after a refused amend, want %s", got, kept)
+	}
+	// So is moving the branch back before it.
+	if output, err := exec.Command("git", "-C", w.repository, "reset", "-q", "--soft", "HEAD~1").CombinedOutput(); err == nil {
+		t.Fatalf("the rewrite guard let a reset drop a brought-back commit: %s", output)
+	}
+	// A new commit on top goes through and comes back fast-forward.
+	writeTestFile(t, filepath.Join(w.repository, "app.txt"), []byte("two\n"), 0o600)
+	runGit(t, w.repository, "commit", "-qam", "two")
+	two := runGit(t, w.repository, "rev-parse", "HEAD")
+	if err := w.bringBack(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := runGit(t, product, "rev-parse", "refs/heads/"+w.branch); got != two {
+		t.Fatalf("product branch = %s, want the fast-forward %s", got, two)
+	}
+}
+
+func TestAWalledRunWhoseEngineAmendsABroughtBackCommitIsRefusedAndStillHandsBack(t *testing.T) {
+	bwrap := requireBwrap(t)
+	previous := fetchBackInterval
+	fetchBackInterval = 20 * time.Millisecond
+	t.Cleanup(func() { fetchBackInterval = previous })
+	fixture, wall, _, _ := walledFixture(t, bwrap, func(wallDirs, string) string {
+		// After Ralphex's commits the branch is brought back; the engine then tries to amend (refused) and commits on top.
+		return strings.TrimSuffix(fakeWalledRalphex(""), "\n") + `
+sleep 1
+if git commit -q --amend -m 'amended candidate' 2>/dev/null; then exit 44; fi
+printf 'more\n' > more.txt
+git add more.txt && git commit -qm 'more on the candidate' || exit 45
+sleep 1
+`
+	})
+	runner := fixture.runner(t)
+	if err := runner.SetBuildWall(wall); err != nil {
+		t.Fatal(err)
+	}
+	result, _ := runner.Run(context.Background())
+	if result.State == domain.StateFailed {
+		t.Fatalf("a refused amend failed the run: %q", result.FailureReason)
 	}
 }
 
@@ -550,9 +629,9 @@ func TestAWalledRunWhoseBranchIsRewrittenFails(t *testing.T) {
 		// After Ralphex's commits the branch is brought back; then the build rewrites it.
 		return strings.TrimSuffix(fakeWalledRalphex(""), "\n") + `
 sleep 1
-git reset -q --hard HEAD~1 || exit 40
+git -c core.hooksPath=/dev/null reset -q --hard HEAD~1 || exit 40
 printf 'rewritten\n' > candidate.txt
-git add candidate.txt && git commit -qm 'rewritten candidate' || exit 41
+git add candidate.txt && git -c core.hooksPath=/dev/null commit -qm 'rewritten candidate' || exit 41
 sleep 1
 `
 	})
@@ -577,11 +656,11 @@ func TestAWalledRunWhoseBranchIsRewrittenAndPutBackStillFails(t *testing.T) {
 		return strings.TrimSuffix(fakeWalledRalphex(""), "\n") + `
 sleep 1
 kept=$(git rev-parse HEAD)
-git reset -q --hard HEAD~1 || exit 40
+git -c core.hooksPath=/dev/null reset -q --hard HEAD~1 || exit 40
 printf 'rewritten\n' > candidate.txt
-git add candidate.txt && git commit -qm 'rewritten candidate' || exit 41
+git add candidate.txt && git -c core.hooksPath=/dev/null commit -qm 'rewritten candidate' || exit 41
 sleep 1
-git reset -q --hard "$kept" || exit 42
+git -c core.hooksPath=/dev/null reset -q --hard "$kept" || exit 42
 printf 'more\n' > more.txt
 git add more.txt && git commit -qm 'more on the kept candidate' || exit 43
 `
