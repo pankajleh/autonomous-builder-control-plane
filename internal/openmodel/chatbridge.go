@@ -22,7 +22,11 @@ import (
 // Beam build (the trial relay's chat_bridge.py, version 4 to 6).
 
 // ChatRequest answers the Chat Completions request for a Responses request.
-func ChatRequest(responses []byte) ([]byte, error) {
+func ChatRequest(responses []byte) ([]byte, error) { return chatRequest(responses, false) }
+
+// chatRequest is ChatRequest, asking for the model's most reasoning when
+// reasoningMax (compat chat_reasoning_max).
+func chatRequest(responses []byte, reasoningMax bool) ([]byte, error) {
 	var request struct {
 		Model             json.RawMessage   `json:"model"`
 		Input             json.RawMessage   `json:"input"`
@@ -88,6 +92,9 @@ func ChatRequest(responses []byte) ([]byte, error) {
 		if present(field.value) {
 			out = append(out, field)
 		}
+	}
+	if reasoningMax {
+		out = append(out, member{key: "reasoning_effort", value: json.RawMessage(`"max"`)})
 	}
 	return out.encode(), nil
 }

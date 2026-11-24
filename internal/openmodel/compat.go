@@ -46,6 +46,13 @@ const (
 	// earlier turn without its reasoning, which Together's /responses never
 	// sends back.
 	CompatChatBridge = "chat_completions_bridge"
+	// CompatChatReasoningMax asks the bridged Chat Completions request for the
+	// model's most reasoning ("reasoning_effort": "max"), for a provider whose
+	// /chat/completions takes low, high and max (DeepSeek's own API, whose
+	// default is high). It goes only with the chat bridge, which otherwise
+	// sends no reasoning effort. Repo C's trial engine codex-deepseek-max
+	// uses it, so customers' DeepSeek builds keep the default (2026-11-24).
+	CompatChatReasoningMax = "chat_reasoning_max"
 	// CompatDropMediumEffort leaves out an empty `"reasoning": {}` (which
 	// Together fills in as "medium") or a "medium" effort, for a model that
 	// refuses medium ("reasoning_effort must be low, high, xhigh, max …").
@@ -77,7 +84,7 @@ const (
 var CompatFixes = []string{
 	CompatDropNullReasoningContent, CompatMessageBeforeCalls, CompatOutputAfterCall,
 	CompatDropMediumEffort, CompatDropNamespaceTools, CompatCustomToolAsFunction, CompatStopAtFirstCall,
-	CompatChatBridge,
+	CompatChatReasoningMax, CompatChatBridge,
 }
 
 // validCompat accepts distinct known fixes; the chat bridge keeps a turn's
@@ -94,6 +101,9 @@ func validCompat(compat []string) error {
 			return fmt.Errorf("compat repeats %q", name)
 		}
 		seen[name] = true
+	}
+	if seen[CompatChatReasoningMax] && !seen[CompatChatBridge] {
+		return errors.New("compat " + CompatChatReasoningMax + " sets the bridged request's reasoning: it goes only with " + CompatChatBridge)
 	}
 	if seen[CompatChatBridge] && (seen[CompatMessageBeforeCalls] || seen[CompatOutputAfterCall]) {
 		return errors.New("compat " + CompatChatBridge + " keeps a turn's calls together itself: it is refused with " + CompatMessageBeforeCalls + " or " + CompatOutputAfterCall)
