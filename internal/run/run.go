@@ -782,6 +782,11 @@ func (r *Runner) Run(ctx context.Context) (result Result, runErr error) {
 		if err != nil {
 			return r.fail(ctx, result, startFrom, "ralphex-adapter", err, nil)
 		}
+		// A walled build from a template copy reviews only what it did after the copy (reviewBaseBranch); a base that
+		// cannot be written leaves Ralphex's own, as before.
+		if walled != nil && walled.startReviewBase() {
+			invocation.BaseRef = walled.reviewBase
+		}
 		// An engine lane (Repo C design note A6) replaces the inherited settings of
 		// its engine for this build only. It is read now, so a changed or removed
 		// file stops the build before the engine starts; only its name, SHA-256 and
