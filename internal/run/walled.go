@@ -123,6 +123,12 @@ type walledRun struct {
 	// rewrites counts the times the branch could not be brought back fast-forward; one fails the run, even when the
 	// build puts the branch back afterwards.
 	rewrites int
+
+	// reviewBase is the branch the review diffs against in a build from a template copy (reviewBaseBranch), and
+	// reviewBaseAt the copy commit it was moved to; template is the copy's manifest. All empty for a fresh build.
+	reviewBase   string
+	reviewBaseAt string
+	template     *authority.TemplateCopyManifest
 }
 
 // SetBuildWall walls every Ralphex run of this runner (Repo C design note BUILD_ISOLATION.md, phase 1). abcp run sets
@@ -185,6 +191,9 @@ func (r *Runner) prepareWalledRun(ctx context.Context) (*walledRun, error) {
 		home: filepath.Join(folder, "home"), tmp: filepath.Join(folder, "tmp"), engineHome: filepath.Join(folder, "engine-home"),
 		product: r.governed.Repository().Path, branch: r.governed.Worktree().Branch, startSHA: r.governed.Repository().StartSHA,
 		readPaths: isolation.ReadPaths, env: map[string]string{},
+	}
+	if template, ok := r.governed.TemplateCopy(); ok && r.governed.Ralphex().Mode != ralphex.ModeReview {
+		w.reviewBase, w.template = reviewBaseBranch, &template
 	}
 	if _, err := os.Lstat(folder); errors.Is(err, os.ErrNotExist) {
 		if r.resume || r.interrupted {
@@ -691,6 +700,7 @@ func (w *walledRun) bringBackWhileRunning(ctx context.Context) func() {
 				return
 			case <-ticker.C:
 				_ = w.bringBack(ctx)
+				w.moveReviewBase(ctx)
 			}
 		}
 	}()
