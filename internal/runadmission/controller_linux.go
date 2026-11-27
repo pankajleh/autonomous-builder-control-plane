@@ -434,6 +434,12 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 		if !ok {
 			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrUnknownAdmissionProfile
 		}
+		// A template's copy with exact writes is checked before its request is receipted (Repo C
+		// TEMPLATE_LIBRARY_ROUND_2 §10.6): Repo C sends a refused one the builder's way under the same request ID, so a
+		// refusal must leave no receipt that would make that request a conflict. It is checked again below.
+		if err := templateWritesRefusal(ctx, profile, admission); err != nil {
+			return serviceapi.RunAdmissionResponseV1{}, err
+		}
 		receipt.ProfileBindingSHA256 = profile.profileBindingSHA256
 		receipt, err = c.createOrVerifyReceipt(ctx, receipt)
 		if err != nil {
@@ -522,7 +528,11 @@ func (c *Controller) admitAuthority(ctx context.Context, principal serviceapi.Pr
 		if admission.executor != nil && !acceptsExecutor(profile.configuration.ExecutorChoices, *admission.executor) {
 			return serviceapi.RunAdmissionResponseV1{}, serviceapi.ErrExecutorChoiceNotAccepted
 		}
-		if admission.exactEdit != nil {
+		if admission.exactEdit != nil && admission.exactEdit.SourceSHA == "" {
+			if err := templateWritesRefusal(ctx, profile, admission); err != nil {
+				return serviceapi.RunAdmissionResponseV1{}, err
+			}
+		} else if admission.exactEdit != nil {
 			// The edit is checked against the version it changes before anything is
 			// written (Repo C design note BF01D_QUICK_EDIT.md §4.5); Git is only read.
 			if profile.template.Ralphex.Mode == ralphex.ModeReview {
@@ -945,7 +955,7 @@ func validateAdmissionBindingMaterial(binding AdmissionBindingV1, principal serv
 	if !reflect.DeepEqual(capsule, expectedCapsule) {
 		return errors.New("admission context capsule binding differs")
 	}
-	manifestData, found, err := readRegularAt(runFD, "manifest.json", MaxManifestTemplateBytes)
+	manifestData, found, err := readRegularAt(runFD, "manifest.json", MaxRunManifestBytes)
 	if err != nil || !found || digest(manifestData) != binding.AuthorityDigest {
 		return errors.New("admission manifest binding is invalid")
 	}
@@ -1113,10 +1123,10 @@ func materialize(profile loadedProfile, principal serviceapi.Principal, admissio
 	}
 	capsulePath := filepath.Join(runDirectory, "context-capsule.json")
 	manifestData, err := derivedManifestData(profile, admission.repositoryBaseSHA, runID, planPath, capsulePath, plan, capsuleData, admission.template, admission.executor, admission.exactEdit, isolation)
-	if err != nil || len(manifestData) > MaxManifestTemplateBytes {
+	if err != nil || len(manifestData) > MaxRunManifestBytes {
 		return "", runBinding{}, errors.New("derived manifest exceeds bounds")
 	}
-	if err := createOrVerifyAt(runFD, "manifest.json", manifestData); err != nil {
+	if err := createOrVerifyBoundedAt(runFD, "manifest.json", manifestData, MaxRunManifestBytes); err != nil {
 		return "", runBinding{}, err
 	}
 	return filepath.Join(runDirectory, "manifest.json"), bindingFor(profile, runID, manifestData), nil
@@ -1341,8 +1351,10 @@ func derivedManifestData(profile loadedProfile, repositoryBaseSHA, runID, planPa
 		}
 	}
 	if exactEdit != nil {
-		if template != nil || executor != nil {
-			return nil, errors.New("an exact edit names no template and no executor choice")
+		// An exact edit names no executor choice, and a template exactly when it names no source commit: then it
+		// writes on the template's copy (Repo C TEMPLATE_LIBRARY_ROUND_2 §10.5), and the manifest binds both.
+		if executor != nil || (template != nil) != (exactEdit.SourceSHA == "") {
+			return nil, errors.New("an exact edit names no executor choice, and a template only in place of its source commit")
 		}
 		edit := exactEditManifest(*exactEdit)
 		manifest.ExactEdit = &edit
@@ -1448,6 +1460,40 @@ func acceptsExecutor(choices *ExecutorChoicesV1, executor serviceapi.RunExecutor
 	}
 	return (executor.Model == "" || slices.Contains(choices.Models, executor.Model)) &&
 		(executor.Effort == "" || slices.Contains(choices.Efforts, executor.Effort))
+}
+
+// templateWritesRefusal checks a template's copy with exact writes (Repo C
+// TEMPLATE_LIBRARY_ROUND_2 §10.5) against the profile, only reading Git: the
+// mirror must hold the template (else ErrTemplateNotAccepted, a profile with no
+// mirror included) and the writes must apply to the template's files (else
+// ErrExactEditNotAccepted, their bounds, a read-only review profile included).
+// Repo C sends the same submission the builder's way on exactly these two. A
+// Git that cannot be read is ErrAdmissionUnavailable; any other request, nil.
+func templateWritesRefusal(ctx context.Context, profile loadedProfile, admission admissionAuthority) error {
+	if admission.exactEdit == nil || admission.exactEdit.SourceSHA != "" || admission.template == nil {
+		return nil
+	}
+	if err := requireMirroredTemplate(profile.configuration.TemplateMirrorPath, *admission.template); err != nil {
+		return serviceapi.ErrTemplateNotAccepted
+	}
+	if profile.template.Ralphex.Mode == ralphex.ModeReview {
+		return serviceapi.ErrExactEditNotAccepted
+	}
+	template := authority.TemplateCopyManifest{
+		MirrorPath: profile.configuration.TemplateMirrorPath, TemplateID: admission.template.TemplateID, Version: admission.template.Version,
+		CommitSHA: admission.template.CommitSHA, TreeSHA: admission.template.TreeSHA,
+	}
+	err := runctl.CheckTemplateExactEdit(ctx, profile.configuration.RepositoryPath, template, exactEditManifest(*admission.exactEdit))
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, runctl.ErrTemplateNotHeld):
+		return serviceapi.ErrTemplateNotAccepted
+	case errors.Is(err, runctl.ErrExactEditDoesNotApply):
+		return serviceapi.ErrExactEditNotAccepted
+	default:
+		return serviceapi.ErrAdmissionUnavailable
+	}
 }
 
 // requireMirroredTemplate checks, before a build is admitted, that the

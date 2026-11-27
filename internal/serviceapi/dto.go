@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"path/filepath"
@@ -83,7 +84,9 @@ type RunAdmissionRequestV1 struct {
 	// ExactEdit asks for a run that applies exact replacements to the files at
 	// the repository base with no builder and no model, then runs the profile's
 	// acceptance (Repo C design note BF01D_QUICK_EDIT.md §4.5). Omitted for every
-	// other build, so every request without it keeps its digest.
+	// other build, so every request without it keeps its digest. Without a
+	// source commit, beside Template, it is a template's copy with exact writes
+	// (Repo C TEMPLATE_LIBRARY_ROUND_2 §10.5): a first version with no builder.
 	ExactEdit *RunExactEditV1 `json:"exact_edit,omitempty"`
 	// ReadPaths are the app's own folders the build is shown read-only inside
 	// its wall (Repo C design note BUILD_ISOLATION.md, phase 1): its earlier
@@ -117,8 +120,16 @@ func ValidateRunReadPaths(paths []string) error {
 // RunExactEditV1 starts from SourceSHA, the commit of the version being changed
 // (a commit an earlier run made), and makes at most MaxExactEditReplacements
 // replacements in it, each in a different file.
+//
+// Or, with no SourceSHA (left out) and only beside a template, it writes on the
+// template's copy (Repo C TEMPLATE_LIBRARY_ROUND_2 §10.5): ABCP commits the
+// template's dist/<template_id> tree from the profile's mirror, then the
+// replacements, each from its file's blob in that tree; a file may take several
+// JSON values at pointers that do not nest, the pointer "" being the whole
+// document (ValidateTemplateRunExactEditV1). An exact edit with a source keeps
+// its JSON and digest: the source is never empty there.
 type RunExactEditV1 struct {
-	SourceSHA    string             `json:"source_sha"`
+	SourceSHA    string             `json:"source_sha,omitempty"`
 	Replacements []RunReplacementV1 `json:"replacements"`
 }
 
@@ -127,7 +138,9 @@ type RunExactEditV1 struct {
 // JSON file, it changes the one value at Pointer (RFC 6901) from From to To,
 // each one JSON value as text: the same item word for word in two places of a
 // site-kit website's content.json can't be told apart by text (Repo C
-// PREVIEW_EDITOR.md §12.2). One form or the other, never both.
+// PREVIEW_EDITOR.md §12.2). One form or the other, never both. A JSON value
+// with the pointer "" (sent as "", or left out) is the whole document, which
+// only a template's copy takes.
 type RunReplacementV1 struct {
 	Path     string `json:"path"`
 	BaseBlob string `json:"base_blob"`
@@ -196,6 +209,39 @@ func ValidateRunExactEditV1(edit RunExactEditV1) error {
 			return errors.New("invalid exact edit")
 		}
 		seen[replacement.Path] = true
+	}
+	return nil
+}
+
+// ValidateTemplateRunExactEditV1 checks the form of a template's copy's exact
+// writes (Repo C TEMPLATE_LIBRARY_ROUND_2 §10.5): no source commit and at least
+// one replacement, each with a valid path (ValidExactEditPath) and a lowercase
+// Git blob ID, and either words (Find not empty, Replace different, both UTF-8
+// without NUL) or a JSON value (no words, a .json file, the pointer "" or one
+// below the root as ValidExactEditJSON takes it, From and To each one JSON
+// value, different). How many there are, how large and how they sit in their
+// files is admission's to check against the template's files, which refuses
+// them as exact_edit_not_accepted (422): Repo C then sends the same submission
+// the builder's way.
+func ValidateTemplateRunExactEditV1(edit RunExactEditV1) error {
+	if edit.SourceSHA != "" || len(edit.Replacements) == 0 {
+		return errors.New("invalid exact edit")
+	}
+	for _, replacement := range edit.Replacements {
+		if !ValidExactEditPath(replacement.Path) || !isLowerGitObjectID(replacement.BaseBlob) {
+			return errors.New("invalid exact edit")
+		}
+		if replacement.Pointer == "" && replacement.From == "" && replacement.To == "" {
+			if replacement.Find == "" || !utf8.ValidString(replacement.Find) || !utf8.ValidString(replacement.Replace) ||
+				strings.ContainsRune(replacement.Find, 0) || strings.ContainsRune(replacement.Replace, 0) || replacement.Find == replacement.Replace {
+				return errors.New("invalid exact edit")
+			}
+			continue
+		}
+		if replacement.Find != "" || replacement.Replace != "" ||
+			!validJSONReplacement(replacement.Path, replacement.Pointer, replacement.From, replacement.To, true, math.MaxInt) {
+			return errors.New("invalid exact edit")
+		}
 	}
 	return nil
 }
@@ -315,11 +361,22 @@ func ValidateRunAdmissionRequestV1(request RunAdmissionRequestV1) error {
 		}
 	}
 	if request.ExactEdit != nil {
-		if request.Template != nil || request.Executor != nil {
+		if request.Executor != nil {
 			return errors.New("invalid exact edit")
 		}
-		if err := ValidateRunExactEditV1(*request.ExactEdit); err != nil {
-			return err
+		// No source commit, beside a template: the template's copy with exact
+		// writes. Any other exact edit names its source and no template.
+		if request.ExactEdit.SourceSHA == "" && request.Template != nil {
+			if err := ValidateTemplateRunExactEditV1(*request.ExactEdit); err != nil {
+				return err
+			}
+		} else {
+			if request.Template != nil {
+				return errors.New("invalid exact edit")
+			}
+			if err := ValidateRunExactEditV1(*request.ExactEdit); err != nil {
+				return err
+			}
 		}
 	}
 	if request.ReadPaths != nil {
@@ -597,10 +654,16 @@ func ValidatePreviewV1(v PreviewV1) error {
 // MaxExactEditPathBytes bytes, UTF-8 without a control character; and from and
 // to each one JSON value of 1 to MaxExactEditTextBytes bytes, different.
 func ValidExactEditJSON(path, pointer, from, to string) bool {
+	return validJSONReplacement(path, pointer, from, to, false, MaxExactEditTextBytes)
+}
+
+// validJSONReplacement is ValidExactEditJSON with the pointer "" (the whole
+// document) allowed when wholeDocument, and each value at most valueBytes.
+func validJSONReplacement(path, pointer, from, to string, wholeDocument bool, valueBytes int) bool {
 	if !strings.HasSuffix(strings.ToLower(path), ".json") {
 		return false
 	}
-	if pointer == "" || pointer[0] != '/' || len(pointer) > MaxExactEditPathBytes || !utf8.ValidString(pointer) {
+	if (pointer == "" && !wholeDocument) || (pointer != "" && pointer[0] != '/') || len(pointer) > MaxExactEditPathBytes || !utf8.ValidString(pointer) {
 		return false
 	}
 	for i, r := range pointer {
@@ -612,7 +675,7 @@ func ValidExactEditJSON(path, pointer, from, to string) bool {
 		}
 	}
 	for _, value := range []string{from, to} {
-		if value == "" || len(value) > MaxExactEditTextBytes || !json.Valid([]byte(value)) {
+		if value == "" || len(value) > valueBytes || !json.Valid([]byte(value)) {
 			return false
 		}
 	}

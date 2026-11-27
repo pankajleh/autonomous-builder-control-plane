@@ -23,6 +23,11 @@ import (
 const (
 	MaxProfileFileBytes      = 256 << 10
 	MaxManifestTemplateBytes = 256 << 10
+	// MaxRunManifestBytes bounds a run's own manifest.json, which a template's copy with exact writes makes larger
+	// than any other (Repo C TEMPLATE_LIBRARY_ROUND_2 §10.5): up to 256 KB of JSON values, each a JSON string in the
+	// manifest, where Go escapes a quote in two bytes and <, > and & in six. Every other manifest is far below
+	// MaxManifestTemplateBytes, as it was.
+	MaxRunManifestBytes      = 2 << 20
 	MaxProfiles              = 64
 	MaxReceiptBytes          = 16 << 10
 	MaxBindingBytes          = 32 << 10

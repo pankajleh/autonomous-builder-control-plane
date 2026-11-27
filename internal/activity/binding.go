@@ -199,7 +199,7 @@ func (r Resolver) resolveBinding(ctx context.Context, run string) (Scope, error)
 	if b.ManifestPath != filepath.Join(admittedDir, "manifest.json") || b.PlanPath != filepath.Join(admittedDir, "plan.md") {
 		return fail("binding-paths")
 	}
-	data, err := readFile(b.ManifestPath, runadmission.MaxManifestTemplateBytes, false)
+	data, err := readFile(b.ManifestPath, runadmission.MaxRunManifestBytes, false)
 	if err != nil || digest(data) != reg.AuthorityDigest {
 		return fail("manifest-digest")
 	}

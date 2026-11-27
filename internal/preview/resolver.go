@@ -116,7 +116,7 @@ func (r Resolver) Resolve(ctx context.Context, run, checkpoint string) (Source, 
 	if b.ContextCapsulePath != filepath.Join(admitted, "context-capsule.json") || b.ManifestPath != filepath.Join(admitted, "manifest.json") || b.PlanPath != filepath.Join(admitted, "plan.md") {
 		return fail()
 	}
-	data, err := readFile(b.ManifestPath, runadmission.MaxManifestTemplateBytes, false)
+	data, err := readFile(b.ManifestPath, runadmission.MaxRunManifestBytes, false)
 	var m authority.Manifest
 	if err != nil || digest(data) != reg.AuthorityDigest || strictjson.Decode(data, &m) != nil || m.RunID != run || m.Repository.Path != scope.Repository || m.Repository.Identity != b.RepositoryIdentity || m.Repository.StartSHA != scope.Base || m.ContextCapsule == nil || m.ContextCapsule.Path != b.ContextCapsulePath {
 		return fail()

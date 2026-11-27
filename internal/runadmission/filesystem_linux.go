@@ -200,7 +200,12 @@ func writeNewAtomicAt(parent int, name string, data []byte) error {
 }
 
 func createOrVerifyAt(parent int, name string, expected []byte) error {
-	data, found, err := readRegularAt(parent, name, MaxManifestTemplateBytes)
+	return createOrVerifyBoundedAt(parent, name, expected, MaxManifestTemplateBytes)
+}
+
+// createOrVerifyBoundedAt is createOrVerifyAt for a file of at most limit bytes.
+func createOrVerifyBoundedAt(parent int, name string, expected []byte, limit int) error {
+	data, found, err := readRegularAt(parent, name, limit)
 	if err != nil {
 		return err
 	}
@@ -213,7 +218,7 @@ func createOrVerifyAt(parent int, name string, expected []byte) error {
 	if err := writeNewAtomicAt(parent, name, expected); err != nil {
 		return err
 	}
-	data, found, err = readRegularAt(parent, name, MaxManifestTemplateBytes)
+	data, found, err = readRegularAt(parent, name, limit)
 	if err != nil || !found || !bytes.Equal(data, expected) {
 		return errors.New("admission material verification failed")
 	}

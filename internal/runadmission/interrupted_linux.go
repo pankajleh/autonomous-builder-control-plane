@@ -151,7 +151,7 @@ func (r *InterruptedResumer) consider(ctx context.Context, runID string, resumes
 // resumeAllowed reads the run's own frozen manifest (the one its binding digests) and answers whether its profile
 // allows a resume after an interruption.
 func resumeAllowed(binding AdmissionBindingV1) (bool, error) {
-	data, err := readProtectedFile(binding.ManifestPath, MaxManifestTemplateBytes)
+	data, err := readProtectedFile(binding.ManifestPath, MaxRunManifestBytes)
 	if err != nil {
 		return false, err
 	}
