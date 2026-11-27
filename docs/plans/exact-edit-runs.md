@@ -20,7 +20,8 @@ base (the profile repository's HEAD, as for every run):
 One to ten replacements, each in a different file; `find` 1 to 1,024 bytes and `replace` at most 1,024, both UTF-8 without
 NUL and different; a relative path with no empty, `.` or `..` segment, no backslash or control character, never under
 `.git` or `.ralphex` and never in a `migrations` or `migration` folder. An exact edit names no template and no executor
-choice. Omitted, every request keeps its digest.
+choice; one with no `source_sha`, beside a template, writes on the template's copy instead (`template-exact-writes.md`).
+Omitted, every request keeps its digest.
 
 **Refused before anything is written** (`422 exact_edit_not_accepted`): the source commit is not in the repository or
 no run's branch (`refs/heads/abcp/*`) holds it; a file is missing there, is not a regular file, or its blob is not
