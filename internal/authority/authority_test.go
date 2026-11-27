@@ -1280,3 +1280,101 @@ func TestNewValidatesAnExactEditsJSONReplacement(t *testing.T) {
 		}
 	}
 }
+
+// A template's copy with exact writes (Repo C TEMPLATE_LIBRARY_ROUND_2 §10.5): an exact edit with no source commit, only
+// beside a template copy, within Repo C's bounds; never with a source, governance, a read-only review or no worktree.
+func TestNewValidatesATemplatesCopyWithExactWrites(t *testing.T) {
+	template := func() *TemplateCopyManifest {
+		return &TemplateCopyManifest{MirrorPath: t.TempDir(), TemplateID: "booking_lite", Version: "1.0.0", CommitSHA: strings.Repeat("c", 40), TreeSHA: strings.Repeat("d", 40)}
+	}
+	setting := func(pointer, from, to string) ExactEditReplacement {
+		return ExactEditReplacement{Path: "app.config.json", BaseBlob: strings.Repeat("b", 40), Pointer: pointer, From: from, To: to}
+	}
+	writes := func() *ExactEditManifest {
+		return &ExactEditManifest{Replacements: []ExactEditReplacement{
+			{Path: "presets/salon.json", BaseBlob: strings.Repeat("e", 40), From: `{"key":"salon"}`, To: `{"key":"salon","brand":{"name":"Nine"}}`},
+			setting("/cal.slotMinutes", `30`, `45`), setting("/site.brand", `{"name":"Booking"}`, `{"name":"Nine"}`),
+			{Path: "public/index.html", BaseBlob: strings.Repeat("f", 40), Find: "Book now", Replace: "Book a visit"},
+		}}
+	}
+	manifest := fixtureManifest(t)
+	manifest.Worktree = WorktreePolicy{Enabled: true, Branch: "abcp/exact-edit"}
+	manifest.TemplateCopy, manifest.ExactEdit = template(), writes()
+	governed, err := New(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := string(governed.CanonicalJSON())
+	if !strings.Contains(canonical, `"exact_edit":{"replacements":[`) || strings.Contains(canonical, "source_sha\":\"\"") || !strings.Contains(canonical, `"template_copy":{`) {
+		t.Fatalf("the authority does not bind the template and its writes: %s", canonical)
+	}
+	if got, ok := governed.ExactEdit(); !ok || got.SourceSHA != "" || len(got.Replacements) != 4 || !got.Replacements[0].JSON() || got.Replacements[0].Pointer != "" || got.Replacements[3].JSON() {
+		t.Fatalf("exact edit %+v", got)
+	}
+	many := writes()
+	for len(many.Replacements) <= MaxTemplateExactEditReplacements {
+		many.Replacements = append(many.Replacements, setting("/x"+strings.Repeat("y", len(many.Replacements)), `1`, `2`))
+	}
+	for name, change := range map[string]func(*Manifest){
+		"a source commit": func(m *Manifest) {
+			m.ExactEdit = &ExactEditManifest{SourceSHA: strings.Repeat("a", 40), Replacements: writes().Replacements[3:]}
+		},
+		"no template":        func(m *Manifest) { m.TemplateCopy = nil },
+		"no worktree":        func(m *Manifest) { m.Worktree = WorktreePolicy{} },
+		"a read-only review": func(m *Manifest) { m.Ralphex.Mode = ralphex.ModeReview; m.Worktree = WorktreePolicy{} },
+		"more than 40":       func(m *Manifest) { m.ExactEdit = many },
+		"a value over 64 KB": func(m *Manifest) {
+			m.ExactEdit.Replacements[1].To = `"` + strings.Repeat("x", MaxTemplateExactEditValueBytes) + `"`
+		},
+		"values over 256 KB together": func(m *Manifest) {
+			for i := 0; i < 5; i++ {
+				m.ExactEdit.Replacements = append(m.ExactEdit.Replacements, setting("/v"+strings.Repeat("w", i), `1`, `"`+strings.Repeat("z", MaxTemplateExactEditValueBytes-2)+`"`))
+			}
+		},
+		"nesting pointers":      func(m *Manifest) { m.ExactEdit.Replacements[2].Pointer = "/cal.slotMinutes/0" },
+		"the same pointer":      func(m *Manifest) { m.ExactEdit.Replacements[2].Pointer = "/cal.slotMinutes" },
+		"the whole and a value": func(m *Manifest) { m.ExactEdit.Replacements[2].Pointer = "" },
+		"words beside a value":  func(m *Manifest) { m.ExactEdit.Replacements[3].Path = "app.config.json" },
+		"words twice in a file": func(m *Manifest) {
+			m.ExactEdit.Replacements = append(m.ExactEdit.Replacements, ExactEditReplacement{Path: "public/index.html", BaseBlob: strings.Repeat("f", 40), Find: "Call", Replace: "Ring"})
+		},
+		"a migration":         func(m *Manifest) { m.ExactEdit.Replacements[3].Path = "db/migrations/001.sql" },
+		"a value not JSON":    func(m *Manifest) { m.ExactEdit.Replacements[1].To = "{" },
+		"the same value":      func(m *Manifest) { m.ExactEdit.Replacements[1].To = `30` },
+		"words and a value":   func(m *Manifest) { m.ExactEdit.Replacements[1].Find = "30" },
+		"a value, not a JSON": func(m *Manifest) { m.ExactEdit.Replacements[1].Path = "app.config.yaml" },
+	} {
+		invalid := fixtureManifest(t)
+		invalid.Worktree = WorktreePolicy{Enabled: true, Branch: "abcp/exact-edit"}
+		invalid.TemplateCopy, invalid.ExactEdit = template(), writes()
+		change(&invalid)
+		if _, err := New(invalid); err == nil {
+			t.Errorf("%s: accepted", name)
+		} else if name != "a read-only review" && !strings.Contains(err.Error(), "exact edit") {
+			t.Errorf("%s: %v", name, err)
+		} else if name == "a source commit" && !strings.Contains(err.Error(), "without a template") {
+			t.Errorf("a source commit beside a template: %v", err)
+		}
+	}
+	// A JSON value with no pointer is the whole document, which no exact edit with a source takes.
+	quick := fixtureManifest(t)
+	quick.Worktree = WorktreePolicy{Enabled: true, Branch: "abcp/exact-edit"}
+	quick.ExactEdit = &ExactEditManifest{SourceSHA: strings.Repeat("a", 40), Replacements: []ExactEditReplacement{writes().Replacements[0]}}
+	if _, err := New(quick); err == nil || !strings.Contains(err.Error(), "exact edit") {
+		t.Fatalf("a quick edit took the whole document: %v", err)
+	}
+}
+
+func TestPointersNest(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		nest bool
+	}{
+		{"/a", "/a", true}, {"/a", "/a/b", true}, {"/a/b", "/a", true}, {"", "/a", true}, {"/a", "", true}, {"", "", true},
+		{"/a", "/ab", false}, {"/a~1b", "/a/b", false}, {"/", "/a", false}, {"/", "//a", true}, {"/a/0", "/a/1", false},
+	} {
+		if got := PointersNest(c.a, c.b); got != c.nest {
+			t.Errorf("PointersNest(%q, %q) = %v", c.a, c.b, got)
+		}
+	}
+}
