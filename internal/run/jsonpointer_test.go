@@ -2,6 +2,7 @@ package run
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -89,5 +90,46 @@ func TestJSONPointerRefusals(t *testing.T) {
 	}
 	if _, err := replaceJSONValue([]byte(siteContent), "/a~1b/x~0y", []byte(`1`), []byte(`{`)); !errors.Is(err, errJSONInvalid) {
 		t.Fatalf("a new value that isn't JSON: got %v", err)
+	}
+}
+
+// A template's copy takes several values in one file and the whole document (Repo C TEMPLATE_LIBRARY_ROUND_2 §10.5):
+// each value written compact in its place, every other byte as it was.
+func TestJSONPointersChangeSeveralValuesAndTheWholeDocument(t *testing.T) {
+	updated, err := replaceJSONValues([]byte(siteContent), []jsonWrite{
+		{pointer: "/pages/gallery/sections/0/items/1/label", from: []byte(`"Coffee"`), to: []byte(`"Tea"`)},
+		{pointer: "/pages/gallery/sections/0/items/0/image", from: []byte(`"public/assets/section-1.png"`), to: []byte(`"x.png"`)},
+		{pointer: "/a~1b", from: []byte(`{"x~y": 1.0}`), to: []byte(`{ "x~y": 2 }`)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.NewReplacer(`{"image": "public/assets/section-1.png", "label": "Our café"},`, `{"image": "x.png", "label": "Our café"},`,
+		`"Coffee"`, `"Tea"`, `{"x~y": 1}`, `{"x~y":2}`).Replace(siteContent)
+	if string(updated) != want {
+		t.Fatalf("got\n%s\nwant\n%s", updated, want)
+	}
+	whole, err := replaceJSONValues([]byte("\n  {\"key\": \"salon\",\n   \"n\": 1}\n\n"), []jsonWrite{{pointer: "", from: []byte(`{"n":1,"key":"salon"}`), to: []byte(`{"key": "salon", "n": 2}`)}})
+	if err != nil || string(whole) != "\n  {\"key\":\"salon\",\"n\":2}\n\n" {
+		t.Fatalf("the whole document = %q, %v", whole, err)
+	}
+	for _, c := range []struct {
+		name   string
+		writes []jsonWrite
+		want   error
+	}{
+		{"nesting", []jsonWrite{{pointer: "/a~1b", from: []byte(`{"x~y":1}`), to: []byte(`1`)}, {pointer: "/a~1b/x~0y", from: []byte(`1`), to: []byte(`2`)}}, errPointersNest},
+		{"the whole document and a value", []jsonWrite{{pointer: "/a~1b/x~0y", from: []byte(`1`), to: []byte(`2`)}, {pointer: "", from: []byte(`{}`), to: []byte(`{}`)}}, errPointersNest},
+		{"one value differs", []jsonWrite{{pointer: "/a~1b/x~0y", from: []byte(`1`), to: []byte(`2`)}, {pointer: "/pages/home/sections/0/kind", from: []byte(`"list"`), to: []byte(`"x"`)}}, errPointerDiffers},
+		{"one names nothing", []jsonWrite{{pointer: "/a~1b/x~0y", from: []byte(`1`), to: []byte(`2`)}, {pointer: "/pages/about", from: []byte(`{}`), to: []byte(`{}`)}}, errPointerNotFound},
+		{"a bad escape", []jsonWrite{{pointer: "/a~2b", from: []byte(`1`), to: []byte(`2`)}}, errPointerInvalid},
+		{"a new value that isn't JSON", []jsonWrite{{pointer: "/a~1b/x~0y", from: []byte(`1`), to: []byte(`{`)}}, errJSONInvalid},
+	} {
+		if _, err := replaceJSONValues([]byte(siteContent), c.writes); !errors.Is(err, c.want) {
+			t.Errorf("%s: got %v, want %v", c.name, err, c.want)
+		}
+	}
+	if _, err := replaceJSONValues([]byte(`{"a": 1, "a": 2}`), []jsonWrite{{pointer: "/a", from: []byte(`1`), to: []byte(`3`)}}); !errors.Is(err, errPointerTwice) {
+		t.Fatalf("the same key twice: got %v", err)
 	}
 }

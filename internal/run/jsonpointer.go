@@ -8,8 +8,11 @@ import (
 	"io"
 	"math/big"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/pankajleh/autonomous-builder-control-plane/internal/authority"
 )
 
 // A JSON replacement (Repo C design note PREVIEW_EDITOR.md §12.2): the value at one RFC 6901 pointer in a JSON file
@@ -191,4 +194,164 @@ func numbersByValue(v any) any {
 		}
 	}
 	return v
+}
+
+// Several JSON replacements in one file (a template's copy's writes, Repo C design note TEMPLATE_LIBRARY_ROUND_2 §10.5):
+// app.config.json takes one per setting, and a preset file is written whole, at the pointer "".
+
+var errPointersNest = errors.New("two pointers in the file nest")
+
+// jsonWrite is one value's replacement in a file: the value the pointer names changes from from to to.
+type jsonWrite struct {
+	pointer  string
+	from, to json.RawMessage
+}
+
+// parseJSONPointerOrRoot is parseJSONPointer with "" too: the whole document (RFC 6901), no reference token.
+func parseJSONPointerOrRoot(pointer string) ([]string, error) {
+	if pointer == "" {
+		return []string{}, nil
+	}
+	return parseJSONPointer(pointer)
+}
+
+// replaceJSONValues makes each write in content, at pointers that do not nest (authority.PointersNest), "" being the
+// whole document. The value each pointer names must equal its from (as JSON, whatever its spacing); each to is written
+// compact in its place, as replaceJSONValue writes one, and every other byte of content stays as it was: the spacing
+// and the line end around a whole document's value included.
+func replaceJSONValues(content []byte, writes []jsonWrite) ([]byte, error) {
+	targets := make([][]string, len(writes))
+	for i, write := range writes {
+		for _, other := range writes[:i] {
+			if authority.PointersNest(other.pointer, write.pointer) {
+				return nil, fmt.Errorf("%q and %q: %w", other.pointer, write.pointer, errPointersNest)
+			}
+		}
+		tokens, err := parseJSONPointerOrRoot(write.pointer)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", write.pointer, err)
+		}
+		targets[i] = tokens
+	}
+	if !json.Valid(content) {
+		return nil, errJSONInvalid
+	}
+	dec := json.NewDecoder(bytes.NewReader(content))
+	dec.UseNumber()
+	spans := make([][][2]int, len(writes))
+	if err := walkJSONTargets(dec, nil, targets, spans); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errJSONInvalid
+	}
+	type placed struct {
+		start, end int
+		value      []byte
+	}
+	values := make([]placed, 0, len(writes))
+	for i, write := range writes {
+		switch len(spans[i]) {
+		case 0:
+			return nil, fmt.Errorf("%q: %w", write.pointer, errPointerNotFound)
+		case 1:
+		default:
+			return nil, fmt.Errorf("%q: %w", write.pointer, errPointerTwice)
+		}
+		start, end := spans[i][0][0], spans[i][0][1]
+		same, err := jsonEqual(content[start:end], write.from)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", write.pointer, err)
+		}
+		if !same {
+			return nil, fmt.Errorf("%q: %w", write.pointer, errPointerDiffers)
+		}
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, write.to); err != nil {
+			return nil, fmt.Errorf("%q: the new value: %w", write.pointer, errJSONInvalid)
+		}
+		values = append(values, placed{start: start, end: end, value: compact.Bytes()})
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i].start < values[j].start })
+	updated := make([]byte, 0, len(content))
+	at := 0
+	for _, value := range values {
+		if value.start < at {
+			return nil, errPointersNest // values that do not nest never overlap
+		}
+		updated = append(updated, content[at:value.start]...)
+		updated = append(updated, value.value...)
+		at = value.end
+	}
+	updated = append(updated, content[at:]...)
+	if !json.Valid(updated) {
+		return nil, errJSONInvalid
+	}
+	return updated, nil
+}
+
+// walkJSONTargets is walkJSON for several targets at once: the value at a target is recorded in that target's spans
+// (its bytes as the file has them), a value on the way to any target is entered, and any other value is skipped whole.
+func walkJSONTargets(dec *json.Decoder, path []string, targets [][]string, spans [][][2]int) error {
+	onTheWay := false
+	for i, target := range targets {
+		if len(path) > len(target) || !tokensHavePrefix(target, path) {
+			continue
+		}
+		if len(path) == len(target) {
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return errJSONInvalid
+			}
+			end := int(dec.InputOffset())
+			spans[i] = append(spans[i], [2]int{end - len(raw), end})
+			return nil
+		}
+		onTheWay = true
+	}
+	if !onTheWay {
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return errJSONInvalid
+		}
+		return nil
+	}
+	token, err := dec.Token()
+	if err != nil {
+		return errJSONInvalid
+	}
+	switch token {
+	case json.Delim('{'):
+		for dec.More() {
+			key, err := dec.Token()
+			name, ok := key.(string)
+			if err != nil || !ok {
+				return errJSONInvalid
+			}
+			if err := walkJSONTargets(dec, append(append([]string(nil), path...), name), targets, spans); err != nil {
+				return err
+			}
+		}
+	case json.Delim('['):
+		for index := 0; dec.More(); index++ {
+			if err := walkJSONTargets(dec, append(append([]string(nil), path...), strconv.Itoa(index)), targets, spans); err != nil {
+				return err
+			}
+		}
+	default:
+		return nil // a scalar on the way: the pointer goes further than the document does
+	}
+	if _, err := dec.Token(); err != nil { // the closing } or ]
+		return errJSONInvalid
+	}
+	return nil
+}
+
+func tokensHavePrefix(tokens, prefix []string) bool {
+	for i := range prefix {
+		if tokens[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
 }

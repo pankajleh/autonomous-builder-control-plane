@@ -187,8 +187,14 @@ func CanonicalUUID(value string) bool {
 // model, checks that commit changes exactly them, and runs the acceptance
 // commands. It is omitted for every build and every manifest created before
 // exact edits.
+//
+// Without SourceSHA, beside the manifest's template copy, it is a template's
+// copy with exact writes (Repo C TEMPLATE_LIBRARY_ROUND_2 §10.5): the copy is
+// the template's tree, read from the mirror, and the replacements are
+// ValidateTemplateExactEdit's. SourceSHA is then left out, so every manifest
+// with one keeps its bytes.
 type ExactEditManifest struct {
-	SourceSHA    string                 `json:"source_sha"`
+	SourceSHA    string                 `json:"source_sha,omitempty"`
 	Replacements []ExactEditReplacement `json:"replacements"`
 }
 
@@ -208,8 +214,11 @@ type ExactEditReplacement struct {
 	To       string `json:"to,omitempty"`
 }
 
-// JSON reports whether the replacement is the JSON form.
-func (r ExactEditReplacement) JSON() bool { return r.Pointer != "" }
+// JSON reports whether the replacement is the JSON form: a pointer, or a value
+// before and after. A JSON replacement with no pointer is the whole document
+// (the pointer "", RFC 6901), which only a template's copy takes; validation
+// refuses it in any other exact edit, as it refused a value without a pointer.
+func (r ExactEditReplacement) JSON() bool { return r.Pointer != "" || r.From != "" || r.To != "" }
 
 const (
 	maxExactEditReplacements = 10
@@ -278,10 +287,16 @@ func validateExactEdit(edit ExactEditManifest) error {
 // character; and from and to each one JSON value of 1 to maxExactEditTextBytes
 // bytes, different.
 func ValidExactEditJSON(path, pointer, from, to string) bool {
+	return validJSONReplacement(path, pointer, from, to, false, maxExactEditTextBytes)
+}
+
+// validJSONReplacement is ValidExactEditJSON with the pointer "" (the whole
+// document) allowed when wholeDocument, and each value at most valueBytes.
+func validJSONReplacement(path, pointer, from, to string, wholeDocument bool, valueBytes int) bool {
 	if !strings.HasSuffix(strings.ToLower(path), ".json") {
 		return false
 	}
-	if pointer == "" || pointer[0] != '/' || len(pointer) > maxExactEditPathBytes || !utf8.ValidString(pointer) {
+	if (pointer == "" && !wholeDocument) || (pointer != "" && pointer[0] != '/') || len(pointer) > maxExactEditPathBytes || !utf8.ValidString(pointer) {
 		return false
 	}
 	for i, r := range pointer {
@@ -293,11 +308,95 @@ func ValidExactEditJSON(path, pointer, from, to string) bool {
 		}
 	}
 	for _, value := range []string{from, to} {
-		if value == "" || len(value) > maxExactEditTextBytes || !json.Valid([]byte(value)) {
+		if value == "" || len(value) > valueBytes || !json.Valid([]byte(value)) {
 			return false
 		}
 	}
 	return from != to
+}
+
+const (
+	// MaxTemplateExactEditReplacements bounds a template's copy's exact writes
+	// (Repo C TEMPLATE_LIBRARY_ROUND_2 §10.5).
+	MaxTemplateExactEditReplacements = 40
+	// MaxTemplateExactEditValueBytes bounds each of their JSON values, before
+	// or after: a whole preset file is one.
+	MaxTemplateExactEditValueBytes = 64 << 10
+	// MaxTemplateExactEditBytes bounds all of their values and words together.
+	MaxTemplateExactEditBytes = 256 << 10
+)
+
+// ValidateTemplateExactEdit checks the exact writes on a template's copy (Repo
+// C design note TEMPLATE_LIBRARY_ROUND_2 §10.5), as Repo C's
+// AbcpRequestFactory.validTemplateExactEdit makes them: no source commit; one
+// to MaxTemplateExactEditReplacements replacements, each with a valid path and
+// blob; words as an exact edit's, the file's only replacement; JSON values in
+// a .json file, several in one file only at pointers that do not nest
+// (PointersNest), so the pointer "" (the whole document) is its file's only
+// one; each value at most MaxTemplateExactEditValueBytes, and every value and
+// word together at most MaxTemplateExactEditBytes.
+func ValidateTemplateExactEdit(edit ExactEditManifest) error {
+	if edit.SourceSHA != "" {
+		return errors.New("exact edit: a template's copy names no source commit")
+	}
+	if len(edit.Replacements) == 0 || len(edit.Replacements) > MaxTemplateExactEditReplacements {
+		return fmt.Errorf("exact edit: one to %d replacements are required", MaxTemplateExactEditReplacements)
+	}
+	words := map[string]bool{}
+	pointers := map[string][]string{}
+	total := 0
+	for _, replacement := range edit.Replacements {
+		if !ValidExactEditPath(replacement.Path) {
+			return errors.New("exact edit: invalid path")
+		}
+		if !templateCopyObjectPattern.MatchString(replacement.BaseBlob) {
+			return errors.New("exact edit: invalid base blob")
+		}
+		if !replacement.JSON() {
+			if !validExactEditWords(replacement.Find, replacement.Replace) {
+				return errors.New("exact edit: invalid text")
+			}
+			if words[replacement.Path] || len(pointers[replacement.Path]) > 0 {
+				return errors.New("exact edit: words are their file's only replacement")
+			}
+			words[replacement.Path] = true
+			total += len(replacement.Find) + len(replacement.Replace)
+			continue
+		}
+		if replacement.Find != "" || replacement.Replace != "" ||
+			!validJSONReplacement(replacement.Path, replacement.Pointer, replacement.From, replacement.To, true, MaxTemplateExactEditValueBytes) {
+			return fmt.Errorf("exact edit: invalid JSON replacement (each value one JSON value of at most %d bytes)", MaxTemplateExactEditValueBytes)
+		}
+		if words[replacement.Path] {
+			return errors.New("exact edit: words are their file's only replacement")
+		}
+		for _, other := range pointers[replacement.Path] {
+			if PointersNest(other, replacement.Pointer) {
+				return errors.New("exact edit: two pointers in one file nest")
+			}
+		}
+		pointers[replacement.Path] = append(pointers[replacement.Path], replacement.Pointer)
+		total += len(replacement.From) + len(replacement.To)
+	}
+	if total > MaxTemplateExactEditBytes {
+		return fmt.Errorf("exact edit: the values are larger than %d bytes together", MaxTemplateExactEditBytes)
+	}
+	return nil
+}
+
+// PointersNest reports whether one RFC 6901 pointer is the other or inside it:
+// "" (the whole document) holds every pointer, and "/a" holds "/a/b" but not
+// "/ab" or "/a~1b" (the key "a/b").
+func PointersNest(a, b string) bool {
+	return a == b || a == "" || b == "" || strings.HasPrefix(b, a+"/") || strings.HasPrefix(a, b+"/")
+}
+
+// validExactEditWords accepts words to find, 1 to maxExactEditTextBytes bytes,
+// and different words to put in their place, at most that, both UTF-8 without
+// NUL.
+func validExactEditWords(find, replace string) bool {
+	return find != "" && len(find) <= maxExactEditTextBytes && len(replace) <= maxExactEditTextBytes &&
+		utf8.ValidString(find) && utf8.ValidString(replace) && !strings.ContainsRune(find, 0) && !strings.ContainsRune(replace, 0) && find != replace
 }
 
 // MaxTaskRetryCount bounds ralphex.task_retry_count: each retry is one more builder session on a failing build (the
@@ -487,12 +586,21 @@ func newAuthority(input Manifest, controller *governancev3.ControllerV1) (Author
 	}
 
 	if manifest.ExactEdit != nil {
-		if err := validateExactEdit(*manifest.ExactEdit); err != nil {
+		// Without a source commit, beside a template copy, the edit writes on the
+		// template's copy (Repo C TEMPLATE_LIBRARY_ROUND_2 §10.5); every other
+		// exact edit is validated as before, so one without a source is refused.
+		templateWrites := manifest.ExactEdit.SourceSHA == "" && manifest.TemplateCopy != nil
+		if templateWrites {
+			if err := ValidateTemplateExactEdit(*manifest.ExactEdit); err != nil {
+				return Authority{}, err
+			}
+		} else if err := validateExactEdit(*manifest.ExactEdit); err != nil {
 			return Authority{}, err
 		}
-		// The edit is the whole implementation: never with a template copy, a
-		// governed workflow or a read-only review, and always in its own worktree.
-		if manifest.TemplateCopy != nil || manifest.Governance != nil || !manifest.Worktree.Enabled || manifest.Ralphex.Mode == ralphex.ModeReview {
+		// The edit is the whole implementation: never with a governed workflow or
+		// a read-only review, always in its own worktree, and with a template
+		// copy only as that template's writes.
+		if (manifest.TemplateCopy != nil && !templateWrites) || manifest.Governance != nil || !manifest.Worktree.Enabled || manifest.Ralphex.Mode == ralphex.ModeReview {
 			return Authority{}, errors.New("exact edit: requires a worktree run without a template, governance or review")
 		}
 	}
